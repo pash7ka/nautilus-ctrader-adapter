@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# uv venv (heavy, local)
+.venv/
+# .python-version is committed on purpose - pins the interpreter for reproducibility
+
+# Pytest / linters / type checkers
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code per-user, per-machine settings
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Superpowers SDD scratch (briefs, reports, review packages, progress ledger)
+.superpowers/
+
+# Secrets: application credentials and OAuth tokens never belong in git
+.env
+.env.*
+!.env.example
+*.pem
+secrets/
+tokens/
+
+# Generated protobuf bindings - build output, regenerated from the vendored .proto files
+src/nautilus_ctrader/messages/*_pb2.py
+src/nautilus_ctrader/messages/*_pb2.pyi
+
+# Logs
+logs/
+*.log
+
+# Recordings captured from a live broker before scrubbing.
+# Only scrubbed fixtures under tests/fixtures/ may be committed.
+tests/recordings/

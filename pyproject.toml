@@ -1,0 +1,57 @@
+[project]
+name = "nautilus-ctrader-adapter"
+version = "0.0.1"
+description = "cTrader Open API adapter for NautilusTrader"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Pavel Rubin", email = "pash7ka@gmail.com" }]
+requires-python = ">=3.13"
+keywords = ["nautilus-trader", "ctrader", "trading", "adapter", "open-api"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "nautilus-trader>=1.228.0",
+    "protobuf>=5.29",
+]
+
+[project.urls]
+Homepage = "https://github.com/pash7ka/nautilus-ctrader-adapter"
+Issues = "https://github.com/pash7ka/nautilus-ctrader-adapter/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.14",
+    # protoc + plugin, used by scripts/gen_protobuf.py to regenerate bindings
+    "grpcio-tools>=1.68",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nautilus_ctrader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not broker'"
+asyncio_mode = "auto"
+markers = [
+    "broker: requires a live cTrader connection; deselected by default and never run in CI",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+# Generated protobuf bindings are build output, not source
+extend-exclude = ["src/nautilus_ctrader/messages"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ASYNC"]

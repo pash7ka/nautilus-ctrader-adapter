@@ -1,0 +1,6 @@
+# Normalize to LF in the repository and in working copies on every platform,
+# so contributors with core.autocrlf enabled do not produce line-ending churn.
+* text=auto eol=lf
+
+# Recorded protobuf payloads are binary
+*.bin binary
