@@ -65,11 +65,16 @@ Open API application:
 
 1. Register an application under your cTID at
    <https://openapi.ctrader.com/> and obtain a `clientId` / `clientSecret` pair.
-2. Grant it access to your trading accounts at
-   <https://id.ctrader.com/my/settings/openapi/grantingaccess/> with `scope=trading`,
-   which returns an authorization code.
-3. Exchange the code for an `accessToken` / `refreshToken` pair; the access token is
-   refreshed periodically from the refresh token.
+2. Send yourself through `https://openapi.ctrader.com/apps/auth` with your `client_id`,
+   a `redirect_uri` and `scope=trading`, sign in with your cTID and select the accounts to
+   expose. The redirect carries back an authorization code.
+3. Exchange the code at `https://openapi.ctrader.com/apps/token` for an `accessToken` /
+   `refreshToken` pair; the access token is refreshed from the refresh token before it
+   expires.
+
+Step 2 needs a browser and a redirect URI, so it is a one-time step you run yourself — the
+adapter does not perform it. The adapter refreshes the access token while running and hands
+the new pair back to your application to persist.
 
 The adapter receives these values from the host application (environment variables or a
 token store you control). `clientSecret` and both tokens are treated as secrets: they are
@@ -100,11 +105,13 @@ node.build()
 ## Protocol notes
 
 - Endpoints: `demo.ctraderapi.com:5035` and `live.ctraderapi.com:5035`, TLS.
-- Messages are length-prefixed frames carrying a `ProtoMessage` envelope
-  (`payloadType`, `payload`, `clientMsgId`); responses are correlated to requests by
-  `clientMsgId`.
-- A heartbeat must be sent periodically or the server drops the connection. After any
-  reconnect, both authentication levels and all subscriptions must be re-established.
+- Each frame is a 4-byte big-endian length prefix followed by a serialised `ProtoMessage`
+  envelope (`payloadType`, `payload`, `clientMsgId`), capped at 15 MB. Responses are
+  correlated to requests by `clientMsgId`.
+- A heartbeat must be sent if the connection would otherwise be idle for more than 30
+  seconds, and an inbound heartbeat is answered with one.
+- After any reconnect, both authentication levels and all subscriptions must be
+  re-established.
 - Outbound requests are rate-limited, with a separate and much tighter budget for historical
   data requests.
 - Volumes are not expressed in lots, and monetary values carry an explicit digit scale

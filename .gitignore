@@ -31,6 +31,9 @@ CLAUDE.local.md
 
 # Superpowers SDD scratch (briefs, reports, review packages, progress ledger)
 .superpowers/
+# Design specs and plans are process artifacts, not documentation. Anything an outside
+# reader needs is promoted into its own document under docs/ instead.
+docs/superpowers/
 
 # Secrets: application credentials and OAuth tokens never belong in git
 .env
@@ -40,9 +43,8 @@ CLAUDE.local.md
 secrets/
 tokens/
 
-# Generated protobuf bindings - build output, regenerated from the vendored .proto files
-src/nautilus_ctrader/messages/*_pb2.py
-src/nautilus_ctrader/messages/*_pb2.pyi
+# Generated protobuf bindings are COMMITTED on purpose, so that installing from git
+# needs no protoc toolchain. Regenerate with scripts/gen_protobuf.py; never hand-edit.
 
 # Logs
 logs/
