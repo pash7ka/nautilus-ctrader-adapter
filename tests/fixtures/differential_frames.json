@@ -1,0 +1,57 @@
+{
+  "generated_by": "scripts/gen_differential_fixtures.py",
+  "source_package": "ctrader-open-api",
+  "python": "3.12.11",
+  "protobuf": "3.20.1",
+  "note": "Frames as produced by Spotware's TcpProtocol. Regenerate with: uv run --isolated --no-project --python 3.12 --with ctrader-open-api python scripts/gen_differential_fixtures.py",
+  "frames": [
+    {
+      "name": "application_auth_req",
+      "payload_type": 2100,
+      "payload_class": "ProtoOAApplicationAuthReq",
+      "client_msg_id": "msg-1",
+      "payload_bytes": "EgljbGllbnQtaWQaDWNsaWVudC1zZWNyZXQ=",
+      "frame": "AAAAJgi0EBIaEgljbGllbnQtaWQaDWNsaWVudC1zZWNyZXQaBW1zZy0x"
+    },
+    {
+      "name": "account_auth_req",
+      "payload_type": 2102,
+      "payload_class": "ProtoOAAccountAuthReq",
+      "client_msg_id": "msg-2",
+      "payload_bytes": "EIetSxoMYWNjZXNzLXRva2Vu",
+      "frame": "AAAAHgi2EBISEIetSxoMYWNjZXNzLXRva2VuGgVtc2ctMg=="
+    },
+    {
+      "name": "subscribe_spots_req",
+      "payload_type": 2127,
+      "payload_class": "ProtoOASubscribeSpotsReq",
+      "client_msg_id": "msg-3",
+      "payload_bytes": "EIetSxgBGBYYzQI=",
+      "frame": "AAAAFwjPEBILEIetSxgBGBYYzQIaBW1zZy0z"
+    },
+    {
+      "name": "get_trendbars_req",
+      "payload_type": 2137,
+      "payload_class": "ProtoOAGetTrendbarsReq",
+      "client_msg_id": "msg-4",
+      "payload_bytes": "EIetSxiA0JX/vDEggK3xgL0xKAcwATj0Aw==",
+      "frame": "AAAAJQjZEBIZEIetSxiA0JX/vDEggK3xgL0xKAcwATj0AxoFbXNnLTQ="
+    },
+    {
+      "name": "refresh_token_req",
+      "payload_type": 2173,
+      "payload_class": "ProtoOARefreshTokenReq",
+      "client_msg_id": "msg-5",
+      "payload_bytes": "Eg1yZWZyZXNoLXRva2Vu",
+      "frame": "AAAAGwj9EBIPEg1yZWZyZXNoLXRva2VuGgVtc2ctNQ=="
+    },
+    {
+      "name": "heartbeat_no_client_msg_id",
+      "payload_type": 51,
+      "payload_class": "ProtoHeartbeatEvent",
+      "client_msg_id": null,
+      "payload_bytes": "",
+      "frame": "AAAABAgzEgA="
+    }
+  ]
+}
