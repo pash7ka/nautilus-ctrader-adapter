@@ -137,3 +137,14 @@ async def test_push_with_no_connected_client_is_an_error() -> None:
             await server.push(oa.ProtoOAAccountsTokenInvalidatedEvent(reason="recalled"))
     finally:
         await server.stop()
+
+
+async def test_waiting_for_a_client_that_never_connects_times_out() -> None:
+    # The bound is what stops a broken connect from hanging the whole suite.
+    server = FakeCTraderServer()
+    await server.start()
+    try:
+        with pytest.raises(TimeoutError):
+            await server.wait_for_connections(timeout_secs=0.1)
+    finally:
+        await server.stop()

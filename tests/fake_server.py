@@ -69,16 +69,16 @@ class FakeCTraderServer:
             with contextlib.suppress(ConnectionError, OSError):
                 await writer.wait_closed()
 
-    async def wait_for_connections(self, count: int = 1) -> None:
-        """Wait until `count` clients are connected.
+    async def wait_for_connections(self, count: int = 1, timeout_secs: float = 2.0) -> None:
+        """Wait until `count` clients are connected, failing after `timeout_secs`.
 
         A client's `open_connection` returns before the server has registered it, so a push
-        issued straight after connecting can reach nobody. Tests wait on this instead.
-        Wrap in asyncio.timeout() if a timeout is needed.
+        issued straight after connecting can reach nobody. Tests wait on this instead. The
+        bound matters: without it, a client that never connects would hang the suite.
         """
-        while len(self._writers) < count:
-            self._connection_event.clear()
-            if len(self._writers) < count:
+        async with asyncio.timeout(timeout_secs):
+            while len(self._writers) < count:
+                self._connection_event.clear()
                 await self._connection_event.wait()
 
     async def push(self, message: Message, client_msg_id: str | None = None) -> None:
