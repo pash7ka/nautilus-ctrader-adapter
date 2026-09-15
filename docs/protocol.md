@@ -67,8 +67,10 @@ job for the host application. Everything below happens over the already-authenti
 access token, a new refresh token, and `expiresIn`. This adapter refreshes proactively, ahead
 of the access token's known expiry, and reactively, when account authentication is rejected.
 
-- *Proactive*: refresh runs a fixed margin before the token's expiry, so an active session
-  never idles into expiry.
+- *Proactive*: refresh runs 15 minutes before the token's expiry. A refresh that times out or
+  fails for another transient reason is retried once the minimum interval between refreshes
+  has passed, and the margin is several times that interval, so an active session never idles
+  into expiry.
 - *Reactive*: refresh runs once when `ProtoOAAccountAuthReq` is rejected with one of two error
   codes the schema defines for a token problem — `OA_AUTH_TOKEN_EXPIRED` or
   `CH_ACCESS_TOKEN_INVALID` — and never for any other rejection reason, since a new token

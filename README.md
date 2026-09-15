@@ -39,7 +39,7 @@ what to trade or when.
 | Transport | asyncio TLS client for the Open API protobuf protocol: framing, request/response correlation, heartbeat, reconnect with backoff, outbound rate limiting |
 | Authentication | Application-level and account-level auth; access-token refresh over the socket (the one-time authorization-code exchange stays with the host application — see Credentials) |
 | Instrument provider | Builds Nautilus `Instrument` objects from broker symbol specifications (precision, lot size, volume step and limits) |
-| Data client | Live trendbar (OHLC) and spot (bid/ask) subscriptions, plus historical trendbar requests for indicator warm-up |
+| Data client | Live trendbar (OHLC) and spot (bid/ask) subscriptions, plus historical trendbar requests |
 | Execution client | Order submission, modification and cancellation; translation between the Nautilus order model and the cTrader position model; execution reports for state reconciliation |
 | Configuration & factories | `LiveDataClientConfig` / `LiveExecClientConfig` subclasses and the factories a `TradingNode` needs |
 | Test doubles | Recorded protobuf fixtures and a fake cTrader server, so reconnect, heartbeat, timeout and re-subscription logic can be tested without a broker |
@@ -72,9 +72,9 @@ Open API application:
    `refreshToken` pair; the access token is refreshed from the refresh token before it
    expires.
 
-Step 2 needs a browser and a redirect URI, so it is a one-time step you run yourself — the
-adapter does not perform it. The adapter refreshes the access token while running and hands
-the new pair back to your application to persist.
+Steps 2 and 3 are one-time steps you run yourself — step 2 needs a browser and a redirect
+URI — and the adapter performs neither. The adapter refreshes the access token while running
+and hands the new pair back to your application to persist.
 
 The adapter receives these values from the host application (environment variables or a
 token store you control). `clientSecret` and both tokens are treated as secrets and are
@@ -128,8 +128,8 @@ needs no protoc toolchain. This package does **not** depend on the official
 `ctrader-open-api` SDK at runtime: it is built on Twisted, while NautilusTrader is asyncio,
 and it hard-pins `protobuf==3.20.1`, which conflicts with the rest of a modern stack.
 
-[docs/protocol.md](docs/protocol.md) documents the wire protocol in full, including the
-scaling rules that are the easiest thing to get expensively wrong.
+[docs/protocol.md](docs/protocol.md) documents the wire protocol in full, including what is
+still unknown about scaling, the easiest thing to get expensively wrong.
 
 ## Development
 
