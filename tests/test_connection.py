@@ -1,6 +1,8 @@
 """The connection layer: framing over a real socket, correlation, heartbeat, failure."""
 
 import asyncio
+import contextlib
+import struct
 
 import pytest
 from nautilus_trader.common.component import Logger
@@ -8,10 +10,12 @@ from nautilus_trader.common.component import Logger
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
+    CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
 )
 from nautilus_ctrader.common.rate_limit import RateLimiter
+from nautilus_ctrader.constants import MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -124,28 +128,32 @@ async def test_a_silent_server_times_out_the_request() -> None:
         await server.stop()
 
 
-async def test_a_heartbeat_is_sent_when_idle() -> None:
+async def test_a_heartbeat_is_sent_when_idle_and_never_loops() -> None:
+    # The fake server echoes heartbeats by default. Answering those echoes once made the two
+    # sides ping-pong thousands of times a second; the upper bound pins that down.
     server = FakeCTraderServer()
     await server.start()
     connection = await _connected(server, heartbeat_idle_secs=0.1)
     try:
         await asyncio.sleep(0.5)
-        assert server.heartbeats_received >= 2
+        assert 2 <= server.heartbeats_received <= 10
     finally:
         await connection.close()
         await server.stop()
 
 
-async def test_an_inbound_heartbeat_is_answered() -> None:
+async def test_an_inbound_heartbeat_is_neither_answered_nor_surfaced() -> None:
     server = FakeCTraderServer()
-    server.answer_heartbeats = False
     await server.start()
     connection = await _connected(server, heartbeat_idle_secs=3600.0)
+    seen: list[object] = []
+    connection.set_event_handler(seen.append)
     try:
         await server.wait_for_connections()
         await server.push(common.ProtoHeartbeatEvent())
         await asyncio.sleep(0.2)
-        assert server.heartbeats_received == 1
+        assert server.heartbeats_received == 0
+        assert seen == []
     finally:
         await connection.close()
         await server.stop()
@@ -257,3 +265,133 @@ async def test_a_request_before_connecting_fails_fast() -> None:
     )
     with pytest.raises(CTraderConnectionError, match="not connected"):
         await connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1))
+
+
+async def _serve_bytes(data: bytes) -> tuple[asyncio.Server, int]:
+    """A server that sends `data` once, then holds the connection until the client leaves."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.write(data)
+        await writer.drain()
+        with contextlib.suppress(ConnectionError):
+            await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def test_an_oversized_frame_drops_the_connection_as_a_protocol_error() -> None:
+    server, port = await _serve_bytes(struct.pack("!I", MAX_FRAME_BYTES + 1))
+    connection = CTraderConnection(
+        host="127.0.0.1", port=port, logger=Logger("test"), ssl_context=None
+    )
+    losses: list[Exception] = []
+    connection.set_disconnect_handler(losses.append)
+    await connection.connect()
+    try:
+        for _ in range(200):
+            if losses:
+                break
+            await asyncio.sleep(0.01)
+        assert len(losses) == 1
+        assert isinstance(losses[0], CTraderProtocolError)
+        assert connection.is_connected is False
+    finally:
+        await connection.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_an_unknown_payload_type_is_ignored_and_the_connection_survives() -> None:
+    # The schema grows; a message type we do not know must not take the connection down.
+    envelope = common.ProtoMessage(payloadType=999_999, payload=b"").SerializeToString()
+    server, port = await _serve_bytes(struct.pack("!I", len(envelope)) + envelope)
+    connection = CTraderConnection(
+        host="127.0.0.1", port=port, logger=Logger("test"), ssl_context=None
+    )
+    seen: list[object] = []
+    losses: list[Exception] = []
+    connection.set_event_handler(seen.append)
+    connection.set_disconnect_handler(losses.append)
+    await connection.connect()
+    try:
+        await asyncio.sleep(0.2)
+        assert connection.is_connected is True
+        assert seen == []
+        assert losses == []
+    finally:
+        await connection.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_a_raising_event_handler_does_not_break_the_connection() -> None:
+    server = FakeCTraderServer()
+    server.on(
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda request: oa.ProtoOASubscribeSpotsRes(
+            ctidTraderAccountId=request.ctidTraderAccountId,
+        ),
+    )
+    await server.start()
+    connection = await _connected(server)
+
+    def explode(_payload: object) -> None:
+        raise RuntimeError("handler bug")
+
+    connection.set_event_handler(explode)
+    try:
+        await server.wait_for_connections()
+        await server.push(oa.ProtoOAAccountsTokenInvalidatedEvent(reason="recalled"))
+        await asyncio.sleep(0.1)
+
+        response = await connection.request(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=7))
+        assert response.ctidTraderAccountId == 7
+        assert connection.is_connected is True
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_send_delivers_and_passes_the_client_msg_id_through() -> None:
+    # With no pending request for this id, the correlated reply arrives as an event - which
+    # proves both that the message was sent and that its clientMsgId went out with it.
+    server = FakeCTraderServer()
+    server.on(
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda request: oa.ProtoOASubscribeSpotsRes(
+            ctidTraderAccountId=request.ctidTraderAccountId,
+        ),
+    )
+    await server.start()
+    connection = await _connected(server)
+    seen: list[object] = []
+    connection.set_event_handler(seen.append)
+    try:
+        await connection.send(
+            oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=5),
+            client_msg_id="fire-1",
+        )
+        for _ in range(200):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+        assert isinstance(server.received[0], oa.ProtoOASubscribeSpotsReq)
+        assert len(seen) == 1
+        assert isinstance(seen[0], oa.ProtoOASubscribeSpotsRes)
+        assert seen[0].ctidTraderAccountId == 5
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_send_before_connecting_fails_fast() -> None:
+    connection = CTraderConnection(
+        host="127.0.0.1",
+        port=1,
+        logger=Logger("test"),
+        ssl_context=None,
+    )
+    with pytest.raises(CTraderConnectionError, match="not connected"):
+        await connection.send(oa.ProtoOATraderReq(ctidTraderAccountId=1))

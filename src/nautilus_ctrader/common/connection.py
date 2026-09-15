@@ -183,9 +183,9 @@ class CTraderConnection:
     def _write_now(self, frame: bytes) -> None:
         """Write without awaiting the rate limiter or the drain.
 
-        Used only for heartbeats: a paused bucket must never suppress a keep-alive, or a
+        Used only for idle heartbeats: a paused bucket must never suppress a keep-alive, or a
         rate-limit breach would escalate into a dropped connection. The frame is a handful of
-        bytes, so skipping `drain()` costs nothing and keeps the dispatch path synchronous.
+        bytes, so skipping `drain()` costs nothing.
         """
         if self._writer is None:
             return
@@ -208,6 +208,11 @@ class CTraderConnection:
             self._fail(e)
         except (ConnectionError, OSError) as e:
             self._fail(CTraderConnectionError(f"read failed: {e!r}"))
+        except Exception as e:
+            # Anything unexpected must still mark the connection down, or it would keep
+            # reporting connected with no reader behind it.
+            self._log.error(f"Read loop failed: {e!r}")
+            self._fail(CTraderConnectionError(f"read loop failed: {e!r}"))
 
     def _dispatch(self, envelope: common.ProtoMessage) -> None:
         self._log.debug(
@@ -216,7 +221,11 @@ class CTraderConnection:
         )
 
         if envelope.payloadType == common_model.HEARTBEAT_EVENT:
-            self._write_now(codec.encode_frame(common.ProtoHeartbeatEvent()))
+            # Not answered. Spotware's SDK replies to every inbound heartbeat, but the schema
+            # describes heartbeats as keep-alive, not ping/pong. The idle timer keeps our side
+            # alive well inside the server's 30 s tolerance, and never replying means no peer
+            # can drive a heartbeat loop.
+            # TODO(verify): confirm on a live connection that the venue expects no reply.
             return
 
         try:
@@ -235,8 +244,7 @@ class CTraderConnection:
                 future.set_result(payload)
             return
 
-        if self._event_handler is not None:
-            self._event_handler(payload)
+        self._call_handler("Event", self._event_handler, payload)
 
     async def _heartbeat_loop(self) -> None:
         interval = max(self._heartbeat_idle_secs / 2.0, 0.01)
@@ -248,12 +256,21 @@ class CTraderConnection:
             if idle >= self._heartbeat_idle_secs:
                 self._write_now(codec.encode_frame(common.ProtoHeartbeatEvent()))
 
+    def _call_handler(self, name: str, handler: Callable[..., None] | None, arg: object) -> None:
+        """Run a caller-supplied handler so that a bug in it cannot take the connection down."""
+        if handler is None:
+            return
+        try:
+            handler(arg)
+        except Exception as e:
+            self._log.error(f"{name} handler raised {e!r}; continuing")
+
     def _fail(self, error: Exception) -> None:
         was_connected = self._connected
         self._connected = False
         self._reject_pending(error)
-        if was_connected and self._disconnect_handler is not None:
-            self._disconnect_handler(error)
+        if was_connected:
+            self._call_handler("Disconnect", self._disconnect_handler, error)
 
     def _reject_pending(self, error: Exception) -> None:
         pending, self._pending = self._pending, {}
