@@ -493,6 +493,33 @@ async def test_a_bring_up_failure_chains_the_real_disconnect_reason() -> None:
         await server.stop()
 
 
+async def test_a_bring_up_loss_through_an_event_does_not_chain_a_stale_cause() -> None:
+    # An auth-loss event (unlike a socket loss) carries no exception of its own. If the bring-up
+    # failure it triggers still chains to `last_error`, repeated failures chain to each other and
+    # the public `__cause__` ends up pointing at an unrelated, older failure.
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server, backoff_base_secs=0.05)
+
+    async def restore() -> None:
+        session._on_event(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
+
+    try:
+        session.add_restore("dropped", restore)
+        await session.start()
+        await wait_until(
+            lambda: server.connection_count >= 3,
+            description="repeated bring-up failures",
+        )
+
+        failure = session.last_error
+        assert isinstance(failure, CTraderConnectionError)
+        assert failure.__cause__ is None
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_connect_timeout_secs_is_forwarded_to_the_connection() -> None:
     # A peer that accepts the TCP connection but never completes a TLS handshake stands in for
     # a black-holed host; a short connect timeout must reach the underlying connection, not

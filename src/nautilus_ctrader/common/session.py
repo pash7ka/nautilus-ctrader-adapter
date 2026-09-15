@@ -127,6 +127,8 @@ class CTraderSession:
         self._reauth_requested = False
         self._stopping = False
         self.last_error: Exception | None = None
+        # The cause of the current loss only, so a bring-up failure never chains to a stale one.
+        self._loss_cause: Exception | None = None
 
     @property
     def state(self) -> SessionState:
@@ -243,6 +245,7 @@ class CTraderSession:
         # Cleared before connecting, not after: a loss landing while bring-up is finishing
         # must survive to wake the supervisor, or it would wait forever on a dead socket.
         self._lost.clear()
+        self._loss_cause = None
         self._ready.clear()
         self._state = SessionState.CONNECTING
         await self._connection.connect()
@@ -287,7 +290,7 @@ class CTraderSession:
         if self._lost.is_set():
             raise CTraderConnectionError(
                 "connection or authentication lost during bring-up",
-            ) from self.last_error
+            ) from self._loss_cause
 
     async def _authenticate(self) -> None:
         try:
@@ -325,6 +328,7 @@ class CTraderSession:
 
     def _on_disconnect(self, error: Exception) -> None:
         self.last_error = error
+        self._loss_cause = error
         self._state = SessionState.CONNECTING
         self._ready.clear()
         self._lost.set()
@@ -468,6 +472,7 @@ class CTraderSession:
         if self._ends_our_authentication(payload):
             self._state = SessionState.CONNECTING
             self._ready.clear()
+            self._loss_cause = None
             self._lost.set()
         if self._event_handler is not None:
             self._event_handler(payload)
