@@ -295,6 +295,41 @@ async def test_a_token_rejection_refreshes_once_and_retries(error_code: str) -> 
         await server.stop()
 
 
+async def test_a_late_refresh_reply_never_reaches_the_event_handler() -> None:
+    # A refresh reply that arrives after its request timed out carries a fresh token pair and
+    # falls through to `_on_event` with no pending future left to claim it; it must be dropped
+    # there rather than forwarded to the application.
+    server = _server()
+    await server.start()
+    session = _session(server)
+    seen: list[object] = []
+    try:
+        session.set_event_handler(seen.append)
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        await server.push(
+            oa.ProtoOARefreshTokenRes(
+                accessToken="late-access",
+                tokenType="bearer",
+                expiresIn=2_592_000,
+                refreshToken="late-refresh",
+            ),
+        )
+        await server.push(
+            oa.ProtoOASpotEvent(ctidTraderAccountId=ACCOUNT_ID, symbolId=1, bid=1, ask=2),
+        )
+        await wait_until(
+            lambda: any(isinstance(m, oa.ProtoOASpotEvent) for m in seen),
+            description="spot event reaching the handler",
+        )
+
+        assert not any(isinstance(m, oa.ProtoOARefreshTokenRes) for m in seen)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_a_non_token_rejection_never_refreshes() -> None:
     # A new token cannot fix an unknown account; refreshing anyway would rotate tokens on
     # every retry.

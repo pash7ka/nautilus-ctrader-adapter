@@ -246,6 +246,7 @@ class CTraderSession:
 
         self._state = SessionState.AUTHENTICATING
         await self._authenticate()
+        self._raise_if_lost()
 
         self._state = SessionState.RESTORING
         for key, factory in list(self._restores.items()):
@@ -261,10 +262,7 @@ class CTraderSession:
                 detail = e.error_code if isinstance(e, CTraderRequestError) else repr(e)
                 self._log.error(f"Restore {key!r} failed: {detail}")
 
-        if self._lost.is_set():
-            # A loss can surface as any error type - a protocol error rejects pending requests
-            # with itself - so decide by what happened to the connection, not by the exception.
-            raise CTraderConnectionError("connection or authentication lost during bring-up")
+        self._raise_if_lost()
 
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = asyncio.create_task(self._refresh_loop())
@@ -273,6 +271,20 @@ class CTraderSession:
         self.last_error = None
         self._ready.set()
         self._log.info("Session ready")
+
+    def _raise_if_lost(self) -> None:
+        """Fail bring-up if the connection or authentication was lost mid-flight.
+
+        Called right after authenticating and again after restoring, so a loss during either
+        phase is caught before the following state would let `request()` through on a socket
+        whose authentication just dropped. A loss can surface as any error type - a protocol
+        error rejects pending requests with itself - so this decides by what happened to the
+        connection, not by the exception.
+        """
+        if self._lost.is_set():
+            raise CTraderConnectionError(
+                "connection or authentication lost during bring-up",
+            ) from self.last_error
 
     async def _authenticate(self) -> None:
         try:
@@ -438,6 +450,13 @@ class CTraderSession:
         return False
 
     def _on_event(self, payload: Message) -> None:
+        if isinstance(payload, oa.ProtoOARefreshTokenRes):
+            # A refresh reply that arrived after its request timed out. It carries a token pair,
+            # which must never travel to the application's event handler.
+            # TODO(verify): whether the venue invalidates a refresh token once used; if it does,
+            # the pair in a late reply is the only valid one and should be adopted, not dropped.
+            self._log.warning("Dropped a late token refresh response")
+            return
         if self._ends_our_authentication(payload):
             self._state = SessionState.CONNECTING
             self._ready.clear()

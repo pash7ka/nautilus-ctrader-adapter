@@ -6,7 +6,11 @@ import struct
 import pytest
 from nautilus_trader.common.component import Logger
 
-from nautilus_ctrader.common.errors import CTraderAuthError, CTraderConnectionError
+from nautilus_ctrader.common.errors import (
+    CTraderAuthError,
+    CTraderConnectionError,
+    CTraderProtocolError,
+)
 from nautilus_ctrader.common.session import CTraderSession, SessionState
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -407,6 +411,82 @@ async def test_a_loss_after_a_stable_session_reconnects_at_once(
             level == "warning" and "Connection lost, reconnecting" in message
             for level, message in logger.lines
         )
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_loss_right_after_authenticating_skips_restoring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A loss landing the instant authentication finishes must be caught before RESTORING
+    # starts, not only after the restore loop runs - or a restore would go out on a socket
+    # whose authentication just dropped.
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server, backoff_base_secs=0.05)
+    attempts: list[int] = []
+    triggered = False
+    original_authenticate = CTraderSession._authenticate
+
+    async def authenticate_then_lose(self: CTraderSession) -> None:
+        nonlocal triggered
+        await original_authenticate(self)
+        if not triggered:
+            triggered = True
+            self._lost.set()
+
+    monkeypatch.setattr(CTraderSession, "_authenticate", authenticate_then_lose)
+
+    async def restore() -> None:
+        attempts.append(1)
+
+    try:
+        session.add_restore("r", restore)
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+
+        # The first attempt's loss must be caught before the restore ever runs.
+        assert attempts == [1]
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_bring_up_failure_chains_the_real_disconnect_reason() -> None:
+    # A protocol error during restore rejects the pending request with itself; the bring-up
+    # failure raised from it must still carry that real reason in its exception chain.
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server, backoff_base_secs=1.0)
+    attempts: list[int] = []
+
+    async def restore() -> None:
+        attempts.append(1)
+        if len(attempts) > 1:
+            return
+        pending = asyncio.create_task(
+            session.request(
+                oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1]),
+            ),
+        )
+        await wait_until(
+            lambda: any(isinstance(m, oa.ProtoOASubscribeSpotsReq) for m in server.received),
+            description="restore request reaching the server",
+        )
+        await server.push_raw(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
+        await pending
+
+    try:
+        session.add_restore("corrupted", restore)
+        await session.start()
+
+        await wait_until(lambda: session.last_error is not None, description="bring-up failure")
+        failure = session.last_error
+        assert isinstance(failure, CTraderConnectionError)
+        assert isinstance(failure.__cause__, CTraderProtocolError)
+
+        await session.wait_ready(timeout_secs=5.0)
     finally:
         await session.stop()
         await server.stop()
