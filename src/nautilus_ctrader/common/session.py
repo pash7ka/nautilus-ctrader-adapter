@@ -35,7 +35,9 @@ from nautilus_ctrader.constants import (
     DEFAULT_REQUEST_TIMEOUT_SECS,
     HEARTBEAT_IDLE_SECS,
     HISTORICAL_RATE_LIMIT_PER_SEC,
+    MIN_TOKEN_REFRESH_INTERVAL_SECS,
     RECONNECT_FAILURE_THRESHOLD,
+    TOKEN_ERROR_CODES,
     TOKEN_REFRESH_MARGIN_SECS,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -115,6 +117,7 @@ class CTraderSession:
         self._lost = asyncio.Event()
         self._supervisor: asyncio.Task | None = None
         self._refresh_task: asyncio.Task | None = None
+        self._last_refresh_at: float | None = None
         self._stopping = False
         self.last_error: Exception | None = None
 
@@ -267,10 +270,12 @@ class CTraderSession:
         try:
             await self._authenticate_account()
         except CTraderRequestError as e:
-            if self._refresh_token is None:
+            if not self._may_refresh_for(e):
                 raise CTraderAuthError(f"account auth rejected: {e.error_code}") from e
-            # The access token may simply have expired. Refresh once, then retry; a second
+            # The access token may simply have expired. Refresh, then retry once; a second
             # rejection is a real authentication failure.
+            # TODO(verify): that the venue accepts a refresh on a connection authenticated only
+            # at application level.
             self._log.warning(f"Account auth rejected ({e.error_code}), refreshing token")
             await self.refresh_tokens()
             try:
@@ -294,13 +299,14 @@ class CTraderSession:
     async def refresh_tokens(self) -> None:
         """Exchange the refresh token for a new pair, over the existing connection.
 
-        A failure here stops trading, so it raises and logs at ERROR rather than retrying
-        quietly - the operator has to learn this from the failure, not from the absence of
-        activity.
+        A rejected refresh stops trading, so it is logged at ERROR and raised rather than
+        retried quietly - the operator has to learn this from the failure, not from the absence
+        of activity.
         """
         if self._refresh_token is None:
             raise CTraderAuthError("no refresh token available")
 
+        self._last_refresh_at = time.time()
         try:
             response = await self._connection.request(
                 oa.ProtoOARefreshTokenReq(refreshToken=self._refresh_token),
@@ -315,11 +321,19 @@ class CTraderSession:
         self._log.info("Access token refreshed")
 
         if self._on_tokens_refreshed is not None:
-            self._on_tokens_refreshed(
-                self._access_token,
-                self._refresh_token,
-                self._expires_at_secs,
-            )
+            try:
+                self._on_tokens_refreshed(
+                    self._access_token,
+                    self._refresh_token,
+                    self._expires_at_secs,
+                )
+            except Exception as e:
+                # The refresh itself succeeded, so carry on with the new tokens - but loudly:
+                # they exist in memory only, and the old refresh token no longer works. Only the
+                # type is logged, since the application's message could contain the tokens.
+                self._log.error(
+                    f"Token persistence callback raised {type(e).__name__}; new tokens not saved",
+                )
 
     async def _authenticate_account(self) -> None:
         await self._connection.request(
@@ -329,17 +343,44 @@ class CTraderSession:
             ),
         )
 
+    def _may_refresh_for(self, error: CTraderRequestError) -> bool:
+        """Whether a rejected account authentication is worth a token refresh.
+
+        Only a token problem is fixed by a new token; refreshing for anything else - an unknown
+        account, a blocked channel, wrong application credentials - would rotate tokens on every
+        retry. The interval covers a venue that keeps reporting a revoked token as expired.
+        """
+        if self._refresh_token is None or error.error_code not in TOKEN_ERROR_CODES:
+            return False
+        if self._last_refresh_at is None:
+            return True
+        return time.time() - self._last_refresh_at >= MIN_TOKEN_REFRESH_INTERVAL_SECS
+
     async def _refresh_loop(self) -> None:
         while self._expires_at_secs is not None and self._refresh_token is not None:
-            delay = self._expires_at_secs - TOKEN_REFRESH_MARGIN_SECS - time.time()
+            now = time.time()
+            delay = self._expires_at_secs - TOKEN_REFRESH_MARGIN_SECS - now
+            if self._last_refresh_at is not None:
+                # TODO(verify): the lifetime a live venue grants; a very short one must still not
+                # turn this into a tight loop.
+                delay = max(delay, self._last_refresh_at + MIN_TOKEN_REFRESH_INTERVAL_SECS - now)
             if delay > 0:
                 await asyncio.sleep(delay)
+                # A refresh made elsewhere may have moved the expiry while this slept.
+                continue
+            await self._ready.wait()
             try:
                 await self.refresh_tokens()
             except (CTraderAuthError, CTraderConnectionError):
                 return
+            except Exception as e:
+                # Anything else must still be seen: a silent exit leaves the token to expire.
+                self._log.error(f"Proactive token refresh failed: {e!r}")
+                return
             # Re-authenticate with the new token through the ordinary reconnect path, rather
             # than relying on the venue to end the old session.
+            # TODO(verify): whether the venue also sends ProtoOAAccountsTokenInvalidatedEvent
+            # after our own refresh; if it does, that costs one extra, harmless reconnect.
             self._lost.set()
 
     def _ends_our_authentication(self, payload: Message) -> bool:
@@ -350,6 +391,7 @@ class CTraderSession:
         invalidation deliberately does not trigger a refresh - the schema lists "token was
         refreshed" among its causes, so refreshing in response could feed itself forever.
         """
+        # TODO(verify): that the venue's reason text never carries account identifiers.
         if isinstance(payload, oa.ProtoOAClientDisconnectEvent):
             reason = payload.reason or "no reason given"
             self._log.error(f"Venue cancelled the application connection: {reason}")

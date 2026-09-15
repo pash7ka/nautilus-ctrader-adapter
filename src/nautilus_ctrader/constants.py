@@ -41,6 +41,15 @@ HISTORICAL_RATE_LIMIT_PER_SEC: float = 1.0
 # Refresh this far ahead of the access token's expiry.
 TOKEN_REFRESH_MARGIN_SECS: float = 300.0
 
+# A refresh can only fix a token problem; any other account-auth rejection is final.
+# TODO(verify): that an expired token surfaces as a rejected ProtoOAAccountAuthReq, and with
+# which of these codes.
+TOKEN_ERROR_CODES: frozenset[str] = frozenset({"OA_AUTH_TOKEN_EXPIRED", "CH_ACCESS_TOKEN_INVALID"})
+
+# No automatic refresh closer to the previous one than this: a venue that keeps rejecting a
+# revoked token as expired, or a very short granted lifetime, must not rotate tokens in a loop.
+MIN_TOKEN_REFRESH_INTERVAL_SECS: float = 300.0
+
 # Reconnect backoff.
 BACKOFF_BASE_SECS: float = 1.0
 BACKOFF_MAX_SECS: float = 60.0

@@ -1,6 +1,7 @@
 """Token refresh, and recovery when the venue drops authentication on a live socket."""
 
 import asyncio
+import struct
 import time
 
 import pytest
@@ -8,6 +9,7 @@ from nautilus_trader.common.component import Logger
 
 from nautilus_ctrader.common.errors import CTraderAuthError
 from nautilus_ctrader.common.session import CTraderSession, SessionState
+from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
@@ -15,6 +17,29 @@ from tests.polling import wait_until
 
 ACCOUNT_ID = 1234567
 OTHER_ACCOUNT_ID = 7654321
+
+
+class _RecordingLogger:
+    """Stands in for the Nautilus Logger, whose output is written from Rust and invisible to
+    tests."""
+
+    def __init__(self) -> None:
+        self.lines: list[tuple[str, str]] = []
+
+    def debug(self, message: str) -> None:
+        self.lines.append(("debug", message))
+
+    def info(self, message: str) -> None:
+        self.lines.append(("info", message))
+
+    def warning(self, message: str) -> None:
+        self.lines.append(("warning", message))
+
+    def error(self, message: str) -> None:
+        self.lines.append(("error", message))
+
+    def errors(self) -> list[str]:
+        return [message for level, message in self.lines if level == "error"]
 
 
 def _refresh_response(_request: object) -> oa.ProtoOARefreshTokenRes:
@@ -118,7 +143,7 @@ async def test_a_rejected_refresh_raises_an_auth_error() -> None:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
 
-        with pytest.raises(CTraderAuthError, match="refresh"):
+        with pytest.raises(CTraderAuthError, match="token refresh rejected"):
             await session.refresh_tokens()
     finally:
         await session.stop()
@@ -267,14 +292,14 @@ async def test_events_for_another_account_are_ignored() -> None:
         await server.stop()
 
 
-async def test_a_rejected_account_auth_refreshes_once_and_retries() -> None:
+async def test_a_token_rejection_refreshes_once_and_retries() -> None:
     server = _server()
     server.on(
         oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
         lambda request: (
             oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID)
             if request.accessToken == "new-access"
-            else oa.ProtoOAErrorRes(errorCode="INVALID_REQUEST", description="expired")
+            else oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID", description="expired")
         ),
     )
     await server.start()
@@ -291,20 +316,140 @@ async def test_a_rejected_account_auth_refreshes_once_and_retries() -> None:
         await server.stop()
 
 
-async def test_a_second_account_auth_rejection_is_an_auth_failure() -> None:
+async def test_a_non_token_rejection_never_refreshes() -> None:
+    # A new token cannot fix an unknown account; refreshing anyway would rotate tokens on
+    # every retry.
     server = _server()
     server.on(
         oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
-        lambda _r: oa.ProtoOAErrorRes(errorCode="INVALID_REQUEST", description="revoked"),
+        lambda _r: oa.ProtoOAErrorRes(errorCode="CH_CTID_TRADER_ACCOUNT_NOT_FOUND"),
     )
     await server.start()
     session = _session(server, backoff_base_secs=0.05)
     try:
         await session.start()
-        await wait_until(lambda: isinstance(session.last_error, CTraderAuthError))
+        await wait_until(
+            lambda: server.connection_count >= 3,
+            description="several rejected attempts",
+        )
 
-        assert "after refresh" in str(session.last_error)
+        assert _refreshes(server) == []
+        assert isinstance(session.last_error, CTraderAuthError)
         assert session.state is not SessionState.READY
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_persistent_token_rejection_refreshes_at_most_once() -> None:
+    # A venue that keeps reporting a revoked token as expired must not make every retry
+    # rotate the tokens.
+    server = _server()
+    server.on(
+        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
+        lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID", description="revoked"),
+    )
+    await server.start()
+    session = _session(server, backoff_base_secs=0.05)
+    try:
+        await session.start()
+        await wait_until(
+            lambda: server.connection_count >= 3,
+            description="several rejected attempts",
+        )
+
+        assert len(_refreshes(server)) == 1
+        assert isinstance(session.last_error, CTraderAuthError)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_on() -> None:
+    # The refresh succeeded, so the session must keep working on the new tokens - but the
+    # operator must hear that they were not saved, without the tokens reaching the log.
+    server = _server()
+    await server.start()
+    logger = _RecordingLogger()
+
+    def explode(_access: str, _refresh: str, _expires_at: float) -> None:
+        raise RuntimeError("storage unavailable")
+
+    session = CTraderSession(
+        host=server.host,
+        port=server.port,
+        client_id="client-id",
+        client_secret="client-secret",
+        account_id=ACCOUNT_ID,
+        access_token="old-access",
+        refresh_token="old-refresh",
+        expires_at_secs=time.time() + 1.0,
+        on_tokens_refreshed=explode,
+        logger=logger,
+        ssl_context=None,
+    )
+    try:
+        await session.start()
+        await wait_until(lambda: server.connection_count >= 2, description="re-authentication")
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert any("not saved" in line for line in logger.errors())
+        assert _account_auths(server)[-1].accessToken == "new-access"
+        assert not any("new-access" in m or "new-refresh" in m for _, m in logger.lines)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged() -> None:
+    # A malformed frame rejects the pending refresh with a protocol error - neither an auth
+    # nor a connection error - and that must still be logged rather than end the loop silently.
+    server = _server()
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    logger = _RecordingLogger()
+    session = CTraderSession(
+        host=server.host,
+        port=server.port,
+        client_id="client-id",
+        client_secret="client-secret",
+        account_id=ACCOUNT_ID,
+        access_token="old-access",
+        refresh_token="old-refresh",
+        expires_at_secs=time.time() + 1.0,
+        logger=logger,
+        ssl_context=None,
+        backoff_base_secs=0.05,
+    )
+    try:
+        await session.start()
+        await wait_until(
+            lambda: bool(_refreshes(server)),
+            description="refresh request reaching the server",
+        )
+        await server.push_raw(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
+        await wait_until(
+            lambda: any("Proactive token refresh failed" in line for line in logger.errors()),
+            description="refresh failure being logged",
+        )
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_an_invalidation_naming_no_account_is_treated_as_ours() -> None:
+    server = _server()
+    await server.start()
+    session = _session(server, backoff_base_secs=0.05)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        await server.push(oa.ProtoOAAccountsTokenInvalidatedEvent(reason="recalled"))
+        await wait_until(lambda: server.connection_count >= 2, description="re-authentication")
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert _refreshes(server) == []
     finally:
         await session.stop()
         await server.stop()
