@@ -204,6 +204,36 @@ async def test_a_lost_connection_rejects_pending_requests_and_notifies() -> None
         await server.stop()
 
 
+async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
+    # A request that failed must not reach the next connection: for an order that would be
+    # a duplicate the caller never knows about.
+    server = FakeCTraderServer()
+    await server.start()
+    limiter = RateLimiter({"default": 1000.0, "historical": 1000.0})
+    connection = await _connected(server, rate_limiter=limiter)
+    try:
+        await server.wait_for_connections()
+        limiter.pause("default", 0.3)
+        pending = asyncio.create_task(
+            connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1)),
+        )
+        await asyncio.sleep(0.05)
+        assert not pending.done(), "request should be waiting on the paused bucket"
+
+        await connection.close()
+        await connection.connect()
+        await server.wait_for_connections()
+
+        with pytest.raises(CTraderConnectionError):
+            await asyncio.wait_for(pending, timeout=2.0)
+        # A fixed wait is right here: this checks that the request never arrives.
+        await asyncio.sleep(0.5)
+        assert not any(isinstance(m, oa.ProtoOATraderReq) for m in server.received)
+    finally:
+        await connection.close()
+        await server.stop()
+
+
 class _RecordingLogger:
     """Stands in for the Nautilus Logger, whose output is written from Rust and is invisible
     to pytest's caplog - asserting against caplog would pass without checking anything."""

@@ -64,6 +64,7 @@ class CTraderConnection:
         self._pending: dict[str, asyncio.Future[Message]] = {}
         self._last_send = 0.0
         self._connected = False
+        self._generation = 0
 
         self._event_handler: Callable[[Message], None] | None = None
         self._disconnect_handler: Callable[[Exception], None] | None = None
@@ -88,6 +89,7 @@ class CTraderConnection:
         except OSError as e:
             raise CTraderConnectionError(f"cannot connect to {self._host}:{self._port}") from e
 
+        self._generation += 1
         self._connected = True
         self._last_send = asyncio.get_running_loop().time()
         self._read_task = asyncio.create_task(self._read_loop())
@@ -147,6 +149,8 @@ class CTraderConnection:
             raise
         finally:
             self._pending.pop(client_msg_id, None)
+            if future.done() and not future.cancelled():
+                future.exception()
 
     async def send(
         self,
@@ -169,10 +173,13 @@ class CTraderConnection:
         )
 
     async def _write(self, frame: bytes, *, bucket: str | None) -> None:
+        generation = self._generation
         if bucket is not None and self._rate_limiter is not None:
             await self._rate_limiter.acquire(bucket)
-        if self._writer is None:
-            raise CTraderConnectionError("not connected")
+        # The wait can outlast the connection it began on. A frame queued for a closed socket
+        # must fail, never go out on the next one.
+        if not self._connected or self._writer is None or self._generation != generation:
+            raise CTraderConnectionError("connection lost while waiting to send")
         self._writer.write(frame)
         self._last_send = asyncio.get_running_loop().time()
         try:
