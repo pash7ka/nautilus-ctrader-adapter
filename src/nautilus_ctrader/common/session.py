@@ -31,6 +31,7 @@ from nautilus_ctrader.constants import (
     BACKOFF_MAX_SECS,
     BUCKET_DEFAULT,
     BUCKET_HISTORICAL,
+    CONNECT_TIMEOUT_SECS,
     DEFAULT_RATE_LIMIT_PER_SEC,
     DEFAULT_REQUEST_TIMEOUT_SECS,
     HEARTBEAT_IDLE_SECS,
@@ -72,6 +73,7 @@ class CTraderSession:
         rate_limiter: RateLimiter | None = None,
         heartbeat_idle_secs: float = HEARTBEAT_IDLE_SECS,
         request_timeout_secs: float = DEFAULT_REQUEST_TIMEOUT_SECS,
+        connect_timeout_secs: float = CONNECT_TIMEOUT_SECS,
         backoff_base_secs: float = BACKOFF_BASE_SECS,
         backoff_max_secs: float = BACKOFF_MAX_SECS,
         failure_threshold: int = RECONNECT_FAILURE_THRESHOLD,
@@ -108,6 +110,7 @@ class CTraderSession:
             rate_limiter=rate_limiter,
             heartbeat_idle_secs=heartbeat_idle_secs,
             request_timeout_secs=request_timeout_secs,
+            connect_timeout_secs=connect_timeout_secs,
             tls=tls,
         )
         self._connection.set_event_handler(self._on_event)

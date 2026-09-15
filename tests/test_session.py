@@ -1,6 +1,7 @@
 """The session: authentication order, subscription restore, and reconnect."""
 
 import asyncio
+import contextlib
 import struct
 
 import pytest
@@ -490,3 +491,40 @@ async def test_a_bring_up_failure_chains_the_real_disconnect_reason() -> None:
     finally:
         await session.stop()
         await server.stop()
+
+
+async def test_connect_timeout_secs_is_forwarded_to_the_connection() -> None:
+    # A peer that accepts the TCP connection but never completes a TLS handshake stands in for
+    # a black-holed host; a short connect timeout must reach the underlying connection, not
+    # wait out its 10s default. `tls` is left at its verifying default so the handshake is the
+    # thing that hangs.
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(ConnectionError):
+            await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    session = CTraderSession(
+        host="127.0.0.1",
+        port=port,
+        client_id="client-id",
+        client_secret="client-secret",
+        account_id=ACCOUNT_ID,
+        access_token="access-token",
+        logger=Logger("test"),
+        connect_timeout_secs=0.2,
+        backoff_base_secs=5.0,
+    )
+    try:
+        await session.start()
+        await wait_until(
+            lambda: session.last_error is not None,
+            timeout_secs=1.0,
+            description="connect timeout being recorded",
+        )
+        assert "timed out" in str(session.last_error)
+    finally:
+        await session.stop()
+        server.close()
+        await server.wait_closed()
