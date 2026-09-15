@@ -89,6 +89,15 @@ class FakeCTraderServer:
         for writer in list(self._writers):
             await self._write(writer, message, client_msg_id)
 
+    async def push_raw(self, data: bytes) -> None:
+        """Send raw bytes to every connected client, bypassing the framing."""
+        if not self._writers:
+            raise RuntimeError("push with no connected client; await wait_for_connections()")
+        for writer in list(self._writers):
+            writer.write(data)
+            with contextlib.suppress(ConnectionError, OSError):
+                await writer.drain()
+
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._connection_count += 1
         self._writers.append(writer)

@@ -1,12 +1,14 @@
 """The session: authentication order, subscription restore, and reconnect."""
 
 import asyncio
+import struct
 
 import pytest
 from nautilus_trader.common.component import Logger
 
 from nautilus_ctrader.common.errors import CTraderAuthError, CTraderConnectionError
 from nautilus_ctrader.common.session import CTraderSession, SessionState
+from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
@@ -255,8 +257,8 @@ async def test_a_failing_restore_does_not_keep_the_session_down() -> None:
         await server.stop()
 
 
-async def test_a_restore_that_loses_the_connection_is_a_bring_up_failure() -> None:
-    # Containing this would mark a dead socket ready; it must reconnect instead.
+async def test_a_restore_raising_a_connection_error_is_a_bring_up_failure() -> None:
+    # The exception clause: a connection error from a restore must not be contained.
     server = _authenticating_server()
     await server.start()
     session = _session(server, backoff_base_secs=0.05)
@@ -286,8 +288,52 @@ async def test_starting_twice_runs_a_single_supervisor() -> None:
         await session.start()
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
+        # A fixed wait is right here: this checks that a second connection never appears.
         await asyncio.sleep(0.1)
         assert server.connection_count == 1
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_protocol_error_during_a_restore_is_a_bring_up_failure() -> None:
+    # A malformed frame rejects pending requests with the protocol error itself, not a
+    # connection error. Bring-up must still fail - and back off - rather than mark a dead
+    # socket ready and reconnect immediately.
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server, backoff_base_secs=0.5)
+    attempts: list[int] = []
+
+    async def restore() -> None:
+        attempts.append(1)
+        if len(attempts) > 1:
+            return
+        # No handler is registered for this request, so it stays pending until the bad
+        # frame arrives and the connection rejects it.
+        pending = asyncio.create_task(
+            session.request(
+                oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1]),
+            ),
+        )
+        await wait_until(
+            lambda: any(isinstance(m, oa.ProtoOASubscribeSpotsReq) for m in server.received),
+            description="restore request reaching the server",
+        )
+        await server.push_raw(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
+        await pending
+
+    try:
+        session.add_restore("corrupted", restore)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await session.start()
+        await session.wait_ready(timeout_secs=5.0)
+
+        # Reaching READY straight away would mean the dead socket was marked ready.
+        assert loop.time() - started >= 0.4
+        assert server.connection_count >= 2
+        assert len(attempts) == 2
     finally:
         await session.stop()
         await server.stop()

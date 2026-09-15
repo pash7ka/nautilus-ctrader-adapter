@@ -10,9 +10,14 @@ import asyncio
 from collections.abc import Callable
 
 
-async def wait_until(condition: Callable[[], bool], attempts: int = 300) -> None:
-    for _ in range(attempts):
-        if condition():
-            return
+async def wait_until(
+    condition: Callable[[], bool],
+    timeout_secs: float = 3.0,
+    description: str = "condition",
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_secs
+    while not condition():
+        if loop.time() >= deadline:
+            raise AssertionError(f"{description} not met within {timeout_secs}s")
         await asyncio.sleep(0.01)
-    raise AssertionError("condition not met within the polling budget")

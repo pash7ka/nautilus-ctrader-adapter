@@ -227,10 +227,15 @@ class CTraderSession:
                 # The connection itself is gone: a bring-up failure, not a bad restore.
                 raise
             except Exception as e:
-                # One rejected restore must not keep the whole session down. The key stays
-                # registered, so the next reconnect retries it; whether a missing subscription
-                # should stop anything else is the upper layer's decision.
-                self._log.error(f"Restore {key!r} failed: {e!r}")
+                # One rejected restore must not keep the whole session down. It is logged, and
+                # the key stays registered so the next reconnect retries it.
+                detail = e.error_code if isinstance(e, CTraderRequestError) else repr(e)
+                self._log.error(f"Restore {key!r} failed: {detail}")
+
+        if self._lost.is_set():
+            # A loss can surface as any error type - a protocol error rejects pending requests
+            # with itself - so decide by what happened to the connection, not by the exception.
+            raise CTraderConnectionError(f"connection lost during bring-up: {self.last_error!r}")
 
         self._state = SessionState.READY
         self.last_error = None
