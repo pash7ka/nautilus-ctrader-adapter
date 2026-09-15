@@ -138,6 +138,8 @@ class CTraderSession:
 
     async def start(self) -> None:
         """Start the supervisor. Returns before the first authentication completes."""
+        if self._supervisor is not None and not self._supervisor.done():
+            return
         self._stopping = False
         self._supervisor = asyncio.create_task(self._supervise())
 
@@ -183,8 +185,9 @@ class CTraderSession:
                 if self._stopping:
                     return
                 self._log.warning("Connection lost, reconnecting")
-                # A token invalidation arrives while the socket is still live; connecting over
-                # it would orphan the old read and heartbeat tasks.
+                # The old socket may still be live (the venue dropped our authentication) or
+                # half-dead (a failed read leaves the writer and heartbeat task running). Either
+                # way it is closed before a new one opens.
                 await self._teardown_connection()
             except asyncio.CancelledError:
                 raise
@@ -218,7 +221,16 @@ class CTraderSession:
         self._state = SessionState.RESTORING
         for key, factory in list(self._restores.items()):
             self._log.info(f"Restoring {key!r}")
-            await factory()
+            try:
+                await factory()
+            except CTraderConnectionError:
+                # The connection itself is gone: a bring-up failure, not a bad restore.
+                raise
+            except Exception as e:
+                # One rejected restore must not keep the whole session down. The key stays
+                # registered, so the next reconnect retries it; whether a missing subscription
+                # should stop anything else is the upper layer's decision.
+                self._log.error(f"Restore {key!r} failed: {e!r}")
 
         self._state = SessionState.READY
         self.last_error = None
@@ -253,6 +265,7 @@ class CTraderSession:
 
     def _on_disconnect(self, error: Exception) -> None:
         self.last_error = error
+        self._state = SessionState.CONNECTING
         self._ready.clear()
         self._lost.set()
 
