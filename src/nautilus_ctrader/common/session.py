@@ -156,6 +156,7 @@ class CTraderSession:
         if self._supervisor is not None and not self._supervisor.done():
             return
         self._stopping = False
+        self._reauth_requested = False
         self._supervisor = asyncio.create_task(self._supervise())
 
     async def stop(self) -> None:
