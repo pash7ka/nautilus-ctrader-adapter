@@ -37,7 +37,7 @@ what to trade or when.
 | Component | What it does |
 |---|---|
 | Transport | asyncio TLS client for the Open API protobuf protocol: framing, request/response correlation, heartbeat, reconnect with backoff, outbound rate limiting |
-| Authentication | Application-level and account-level auth; OAuth 2.0 token exchange and refresh |
+| Authentication | Application-level and account-level auth; access-token refresh over the socket (the one-time authorization-code exchange stays with the host application — see Credentials) |
 | Instrument provider | Builds Nautilus `Instrument` objects from broker symbol specifications (precision, lot size, volume step and limits) |
 | Data client | Live trendbar (OHLC) and spot (bid/ask) subscriptions, plus historical trendbar requests for indicator warm-up |
 | Execution client | Order submission, modification and cancellation; translation between the Nautilus order model and the cTrader position model; execution reports for state reconciliation |
@@ -77,8 +77,8 @@ adapter does not perform it. The adapter refreshes the access token while runnin
 the new pair back to your application to persist.
 
 The adapter receives these values from the host application (environment variables or a
-token store you control). `clientSecret` and both tokens are treated as secrets: they are
-masked in the transport layer and are never written to logs.
+token store you control). `clientSecret` and both tokens are treated as secrets and are
+never written to logs: the transport logs no payload bytes at all.
 
 ## Usage
 
@@ -117,15 +117,16 @@ node.build()
   data requests.
 - Volumes are not expressed in lots, and monetary values carry an explicit digit scale
   (`moneyDigits`). Getting a scale factor wrong is the most expensive mistake available in
-  this API, so scaling is covered by fixtures and verified against a live account with a
-  minimum-size order before anything else is trusted.
+  this API. None of that conversion exists yet: when it is built, each converter will be
+  checked against a recorded real response, and scaling verified against a live account with
+  a minimum-size order, before anything else is trusted.
 
 Protobuf message definitions come from Spotware's MIT-licensed
 [openapi-proto-messages](https://github.com/spotware/openapi-proto-messages); the Python
-bindings are generated from them at build time. This package does **not** depend on the
-official `ctrader-open-api` SDK at runtime: it is built on Twisted, while NautilusTrader is
-asyncio, and it hard-pins `protobuf==3.20.1`, which conflicts with the rest of a modern
-stack.
+bindings are generated from them by `scripts/gen_protobuf.py` and committed, so installing
+needs no protoc toolchain. This package does **not** depend on the official
+`ctrader-open-api` SDK at runtime: it is built on Twisted, while NautilusTrader is asyncio,
+and it hard-pins `protobuf==3.20.1`, which conflicts with the rest of a modern stack.
 
 [docs/protocol.md](docs/protocol.md) documents the wire protocol in full, including the
 scaling rules that are the easiest thing to get expensively wrong.

@@ -70,11 +70,13 @@ of the access token's known expiry, and reactively, when account authentication 
 - *Proactive*: refresh runs a fixed margin before the token's expiry, so an active session
   never idles into expiry.
 - *Reactive*: refresh runs once when `ProtoOAAccountAuthReq` is rejected with one of two error
-  codes that mean the token itself is the problem — `OA_AUTH_TOKEN_EXPIRED` or
+  codes the schema defines for a token problem — `OA_AUTH_TOKEN_EXPIRED` or
   `CH_ACCESS_TOKEN_INVALID` — and never for any other rejection reason, since a new token
   cannot fix those. A reactive refresh is also never issued more often than a fixed minimum
   interval, so a venue that keeps rejecting the same token as expired cannot drive a
-  refresh loop.
+  refresh loop. **Unconfirmed**: that an expired or invalid token surfaces as a rejected
+  account authentication at all, and which of these two codes a live venue actually returns
+  for it.
 
 After every refresh, the new pair is handed to the host application through a callback so it
 can be persisted; if that callback raises, the failure is logged at ERROR (the new tokens stay
@@ -109,10 +111,10 @@ and a `retryAfter` value in seconds, scoped to the specific payload type that wa
 This adapter treats `retryAfter` as authoritative: on a breach, the affected bucket is paused
 for exactly the duration the venue reports, rather than guessing a backoff. Requests are
 throttled locally before they are ever sent, using separate budgets for ordinary requests and
-for historical (trendbar) requests, so that a burst of historical requests cannot starve
-everything else. **Unconfirmed**: the real budgets. Published figures for this API are
-inconsistent, so the defaults this adapter ships with are deliberately conservative until a
-live connection's own `BLOCKED_PAYLOAD_TYPE` responses settle the real numbers.
+for historical requests, so that a burst of historical requests cannot starve everything
+else. **Unconfirmed**: the real budgets. Published figures for this API are inconsistent, so
+the defaults this adapter ships with are deliberately conservative until a live connection's
+own `BLOCKED_PAYLOAD_TYPE` responses settle the real numbers.
 
 ## 7. Scaling — read this before trusting any number
 
@@ -125,9 +127,10 @@ because getting any of them wrong by a factor produces a working request for the
   money depending on the instrument's configured digit count.
 - **Trendbar prices are integers encoded as deltas from `low`**, not absolute prices.
 
-None of these are guessed at in this adapter: every converter is checked against a recorded
-real response, and scaling in particular is verified against a live account with a
-minimum-size order before it is trusted for anything larger.
+None of this conversion exists in the adapter yet. When it is built, each converter must be
+checked against a recorded real response before it ships, and scaling in particular will be
+verified against a live account with a minimum-size order before it is trusted for anything
+larger.
 
 ## 8. A known inconsistency: `maintenanceEndTimestamp`
 
