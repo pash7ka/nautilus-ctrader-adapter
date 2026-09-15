@@ -13,6 +13,7 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
+from tests.recording_logger import RecordingLogger
 
 ACCOUNT_ID = 1234567
 
@@ -360,6 +361,52 @@ async def test_a_protocol_error_during_a_restore_is_a_bring_up_failure() -> None
         assert loop.time() - started >= 0.4
         assert server.connection_count >= 2
         assert len(attempts) == 2
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_loss_after_a_stable_session_reconnects_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A session that had been ready for a while is recovering, not failing: the attempt
+    # counter resets and the next connection is not made to wait out a backoff.
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    server = _authenticating_server()
+    await server.start()
+    logger = RecordingLogger()
+    session = CTraderSession(
+        host=server.host,
+        port=server.port,
+        client_id="client-id",
+        client_secret="client-secret",
+        account_id=ACCOUNT_ID,
+        access_token="access-token",
+        logger=logger,
+        tls=False,
+        backoff_base_secs=5.0,
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        for _ in range(2):
+            before = server.connection_count
+            started = loop.time()
+            await server.drop_connections()
+            await wait_until(
+                lambda: server.connection_count > before,  # noqa: B023
+                description="reconnect after a stable loss",
+            )
+            await session.wait_ready(timeout_secs=3.0)
+            elapsed = loop.time() - started
+            assert elapsed < 2.0, f"reconnect took {elapsed:.2f}s, a backoff appears to apply"
+
+        assert any(
+            level == "warning" and "Connection lost, reconnecting" in message
+            for level, message in logger.lines
+        )
     finally:
         await session.stop()
         await server.stop()
