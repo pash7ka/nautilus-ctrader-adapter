@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import random
 import ssl
+import time
 from collections.abc import Awaitable, Callable, Hashable
 from enum import Enum, auto
 
@@ -35,6 +36,7 @@ from nautilus_ctrader.constants import (
     HEARTBEAT_IDLE_SECS,
     HISTORICAL_RATE_LIMIT_PER_SEC,
     RECONNECT_FAILURE_THRESHOLD,
+    TOKEN_REFRESH_MARGIN_SECS,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 
@@ -112,6 +114,7 @@ class CTraderSession:
         self._ready = asyncio.Event()
         self._lost = asyncio.Event()
         self._supervisor: asyncio.Task | None = None
+        self._refresh_task: asyncio.Task | None = None
         self._stopping = False
         self.last_error: Exception | None = None
 
@@ -151,6 +154,11 @@ class CTraderSession:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._supervisor
             self._supervisor = None
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._refresh_task
+            self._refresh_task = None
         await self._connection.close()
         self._state = SessionState.STOPPED
         self._ready.clear()
@@ -237,6 +245,9 @@ class CTraderSession:
             # with itself - so decide by what happened to the connection, not by the exception.
             raise CTraderConnectionError(f"connection lost during bring-up: {self.last_error!r}")
 
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._refresh_loop())
+
         self._state = SessionState.READY
         self.last_error = None
         self._ready.set()
@@ -254,14 +265,20 @@ class CTraderSession:
             raise CTraderAuthError(f"application auth rejected: {e.error_code}") from e
 
         try:
-            await self._connection.request(
-                oa.ProtoOAAccountAuthReq(
-                    ctidTraderAccountId=self._account_id,
-                    accessToken=self._access_token,
-                ),
-            )
+            await self._authenticate_account()
         except CTraderRequestError as e:
-            raise CTraderAuthError(f"account auth rejected: {e.error_code}") from e
+            if self._refresh_token is None:
+                raise CTraderAuthError(f"account auth rejected: {e.error_code}") from e
+            # The access token may simply have expired. Refresh once, then retry; a second
+            # rejection is a real authentication failure.
+            self._log.warning(f"Account auth rejected ({e.error_code}), refreshing token")
+            await self.refresh_tokens()
+            try:
+                await self._authenticate_account()
+            except CTraderRequestError as retry_error:
+                raise CTraderAuthError(
+                    f"account auth rejected after refresh: {retry_error.error_code}",
+                ) from retry_error
 
     async def _teardown_connection(self) -> None:
         self._state = SessionState.CONNECTING
@@ -274,6 +291,85 @@ class CTraderSession:
         self._ready.clear()
         self._lost.set()
 
+    async def refresh_tokens(self) -> None:
+        """Exchange the refresh token for a new pair, over the existing connection.
+
+        A failure here stops trading, so it raises and logs at ERROR rather than retrying
+        quietly - the operator has to learn this from the failure, not from the absence of
+        activity.
+        """
+        if self._refresh_token is None:
+            raise CTraderAuthError("no refresh token available")
+
+        try:
+            response = await self._connection.request(
+                oa.ProtoOARefreshTokenReq(refreshToken=self._refresh_token),
+            )
+        except CTraderRequestError as e:
+            self._log.error(f"Token refresh rejected: {e.error_code}")
+            raise CTraderAuthError(f"token refresh rejected: {e.error_code}") from e
+
+        self._access_token = response.accessToken
+        self._refresh_token = response.refreshToken
+        self._expires_at_secs = time.time() + response.expiresIn
+        self._log.info("Access token refreshed")
+
+        if self._on_tokens_refreshed is not None:
+            self._on_tokens_refreshed(
+                self._access_token,
+                self._refresh_token,
+                self._expires_at_secs,
+            )
+
+    async def _authenticate_account(self) -> None:
+        await self._connection.request(
+            oa.ProtoOAAccountAuthReq(
+                ctidTraderAccountId=self._account_id,
+                accessToken=self._access_token,
+            ),
+        )
+
+    async def _refresh_loop(self) -> None:
+        while self._expires_at_secs is not None and self._refresh_token is not None:
+            delay = self._expires_at_secs - TOKEN_REFRESH_MARGIN_SECS - time.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                await self.refresh_tokens()
+            except (CTraderAuthError, CTraderConnectionError):
+                return
+            # Re-authenticate with the new token through the ordinary reconnect path, rather
+            # than relying on the venue to end the old session.
+            self._lost.set()
+
+    def _ends_our_authentication(self, payload: Message) -> bool:
+        """Whether the venue has dropped this session's authentication on a live socket.
+
+        All three cases recover the same way: the reconnect path re-authenticates with the
+        current token and replays restores, which belong to the account session. A token
+        invalidation deliberately does not trigger a refresh - the schema lists "token was
+        refreshed" among its causes, so refreshing in response could feed itself forever.
+        """
+        if isinstance(payload, oa.ProtoOAClientDisconnectEvent):
+            reason = payload.reason or "no reason given"
+            self._log.error(f"Venue cancelled the application connection: {reason}")
+            return True
+        if isinstance(payload, oa.ProtoOAAccountDisconnectEvent):
+            if payload.ctidTraderAccountId != self._account_id:
+                return False
+            self._log.warning("Venue dropped the account session, re-authenticating")
+            return True
+        if isinstance(payload, oa.ProtoOAAccountsTokenInvalidatedEvent):
+            ids = payload.ctidTraderAccountIds
+            if ids and self._account_id not in ids:
+                return False
+            reason = payload.reason or "no reason given"
+            self._log.warning(f"Access token invalidated ({reason}), re-authenticating")
+            return True
+        return False
+
     def _on_event(self, payload: Message) -> None:
+        if self._ends_our_authentication(payload):
+            self._lost.set()
         if self._event_handler is not None:
             self._event_handler(payload)
