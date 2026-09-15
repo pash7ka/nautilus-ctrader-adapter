@@ -236,8 +236,8 @@ async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
 
 
 async def test_credentials_never_reach_the_log() -> None:
-    # Spec section 9: DEBUG carries payload type, correlation id and byte length, never payload
-    # bytes. Authentication payloads are where the secrets are.
+    # DEBUG carries payload type, correlation id and byte length, never payload bytes.
+    # Authentication payloads are where the secrets are.
     server = FakeCTraderServer()
     server.on(
         oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
