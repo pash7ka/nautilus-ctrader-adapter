@@ -109,7 +109,8 @@ node.build()
   envelope (`payloadType`, `payload`, `clientMsgId`), capped at 15 MB. Responses are
   correlated to requests by `clientMsgId`.
 - A heartbeat must be sent if the connection would otherwise be idle for more than 30
-  seconds, and an inbound heartbeat is answered with one.
+  seconds. This adapter sends one after 10 seconds of outbound silence and does not answer
+  the server's own heartbeats.
 - After any reconnect, both authentication levels and all subscriptions must be
   re-established.
 - Outbound requests are rate-limited, with a separate and much tighter budget for historical
@@ -125,6 +126,9 @@ bindings are generated from them at build time. This package does **not** depend
 official `ctrader-open-api` SDK at runtime: it is built on Twisted, while NautilusTrader is
 asyncio, and it hard-pins `protobuf==3.20.1`, which conflicts with the rest of a modern
 stack.
+
+[docs/protocol.md](docs/protocol.md) documents the wire protocol in full, including the
+scaling rules that are the easiest thing to get expensively wrong.
 
 ## Development
 
