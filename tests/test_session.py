@@ -435,7 +435,11 @@ async def test_a_loss_right_after_authenticating_skips_restoring(
         await original_authenticate(self)
         if not triggered:
             triggered = True
-            self._lost.set()
+            self._on_event(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
+            # Bring-up has not moved past this point yet, so the session must already refuse
+            # requests rather than let one through on the socket that just lost authentication.
+            with pytest.raises(CTraderConnectionError, match="not ready"):
+                await self.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
 
     monkeypatch.setattr(CTraderSession, "_authenticate", authenticate_then_lose)
 
@@ -482,7 +486,10 @@ async def test_a_bring_up_failure_chains_the_real_disconnect_reason() -> None:
         session.add_restore("corrupted", restore)
         await session.start()
 
-        await wait_until(lambda: session.last_error is not None, description="bring-up failure")
+        await wait_until(
+            lambda: isinstance(session.last_error, CTraderConnectionError),
+            description="bring-up failure",
+        )
         failure = session.last_error
         assert isinstance(failure, CTraderConnectionError)
         assert isinstance(failure.__cause__, CTraderProtocolError)

@@ -469,7 +469,7 @@ async def test_a_proactive_refresh_that_will_be_retried_before_expiry_is_a_warni
         account_id=ACCOUNT_ID,
         access_token="old-access",
         refresh_token="old-refresh",
-        expires_at_secs=time.time() + 1.0,
+        expires_at_secs=time.time() + 10.0,
         logger=logger,
         tls=False,
         backoff_base_secs=0.05,
@@ -545,6 +545,7 @@ async def test_a_proactive_reauth_is_not_treated_as_a_failed_session() -> None:
 
         assert elapsed < 2.0, f"re-authentication took {elapsed:.2f}s, a backoff appears to apply"
         assert not any("soon after becoming ready" in message for _level, message in logger.lines)
+        assert ("info", "Re-authenticating with the refreshed token") in logger.lines
     finally:
         await session.stop()
         await server.stop()
