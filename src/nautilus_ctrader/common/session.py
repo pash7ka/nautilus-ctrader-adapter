@@ -121,6 +121,7 @@ class CTraderSession:
         self._supervisor: asyncio.Task | None = None
         self._refresh_task: asyncio.Task | None = None
         self._last_refresh_at: float | None = None
+        self._reauth_requested = False
         self._stopping = False
         self.last_error: Exception | None = None
 
@@ -203,9 +204,13 @@ class CTraderSession:
                 # half-dead (a failed read leaves the writer and heartbeat task running). Either
                 # way it is closed before a new one opens.
                 await self._teardown_connection()
-                if loop.time() - ready_at >= STABLE_SESSION_SECS:
+                reauth_requested, self._reauth_requested = self._reauth_requested, False
+                if reauth_requested or loop.time() - ready_at >= STABLE_SESSION_SECS:
                     attempt = 0
-                    self._log.warning("Connection lost, reconnecting")
+                    if reauth_requested:
+                        self._log.info("Re-authenticating with the refreshed token")
+                    else:
+                        self._log.warning("Connection lost, reconnecting")
                 else:
                     # A peer that drops every new session is failing, not recovering.
                     attempt += 1
@@ -402,6 +407,7 @@ class CTraderSession:
             # than relying on the venue to end the old session.
             # TODO(verify): whether the venue also sends ProtoOAAccountsTokenInvalidatedEvent
             # after our own refresh; if it does, that costs one extra, harmless reconnect.
+            self._reauth_requested = True
             self._lost.set()
 
     def _ends_our_authentication(self, payload: Message) -> bool:

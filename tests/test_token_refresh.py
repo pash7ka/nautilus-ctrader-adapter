@@ -437,6 +437,40 @@ async def test_a_proactive_refresh_that_times_out_is_retried(
         await server.stop()
 
 
+async def test_a_proactive_reauth_is_not_treated_as_a_failed_session() -> None:
+    # A proactive refresh forces re-authentication with the new token by design; that must be
+    # recognised as recovery, not counted as a session that failed soon after becoming ready.
+    server = _server()
+    await server.start()
+    logger = RecordingLogger()
+    session = CTraderSession(
+        host=server.host,
+        port=server.port,
+        client_id="client-id",
+        client_secret="client-secret",
+        account_id=ACCOUNT_ID,
+        access_token="old-access",
+        refresh_token="old-refresh",
+        expires_at_secs=time.time() + 1.0,
+        logger=logger,
+        tls=False,
+        backoff_base_secs=5.0,
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        started = loop.time()
+        await session.start()
+        await wait_until(lambda: server.connection_count >= 2, description="re-authentication")
+        await session.wait_ready(timeout_secs=2.0)
+        elapsed = loop.time() - started
+
+        assert elapsed < 2.0, f"re-authentication took {elapsed:.2f}s, a backoff appears to apply"
+        assert not any("soon after becoming ready" in message for _level, message in logger.lines)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_an_auth_loss_event_stops_the_session_accepting_requests() -> None:
     # Once the venue drops our authentication, the live socket must not keep accepting work.
     server = _server()
