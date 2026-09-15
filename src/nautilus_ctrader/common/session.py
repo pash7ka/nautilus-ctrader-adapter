@@ -65,7 +65,9 @@ class CTraderSession:
         refresh_token: str | None = None,
         expires_at_secs: float | None = None,
         on_tokens_refreshed: Callable[[str, str, float], None] | None = None,
-        ssl_context: ssl.SSLContext | None = None,
+        # `True` (verified TLS) is the only safe choice against a real venue; `False` is for
+        # tests against the local fake server.
+        tls: ssl.SSLContext | bool = True,
         rate_limiter: RateLimiter | None = None,
         heartbeat_idle_secs: float = HEARTBEAT_IDLE_SECS,
         request_timeout_secs: float = DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -105,7 +107,7 @@ class CTraderSession:
             rate_limiter=rate_limiter,
             heartbeat_idle_secs=heartbeat_idle_secs,
             request_timeout_secs=request_timeout_secs,
-            ssl_context=ssl_context,
+            tls=tls,
         )
         self._connection.set_event_handler(self._on_event)
         self._connection.set_disconnect_handler(self._on_disconnect)

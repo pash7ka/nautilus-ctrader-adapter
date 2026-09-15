@@ -27,7 +27,7 @@ async def _connected(server: FakeCTraderServer, **kwargs) -> CTraderConnection:
         host=server.host,
         port=server.port,
         logger=Logger("test"),
-        ssl_context=None,
+        tls=False,
         **kwargs,
     )
     await connection.connect()
@@ -261,7 +261,7 @@ async def test_credentials_never_reach_the_log() -> None:
         host=server.host,
         port=server.port,
         logger=logger,
-        ssl_context=None,
+        tls=False,
     )
     await connection.connect()
     try:
@@ -291,7 +291,7 @@ async def test_a_request_before_connecting_fails_fast() -> None:
         host="127.0.0.1",
         port=1,
         logger=Logger("test"),
-        ssl_context=None,
+        tls=False,
     )
     with pytest.raises(CTraderConnectionError, match="not connected"):
         await connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1))
@@ -313,11 +313,57 @@ async def _serve_bytes(data: bytes) -> tuple[asyncio.Server, int]:
     return server, server.sockets[0].getsockname()[1]
 
 
+async def test_tls_is_attempted_by_default() -> None:
+    # The first frame carries the client secret, so an unconfigured connection must not
+    # open in plaintext.
+    first_bytes: list[bytes] = []
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(ConnectionError):
+            first_bytes.append(await reader.read(64))
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    connection = CTraderConnection(host="127.0.0.1", port=port, logger=Logger("test"))
+    try:
+        with pytest.raises(CTraderConnectionError):
+            await asyncio.wait_for(connection.connect(), timeout=5.0)
+        assert first_bytes, "server received nothing"
+        assert first_bytes[0][:1] == b"\x16", "first byte is not a TLS handshake record"
+    finally:
+        await connection.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_a_silent_peer_times_out_the_connect() -> None:
+    # A peer that accepts and never answers the TLS handshake stands in for a black-holed host.
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(ConnectionError):
+            await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    connection = CTraderConnection(
+        host="127.0.0.1",
+        port=port,
+        logger=Logger("test"),
+        connect_timeout_secs=0.2,
+    )
+    try:
+        with pytest.raises(CTraderConnectionError, match="timed out"):
+            await asyncio.wait_for(connection.connect(), timeout=2.0)
+    finally:
+        await connection.close()
+        server.close()
+        await server.wait_closed()
+
+
 async def test_an_oversized_frame_drops_the_connection_as_a_protocol_error() -> None:
     server, port = await _serve_bytes(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
-    connection = CTraderConnection(
-        host="127.0.0.1", port=port, logger=Logger("test"), ssl_context=None
-    )
+    connection = CTraderConnection(host="127.0.0.1", port=port, logger=Logger("test"), tls=False)
     losses: list[Exception] = []
     connection.set_disconnect_handler(losses.append)
     await connection.connect()
@@ -339,9 +385,7 @@ async def test_an_unknown_payload_type_is_ignored_and_the_connection_survives() 
     # The schema grows; a message type we do not know must not take the connection down.
     envelope = common.ProtoMessage(payloadType=999_999, payload=b"").SerializeToString()
     server, port = await _serve_bytes(struct.pack(LENGTH_PREFIX_FORMAT, len(envelope)) + envelope)
-    connection = CTraderConnection(
-        host="127.0.0.1", port=port, logger=Logger("test"), ssl_context=None
-    )
+    connection = CTraderConnection(host="127.0.0.1", port=port, logger=Logger("test"), tls=False)
     seen: list[object] = []
     losses: list[Exception] = []
     connection.set_event_handler(seen.append)
@@ -458,7 +502,7 @@ async def test_send_before_connecting_fails_fast() -> None:
         host="127.0.0.1",
         port=1,
         logger=Logger("test"),
-        ssl_context=None,
+        tls=False,
     )
     with pytest.raises(CTraderConnectionError, match="not connected"):
         await connection.send(oa.ProtoOATraderReq(ctidTraderAccountId=1))

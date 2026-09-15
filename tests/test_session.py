@@ -39,7 +39,7 @@ def _session(server: FakeCTraderServer, **kwargs) -> CTraderSession:
         account_id=ACCOUNT_ID,
         access_token="access-token",
         logger=Logger("test"),
-        ssl_context=None,
+        tls=False,
         **kwargs,
     )
 

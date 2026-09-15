@@ -28,6 +28,9 @@ HEARTBEAT_IDLE_SECS: float = 10.0
 # Client.send in their SDK defaults to a 5 s response timeout.
 DEFAULT_REQUEST_TIMEOUT_SECS: float = 5.0
 
+# Bounds the TCP connect and TLS handshake, which would otherwise wait on the OS timeout.
+CONNECT_TIMEOUT_SECS: float = 10.0
+
 BUCKET_DEFAULT: str = "default"
 BUCKET_HISTORICAL: str = "historical"
 

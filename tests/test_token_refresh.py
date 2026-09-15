@@ -75,7 +75,7 @@ def _session(server: FakeCTraderServer, **kwargs) -> CTraderSession:
         access_token="old-access",
         refresh_token="old-refresh",
         logger=Logger("test"),
-        ssl_context=None,
+        tls=False,
         **kwargs,
     )
 
@@ -161,7 +161,7 @@ async def test_refresh_without_a_refresh_token_raises() -> None:
         account_id=ACCOUNT_ID,
         access_token="only-access",
         logger=Logger("test"),
-        ssl_context=None,
+        tls=False,
     )
     try:
         await session.start()
@@ -386,7 +386,7 @@ async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_
         expires_at_secs=time.time() + 1.0,
         on_tokens_refreshed=explode,
         logger=logger,
-        ssl_context=None,
+        tls=False,
     )
     try:
         await session.start()
@@ -418,7 +418,7 @@ async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged() -> None:
         refresh_token="old-refresh",
         expires_at_secs=time.time() + 1.0,
         logger=logger,
-        ssl_context=None,
+        tls=False,
         backoff_base_secs=0.05,
     )
     try:

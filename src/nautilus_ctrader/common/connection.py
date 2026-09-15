@@ -29,6 +29,7 @@ from nautilus_ctrader.common.errors import (
 from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import (
     BUCKET_DEFAULT,
+    CONNECT_TIMEOUT_SECS,
     DEFAULT_REQUEST_TIMEOUT_SECS,
     HEARTBEAT_IDLE_SECS,
     LENGTH_PREFIX_BYTES,
@@ -47,15 +48,22 @@ class CTraderConnection:
         rate_limiter: RateLimiter | None = None,
         heartbeat_idle_secs: float = HEARTBEAT_IDLE_SECS,
         request_timeout_secs: float = DEFAULT_REQUEST_TIMEOUT_SECS,
-        ssl_context: ssl.SSLContext | None = None,
+        connect_timeout_secs: float = CONNECT_TIMEOUT_SECS,
+        tls: ssl.SSLContext | bool = True,
     ) -> None:
+        """
+        `tls` is passed to `asyncio.open_connection` as `ssl`: `True` (a verifying default
+        context) is the only safe choice against a real venue; `False` (plaintext) is for tests
+        against the local fake server.
+        """
         self._host = host
         self._port = port
         self._log = logger
         self._rate_limiter = rate_limiter
         self._heartbeat_idle_secs = heartbeat_idle_secs
         self._request_timeout_secs = request_timeout_secs
-        self._ssl_context = ssl_context
+        self._connect_timeout_secs = connect_timeout_secs
+        self._tls = tls
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -81,11 +89,17 @@ class CTraderConnection:
 
     async def connect(self) -> None:
         try:
-            self._reader, self._writer = await asyncio.open_connection(
-                self._host,
-                self._port,
-                ssl=self._ssl_context,
-            )
+            async with asyncio.timeout(self._connect_timeout_secs):
+                self._reader, self._writer = await asyncio.open_connection(
+                    self._host,
+                    self._port,
+                    ssl=self._tls,
+                )
+        except TimeoutError as e:
+            # Caught before OSError, of which TimeoutError is a subclass.
+            raise CTraderConnectionError(
+                f"timed out connecting to {self._host}:{self._port}",
+            ) from e
         except OSError as e:
             raise CTraderConnectionError(f"cannot connect to {self._host}:{self._port}") from e
 
