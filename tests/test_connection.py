@@ -20,6 +20,7 @@ from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
+from tests.recording_logger import RecordingLogger
 
 
 async def _connected(server: FakeCTraderServer, **kwargs) -> CTraderConnection:
@@ -234,19 +235,6 @@ async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
         await server.stop()
 
 
-class _RecordingLogger:
-    """Stands in for the Nautilus Logger, whose output is written from Rust and is invisible
-    to pytest's caplog - asserting against caplog would pass without checking anything."""
-
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def debug(self, message: str) -> None:
-        self.lines.append(message)
-
-    info = warning = error = exception = debug
-
-
 async def test_credentials_never_reach_the_log() -> None:
     # Spec section 9: DEBUG carries payload type, correlation id and byte length, never payload
     # bytes. Authentication payloads are where the secrets are.
@@ -256,7 +244,7 @@ async def test_credentials_never_reach_the_log() -> None:
         lambda _r: oa.ProtoOAApplicationAuthRes(),
     )
     await server.start()
-    logger = _RecordingLogger()
+    logger = RecordingLogger()
     connection = CTraderConnection(
         host=server.host,
         port=server.port,
@@ -275,10 +263,11 @@ async def test_credentials_never_reach_the_log() -> None:
 
         # The outbound auth request must have passed through the logger, or the absence of
         # secrets below would prove nothing.
-        sent = [line for line in logger.lines if line.startswith("send payloadType=2100")]
+        messages = [message for _level, message in logger.lines]
+        sent = [m for m in messages if m.startswith("send payloadType=2100")]
         assert sent, f"auth request was never logged; lines were {logger.lines}"
 
-        logged = "\n".join(logger.lines)
+        logged = "\n".join(messages)
         assert "super-secret-client-id" not in logged
         assert "super-secret-client-secret" not in logged
     finally:

@@ -14,32 +14,10 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
+from tests.recording_logger import RecordingLogger
 
 ACCOUNT_ID = 1234567
 OTHER_ACCOUNT_ID = 7654321
-
-
-class _RecordingLogger:
-    """Stands in for the Nautilus Logger, whose output is written from Rust and invisible to
-    tests."""
-
-    def __init__(self) -> None:
-        self.lines: list[tuple[str, str]] = []
-
-    def debug(self, message: str) -> None:
-        self.lines.append(("debug", message))
-
-    def info(self, message: str) -> None:
-        self.lines.append(("info", message))
-
-    def warning(self, message: str) -> None:
-        self.lines.append(("warning", message))
-
-    def error(self, message: str) -> None:
-        self.lines.append(("error", message))
-
-    def errors(self) -> list[str]:
-        return [message for level, message in self.lines if level == "error"]
 
 
 def _refresh_response(_request: object) -> oa.ProtoOARefreshTokenRes:
@@ -371,7 +349,7 @@ async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_
     # operator must hear that they were not saved, without the tokens reaching the log.
     server = _server()
     await server.start()
-    logger = _RecordingLogger()
+    logger = RecordingLogger()
 
     def explode(_access: str, _refresh: str, _expires_at: float) -> None:
         raise RuntimeError("storage unavailable")
@@ -408,7 +386,7 @@ async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged() -> None:
     server = _server()
     server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
     await server.start()
-    logger = _RecordingLogger()
+    logger = RecordingLogger()
     session = CTraderSession(
         host=server.host,
         port=server.port,
@@ -483,7 +461,7 @@ async def test_an_auth_loss_event_stops_the_session_accepting_requests() -> None
 async def test_an_auth_loss_during_bring_up_is_reported_without_a_stale_error() -> None:
     server = _server()
     await server.start()
-    logger = _RecordingLogger()
+    logger = RecordingLogger()
     session = CTraderSession(
         host=server.host,
         port=server.port,
