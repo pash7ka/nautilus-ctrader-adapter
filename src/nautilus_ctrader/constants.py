@@ -41,8 +41,9 @@ BUCKET_HISTORICAL: str = "historical"
 DEFAULT_RATE_LIMIT_PER_SEC: float = 5.0
 HISTORICAL_RATE_LIMIT_PER_SEC: float = 1.0
 
-# Refresh this far ahead of the access token's expiry.
-TOKEN_REFRESH_MARGIN_SECS: float = 300.0
+# Refresh this far ahead of the access token's expiry. Several times the minimum refresh
+# interval, so a failed attempt can be retried before the token lapses.
+TOKEN_REFRESH_MARGIN_SECS: float = 900.0
 
 # A refresh can only fix a token problem; any other account-auth rejection is final.
 # TODO(verify): that an expired token surfaces as a rejected ProtoOAAccountAuthReq, and with

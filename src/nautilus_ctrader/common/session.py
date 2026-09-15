@@ -374,22 +374,27 @@ class CTraderSession:
             now = time.time()
             delay = self._expires_at_secs - TOKEN_REFRESH_MARGIN_SECS - now
             if self._last_refresh_at is not None:
-                # TODO(verify): the lifetime a live venue grants; a very short one must still not
-                # turn this into a tight loop.
+                # TODO(verify): the lifetime a live venue grants. A lifetime shorter than this
+                # interval leaves the session without a valid token until the interval passes -
+                # chosen over a tight refresh loop.
                 delay = max(delay, self._last_refresh_at + MIN_TOKEN_REFRESH_INTERVAL_SECS - now)
             if delay > 0:
                 await asyncio.sleep(delay)
                 # A refresh made elsewhere may have moved the expiry while this slept.
                 continue
-            await self._ready.wait()
+            if not self._ready.is_set():
+                await self._ready.wait()
+                # A reconnect may have refreshed the token itself.
+                continue
             try:
                 await self.refresh_tokens()
             except (CTraderAuthError, CTraderConnectionError):
                 return
             except Exception as e:
-                # Anything else must still be seen: a silent exit leaves the token to expire.
+                # A timeout or protocol error is transient. `refresh_tokens()` has recorded the
+                # attempt, so the retry waits the minimum interval.
                 self._log.error(f"Proactive token refresh failed: {e!r}")
-                return
+                continue
             # Re-authenticate with the new token through the ordinary reconnect path, rather
             # than relying on the venue to end the old session.
             # TODO(verify): whether the venue also sends ProtoOAAccountsTokenInvalidatedEvent

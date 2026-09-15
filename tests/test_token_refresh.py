@@ -292,14 +292,15 @@ async def test_events_for_another_account_are_ignored() -> None:
         await server.stop()
 
 
-async def test_a_token_rejection_refreshes_once_and_retries() -> None:
+@pytest.mark.parametrize("error_code", ["OA_AUTH_TOKEN_EXPIRED", "CH_ACCESS_TOKEN_INVALID"])
+async def test_a_token_rejection_refreshes_once_and_retries(error_code: str) -> None:
     server = _server()
     server.on(
         oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
         lambda request: (
             oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID)
             if request.accessToken == "new-access"
-            else oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID", description="expired")
+            else oa.ProtoOAErrorRes(errorCode=error_code, description="expired")
         ),
     )
     await server.start()
@@ -431,6 +432,27 @@ async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged() -> None:
         await wait_until(
             lambda: any("Proactive token refresh failed" in line for line in logger.errors()),
             description="refresh failure being logged",
+        )
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_proactive_refresh_that_times_out_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A transient failure must not end proactive refresh until the next reconnect, or the
+    # token is left to expire.
+    monkeypatch.setattr("nautilus_ctrader.common.session.MIN_TOKEN_REFRESH_INTERVAL_SECS", 0.2)
+    server = _server()
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    session = _session(server, expires_at_secs=time.time() + 1.0, request_timeout_secs=0.3)
+    try:
+        await session.start()
+        await wait_until(
+            lambda: len(_refreshes(server)) >= 2,
+            description="a second refresh attempt",
         )
     finally:
         await session.stop()
