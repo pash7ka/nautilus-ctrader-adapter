@@ -459,6 +459,67 @@ async def test_a_proactive_refresh_that_times_out_is_retried(
         await server.stop()
 
 
+async def test_an_auth_loss_event_stops_the_session_accepting_requests() -> None:
+    # Once the venue drops our authentication, the live socket must not keep accepting work.
+    server = _server()
+    await server.start()
+    session = _session(server, backoff_base_secs=0.05)
+    states: list[SessionState] = []
+    # The handler runs right after the session reacts to the event, before any teardown.
+    session.set_event_handler(lambda _payload: states.append(session.state))
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        await server.push(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
+        await wait_until(lambda: bool(states), description="event reaching the handler")
+
+        assert states[0] is not SessionState.READY
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_an_auth_loss_during_bring_up_is_reported_without_a_stale_error() -> None:
+    server = _server()
+    await server.start()
+    logger = _RecordingLogger()
+    session = CTraderSession(
+        host=server.host,
+        port=server.port,
+        client_id="client-id",
+        client_secret="client-secret",
+        account_id=ACCOUNT_ID,
+        access_token="old-access",
+        logger=logger,
+        tls=False,
+        backoff_base_secs=0.05,
+    )
+    seen: list[object] = []
+    session.set_event_handler(seen.append)
+    attempts: list[int] = []
+
+    async def restore() -> None:
+        attempts.append(1)
+        if len(attempts) > 1:
+            return
+        await server.push(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
+        await wait_until(lambda: bool(seen), description="auth loss reaching the session")
+
+    try:
+        session.add_restore("dropped", restore)
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+
+        failures = [m for level, m in logger.lines if level == "warning" and "bring-up" in m]
+        assert failures, f"bring-up failure was never logged; lines were {logger.lines}"
+        assert "connection or authentication lost during bring-up" in failures[0]
+        assert "None" not in failures[0]
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_an_invalidation_naming_no_account_is_treated_as_ours() -> None:
     server = _server()
     await server.start()

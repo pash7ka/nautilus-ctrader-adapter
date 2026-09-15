@@ -259,7 +259,7 @@ class CTraderSession:
         if self._lost.is_set():
             # A loss can surface as any error type - a protocol error rejects pending requests
             # with itself - so decide by what happened to the connection, not by the exception.
-            raise CTraderConnectionError(f"connection lost during bring-up: {self.last_error!r}")
+            raise CTraderConnectionError("connection or authentication lost during bring-up")
 
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = asyncio.create_task(self._refresh_loop())
@@ -315,6 +315,9 @@ class CTraderSession:
         A rejected refresh stops trading, so it is logged at ERROR and raised rather than
         retried quietly - the operator has to learn this from the failure, not from the absence
         of activity.
+
+        It does not re-authenticate by itself: the new access token takes effect at the next
+        account authentication, which the proactive loop forces.
         """
         if self._refresh_token is None:
             raise CTraderAuthError("no refresh token available")
@@ -430,6 +433,8 @@ class CTraderSession:
 
     def _on_event(self, payload: Message) -> None:
         if self._ends_our_authentication(payload):
+            self._state = SessionState.CONNECTING
+            self._ready.clear()
             self._lost.set()
         if self._event_handler is not None:
             self._event_handler(payload)

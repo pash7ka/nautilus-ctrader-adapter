@@ -30,6 +30,12 @@ def test_client_msg_id_is_absent_when_not_given() -> None:
     assert not envelope.HasField("clientMsgId")
 
 
+def test_encoding_a_message_missing_required_fields_is_a_protocol_error() -> None:
+    # A raw protobuf EncodeError would escape the adapter's error hierarchy.
+    with pytest.raises(CTraderProtocolError, match="cannot encode"):
+        codec.encode_frame(oa.ProtoOATraderRes())
+
+
 def test_decode_length_reads_the_prefix() -> None:
     assert codec.decode_length(struct.pack("!I", 1234)) == 1234
 

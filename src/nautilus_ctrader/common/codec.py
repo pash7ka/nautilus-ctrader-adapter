@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import struct
 
-from google.protobuf.message import DecodeError, Message
+from google.protobuf.message import DecodeError, EncodeError, Message
 
 from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
 from nautilus_ctrader.constants import LENGTH_PREFIX_BYTES, LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
@@ -17,11 +17,16 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 
 
 def encode_envelope(payload: Message, client_msg_id: str | None = None) -> bytes:
-    """Wrap a payload message in a `ProtoMessage` envelope and serialise it."""
-    envelope = common.ProtoMessage(
-        payloadType=payload.payloadType,
-        payload=payload.SerializeToString(),
-    )
+    """Wrap a payload message in a `ProtoMessage` envelope and serialise it.
+
+    Raises `CTraderProtocolError` if a required field is missing.
+    """
+    try:
+        body = payload.SerializeToString()
+    except EncodeError as e:
+        # The message names the missing fields, never their values.
+        raise CTraderProtocolError(f"cannot encode payloadType={payload.payloadType}: {e}") from e
+    envelope = common.ProtoMessage(payloadType=payload.payloadType, payload=body)
     if client_msg_id is not None:
         envelope.clientMsgId = client_msg_id
     return envelope.SerializeToString()
