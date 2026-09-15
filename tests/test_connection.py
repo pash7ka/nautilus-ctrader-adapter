@@ -15,7 +15,7 @@ from nautilus_ctrader.common.errors import (
     CTraderTimeoutError,
 )
 from nautilus_ctrader.common.rate_limit import RateLimiter
-from nautilus_ctrader.constants import MAX_FRAME_BYTES
+from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -276,13 +276,15 @@ async def _serve_bytes(data: bytes) -> tuple[asyncio.Server, int]:
         with contextlib.suppress(ConnectionError):
             await reader.read()
         writer.close()
+        with contextlib.suppress(ConnectionError):
+            await writer.wait_closed()
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     return server, server.sockets[0].getsockname()[1]
 
 
 async def test_an_oversized_frame_drops_the_connection_as_a_protocol_error() -> None:
-    server, port = await _serve_bytes(struct.pack("!I", MAX_FRAME_BYTES + 1))
+    server, port = await _serve_bytes(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
     connection = CTraderConnection(
         host="127.0.0.1", port=port, logger=Logger("test"), ssl_context=None
     )
@@ -306,7 +308,7 @@ async def test_an_oversized_frame_drops_the_connection_as_a_protocol_error() -> 
 async def test_an_unknown_payload_type_is_ignored_and_the_connection_survives() -> None:
     # The schema grows; a message type we do not know must not take the connection down.
     envelope = common.ProtoMessage(payloadType=999_999, payload=b"").SerializeToString()
-    server, port = await _serve_bytes(struct.pack("!I", len(envelope)) + envelope)
+    server, port = await _serve_bytes(struct.pack(LENGTH_PREFIX_FORMAT, len(envelope)) + envelope)
     connection = CTraderConnection(
         host="127.0.0.1", port=port, logger=Logger("test"), ssl_context=None
     )
@@ -337,7 +339,10 @@ async def test_a_raising_event_handler_does_not_break_the_connection() -> None:
     await server.start()
     connection = await _connected(server)
 
-    def explode(_payload: object) -> None:
+    calls: list[object] = []
+
+    def explode(payload: object) -> None:
+        calls.append(payload)
         raise RuntimeError("handler bug")
 
     connection.set_event_handler(explode)
@@ -349,38 +354,70 @@ async def test_a_raising_event_handler_does_not_break_the_connection() -> None:
         response = await connection.request(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=7))
         assert response.ctidTraderAccountId == 7
         assert connection.is_connected is True
+        assert len(calls) == 1
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_a_raising_disconnect_handler_still_marks_the_connection_down() -> None:
+    server = FakeCTraderServer()
+    await server.start()
+    connection = await _connected(server)
+    calls: list[Exception] = []
+
+    def explode(error: Exception) -> None:
+        calls.append(error)
+        raise RuntimeError("handler bug")
+
+    connection.set_disconnect_handler(explode)
+    try:
+        await server.wait_for_connections()
+        await server.drop_connections()
+        for _ in range(200):
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        assert len(calls) == 1
+        assert connection.is_connected is False
     finally:
         await connection.close()
         await server.stop()
 
 
 async def test_send_delivers_and_passes_the_client_msg_id_through() -> None:
-    # With no pending request for this id, the correlated reply arrives as an event - which
-    # proves both that the message was sent and that its clientMsgId went out with it.
     server = FakeCTraderServer()
-    server.on(
-        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
-        lambda request: oa.ProtoOASubscribeSpotsRes(
-            ctidTraderAccountId=request.ctidTraderAccountId,
-        ),
-    )
     await server.start()
     connection = await _connected(server)
-    seen: list[object] = []
-    connection.set_event_handler(seen.append)
     try:
         await connection.send(
             oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=5),
             client_msg_id="fire-1",
         )
         for _ in range(200):
-            if seen:
+            if server.received:
                 break
             await asyncio.sleep(0.01)
         assert isinstance(server.received[0], oa.ProtoOASubscribeSpotsReq)
-        assert len(seen) == 1
-        assert isinstance(seen[0], oa.ProtoOASubscribeSpotsRes)
-        assert seen[0].ctidTraderAccountId == 5
+        assert server.received[0].ctidTraderAccountId == 5
+        assert server.received_client_msg_ids == ["fire-1"]
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_send_without_a_client_msg_id_sends_none() -> None:
+    # The counterpart that makes the test above discriminating: an id appears only when given.
+    server = FakeCTraderServer()
+    await server.start()
+    connection = await _connected(server)
+    try:
+        await connection.send(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=5))
+        for _ in range(200):
+            if server.received:
+                break
+            await asyncio.sleep(0.01)
+        assert server.received_client_msg_ids == [None]
     finally:
         await connection.close()
         await server.stop()

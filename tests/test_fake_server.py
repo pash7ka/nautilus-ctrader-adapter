@@ -37,6 +37,7 @@ async def test_it_answers_a_request_on_the_correlated_client_msg_id() -> None:
         assert envelope.payloadType == oa_model.PROTO_OA_APPLICATION_AUTH_RES
         assert envelope.clientMsgId == "abc"
         assert len(server.received) == 1
+        assert server.received_client_msg_ids == ["abc"]
 
         writer.close()
         await writer.wait_closed()

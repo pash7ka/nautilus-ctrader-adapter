@@ -27,6 +27,7 @@ class FakeCTraderServer:
         self.host = host
         self.port = 0
         self.received: list[Message] = []
+        self.received_client_msg_ids: list[str | None] = []
         self.heartbeats_received = 0
 
         # Scenario switches.
@@ -114,6 +115,7 @@ class FakeCTraderServer:
 
         payload = codec.parse_payload(envelope)
         self.received.append(payload)
+        self.received_client_msg_ids.append(envelope.clientMsgId or None)
 
         if self.close_after_next_request:
             self.close_after_next_request = False
