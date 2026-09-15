@@ -451,6 +451,50 @@ async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged() -> None:
         await server.stop()
 
 
+async def test_a_proactive_refresh_that_will_be_retried_before_expiry_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The loop's own retry will land before the token expires, so this is a WARNING, not the
+    # ERROR that means a human must intervene.
+    monkeypatch.setattr("nautilus_ctrader.common.session.MIN_TOKEN_REFRESH_INTERVAL_SECS", 0.2)
+    server = _server()
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    logger = RecordingLogger()
+    session = CTraderSession(
+        host=server.host,
+        port=server.port,
+        client_id="client-id",
+        client_secret="client-secret",
+        account_id=ACCOUNT_ID,
+        access_token="old-access",
+        refresh_token="old-refresh",
+        expires_at_secs=time.time() + 1.0,
+        logger=logger,
+        tls=False,
+        backoff_base_secs=0.05,
+    )
+    try:
+        await session.start()
+        await wait_until(
+            lambda: bool(_refreshes(server)),
+            description="refresh request reaching the server",
+        )
+        await server.push_raw(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
+        await wait_until(
+            lambda: any(
+                level == "warning" and "Proactive token refresh failed" in message
+                for level, message in logger.lines
+            ),
+            description="refresh failure being logged as a warning",
+        )
+
+        assert not any("Proactive token refresh failed" in line for line in logger.errors())
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_a_proactive_refresh_that_times_out_is_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -412,8 +412,13 @@ class CTraderSession:
                 return
             except Exception as e:
                 # A timeout or protocol error is transient. `refresh_tokens()` has recorded the
-                # attempt, so the retry waits the minimum interval.
-                self._log.error(f"Proactive token refresh failed: {e!r}")
+                # attempt, so the retry waits the minimum interval - a human must intervene only
+                # if that retry would land too late to matter.
+                next_attempt_at = self._last_refresh_at + MIN_TOKEN_REFRESH_INTERVAL_SECS
+                if next_attempt_at < self._expires_at_secs:
+                    self._log.warning(f"Proactive token refresh failed: {e!r}")
+                else:
+                    self._log.error(f"Proactive token refresh failed: {e!r}")
                 continue
             # Re-authenticate with the new token through the ordinary reconnect path, rather
             # than relying on the venue to end the old session.
