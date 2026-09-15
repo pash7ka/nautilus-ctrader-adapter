@@ -37,6 +37,7 @@ from nautilus_ctrader.constants import (
     HISTORICAL_RATE_LIMIT_PER_SEC,
     MIN_TOKEN_REFRESH_INTERVAL_SECS,
     RECONNECT_FAILURE_THRESHOLD,
+    STABLE_SESSION_SECS,
     TOKEN_ERROR_CODES,
     TOKEN_REFRESH_MARGIN_SECS,
 )
@@ -189,36 +190,46 @@ class CTraderSession:
         )
 
     async def _supervise(self) -> None:
+        loop = asyncio.get_running_loop()
         attempt = 0
         while not self._stopping:
             try:
                 await self._bring_up()
-                attempt = 0
+                ready_at = loop.time()
                 await self._lost.wait()
                 if self._stopping:
                     return
-                self._log.warning("Connection lost, reconnecting")
                 # The old socket may still be live (the venue dropped our authentication) or
                 # half-dead (a failed read leaves the writer and heartbeat task running). Either
                 # way it is closed before a new one opens.
                 await self._teardown_connection()
+                if loop.time() - ready_at >= STABLE_SESSION_SECS:
+                    attempt = 0
+                    self._log.warning("Connection lost, reconnecting")
+                else:
+                    # A peer that drops every new session is failing, not recovering.
+                    attempt += 1
+                    await self._back_off(
+                        attempt,
+                        f"Connection lost soon after becoming ready (attempt {attempt})",
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.last_error = e
                 attempt += 1
-                delay = min(
-                    self._backoff_max_secs,
-                    self._backoff_base_secs * 2 ** (attempt - 1),
-                )
-                delay *= 1.0 + random.random() * BACKOFF_JITTER
-                message = f"Session bring-up failed (attempt {attempt}): {e}"
-                if attempt >= self._failure_threshold:
-                    self._log.error(f"{message}; retrying in {delay:.1f}s")
-                else:
-                    self._log.warning(f"{message}; retrying in {delay:.1f}s")
                 await self._teardown_connection()
-                await asyncio.sleep(delay)
+                await self._back_off(attempt, f"Session bring-up failed (attempt {attempt}): {e}")
+
+    async def _back_off(self, attempt: int, message: str) -> None:
+        """Log `message` and sleep an exponential, jittered delay; ERROR from the threshold on."""
+        delay = min(self._backoff_max_secs, self._backoff_base_secs * 2 ** (attempt - 1))
+        delay *= 1.0 + random.random() * BACKOFF_JITTER
+        if attempt >= self._failure_threshold:
+            self._log.error(f"{message}; retrying in {delay:.1f}s")
+        else:
+            self._log.warning(f"{message}; retrying in {delay:.1f}s")
+        await asyncio.sleep(delay)
 
     async def _bring_up(self) -> None:
         # Cleared before connecting, not after: a loss landing while bring-up is finishing

@@ -58,3 +58,6 @@ BACKOFF_BASE_SECS: float = 1.0
 BACKOFF_MAX_SECS: float = 60.0
 BACKOFF_JITTER: float = 0.25
 RECONNECT_FAILURE_THRESHOLD: int = 5
+
+# A session must stay ready this long before a loss is treated as recovery rather than failure.
+STABLE_SESSION_SECS: float = 30.0

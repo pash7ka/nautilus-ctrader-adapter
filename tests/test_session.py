@@ -296,6 +296,32 @@ async def test_starting_twice_runs_a_single_supervisor() -> None:
         await server.stop()
 
 
+async def test_a_session_lost_soon_after_ready_backs_off() -> None:
+    # A peer that drops every new session must not be hammered with immediate reconnects.
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server, backoff_base_secs=1.0)
+    try:
+        await session.start()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while loop.time() < deadline:
+            if session.is_ready:
+                before = server.connection_count
+                await server.drop_connections()
+                # Without backoff the session can be ready again before a poll sees it down.
+                await wait_until(
+                    lambda: not session.is_ready or server.connection_count > before,  # noqa: B023
+                    description="loss being noticed",
+                )
+            await asyncio.sleep(0.01)
+
+        assert server.connection_count <= 3
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_a_protocol_error_during_a_restore_is_a_bring_up_failure() -> None:
     # A malformed frame rejects pending requests with the protocol error itself, not a
     # connection error. Bring-up must still fail - and back off - rather than mark a dead
