@@ -54,9 +54,9 @@ def decode_length(prefix: bytes) -> int:
 def decode_envelope(body: bytes) -> common.ProtoMessage:
     """Parse a frame body into its `ProtoMessage` envelope."""
     envelope = common.ProtoMessage()
+    # The pure-Python protobuf backend raises UnicodeDecodeError on invalid UTF-8 strings.
     try:
         envelope.ParseFromString(body)
-    # The pure-Python protobuf backend raises UnicodeDecodeError on invalid UTF-8 strings.
     except (DecodeError, ValueError) as e:
         raise CTraderProtocolError(f"undecodable envelope of {len(body)} bytes") from e
     if not envelope.IsInitialized():
@@ -87,7 +87,9 @@ def _build_registry() -> dict[int, type[Message]]:
             payload_type = candidate().payloadType
             existing = registry.get(payload_type)
             if existing is not None:
-                raise CTraderProtocolError(
+                # A schema/programming error, not a wire error: it must not be caught as an
+                # undecodable message and silently ignored by the connection's dispatch.
+                raise RuntimeError(
                     f"payloadType {payload_type} is claimed by both "
                     f"{existing.__name__} and {candidate.__name__}",
                 )
@@ -106,9 +108,9 @@ def payload_class(payload_type: int) -> type[Message]:
 def parse_payload(envelope: common.ProtoMessage) -> Message:
     """Parse an envelope's payload into its typed message."""
     message = payload_class(envelope.payloadType)()
+    # ValueError: see `decode_envelope()`.
     try:
         message.ParseFromString(envelope.payload)
-    # ValueError: see `decode_envelope()`.
     except (DecodeError, ValueError) as e:
         raise CTraderProtocolError(
             f"undecodable payload for type {envelope.payloadType}",

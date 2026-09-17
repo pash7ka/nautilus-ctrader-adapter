@@ -141,13 +141,15 @@ def _duplicate_payload_module() -> types.ModuleType:
 
 
 def test_registry_rejects_a_duplicate_payload_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A schema/programming error, not a wire error: it must not be treated as an undecodable
+    # message and silently ignored by the connection's dispatch.
     monkeypatch.setattr(
         codec,
         "_PAYLOAD_MODULES",
         (*codec._PAYLOAD_MODULES, _duplicate_payload_module()),
     )
     codec._build_registry.cache_clear()
-    with pytest.raises(CTraderProtocolError) as excinfo:
+    with pytest.raises(RuntimeError) as excinfo:
         codec._build_registry()
     assert "ProtoOAApplicationAuthReq" in str(excinfo.value)
     assert "ProtoDuplicateAuthReq" in str(excinfo.value)

@@ -153,6 +153,7 @@ class CTraderSession:
 
     def remove_restore(self, key: Hashable) -> None:
         self._restores.pop(key, None)
+        self._failed_restores.discard(key)
 
     async def wait_ready(self, timeout_secs: float | None = None) -> None:
         await asyncio.wait_for(self._ready.wait(), timeout_secs)
@@ -276,7 +277,7 @@ class CTraderSession:
                 # The connection itself is gone: a bring-up failure, not a bad restore.
                 raise
             except Exception as e:
-                # A loss can surface as another error type; the connection has logged it.
+                # A loss can surface as another error type; it is already logged.
                 self._raise_if_lost()
                 # One rejected restore must not keep the whole session down. It is logged, and
                 # the key stays registered so the next reconnect retries it.

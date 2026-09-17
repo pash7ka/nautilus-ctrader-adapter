@@ -637,6 +637,33 @@ async def test_failed_restores_reports_the_keys_that_failed_in_the_last_bring_up
         await server.stop()
 
 
+async def test_remove_restore_also_clears_it_from_failed_restores() -> None:
+    server = _authenticating_server()
+    server.on(
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda _r: oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone"),
+    )
+    await server.start()
+    session = _session(server)
+
+    async def subscribe() -> None:
+        await session.request(
+            oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1]),
+        )
+
+    try:
+        session.add_restore(("spots", 1), subscribe)
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        assert session.failed_restores == frozenset({("spots", 1)})
+
+        session.remove_restore(("spots", 1))
+        assert session.failed_restores == frozenset()
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_a_loss_after_the_last_restore_fails_the_bring_up() -> None:
     # The restore's own request succeeded, so only the loss check after the loop stands between
     # this bring-up and a session marked ready on a dead socket.
