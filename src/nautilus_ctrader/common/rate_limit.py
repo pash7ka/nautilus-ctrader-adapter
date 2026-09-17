@@ -1,9 +1,9 @@
 """Outbound rate limiting.
 
 Spotware's SDK drains a send queue on a one-second timer (`TcpProtocol._sendStrings`, run by
-`LoopingCall(...).start(1)`). Here each named bucket is a token
-bucket that callers await, so a caller is delayed rather than parked behind a timer, and a
-message is either sent or its caller sees an error.
+`LoopingCall(...).start(1)`). Here each named bucket is a token bucket that callers await, so a
+caller is delayed rather than parked behind a timer, and a message is either sent or its caller
+sees an error.
 
 The venue reports a breach as `BLOCKED_PAYLOAD_TYPE` carrying `retryAfter`, so the limiter
 does not have to guess the real limits: `pause_for` applies exactly what the venue asked for.
@@ -24,8 +24,12 @@ class TokenBucket:
     def __init__(self, rate_per_sec: float, capacity: float | None = None) -> None:
         if rate_per_sec <= 0:
             raise ValueError("rate_per_sec must be positive")
+        if capacity is not None and capacity < 1:
+            raise ValueError("capacity must be at least 1, or a token could never be held")
         self._rate = rate_per_sec
-        self._capacity = rate_per_sec if capacity is None else capacity
+        # A capacity below 1 could never hold a whole token, so acquire() would hang forever
+        # below 1/s; the floor keeps a burst of exactly one available immediately.
+        self._capacity = max(1.0, rate_per_sec) if capacity is None else capacity
         self._tokens = self._capacity
         self._updated: float | None = None
         self._paused_until = 0.0
@@ -58,6 +62,8 @@ class TokenBucket:
         Never shortens a pause already in effect. Nothing accrues while paused: the bucket
         resumes with one token and refills at the normal rate from there.
         """
+        if seconds < 0:
+            raise ValueError("seconds must not be negative")
         self._paused_until = max(
             self._paused_until,
             asyncio.get_running_loop().time() + seconds,

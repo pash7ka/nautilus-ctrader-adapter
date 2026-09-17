@@ -68,6 +68,29 @@ def test_a_non_positive_rate_is_rejected() -> None:
         TokenBucket(rate_per_sec=0.0)
 
 
+def test_an_explicit_sub_unit_capacity_is_rejected() -> None:
+    with pytest.raises(ValueError, match="capacity"):
+        TokenBucket(rate_per_sec=1.0, capacity=0.5)
+
+
+async def test_a_sub_unit_rate_still_holds_a_whole_token() -> None:
+    # A bucket built with `capacity = rate` (the default) never fills to 1.0 below 1/s, so
+    # `acquire()` would hang forever without a capacity floor.
+    bucket = TokenBucket(rate_per_sec=0.5)
+    await asyncio.wait_for(bucket.acquire(), timeout=0.1)
+
+
+async def test_a_rate_limiter_with_a_sub_unit_rate_acquires_once_immediately() -> None:
+    limiter = RateLimiter({"default": 0.5})
+    await asyncio.wait_for(limiter.acquire("default"), timeout=0.1)
+
+
+def test_pause_for_rejects_a_negative_duration() -> None:
+    bucket = TokenBucket(rate_per_sec=10.0)
+    with pytest.raises(ValueError, match="seconds"):
+        bucket.pause_for(-1.0)
+
+
 async def test_buckets_are_independent() -> None:
     limiter = RateLimiter({"default": 1000.0, "historical": 1000.0})
     limiter.pause("historical", 0.1)
