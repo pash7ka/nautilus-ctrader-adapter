@@ -790,6 +790,75 @@ async def test_stop_can_be_cancelled_by_its_own_caller() -> None:
         await server.stop()
 
 
+async def test_stop_survives_repeated_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A heartbeat task slow to react to cancellation holds `close()` inside its task wait, so
+    # the second cancellation lands there deterministically.
+    original_heartbeat_loop = CTraderConnection._heartbeat_loop
+    heartbeat_cancelled = asyncio.Event()
+
+    async def slow_to_cancel_heartbeat_loop(self: CTraderConnection) -> None:
+        try:
+            await original_heartbeat_loop(self)
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            await asyncio.sleep(0.2)
+            raise
+
+    monkeypatch.setattr(CTraderConnection, "_heartbeat_loop", slow_to_cancel_heartbeat_loop)
+
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        heartbeat_task = session._connection._heartbeat_task
+        assert heartbeat_task is not None
+
+        stop_task = asyncio.create_task(session.stop())
+        await asyncio.sleep(0)
+        stop_task.cancel()
+        await wait_until(heartbeat_cancelled.is_set, description="stop inside close()")
+        assert not stop_task.done()
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        assert session.state is SessionState.STOPPED
+        assert session.is_ready is False
+        assert session._connection.is_connected is False
+        with pytest.raises(CTraderConnectionError):
+            await session.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+
+        await session.stop()
+        await asyncio.wait({heartbeat_task})
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_loss_while_stop_waits_keeps_the_session_stopped() -> None:
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        stop_task = asyncio.create_task(session.stop())
+        await asyncio.sleep(0)
+        assert not stop_task.done()
+        # A loss reported while `stop()` still waits for its tasks.
+        session._connection._fail(CTraderConnectionError("dropped during stop"))
+        await stop_task
+
+        assert session.state is SessionState.STOPPED
+        assert session.is_ready is False
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_stop_returns_promptly_after_the_server_drops_the_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

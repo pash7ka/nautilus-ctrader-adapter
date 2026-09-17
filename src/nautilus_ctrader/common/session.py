@@ -167,15 +167,19 @@ class CTraderSession:
         self._supervisor = asyncio.create_task(self._supervise())
 
     async def stop(self) -> None:
+        # State first, awaits last: repeated cancellation can only cut a wait short, never leave
+        # a live, unsupervised connection behind a session that still looks ready.
         self._stopping = True
         self._lost.set()
-        # The whole body runs under `finally`: if a cancellation aimed at this `stop()` call
-        # lands while it awaits `asyncio.wait(...)` below, the session must still end up closed
-        # and `STOPPED` rather than left `READY` with an orphaned, still-open connection.
+        self._state = SessionState.STOPPED
+        self._ready.clear()
         tasks = {t for t in (self._supervisor, self._refresh_task) if t is not None}
+        self._supervisor = None
+        self._refresh_task = None
+        for task in tasks:
+            task.cancel()
+
         try:
-            for task in tasks:
-                task.cancel()
             if tasks:
                 # Not a per-task suppress: that would also catch a cancellation of the caller of
                 # `stop()` itself and let it slip past unnoticed.
@@ -184,11 +188,8 @@ class CTraderSession:
                 if task.done() and not task.cancelled():
                     task.exception()  # fetch it so it is not reported as never retrieved
         finally:
-            self._supervisor = None
-            self._refresh_task = None
+            # Safe to interrupt: `close()` releases everything before its own first await.
             await self._connection.close()
-            self._state = SessionState.STOPPED
-            self._ready.clear()
 
     async def request(
         self,
@@ -349,6 +350,10 @@ class CTraderSession:
     def _on_disconnect(self, error: Exception) -> None:
         self.last_error = error
         self._loss_cause = error
+        if self._stopping:
+            # `stop()` has already settled the state; a loss reported while it waits must not
+            # revive it.
+            return
         self._state = SessionState.CONNECTING
         self._ready.clear()
         self._lost.set()
@@ -494,7 +499,7 @@ class CTraderSession:
             # the pair in a late reply is the only valid one and should be adopted, not dropped.
             self._log.warning("Dropped a late token refresh response")
             return
-        if self._ends_our_authentication(payload):
+        if self._ends_our_authentication(payload) and not self._stopping:
             self._state = SessionState.CONNECTING
             self._ready.clear()
             self._loss_cause = None
