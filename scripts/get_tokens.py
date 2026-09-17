@@ -1,0 +1,517 @@
+"""One-time helper that performs the interactive cTrader Open API OAuth flow.
+
+Run once per application, after registering it and filling `CTRADER_CLIENT_ID` /
+`CTRADER_CLIENT_SECRET` into a `.env` file:
+
+    uv run python scripts/get_tokens.py
+
+It opens the authorization page in a browser, exchanges the code the redirect carries back
+for an access/refresh token pair, writes the tokens into the same env file, and lists the
+accounts the token grants so you can pick one. The application's registered redirect URI
+must match `--redirect-uri` exactly (default `http://localhost:8080/callback`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import http.server
+import json
+import os
+import re
+import ssl
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+from nautilus_ctrader.common.connection import CTraderConnection
+from nautilus_ctrader.common.errors import CTraderRequestError
+from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
+from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
+
+AUTHORIZATION_URL = "https://openapi.ctrader.com/apps/auth"
+TOKEN_URL = "https://openapi.ctrader.com/apps/token"
+
+# Overridable only by tests, to point the account-listing step at a local fake server instead
+# of a real venue. Never exposed on the command line: production use always wants TLS.
+PROTOBUF_TLS: bool | ssl.SSLContext = True
+
+CLIENT_ID_KEY = "CTRADER_CLIENT_ID"
+CLIENT_SECRET_KEY = "CTRADER_CLIENT_SECRET"
+ACCESS_TOKEN_KEY = "CTRADER_ACCESS_TOKEN"
+REFRESH_TOKEN_KEY = "CTRADER_REFRESH_TOKEN"
+TOKEN_EXPIRES_AT_KEY = "CTRADER_TOKEN_EXPIRES_AT"
+
+
+class AuthorizationError(RuntimeError):
+    """The redirect carried `?error=...` instead of a code."""
+
+
+class TokenExchangeError(RuntimeError):
+    """The token endpoint rejected the exchange, or its response was unusable.
+
+    The message carries only the endpoint's own error fields or the bare HTTP status -
+    never the client secret, the code, or a token value.
+    """
+
+
+@dataclass(frozen=True)
+class TokenResponse:
+    access_token: str
+    refresh_token: str
+    expires_in: int
+    token_type: str | None
+
+
+@dataclass(frozen=True)
+class AccountRecord:
+    ctid_trader_account_id: int
+    is_live: bool | None
+    trader_login: int | None
+    broker_title_short: str | None
+
+
+@dataclass(frozen=True)
+class AccountsResult:
+    permission_scope: int
+    accounts: list[AccountRecord]
+
+
+class _NullLogger:
+    """Discards everything. Used when a caller of `list_accounts` has no logger to hand it."""
+
+    def debug(self, message: str) -> None:
+        pass
+
+    def info(self, message: str) -> None:
+        pass
+
+    def warning(self, message: str) -> None:
+        pass
+
+    def error(self, message: str) -> None:
+        pass
+
+    def exception(self, message: str, ex: BaseException) -> None:
+        pass
+
+
+class _PrintLogger:
+    """Enough of the Nautilus `Logger` interface for `CTraderConnection`, printed to stderr.
+
+    Debug is dropped: it would only add per-message envelope noise to a one-shot script.
+    """
+
+    def debug(self, message: str) -> None:
+        pass
+
+    def info(self, message: str) -> None:
+        print(message, file=sys.stderr)
+
+    def warning(self, message: str) -> None:
+        print(f"warning: {message}", file=sys.stderr)
+
+    def error(self, message: str) -> None:
+        print(f"error: {message}", file=sys.stderr)
+
+    def exception(self, message: str, ex: BaseException) -> None:
+        print(f"error: {message}: {ex!r}", file=sys.stderr)
+
+
+def _strip_matching_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+_ENV_LINE_RE = re.compile(r"^([^=\s][^=]*?)\s*=\s*(.*)$")
+
+
+def load_env(path: Path) -> dict[str, str]:
+    """Parse a `KEY=VALUE` env file.
+
+    Blank lines and whole-line `#` comments are ignored. A value may be wrapped in one pair
+    of matching quotes, which is stripped. Missing keys are simply absent from the result;
+    callers decide what is required.
+    """
+    env: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _ENV_LINE_RE.match(line)
+        if not match:
+            continue
+        env[match.group(1).strip()] = _strip_matching_quotes(match.group(2).strip())
+    return env
+
+
+def build_authorization_url(client_id: str, redirect_uri: str) -> str:
+    """The one-time authorization page URL. Carries the client id, so it is only ever
+    printed with `--print-url`."""
+    query = urllib.parse.urlencode(
+        {"client_id": client_id, "redirect_uri": redirect_uri, "scope": "trading"},
+    )
+    return f"{AUTHORIZATION_URL}?{query}"
+
+
+def wait_for_authorization_code(
+    host: str,
+    port: int,
+    path: str,
+    timeout_secs: float,
+    *,
+    on_listening: Callable[[], None] | None = None,
+) -> str:
+    """Serve exactly `path` until the redirect carries a code, an error, or the timeout ends.
+
+    A request to any other path gets 404 and does not end the wait: browsers probe things
+    like `/favicon.ico` on their own. `on_listening`, if given, runs once the socket is bound
+    and listening - the caller's cue to open the browser (or, in a test, to drive a request).
+    """
+    outcome: dict[str, str] = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path != path:
+                self.send_response(404)
+                self.end_headers()
+                return
+            params = urllib.parse.parse_qs(parsed.query)
+            if "code" in params:
+                outcome["code"] = params["code"][0]
+                self._respond("Authorization received. You can close this tab.")
+            elif "error" in params:
+                outcome["error"] = params["error"][0]
+                self._respond(f"Authorization failed: {outcome['error']}")
+            else:
+                self.send_response(400)
+                self.end_headers()
+
+        def _respond(self, message: str) -> None:
+            body = f"<html><body>{message}</body></html>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass  # the default access log would echo the redirect's query string
+
+    server = http.server.HTTPServer((host, port), _Handler)
+    try:
+        if on_listening is not None:
+            on_listening()
+        deadline = time.monotonic() + timeout_secs
+        while "code" not in outcome and "error" not in outcome:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"no authorization redirect received within {timeout_secs:g}s")
+            server.timeout = remaining
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    if "error" in outcome:
+        raise AuthorizationError(outcome["error"])
+    return outcome["code"]
+
+
+def exchange_code(
+    code: str,
+    *,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    token_url: str = TOKEN_URL,
+    timeout_secs: float = 30.0,
+) -> TokenResponse:
+    """Exchange an authorization code for an access/refresh token pair.
+
+    GET with query parameters, exactly as Spotware's own SDK does it
+    (`ctrader_open_api/auth.py`).
+    TODO(verify): confirm GET-vs-POST and the response field names against a live exchange;
+    this endpoint is outside the protobuf schema this repository vendors.
+    """
+    query = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+    )
+    try:
+        with urllib.request.urlopen(f"{token_url}?{query}", timeout=timeout_secs) as response:
+            body = response.read()
+    except urllib.error.HTTPError as e:
+        raise TokenExchangeError(f"token endpoint returned HTTP {e.code}") from e
+    except urllib.error.URLError as e:
+        raise TokenExchangeError(f"token endpoint request failed: {e.reason}") from e
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise TokenExchangeError("token endpoint returned an unparsable response") from e
+
+    error_code = data.get("errorCode")
+    if error_code:
+        raise TokenExchangeError(
+            f"token endpoint rejected the code: {error_code}: {data.get('description')}",
+        )
+    if "accessToken" not in data or "refreshToken" not in data:
+        raise TokenExchangeError("token endpoint response is missing accessToken/refreshToken")
+
+    return TokenResponse(
+        access_token=data["accessToken"],
+        refresh_token=data["refreshToken"],
+        expires_in=int(data.get("expiresIn", 0)),
+        token_type=data.get("tokenType"),
+    )
+
+
+_ENV_ASSIGNMENT_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
+
+
+def update_env_file(path: Path, updates: dict[str, str]) -> None:
+    """Replace or append `KEY=VALUE` lines, keeping every other line, comment and the file's
+    order and line-ending style. Written atomically: a temp file in the same directory, then
+    `os.replace`.
+    """
+    original = path.read_text(encoding="utf-8-sig", newline="") if path.exists() else ""
+    newline = "\r\n" if "\r\n" in original else "\n"
+
+    remaining = dict(updates)
+    lines: list[str] = []
+    for line in original.splitlines():
+        match = _ENV_ASSIGNMENT_RE.match(line)
+        if match and match.group(1) in remaining:
+            lines.append(f"{match.group(1)}={remaining.pop(match.group(1))}")
+        else:
+            lines.append(line)
+    for key, value in remaining.items():
+        lines.append(f"{key}={value}")
+
+    new_text = "".join(f"{line}{newline}" for line in lines)
+    _write_atomically(path, new_text)
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_name)
+        raise
+
+
+async def list_accounts(
+    access_token: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    host: str,
+    port: int = PROTOBUF_PORT,
+    tls: bool | ssl.SSLContext = True,
+    logger: object | None = None,
+) -> AccountsResult:
+    """Authenticate the application, then list the accounts the access token grants.
+
+    `ProtoOAGetAccountListByAccessTokenRes` echoes the access token back; only the account
+    records and the permission scope are returned, never the token itself.
+    """
+    connection = CTraderConnection(
+        host,
+        port,
+        logger=logger if logger is not None else _NullLogger(),
+        tls=tls,
+    )
+    await connection.connect()
+    try:
+        await connection.request(
+            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
+        )
+        response = await connection.request(
+            oa.ProtoOAGetAccountListByAccessTokenReq(accessToken=access_token),
+        )
+    finally:
+        await connection.close()
+
+    accounts = [
+        AccountRecord(
+            ctid_trader_account_id=account.ctidTraderAccountId,
+            is_live=account.isLive if account.HasField("isLive") else None,
+            trader_login=account.traderLogin if account.HasField("traderLogin") else None,
+            broker_title_short=(
+                account.brokerTitleShort if account.HasField("brokerTitleShort") else None
+            ),
+        )
+        for account in response.ctidTraderAccount
+    ]
+    return AccountsResult(permission_scope=response.permissionScope, accounts=accounts)
+
+
+def _print_accounts(result: AccountsResult, *, live: bool) -> None:
+    try:
+        scope_name = oa_model.ProtoOAClientPermissionScope.Name(result.permission_scope)
+    except ValueError:
+        scope_name = str(result.permission_scope)
+    print(f"Permission scope: {scope_name}")
+
+    for account in result.accounts:
+        if account.is_live is None:
+            is_live_text = "unknown"
+        else:
+            is_live_text = "live" if account.is_live else "demo"
+        parts = [
+            f"ctidTraderAccountId={account.ctid_trader_account_id}",
+            f"isLive={is_live_text}",
+        ]
+        if account.trader_login is not None:
+            parts.append(f"traderLogin={account.trader_login}")
+        if account.broker_title_short is not None:
+            parts.append(f"brokerTitleShort={account.broker_title_short}")
+        print("  " + " ".join(parts))
+
+        if account.is_live is not None and account.is_live != live:
+            used = "live" if live else "demo"
+            print(
+                f"  warning: account {account.ctid_trader_account_id} is {is_live_text}, "
+                f"but the {used} host was used; an account must be authorised on its own "
+                "environment",
+                file=sys.stderr,
+            )
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Perform the one-time cTrader OAuth flow and list the granted accounts.",
+    )
+    parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--redirect-uri", default="http://localhost:8080/callback")
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--timeout-secs", type=float, default=300.0)
+    parser.add_argument("--print-url", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+
+    try:
+        env = load_env(args.env_file)
+    except FileNotFoundError:
+        print(f"Env file not found: {args.env_file}", file=sys.stderr)
+        return 2
+
+    missing = [key for key in (CLIENT_ID_KEY, CLIENT_SECRET_KEY) if not env.get(key)]
+    if missing:
+        print(f"Missing required key(s) in {args.env_file}: {', '.join(missing)}", file=sys.stderr)
+        return 2
+    client_id = env[CLIENT_ID_KEY]
+    client_secret = env[CLIENT_SECRET_KEY]
+
+    redirect = urllib.parse.urlsplit(args.redirect_uri)
+    redirect_host = redirect.hostname or "localhost"
+    redirect_port = redirect.port or (443 if redirect.scheme == "https" else 80)
+    redirect_path = redirect.path or "/"
+
+    auth_url = build_authorization_url(client_id, args.redirect_uri)
+    if args.print_url:
+        print(auth_url)
+
+    def _open_browser() -> None:
+        try:
+            opened = webbrowser.open(auth_url)
+        except webbrowser.Error:
+            opened = False
+        if not opened:
+            print(
+                "Could not open a browser automatically; rerun with --print-url and open "
+                "the URL yourself.",
+                file=sys.stderr,
+            )
+
+    try:
+        code = wait_for_authorization_code(
+            redirect_host,
+            redirect_port,
+            redirect_path,
+            args.timeout_secs,
+            on_listening=_open_browser,
+        )
+    except AuthorizationError as e:
+        print(f"Authorization was not granted: {e}", file=sys.stderr)
+        return 1
+    except TimeoutError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    try:
+        tokens = exchange_code(
+            code,
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=args.redirect_uri,
+            token_url=TOKEN_URL,
+        )
+    except TokenExchangeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    expires_at = int(time.time()) + tokens.expires_in
+    update_env_file(
+        args.env_file,
+        {
+            ACCESS_TOKEN_KEY: tokens.access_token,
+            REFRESH_TOKEN_KEY: tokens.refresh_token,
+            TOKEN_EXPIRES_AT_KEY: str(expires_at),
+        },
+    )
+    expires_iso = datetime.fromtimestamp(expires_at, tz=UTC).isoformat()
+    print(f"Tokens written to {args.env_file} (expires {expires_iso})")
+
+    account_host = LIVE_HOST if args.live else DEMO_HOST
+    try:
+        result = asyncio.run(
+            list_accounts(
+                tokens.access_token,
+                client_id,
+                client_secret,
+                host=account_host,
+                port=PROTOBUF_PORT,
+                tls=PROTOBUF_TLS,
+                logger=_PrintLogger(),
+            ),
+        )
+    except CTraderRequestError as e:
+        print(f"Could not list accounts: {e.error_code}", file=sys.stderr)
+        print(
+            "Tokens were saved even though the account list could not be retrieved.",
+            file=sys.stderr,
+        )
+        return 1
+
+    _print_accounts(result, live=args.live)
+    print(f"Add CTRADER_ACCOUNT_ID=<id> to {args.env_file} for the account you want to use.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,566 @@
+"""Tests for the one-time OAuth token script.
+
+`scripts/get_tokens.py` is developer tooling, not part of the installed package, so it is
+imported by file path rather than as `nautilus_ctrader.*`. Everything here runs offline: the
+OAuth redirect and the token exchange are driven against local HTTP servers, and the account
+listing step runs against `tests/fake_server.py`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import http.server
+import importlib.util
+import json
+import socket
+import sys
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+from nautilus_ctrader.common.errors import CTraderRequestError
+from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
+from tests.fake_server import FakeCTraderServer
+from tests.recording_logger import RecordingLogger
+
+_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "get_tokens.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("get_tokens", _SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    # Dataclasses resolve string annotations via sys.modules[cls.__module__]; the module must
+    # be registered there before exec_module runs the class bodies.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+get_tokens = _load_module()
+
+
+def _free_port() -> int:
+    """A port that is free right now. A local test's window for another process to grab it
+    first is small enough to accept."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _get(url: str) -> None:
+    with contextlib.suppress(urllib.error.URLError):
+        urllib.request.urlopen(url, timeout=2)
+
+
+# --------------------------------------------------------------------------------------
+# load_env
+# --------------------------------------------------------------------------------------
+
+
+def test_load_env_parses_quotes_comments_and_blank_lines(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "# a comment",
+                "",
+                'CTRADER_CLIENT_ID="abc123"',
+                "CTRADER_CLIENT_SECRET='s3cr3t'",
+                "  UNQUOTED = value  ",
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    env = get_tokens.load_env(env_file)
+
+    assert env["CTRADER_CLIENT_ID"] == "abc123"
+    assert env["CTRADER_CLIENT_SECRET"] == "s3cr3t"
+    assert env["UNQUOTED"] == "value"
+
+
+def test_load_env_reads_a_bom(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_bytes("CTRADER_CLIENT_ID=abc123\n".encode("utf-8-sig"))
+
+    env = get_tokens.load_env(env_file)
+
+    assert env["CTRADER_CLIENT_ID"] == "abc123"
+
+
+def test_load_env_omits_missing_keys(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("CTRADER_CLIENT_ID=abc123\n", encoding="utf-8")
+
+    env = get_tokens.load_env(env_file)
+
+    assert "CTRADER_CLIENT_SECRET" not in env
+
+
+# --------------------------------------------------------------------------------------
+# build_authorization_url
+# --------------------------------------------------------------------------------------
+
+
+def test_build_authorization_url_encodes_parameters() -> None:
+    url = get_tokens.build_authorization_url("my client", "http://localhost:8080/callback")
+
+    parsed = urllib.parse.urlsplit(url)
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "openapi.ctrader.com"
+    assert parsed.path == "/apps/auth"
+    params = urllib.parse.parse_qs(parsed.query)
+    assert params == {
+        "client_id": ["my client"],
+        "redirect_uri": ["http://localhost:8080/callback"],
+        "scope": ["trading"],
+    }
+
+
+# --------------------------------------------------------------------------------------
+# wait_for_authorization_code
+# --------------------------------------------------------------------------------------
+
+
+def test_wait_for_authorization_code_returns_the_code() -> None:
+    port = _free_port()
+    started = {}
+
+    def on_listening() -> None:
+        started["thread"] = threading.Thread(
+            target=_get,
+            args=(f"http://127.0.0.1:{port}/callback?code=the-code",),
+        )
+        started["thread"].start()
+
+    code = get_tokens.wait_for_authorization_code(
+        "127.0.0.1",
+        port,
+        "/callback",
+        5.0,
+        on_listening=on_listening,
+    )
+
+    assert code == "the-code"
+    started["thread"].join(timeout=2)
+
+
+def test_wait_for_authorization_code_raises_on_error() -> None:
+    port = _free_port()
+    started = {}
+
+    def on_listening() -> None:
+        started["thread"] = threading.Thread(
+            target=_get,
+            args=(f"http://127.0.0.1:{port}/callback?error=access_denied",),
+        )
+        started["thread"].start()
+
+    with pytest.raises(get_tokens.AuthorizationError) as exc_info:
+        get_tokens.wait_for_authorization_code(
+            "127.0.0.1",
+            port,
+            "/callback",
+            5.0,
+            on_listening=on_listening,
+        )
+
+    assert "access_denied" in str(exc_info.value)
+    started["thread"].join(timeout=2)
+
+
+def test_wait_for_authorization_code_ignores_other_paths() -> None:
+    port = _free_port()
+    started = {}
+
+    def on_listening() -> None:
+        def _drive() -> None:
+            _get(f"http://127.0.0.1:{port}/favicon.ico")
+            _get(f"http://127.0.0.1:{port}/callback?code=the-code")
+
+        started["thread"] = threading.Thread(target=_drive)
+        started["thread"].start()
+
+    code = get_tokens.wait_for_authorization_code(
+        "127.0.0.1",
+        port,
+        "/callback",
+        5.0,
+        on_listening=on_listening,
+    )
+
+    assert code == "the-code"
+    started["thread"].join(timeout=2)
+
+
+def test_wait_for_authorization_code_times_out() -> None:
+    port = _free_port()
+
+    with pytest.raises(TimeoutError):
+        get_tokens.wait_for_authorization_code("127.0.0.1", port, "/callback", 0.2)
+
+
+# --------------------------------------------------------------------------------------
+# exchange_code
+# --------------------------------------------------------------------------------------
+
+
+class _StubTokenHandler(http.server.BaseHTTPRequestHandler):
+    response_status = 200
+    response_body = b"{}"
+    captured_path: str | None = None
+
+    def do_GET(self) -> None:
+        type(self).captured_path = self.path
+        body = type(self).response_body
+        self.send_response(type(self).response_status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@pytest.fixture
+def stub_token_server():
+    _StubTokenHandler.response_status = 200
+    _StubTokenHandler.response_body = b"{}"
+    _StubTokenHandler.captured_path = None
+    server = http.server.HTTPServer(("127.0.0.1", 0), _StubTokenHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, f"http://127.0.0.1:{server.server_address[1]}/apps/token"
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_exchange_code_sends_the_documented_query_parameters(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "RT", "expiresIn": 2419200, "tokenType": "bearer"},
+    ).encode()
+
+    get_tokens.exchange_code(
+        "the-code",
+        client_id="cid",
+        client_secret="csecret",
+        redirect_uri="http://localhost:8080/callback",
+        token_url=token_url,
+    )
+
+    parsed = urllib.parse.urlsplit(_StubTokenHandler.captured_path)
+    assert parsed.path == "/apps/token"
+    params = urllib.parse.parse_qs(parsed.query)
+    assert params == {
+        "grant_type": ["authorization_code"],
+        "code": ["the-code"],
+        "redirect_uri": ["http://localhost:8080/callback"],
+        "client_id": ["cid"],
+        "client_secret": ["csecret"],
+    }
+
+
+def test_exchange_code_returns_parsed_tokens(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "RT", "expiresIn": 2419200, "tokenType": "bearer"},
+    ).encode()
+
+    tokens = get_tokens.exchange_code(
+        "the-code",
+        client_id="cid",
+        client_secret="csecret",
+        redirect_uri="http://localhost:8080/callback",
+        token_url=token_url,
+    )
+
+    assert tokens.access_token == "AT"
+    assert tokens.refresh_token == "RT"
+    assert tokens.expires_in == 2419200
+    assert tokens.token_type == "bearer"
+
+
+def test_exchange_code_raises_on_error_code(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"errorCode": "INVALID_GRANT", "description": "code expired"},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+    message = str(exc_info.value)
+    assert "INVALID_GRANT" in message
+    assert "code expired" in message
+    assert "csecret" not in message
+
+
+def test_exchange_code_raises_on_http_error(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_status = 400
+    _StubTokenHandler.response_body = json.dumps({"errorCode": "SHOULD_NOT_APPEAR"}).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+    message = str(exc_info.value)
+    assert "400" in message
+    assert "SHOULD_NOT_APPEAR" not in message
+    assert "csecret" not in message
+
+
+# --------------------------------------------------------------------------------------
+# update_env_file
+# --------------------------------------------------------------------------------------
+
+
+def test_update_env_file_replaces_existing_and_appends_missing(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# a comment\nCTRADER_CLIENT_ID=abc\nCTRADER_ACCESS_TOKEN=old\n",
+        encoding="utf-8",
+    )
+
+    get_tokens.update_env_file(
+        env_file,
+        {"CTRADER_ACCESS_TOKEN": "new", "CTRADER_REFRESH_TOKEN": "rt"},
+    )
+
+    text = env_file.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    assert lines[0] == "# a comment"
+    assert lines[1] == "CTRADER_CLIENT_ID=abc"
+    assert lines[2] == "CTRADER_ACCESS_TOKEN=new"
+    assert "CTRADER_REFRESH_TOKEN=rt" in lines
+
+
+def test_update_env_file_keeps_lf_line_endings(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b"CTRADER_CLIENT_ID=abc\nCTRADER_CLIENT_SECRET=s\n")
+
+    get_tokens.update_env_file(env_file, {"CTRADER_ACCESS_TOKEN": "new"})
+
+    raw = env_file.read_bytes()
+    assert b"\r\n" not in raw
+    assert b"CTRADER_ACCESS_TOKEN=new\n" in raw
+
+
+def test_update_env_file_keeps_crlf_line_endings(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_bytes(b"CTRADER_CLIENT_ID=abc\r\nCTRADER_CLIENT_SECRET=s\r\n")
+
+    get_tokens.update_env_file(env_file, {"CTRADER_ACCESS_TOKEN": "new"})
+
+    raw = env_file.read_bytes()
+    assert b"CTRADER_ACCESS_TOKEN=new\r\n" in raw
+    # Every line uses CRLF, not just the appended one.
+    assert raw.count(b"\r\n") == raw.count(b"\n")
+
+
+def test_update_env_file_writes_an_integer_expiry(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("CTRADER_CLIENT_ID=abc\n", encoding="utf-8")
+
+    get_tokens.update_env_file(env_file, {"CTRADER_TOKEN_EXPIRES_AT": str(1234567890)})
+
+    env = get_tokens.load_env(env_file)
+    assert int(env["CTRADER_TOKEN_EXPIRES_AT"]) == 1234567890
+
+
+# --------------------------------------------------------------------------------------
+# list_accounts
+# --------------------------------------------------------------------------------------
+
+
+async def test_list_accounts_returns_records_from_the_venue() -> None:
+    server = FakeCTraderServer()
+    server.on(
+        oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
+        lambda _r: oa.ProtoOAApplicationAuthRes(),
+    )
+    server.on(
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda _r: oa.ProtoOAGetAccountListByAccessTokenRes(
+            accessToken="super-secret-token",
+            permissionScope=oa_model.SCOPE_TRADE,
+            ctidTraderAccount=[
+                oa_model.ProtoOACtidTraderAccount(
+                    ctidTraderAccountId=123,
+                    isLive=False,
+                    traderLogin=456,
+                    brokerTitleShort="Acme",
+                ),
+            ],
+        ),
+    )
+    await server.start()
+    try:
+        result = await get_tokens.list_accounts(
+            "super-secret-token",
+            "cid",
+            "csecret",
+            host=server.host,
+            port=server.port,
+            tls=False,
+            logger=RecordingLogger(),
+        )
+    finally:
+        await server.stop()
+
+    assert result.permission_scope == oa_model.SCOPE_TRADE
+    assert len(result.accounts) == 1
+    account = result.accounts[0]
+    assert account.ctid_trader_account_id == 123
+    assert account.is_live is False
+    assert account.trader_login == 456
+    assert account.broker_title_short == "Acme"
+    assert "super-secret-token" not in repr(result)
+
+
+async def test_list_accounts_surfaces_a_rejected_application_auth() -> None:
+    server = FakeCTraderServer()
+    server.on(
+        oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
+        lambda _r: oa.ProtoOAErrorRes(errorCode="CH_CLIENT_AUTH_FAILURE"),
+    )
+    await server.start()
+    try:
+        with pytest.raises(CTraderRequestError) as exc_info:
+            await get_tokens.list_accounts(
+                "token",
+                "cid",
+                "csecret",
+                host=server.host,
+                port=server.port,
+                tls=False,
+                logger=RecordingLogger(),
+            )
+    finally:
+        await server.stop()
+
+    assert exc_info.value.error_code == "CH_CLIENT_AUTH_FAILURE"
+
+
+# --------------------------------------------------------------------------------------
+# main() end to end
+# --------------------------------------------------------------------------------------
+
+
+async def test_main_writes_tokens_and_never_prints_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "CTRADER_CLIENT_ID=cid\nCTRADER_CLIENT_SECRET=csecret\n",
+        encoding="utf-8",
+    )
+
+    # Token exchange stub.
+    _StubTokenHandler.response_status = 200
+    _StubTokenHandler.response_body = json.dumps(
+        {
+            "accessToken": "the-access-token",
+            "refreshToken": "the-refresh-token",
+            "expiresIn": 2419200,
+            "tokenType": "bearer",
+        },
+    ).encode()
+    token_server = http.server.HTTPServer(("127.0.0.1", 0), _StubTokenHandler)
+    token_thread = threading.Thread(target=token_server.serve_forever, daemon=True)
+    token_thread.start()
+    monkeypatch.setattr(
+        get_tokens,
+        "TOKEN_URL",
+        f"http://127.0.0.1:{token_server.server_address[1]}/apps/token",
+    )
+
+    # Account-listing fake server, wired in place of the real demo host.
+    fake_server = FakeCTraderServer()
+    fake_server.on(
+        oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
+        lambda _r: oa.ProtoOAApplicationAuthRes(),
+    )
+    fake_server.on(
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda _r: oa.ProtoOAGetAccountListByAccessTokenRes(
+            accessToken="the-access-token",
+            permissionScope=oa_model.SCOPE_TRADE,
+            ctidTraderAccount=[
+                oa_model.ProtoOACtidTraderAccount(ctidTraderAccountId=1, isLive=False),
+            ],
+        ),
+    )
+    await fake_server.start()
+    monkeypatch.setattr(get_tokens, "DEMO_HOST", fake_server.host)
+    monkeypatch.setattr(get_tokens, "PROTOBUF_PORT", fake_server.port)
+    monkeypatch.setattr(get_tokens, "PROTOBUF_TLS", False)
+
+    # The redirect: webbrowser.open is patched to perform the request itself, as if a real
+    # browser had followed it and cTrader had redirected back with a code.
+    redirect_port = _free_port()
+    redirect_uri = f"http://127.0.0.1:{redirect_port}/callback"
+
+    def fake_open(_url: str) -> bool:
+        threading.Thread(target=_get, args=(f"{redirect_uri}?code=the-auth-code",)).start()
+        return True
+
+    monkeypatch.setattr(get_tokens.webbrowser, "open", fake_open)
+
+    try:
+        # main() calls asyncio.run() internally for the account-listing step; run it on a
+        # separate thread so that call does not collide with this test's own running loop.
+        rc = await asyncio.to_thread(
+            get_tokens.main,
+            [
+                "--env-file",
+                str(env_file),
+                "--redirect-uri",
+                redirect_uri,
+                "--timeout-secs",
+                "5",
+            ],
+        )
+    finally:
+        token_server.shutdown()
+        token_thread.join(timeout=2)
+        token_server.server_close()
+        await fake_server.stop()
+
+    assert rc == 0
+
+    env = get_tokens.load_env(env_file)
+    assert env["CTRADER_ACCESS_TOKEN"] == "the-access-token"
+    assert env["CTRADER_REFRESH_TOKEN"] == "the-refresh-token"
+    assert int(env["CTRADER_TOKEN_EXPIRES_AT"]) > 0
+    assert env["CTRADER_CLIENT_ID"] == "cid"
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "the-access-token" not in output
+    assert "the-refresh-token" not in output
+    assert "csecret" not in output
