@@ -538,6 +538,53 @@ def test_wait_for_authorization_code_raises_the_error_even_if_the_response_write
     assert "access_denied" in str(exc_info.value)
 
 
+def test_wait_for_authorization_code_rejects_non_ascii_state_without_a_traceback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`secrets.compare_digest` raises `TypeError` for `str` arguments containing non-ASCII
+    characters; a stray request such as `?state=%C3%A9` must get a clean 400 and let the wait
+    continue, not print a `socketserver` traceback to stderr."""
+    port = _free_port()
+    started = {}
+
+    def _status(url: str) -> int:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:
+                return response.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except (urllib.error.URLError, OSError):
+            # The connection was reset without any response at all - e.g. the pre-fix
+            # `TypeError` inside `do_GET` closing the connection - which is itself a failure
+            # this test must be able to report instead of only hanging.
+            return -1
+
+    result: dict[str, int] = {}
+
+    def on_listening() -> None:
+        def _drive() -> None:
+            query = urllib.parse.urlencode({"state": "é", "code": "wrong-code"})
+            result["status"] = _status(f"http://127.0.0.1:{port}/callback?{query}")
+            _get(f"http://127.0.0.1:{port}/callback?code=the-code&state=s")
+
+        started["thread"] = threading.Thread(target=_drive)
+        started["thread"].start()
+
+    code = get_tokens.wait_for_authorization_code(
+        "127.0.0.1",
+        port,
+        "/callback",
+        5.0,
+        state="s",
+        on_listening=on_listening,
+    )
+
+    assert code == "the-code"
+    started["thread"].join(timeout=2)
+    assert result["status"] == 400
+    assert "Traceback" not in capsys.readouterr().err
+
+
 def test_wait_for_authorization_code_times_out_close_to_the_deadline() -> None:
     """With only an idle connection present, the timeout must fire close to `timeout_secs`,
     not be stretched out by the idle connection's own per-connection read timeout."""
@@ -1127,7 +1174,7 @@ def test_main_refuses_a_redirect_uri_with_the_wrong_scheme_alone(
 
     assert rc == 2
     message = capsys.readouterr().err
-    assert "http" in message
+    assert "scheme must be http" in message
 
 
 def test_main_refuses_a_redirect_uri_with_the_wrong_host_alone(
@@ -1204,6 +1251,39 @@ def test_main_refuses_a_bad_redirect_port(tmp_path: Path, redirect_uri: str) -> 
     )
 
     assert rc == 2
+
+
+def test_main_reports_a_busy_callback_port_without_a_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A callback port already in use must exit 2 with a clear message, like every other
+    redirect-URI problem, instead of an unhandled `OSError` traceback."""
+    env_file = _write_minimal_env(tmp_path)
+    port = _free_port()
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", port))
+    blocker.listen(1)
+    try:
+        rc = get_tokens.main(
+            [
+                "--env-file",
+                str(env_file),
+                "--redirect-uri",
+                f"http://127.0.0.1:{port}/callback",
+                "--timeout-secs",
+                "2",
+            ],
+        )
+    finally:
+        blocker.close()
+
+    assert rc == 2
+    message = capsys.readouterr().err
+    assert str(port) in message
+    assert "already in use" in message
+    assert "Traceback" not in message
 
 
 def test_main_exits_2_on_missing_keys(tmp_path: Path) -> None:

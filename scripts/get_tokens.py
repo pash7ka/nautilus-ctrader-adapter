@@ -237,7 +237,11 @@ def wait_for_authorization_code(
                 return
             params = urllib.parse.parse_qs(parsed.query)
             request_state = params.get("state", [""])[0]
-            if not secrets.compare_digest(request_state, state):
+            # `compare_digest` requires both arguments to be either `str` restricted to ASCII
+            # or `bytes`; encoding both sides first accepts any `request_state` (a stray
+            # non-ASCII value must compare as a mismatch, not raise) while keeping the
+            # comparison constant-time.
+            if not secrets.compare_digest(request_state.encode(), state.encode()):
                 self.send_response(400)
                 self.end_headers()
                 return
@@ -602,6 +606,12 @@ def main(argv: list[str] | None = None) -> int:
             state=state,
             on_listening=_open_browser,
         )
+    except OSError:
+        # Most likely the callback port is already bound by another process. The exception's
+        # own text isn't printed - on some platforms it can carry more than the address - the
+        # port number and a fixed message are enough to act on.
+        print(f"callback port {redirect_port} is already in use", file=sys.stderr)
+        return 2
     except AuthorizationError as e:
         print(f"Authorization was not granted: {e}", file=sys.stderr)
         return 1
