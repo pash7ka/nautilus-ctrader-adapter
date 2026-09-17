@@ -58,6 +58,12 @@ def _get(url: str) -> None:
         urllib.request.urlopen(url, timeout=2)
 
 
+def _state_from_authorization_url(url: str) -> str:
+    """`main()` generates a fresh OAuth `state` per run; a faked browser must echo it back on
+    the redirect, exactly as the real authorization server would."""
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["state"][0]
+
+
 # --------------------------------------------------------------------------------------
 # load_env
 # --------------------------------------------------------------------------------------
@@ -109,7 +115,11 @@ def test_load_env_omits_missing_keys(tmp_path: Path) -> None:
 
 
 def test_build_authorization_url_encodes_parameters() -> None:
-    url = get_tokens.build_authorization_url("my client", "http://localhost:8080/callback")
+    url = get_tokens.build_authorization_url(
+        "my client",
+        "http://localhost:8080/callback",
+        "the-state",
+    )
 
     parsed = urllib.parse.urlsplit(url)
     assert parsed.scheme == "https"
@@ -120,6 +130,7 @@ def test_build_authorization_url_encodes_parameters() -> None:
         "client_id": ["my client"],
         "redirect_uri": ["http://localhost:8080/callback"],
         "scope": ["trading"],
+        "state": ["the-state"],
     }
 
 
@@ -135,7 +146,7 @@ def test_wait_for_authorization_code_returns_the_code() -> None:
     def on_listening() -> None:
         started["thread"] = threading.Thread(
             target=_get,
-            args=(f"http://127.0.0.1:{port}/callback?code=the-code",),
+            args=(f"http://127.0.0.1:{port}/callback?code=the-code&state=s",),
         )
         started["thread"].start()
 
@@ -144,6 +155,7 @@ def test_wait_for_authorization_code_returns_the_code() -> None:
         port,
         "/callback",
         5.0,
+        state="s",
         on_listening=on_listening,
     )
 
@@ -158,7 +170,7 @@ def test_wait_for_authorization_code_raises_on_error() -> None:
     def on_listening() -> None:
         started["thread"] = threading.Thread(
             target=_get,
-            args=(f"http://127.0.0.1:{port}/callback?error=access_denied",),
+            args=(f"http://127.0.0.1:{port}/callback?error=access_denied&state=s",),
         )
         started["thread"].start()
 
@@ -168,6 +180,7 @@ def test_wait_for_authorization_code_raises_on_error() -> None:
             port,
             "/callback",
             5.0,
+            state="s",
             on_listening=on_listening,
         )
 
@@ -182,7 +195,7 @@ def test_wait_for_authorization_code_ignores_other_paths() -> None:
     def on_listening() -> None:
         def _drive() -> None:
             _get(f"http://127.0.0.1:{port}/favicon.ico")
-            _get(f"http://127.0.0.1:{port}/callback?code=the-code")
+            _get(f"http://127.0.0.1:{port}/callback?code=the-code&state=s")
 
         started["thread"] = threading.Thread(target=_drive)
         started["thread"].start()
@@ -192,6 +205,7 @@ def test_wait_for_authorization_code_ignores_other_paths() -> None:
         port,
         "/callback",
         5.0,
+        state="s",
         on_listening=on_listening,
     )
 
@@ -203,7 +217,120 @@ def test_wait_for_authorization_code_times_out() -> None:
     port = _free_port()
 
     with pytest.raises(TimeoutError):
-        get_tokens.wait_for_authorization_code("127.0.0.1", port, "/callback", 0.2)
+        get_tokens.wait_for_authorization_code("127.0.0.1", port, "/callback", 0.2, state="s")
+
+
+def test_wait_for_authorization_code_rejects_wrong_state_then_accepts_the_right_one() -> None:
+    """A request with a missing or wrong `state` must not end the wait, so a stray page can't
+    inject a code or abort the run."""
+    port = _free_port()
+    started = {}
+
+    def on_listening() -> None:
+        def _drive() -> None:
+            _get(f"http://127.0.0.1:{port}/callback?code=wrong-state-code&state=nope")
+            _get(f"http://127.0.0.1:{port}/callback?code=the-code")  # missing state
+            _get(f"http://127.0.0.1:{port}/callback?code=the-code&state=s")
+
+        started["thread"] = threading.Thread(target=_drive)
+        started["thread"].start()
+
+    code = get_tokens.wait_for_authorization_code(
+        "127.0.0.1",
+        port,
+        "/callback",
+        5.0,
+        state="s",
+        on_listening=on_listening,
+    )
+
+    assert code == "the-code"
+    started["thread"].join(timeout=2)
+
+
+def test_wait_for_authorization_code_ignores_error_with_wrong_state() -> None:
+    """A `?error=...` with the wrong state must not abort the run either."""
+    port = _free_port()
+    started = {}
+
+    def on_listening() -> None:
+        def _drive() -> None:
+            _get(f"http://127.0.0.1:{port}/callback?error=access_denied&state=nope")
+            _get(f"http://127.0.0.1:{port}/callback?code=the-code&state=s")
+
+        started["thread"] = threading.Thread(target=_drive)
+        started["thread"].start()
+
+    code = get_tokens.wait_for_authorization_code(
+        "127.0.0.1",
+        port,
+        "/callback",
+        5.0,
+        state="s",
+        on_listening=on_listening,
+    )
+
+    assert code == "the-code"
+    started["thread"].join(timeout=2)
+
+
+def test_wait_for_authorization_code_escapes_the_error_in_the_page() -> None:
+    port = _free_port()
+    page: dict[str, str] = {}
+
+    def _fetch() -> None:
+        query = urllib.parse.urlencode({"error": "<script>bad()</script>", "state": "s"})
+        with (
+            contextlib.suppress(urllib.error.URLError),
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/callback?{query}", timeout=5) as r,
+        ):
+            page["body"] = r.read().decode()
+
+    started = {}
+
+    def on_listening() -> None:
+        started["thread"] = threading.Thread(target=_fetch)
+        started["thread"].start()
+
+    with pytest.raises(get_tokens.AuthorizationError):
+        get_tokens.wait_for_authorization_code(
+            "127.0.0.1",
+            port,
+            "/callback",
+            5.0,
+            state="s",
+            on_listening=on_listening,
+        )
+    started["thread"].join(timeout=5)
+
+    assert "<script>" not in page["body"]
+    assert "&lt;script&gt;" in page["body"]
+
+
+def test_wait_for_authorization_code_sanitizes_the_error_for_the_terminal() -> None:
+    port = _free_port()
+    nasty = "bad\x07\x1b[31m" + ("x" * 500)
+
+    def on_listening() -> None:
+        query = urllib.parse.urlencode({"error": nasty, "state": "s"})
+        threading.Thread(
+            target=_get,
+            args=(f"http://127.0.0.1:{port}/callback?{query}",),
+        ).start()
+
+    with pytest.raises(get_tokens.AuthorizationError) as exc_info:
+        get_tokens.wait_for_authorization_code(
+            "127.0.0.1",
+            port,
+            "/callback",
+            5.0,
+            state="s",
+            on_listening=on_listening,
+        )
+
+    message = str(exc_info.value)
+    assert all(ch.isprintable() for ch in message)
+    assert len(message) <= 200
 
 
 def test_wait_for_authorization_code_survives_an_idle_connection() -> None:
@@ -217,7 +344,10 @@ def test_wait_for_authorization_code_survives_an_idle_connection() -> None:
         # The server may be busy dropping the idle connection for a few seconds before it
         # accepts this one, so give the response more room than `_get`'s default 2s.
         with contextlib.suppress(urllib.error.URLError, TimeoutError):
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/callback?code=the-code", timeout=10)
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/callback?code=the-code&state=s",
+                timeout=10,
+            )
 
     def on_listening() -> None:
         idle_sock.connect(("127.0.0.1", port))
@@ -229,6 +359,7 @@ def test_wait_for_authorization_code_survives_an_idle_connection() -> None:
             port,
             "/callback",
             10.0,
+            state="s",
             on_listening=on_listening,
         )
 
@@ -499,6 +630,25 @@ async def test_list_accounts_surfaces_a_rejected_application_auth() -> None:
     assert exc_info.value.error_code == "CH_CLIENT_AUTH_FAILURE"
 
 
+def test_main_refuses_a_non_loopback_redirect_uri(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "CTRADER_CLIENT_ID=cid\nCTRADER_CLIENT_SECRET=csecret\n",
+        encoding="utf-8",
+    )
+
+    rc = get_tokens.main(
+        [
+            "--env-file",
+            str(env_file),
+            "--redirect-uri",
+            "https://example.com/callback",
+        ],
+    )
+
+    assert rc == 2
+
+
 # --------------------------------------------------------------------------------------
 # main() end to end
 # --------------------------------------------------------------------------------------
@@ -537,8 +687,12 @@ async def test_main_reports_a_connection_refused_while_listing_accounts(
     redirect_port = _free_port()
     redirect_uri = f"http://127.0.0.1:{redirect_port}/callback"
 
-    def fake_open(_url: str) -> bool:
-        threading.Thread(target=_get, args=(f"{redirect_uri}?code=the-auth-code",)).start()
+    def fake_open(url: str) -> bool:
+        state = _state_from_authorization_url(url)
+        threading.Thread(
+            target=_get,
+            args=(f"{redirect_uri}?code=the-auth-code&state={state}",),
+        ).start()
         return True
 
     monkeypatch.setattr(get_tokens.webbrowser, "open", fake_open)
@@ -562,7 +716,7 @@ async def test_main_writes_tokens_and_never_prints_secrets(
 ) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "CTRADER_CLIENT_ID=cid\nCTRADER_CLIENT_SECRET=csecret\n",
+        "CTRADER_CLIENT_ID=the-distinctive-client-id\nCTRADER_CLIENT_SECRET=csecret\n",
         encoding="utf-8",
     )
 
@@ -611,8 +765,12 @@ async def test_main_writes_tokens_and_never_prints_secrets(
     redirect_port = _free_port()
     redirect_uri = f"http://127.0.0.1:{redirect_port}/callback"
 
-    def fake_open(_url: str) -> bool:
-        threading.Thread(target=_get, args=(f"{redirect_uri}?code=the-auth-code",)).start()
+    def fake_open(url: str) -> bool:
+        state = _state_from_authorization_url(url)
+        threading.Thread(
+            target=_get,
+            args=(f"{redirect_uri}?code=the-auth-code&state={state}",),
+        ).start()
         return True
 
     monkeypatch.setattr(get_tokens.webbrowser, "open", fake_open)
@@ -643,10 +801,12 @@ async def test_main_writes_tokens_and_never_prints_secrets(
     assert env["CTRADER_ACCESS_TOKEN"] == "the-access-token"
     assert env["CTRADER_REFRESH_TOKEN"] == "the-refresh-token"
     assert int(env["CTRADER_TOKEN_EXPIRES_AT"]) > 0
-    assert env["CTRADER_CLIENT_ID"] == "cid"
+    assert env["CTRADER_CLIENT_ID"] == "the-distinctive-client-id"
 
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert "the-access-token" not in output
     assert "the-refresh-token" not in output
     assert "csecret" not in output
+    assert "the-auth-code" not in output
+    assert "the-distinctive-client-id" not in output

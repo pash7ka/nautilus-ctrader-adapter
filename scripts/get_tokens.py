@@ -16,10 +16,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import html
 import http.server
 import json
 import os
 import re
+import secrets
 import ssl
 import sys
 import tempfile
@@ -51,6 +53,10 @@ CLIENT_SECRET_KEY = "CTRADER_CLIENT_SECRET"
 ACCESS_TOKEN_KEY = "CTRADER_ACCESS_TOKEN"
 REFRESH_TOKEN_KEY = "CTRADER_REFRESH_TOKEN"
 TOKEN_EXPIRES_AT_KEY = "CTRADER_TOKEN_EXPIRES_AT"
+
+# The callback server always binds 127.0.0.1 regardless of the redirect host, so only these
+# are accepted as --redirect-uri hosts: a wider host could bind and expose the callback port.
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 class AuthorizationError(RuntimeError):
@@ -156,13 +162,30 @@ def load_env(path: Path) -> dict[str, str]:
     return env
 
 
-def build_authorization_url(client_id: str, redirect_uri: str) -> str:
+def build_authorization_url(client_id: str, redirect_uri: str, state: str) -> str:
     """The one-time authorization page URL. Carries the client id, so it is only ever
     printed with `--print-url`."""
     query = urllib.parse.urlencode(
-        {"client_id": client_id, "redirect_uri": redirect_uri, "scope": "trading"},
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": "trading",
+            "state": state,
+        },
     )
     return f"{AUTHORIZATION_URL}?{query}"
+
+
+def _sanitize_for_terminal(value: str, *, max_len: int = 200) -> str:
+    """Strip non-printable characters and cap the length, so a redirect's `error` value can't
+    smuggle control sequences or an unbounded blob into terminal output."""
+    return "".join(ch for ch in value if ch.isprintable())[:max_len]
+
+
+class _CallbackServer(http.server.HTTPServer):
+    # HTTPServer defaults this on; on Windows SO_REUSEADDR lets another process share or steal
+    # the port instead of just permitting reuse of one still in TIME_WAIT.
+    allow_reuse_address = sys.platform != "win32"
 
 
 def wait_for_authorization_code(
@@ -171,13 +194,20 @@ def wait_for_authorization_code(
     path: str,
     timeout_secs: float,
     *,
+    state: str,
     on_listening: Callable[[], None] | None = None,
 ) -> str:
     """Serve exactly `path` until the redirect carries a code, an error, or the timeout ends.
 
     A request to any other path gets 404 and does not end the wait: browsers probe things
-    like `/favicon.ico` on their own. `on_listening`, if given, runs once the socket is bound
-    and listening - the caller's cue to open the browser (or, in a test, to drive a request).
+    like `/favicon.ico` on their own. So does a request whose `state` is missing or does not
+    match `state` exactly - it could be a stray page rather than the real redirect, and must
+    not be able to inject a code or abort the run. `on_listening`, if given, runs once the
+    socket is bound and listening - the caller's cue to open the browser (or, in a test, to
+    drive a request).
+
+    TODO(verify): that the authorization endpoint echoes `state` back on the redirect; if it
+    doesn't, every real callback will be rejected as a state mismatch.
     """
     outcome: dict[str, str] = {}
 
@@ -195,12 +225,17 @@ def wait_for_authorization_code(
                 self.end_headers()
                 return
             params = urllib.parse.parse_qs(parsed.query)
+            if params.get("state", [None])[0] != state:
+                self.send_response(400)
+                self.end_headers()
+                return
             if "code" in params:
                 outcome["code"] = params["code"][0]
                 self._respond("Authorization received. You can close this tab.")
             elif "error" in params:
-                outcome["error"] = params["error"][0]
-                self._respond(f"Authorization failed: {outcome['error']}")
+                error = _sanitize_for_terminal(params["error"][0])
+                outcome["error"] = error
+                self._respond(f"Authorization failed: {html.escape(error)}")
             else:
                 self.send_response(400)
                 self.end_headers()
@@ -216,7 +251,7 @@ def wait_for_authorization_code(
         def log_message(self, format: str, *args: object) -> None:
             pass  # the default access log would echo the redirect's query string
 
-    server = http.server.HTTPServer((host, port), _Handler)
+    server = _CallbackServer((host, port), _Handler)
     try:
         if on_listening is not None:
             on_listening()
@@ -434,11 +469,18 @@ def main(argv: list[str] | None = None) -> int:
     client_secret = env[CLIENT_SECRET_KEY]
 
     redirect = urllib.parse.urlsplit(args.redirect_uri)
-    redirect_host = redirect.hostname or "localhost"
-    redirect_port = redirect.port or (443 if redirect.scheme == "https" else 80)
+    if redirect.scheme != "http" or redirect.hostname not in _LOOPBACK_HOSTNAMES:
+        print(
+            f"Refusing --redirect-uri {args.redirect_uri!r}: scheme must be http and host "
+            "must be localhost, 127.0.0.1 or ::1.",
+            file=sys.stderr,
+        )
+        return 2
+    redirect_port = redirect.port or 80
     redirect_path = redirect.path or "/"
 
-    auth_url = build_authorization_url(client_id, args.redirect_uri)
+    state = secrets.token_urlsafe(32)
+    auth_url = build_authorization_url(client_id, args.redirect_uri, state)
     if args.print_url:
         print(auth_url)
 
@@ -456,10 +498,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         code = wait_for_authorization_code(
-            redirect_host,
+            "127.0.0.1",
             redirect_port,
             redirect_path,
             args.timeout_secs,
+            state=state,
             on_listening=_open_browser,
         )
     except AuthorizationError as e:
