@@ -169,21 +169,24 @@ class CTraderSession:
     async def stop(self) -> None:
         self._stopping = True
         self._lost.set()
+        # The whole body runs under `finally`: if a cancellation aimed at this `stop()` call
+        # lands while it awaits `asyncio.wait(...)` below, the session must still end up closed
+        # and `STOPPED` rather than left `READY` with an orphaned, still-open connection.
         tasks = {t for t in (self._supervisor, self._refresh_task) if t is not None}
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            # Not a per-task suppress: that would also catch a cancellation of the caller of
-            # `stop()` itself and let it slip past unnoticed.
-            await asyncio.wait(tasks)
-        for task in tasks:
-            if task.done() and not task.cancelled():
-                task.exception()  # fetch it so it is not reported as never retrieved
-        self._supervisor = None
-        self._refresh_task = None
         try:
-            await self._connection.close()
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                # Not a per-task suppress: that would also catch a cancellation of the caller of
+                # `stop()` itself and let it slip past unnoticed.
+                await asyncio.wait(tasks)
+            for task in tasks:
+                if task.done() and not task.cancelled():
+                    task.exception()  # fetch it so it is not reported as never retrieved
         finally:
+            self._supervisor = None
+            self._refresh_task = None
+            await self._connection.close()
             self._state = SessionState.STOPPED
             self._ready.clear()
 

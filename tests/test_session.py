@@ -779,6 +779,11 @@ async def test_stop_can_be_cancelled_by_its_own_caller() -> None:
         with pytest.raises(asyncio.CancelledError):
             await stop_task
 
+        # A cancelled `stop()` must still finish tearing the session down: otherwise it is left
+        # `READY` with a live, orphaned connection that nothing will ever close.
+        assert session.state is SessionState.STOPPED
+        assert session._connection.is_connected is False
+
         await session.stop()
     finally:
         await session.stop()
@@ -801,6 +806,8 @@ async def test_stop_returns_promptly_after_the_server_drops_the_connection(
             await original_heartbeat_loop(self)
         except asyncio.CancelledError:
             heartbeat_cancelled.set()
+            # With the fixed `stop()`, this sleep is what `stop()`'s own `close()` interrupts,
+            # not something `stop()` waits out.
             await asyncio.sleep(0.2)
             raise
 
