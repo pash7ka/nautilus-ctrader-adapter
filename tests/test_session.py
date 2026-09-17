@@ -13,8 +13,14 @@ from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderProtocolError,
 )
+from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.common.session import CTraderSession, SessionState
-from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
+from nautilus_ctrader.constants import (
+    BUCKET_DEFAULT,
+    BUCKET_HISTORICAL,
+    LENGTH_PREFIX_FORMAT,
+    MAX_FRAME_BYTES,
+)
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
@@ -837,7 +843,24 @@ async def test_stop_survives_repeated_cancellation(monkeypatch: pytest.MonkeyPat
         await server.stop()
 
 
-async def test_a_loss_while_stop_waits_keeps_the_session_stopped() -> None:
+async def test_a_loss_while_stop_waits_keeps_the_session_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A heartbeat task slow to react to cancellation keeps `stop()` waiting while the venue
+    # drops the connection.
+    original_heartbeat_loop = CTraderConnection._heartbeat_loop
+    heartbeat_cancelled = asyncio.Event()
+
+    async def slow_to_cancel_heartbeat_loop(self: CTraderConnection) -> None:
+        try:
+            await original_heartbeat_loop(self)
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            await asyncio.sleep(0.3)
+            raise
+
+    monkeypatch.setattr(CTraderConnection, "_heartbeat_loop", slow_to_cancel_heartbeat_loop)
+
     server = _authenticating_server()
     await server.start()
     session = _session(server)
@@ -846,14 +869,84 @@ async def test_a_loss_while_stop_waits_keeps_the_session_stopped() -> None:
         await session.wait_ready(timeout_secs=2.0)
 
         stop_task = asyncio.create_task(session.stop())
-        await asyncio.sleep(0)
-        assert not stop_task.done()
-        # A loss reported while `stop()` still waits for its tasks.
-        session._connection._fail(CTraderConnectionError("dropped during stop"))
+        await wait_until(heartbeat_cancelled.is_set, description="stop waiting on its tasks")
+        await server.drop_connections()
+        await asyncio.sleep(0.05)
+        assert not stop_task.done(), "the loss must land while stop() still waits"
         await stop_task
 
         assert session.state is SessionState.STOPPED
         assert session.is_ready is False
+        assert session._connection.is_connected is False
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_start_during_stop_ends_healthy() -> None:
+    # A restore slow to honour cancellation keeps `stop()` waiting while `start()` is called,
+    # as when Nautilus schedules disconnect and connect as separate tasks.
+    server = _authenticating_server()
+    server.on(
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
+    )
+    await server.start()
+    # A fast limiter, so the new bring-up finishes well inside the restore's cancellation delay.
+    limiter = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
+    session = _session(server, backoff_base_secs=0.01, rate_limiter=limiter)
+    block_restore = False
+    restore_entered = asyncio.Event()
+
+    async def slow_to_cancel_restore() -> None:
+        if not block_restore:
+            return
+        restore_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.3)
+            raise
+
+    def subscribe_request() -> oa.ProtoOASubscribeSpotsReq:
+        return oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1])
+
+    def owned_tasks(name: str) -> list[asyncio.Task]:
+        qualname = f"CTraderConnection.{name}"
+        return [
+            task
+            for task in asyncio.all_tasks()
+            if not task.done() and task.get_coro().__qualname__.endswith(qualname)
+        ]
+
+    try:
+        session.add_restore("slow", slow_to_cancel_restore)
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        # Hold the next bring-up inside the restore.
+        block_restore = True
+        await server.drop_connections()
+        await wait_until(restore_entered.is_set, description="bring-up inside the restore")
+        block_restore = False
+
+        stop_task = asyncio.create_task(session.stop())
+        await asyncio.sleep(0)
+        assert not stop_task.done()
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert session.is_ready
+        assert session._connection.is_connected
+        await session.request(subscribe_request(), timeout_secs=2.0)
+
+        await stop_task
+        assert session.is_ready
+        assert session._connection.is_connected
+        await session.request(subscribe_request(), timeout_secs=2.0)
+        assert len(owned_tasks("_heartbeat_loop")) == 1
+        assert len(owned_tasks("_read_loop")) == 1
     finally:
         await session.stop()
         await server.stop()

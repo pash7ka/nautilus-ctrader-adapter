@@ -14,7 +14,8 @@ import asyncio
 import contextlib
 import ssl
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from typing import NamedTuple
 
 from google.protobuf.message import Message
 from nautilus_trader.common.component import Logger
@@ -37,6 +38,25 @@ from nautilus_ctrader.constants import (
 )
 from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiCommonModelMessages_pb2 as common_model
+
+
+def retrieve_exceptions(tasks: Iterable[asyncio.Task]) -> None:
+    """Retrieve each task's exception, now or once it ends, so none is reported as unretrieved."""
+    for task in tasks:
+        if task.done():
+            _retrieve_exception(task)
+        else:
+            task.add_done_callback(_retrieve_exception)
+
+
+def _retrieve_exception(task: asyncio.Task) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+class _CloseHandles(NamedTuple):
+    tasks: set[asyncio.Task]
+    writer: asyncio.StreamWriter | None
 
 
 class CTraderConnection:
@@ -124,8 +144,14 @@ class CTraderConnection:
         self._log.info(f"Connected to {self._host}:{self._port}")
 
     async def close(self) -> None:
-        # State first, awaits last: a cancellation landing in an await below can only cut the
-        # wait short, never leave the socket open or requests pending.
+        await self._finish_close(self._begin_close())
+
+    def _begin_close(self) -> _CloseHandles:
+        """Release everything at once and return what is left to await.
+
+        State first, awaits last: a cancellation landing in `_finish_close()` can only cut the
+        wait short, never leave the socket open or requests pending.
+        """
         self._connected = False
         tasks = {t for t in (self._heartbeat_task, self._read_task) if t is not None}
         for task in tasks:
@@ -138,19 +164,20 @@ class CTraderConnection:
         self._read_task = None
         self._writer = None
         self._reader = None
+        return _CloseHandles(tasks, writer)
 
+    async def _finish_close(self, handles: _CloseHandles) -> None:
+        """Await exactly `handles`, never whatever connection exists by now."""
         try:
-            if tasks:
-                # Not a per-task suppress: that would also catch a cancellation of the caller of
-                # `close()` itself and let it slip past unnoticed.
-                await asyncio.wait(tasks)
-            for task in tasks:
-                if task.done() and not task.cancelled():
-                    task.exception()  # fetch it so it is not reported as never retrieved
+            if handles.tasks:
+                # Not a per-task suppress: that would also catch a cancellation of the caller
+                # itself and let it slip past unnoticed.
+                await asyncio.wait(handles.tasks)
         finally:
-            if writer is not None:
+            retrieve_exceptions(handles.tasks)
+            if handles.writer is not None:
                 with contextlib.suppress(ConnectionError, OSError):
-                    await writer.wait_closed()
+                    await handles.writer.wait_closed()
 
     async def request(
         self,

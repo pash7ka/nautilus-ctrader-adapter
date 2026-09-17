@@ -17,7 +17,7 @@ from enum import Enum, auto
 from google.protobuf.message import Message
 from nautilus_trader.common.component import Logger
 
-from nautilus_ctrader.common.connection import CTraderConnection
+from nautilus_ctrader.common.connection import CTraderConnection, retrieve_exceptions
 from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
@@ -127,6 +127,10 @@ class CTraderSession:
         self._last_refresh_at: float | None = None
         self._reauth_requested = False
         self._stopping = False
+        # Set while no `stop()` is running; `start()` waits on it.
+        self._stop_idle = asyncio.Event()
+        self._stop_idle.set()
+        self._stops_in_progress = 0
         self.last_error: Exception | None = None
         # The cause of the current loss only, so a bring-up failure never chains to a stale one.
         self._loss_cause: Exception | None = None
@@ -159,7 +163,11 @@ class CTraderSession:
         await asyncio.wait_for(self._ready.wait(), timeout_secs)
 
     async def start(self) -> None:
-        """Start the supervisor. Returns before the first authentication completes."""
+        """Start the supervisor. Returns before the first authentication completes.
+
+        Waits for any `stop()` still in progress, so a restart never overlaps its teardown.
+        """
+        await self._stop_idle.wait()
         if self._supervisor is not None and not self._supervisor.done():
             return
         self._stopping = False
@@ -167,29 +175,36 @@ class CTraderSession:
         self._supervisor = asyncio.create_task(self._supervise())
 
     async def stop(self) -> None:
-        # State first, awaits last: repeated cancellation can only cut a wait short, never leave
-        # a live, unsupervised connection behind a session that still looks ready.
-        self._stopping = True
-        self._lost.set()
-        self._state = SessionState.STOPPED
-        self._ready.clear()
-        tasks = {t for t in (self._supervisor, self._refresh_task) if t is not None}
-        self._supervisor = None
-        self._refresh_task = None
-        for task in tasks:
-            task.cancel()
-
+        self._stops_in_progress += 1
+        self._stop_idle.clear()
         try:
-            if tasks:
-                # Not a per-task suppress: that would also catch a cancellation of the caller of
-                # `stop()` itself and let it slip past unnoticed.
-                await asyncio.wait(tasks)
+            # State first, awaits last: repeated cancellation can only cut a wait short, never
+            # leave a live, unsupervised connection behind a session that still looks ready.
+            # Only what is captured here is awaited, so a restart begun meanwhile is never
+            # touched.
+            self._stopping = True
+            self._lost.set()
+            self._state = SessionState.STOPPED
+            self._ready.clear()
+            tasks = {t for t in (self._supervisor, self._refresh_task) if t is not None}
+            self._supervisor = None
+            self._refresh_task = None
             for task in tasks:
-                if task.done() and not task.cancelled():
-                    task.exception()  # fetch it so it is not reported as never retrieved
+                task.cancel()
+            handles = self._connection._begin_close()
+
+            try:
+                if tasks:
+                    # Not a per-task suppress: that would also catch a cancellation of the
+                    # caller of `stop()` itself and let it slip past unnoticed.
+                    await asyncio.wait(tasks)
+            finally:
+                retrieve_exceptions(tasks)
+                await self._connection._finish_close(handles)
         finally:
-            # Safe to interrupt: `close()` releases everything before its own first await.
-            await self._connection.close()
+            self._stops_in_progress -= 1
+            if self._stops_in_progress == 0:
+                self._stop_idle.set()
 
     async def request(
         self,
