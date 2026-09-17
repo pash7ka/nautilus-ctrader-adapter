@@ -6,6 +6,7 @@ this is the one module that can be compared byte-for-byte against Spotware's imp
 
 from __future__ import annotations
 
+import functools
 import struct
 
 from google.protobuf.message import DecodeError, EncodeError, Message
@@ -55,6 +56,7 @@ def decode_envelope(body: bytes) -> common.ProtoMessage:
     envelope = common.ProtoMessage()
     try:
         envelope.ParseFromString(body)
+    # The pure-Python protobuf backend raises UnicodeDecodeError on invalid UTF-8 strings.
     except (DecodeError, ValueError) as e:
         raise CTraderProtocolError(f"undecodable envelope of {len(body)} bytes") from e
     if not envelope.IsInitialized():
@@ -64,12 +66,13 @@ def decode_envelope(body: bytes) -> common.ProtoMessage:
 
 _MILLISECONDS_PER_SECOND = 1000
 
-_registry: dict[int, type[Message]] | None = None
+_PAYLOAD_MODULES = (common, oa)
 
 
+@functools.cache
 def _build_registry() -> dict[int, type[Message]]:
     registry: dict[int, type[Message]] = {}
-    for module in (common, oa):
+    for module in _PAYLOAD_MODULES:
         for name in dir(module):
             if not name.startswith("Proto"):
                 continue
@@ -81,17 +84,21 @@ def _build_registry() -> dict[int, type[Message]]:
             # register itself under 0, shadowing real lookups.
             if field is None or not field.has_default_value:
                 continue
-            registry[candidate().payloadType] = candidate
+            payload_type = candidate().payloadType
+            existing = registry.get(payload_type)
+            if existing is not None:
+                raise CTraderProtocolError(
+                    f"payloadType {payload_type} is claimed by both "
+                    f"{existing.__name__} and {candidate.__name__}",
+                )
+            registry[payload_type] = candidate
     return registry
 
 
 def payload_class(payload_type: int) -> type[Message]:
     """Return the message class for a payload type."""
-    global _registry
-    if _registry is None:
-        _registry = _build_registry()
     try:
-        return _registry[payload_type]
+        return _build_registry()[payload_type]
     except KeyError as e:
         raise CTraderProtocolError(f"unknown payload type {payload_type}") from e
 
@@ -101,6 +108,7 @@ def parse_payload(envelope: common.ProtoMessage) -> Message:
     message = payload_class(envelope.payloadType)()
     try:
         message.ParseFromString(envelope.payload)
+    # ValueError: see `decode_envelope()`.
     except (DecodeError, ValueError) as e:
         raise CTraderProtocolError(
             f"undecodable payload for type {envelope.payloadType}",

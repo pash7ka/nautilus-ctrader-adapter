@@ -1,8 +1,10 @@
 """Framing and envelope encoding. Pure and synchronous - no sockets, no event loop."""
 
 import struct
+import types
 
 import pytest
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.errors import CTraderProtocolError
@@ -112,3 +114,40 @@ def test_as_request_error_normalises_common_error_milliseconds() -> None:
 
 def test_as_request_error_returns_none_for_a_normal_payload() -> None:
     assert codec.as_request_error(oa.ProtoOAAccountAuthRes(ctidTraderAccountId=1)) is None
+
+
+def _duplicate_payload_module() -> types.ModuleType:
+    # A generated-style class claiming an existing payloadType, built in a private pool.
+    file_proto = descriptor_pb2.FileDescriptorProto(
+        name="duplicate.proto",
+        package="duplicate",
+        syntax="proto2",
+    )
+    message_proto = file_proto.message_type.add(name="ProtoDuplicateAuthReq")
+    message_proto.field.add(
+        name="payloadType",
+        number=1,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+        default_value=str(oa_model.PROTO_OA_APPLICATION_AUTH_REQ),
+    )
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file_proto)
+    module = types.ModuleType("duplicate_pb2")
+    module.ProtoDuplicateAuthReq = message_factory.GetMessageClass(
+        pool.FindMessageTypeByName("duplicate.ProtoDuplicateAuthReq"),
+    )
+    return module
+
+
+def test_registry_rejects_a_duplicate_payload_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        codec,
+        "_PAYLOAD_MODULES",
+        (*codec._PAYLOAD_MODULES, _duplicate_payload_module()),
+    )
+    codec._build_registry.cache_clear()
+    with pytest.raises(CTraderProtocolError) as excinfo:
+        codec._build_registry()
+    assert "ProtoOAApplicationAuthReq" in str(excinfo.value)
+    assert "ProtoDuplicateAuthReq" in str(excinfo.value)
