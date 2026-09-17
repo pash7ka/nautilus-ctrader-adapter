@@ -299,14 +299,18 @@ def exchange_code(
         with urllib.request.urlopen(f"{token_url}?{query}", timeout=timeout_secs) as response:
             body = response.read()
     except urllib.error.HTTPError as e:
-        raise TokenExchangeError(f"token endpoint returned HTTP {e.code}") from e
+        # e.url carries the full request URL, client secret included; chaining from it would
+        # put that in any traceback.
+        raise TokenExchangeError(f"token endpoint returned HTTP {e.code}") from None
     except urllib.error.URLError as e:
-        raise TokenExchangeError(f"token endpoint request failed: {e.reason}") from e
+        raise TokenExchangeError(f"token endpoint request failed: {e.reason}") from None
 
     try:
         data = json.loads(body)
     except json.JSONDecodeError as e:
         raise TokenExchangeError("token endpoint returned an unparsable response") from e
+    if not isinstance(data, dict):
+        raise TokenExchangeError("token endpoint response is not a JSON object")
 
     error_code = data.get("errorCode")
     if error_code:
@@ -316,10 +320,14 @@ def exchange_code(
     if "accessToken" not in data or "refreshToken" not in data:
         raise TokenExchangeError("token endpoint response is missing accessToken/refreshToken")
 
+    expires_in = data.get("expiresIn")
+    if not isinstance(expires_in, int | float) or expires_in <= 0:
+        raise TokenExchangeError("token endpoint response has a missing or non-positive expiresIn")
+
     return TokenResponse(
         access_token=data["accessToken"],
         refresh_token=data["refreshToken"],
-        expires_in=int(data.get("expiresIn", 0)),
+        expires_in=int(expires_in),
         token_type=data.get("tokenType"),
     )
 
@@ -329,24 +337,36 @@ _ENV_ASSIGNMENT_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
 def update_env_file(path: Path, updates: dict[str, str]) -> None:
     """Replace or append `KEY=VALUE` lines, keeping every other line, comment and the file's
-    order and line-ending style. Written atomically: a temp file in the same directory, then
-    `os.replace`.
+    order, line-ending style and leading BOM. Written atomically: a temp file in the same
+    directory, then `os.replace`. Every existing line for a key is replaced, not just the
+    first. Raises `ValueError` if a value contains CR or LF, which would otherwise split into
+    extra, unparsable lines.
     """
+    for value in updates.values():
+        if "\r" in value or "\n" in value:
+            raise ValueError("env value must not contain a CR or LF")
+
+    has_bom = path.exists() and path.read_bytes().startswith(b"\xef\xbb\xbf")
     original = path.read_text(encoding="utf-8-sig", newline="") if path.exists() else ""
     newline = "\r\n" if "\r\n" in original else "\n"
 
-    remaining = dict(updates)
+    seen: set[str] = set()
     lines: list[str] = []
     for line in original.splitlines():
         match = _ENV_ASSIGNMENT_RE.match(line)
-        if match and match.group(1) in remaining:
-            lines.append(f"{match.group(1)}={remaining.pop(match.group(1))}")
+        if match and match.group(1) in updates:
+            key = match.group(1)
+            lines.append(f"{key}={updates[key]}")
+            seen.add(key)
         else:
             lines.append(line)
-    for key, value in remaining.items():
-        lines.append(f"{key}={value}")
+    for key, value in updates.items():
+        if key not in seen:
+            lines.append(f"{key}={value}")
 
     new_text = "".join(f"{line}{newline}" for line in lines)
+    if has_bom:
+        new_text = "﻿" + new_text
     _write_atomically(path, new_text)
 
 

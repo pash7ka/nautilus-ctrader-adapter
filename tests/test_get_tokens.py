@@ -498,6 +498,107 @@ def test_exchange_code_raises_on_http_error(stub_token_server) -> None:
     assert "csecret" not in message
 
 
+def test_exchange_code_chains_from_none_on_http_error(stub_token_server) -> None:
+    """`HTTPError` carries the full request URL, secret included, in `.url`; chaining from it
+    would put that URL in any traceback."""
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_status = 500
+    _StubTokenHandler.response_body = b"{}"
+
+    with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_exchange_code_raises_on_connection_failure(tmp_path: Path) -> None:
+    """A `URLError` (for example a closed port) must be wrapped the same way, without
+    chaining from the original exception - it too can carry the request URL."""
+    closed_port = _free_port()
+
+    with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=f"http://127.0.0.1:{closed_port}/apps/token",
+        )
+
+    assert "csecret" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_exchange_code_raises_on_a_non_json_body(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = b"not json"
+
+    with pytest.raises(get_tokens.TokenExchangeError):
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+
+def test_exchange_code_raises_on_a_json_body_that_is_not_an_object(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(["not", "an", "object"]).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError):
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+
+def test_exchange_code_raises_on_missing_expires_in(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "RT"},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+    assert "AT" not in str(exc_info.value)
+
+
+def test_exchange_code_raises_on_non_positive_expires_in(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "RT", "expiresIn": 0},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError):
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+
 # --------------------------------------------------------------------------------------
 # update_env_file
 # --------------------------------------------------------------------------------------
@@ -554,6 +655,42 @@ def test_update_env_file_writes_an_integer_expiry(tmp_path: Path) -> None:
 
     env = get_tokens.load_env(env_file)
     assert int(env["CTRADER_TOKEN_EXPIRES_AT"]) == 1234567890
+
+
+def test_update_env_file_replaces_every_duplicate_line(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "CTRADER_ACCESS_TOKEN=old1\nCTRADER_CLIENT_ID=abc\nCTRADER_ACCESS_TOKEN=old2\n",
+        encoding="utf-8",
+    )
+
+    get_tokens.update_env_file(env_file, {"CTRADER_ACCESS_TOKEN": "new"})
+
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "CTRADER_ACCESS_TOKEN=new"
+    assert lines[2] == "CTRADER_ACCESS_TOKEN=new"
+    assert "old1" not in lines[0] + lines[2]
+    assert "old2" not in lines[0] + lines[2]
+
+
+def test_update_env_file_rejects_a_value_with_cr_or_lf(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("CTRADER_CLIENT_ID=abc\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"CR|LF|newline"):
+        get_tokens.update_env_file(env_file, {"CTRADER_ACCESS_TOKEN": "bad\nvalue"})
+
+
+def test_update_env_file_keeps_a_bom(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_bytes("CTRADER_CLIENT_ID=abc\n".encode("utf-8-sig"))
+
+    get_tokens.update_env_file(env_file, {"CTRADER_ACCESS_TOKEN": "new"})
+
+    raw = env_file.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")
+    env = get_tokens.load_env(env_file)
+    assert env["CTRADER_ACCESS_TOKEN"] == "new"
 
 
 # --------------------------------------------------------------------------------------
