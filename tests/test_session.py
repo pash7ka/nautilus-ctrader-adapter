@@ -7,6 +7,7 @@ import struct
 import pytest
 from nautilus_trader.common.component import Logger
 
+from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
@@ -709,7 +710,7 @@ async def test_stop_during_bring_up_returns_promptly() -> None:
             description="authentication in flight",
         )
 
-        # Timed directly: `stop()` suppresses cancellation, which would hide a `wait_for` timeout.
+        # Timed directly rather than via `wait_for(stop(), ...)`, though that would now work too.
         loop = asyncio.get_running_loop()
         started = loop.time()
         await session.stop()
@@ -723,6 +724,78 @@ async def test_stop_during_bring_up_returns_promptly() -> None:
             if not task.done() and task.get_coro().__qualname__.startswith(owned)
         ]
         assert leftovers == []
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_stop_can_be_cancelled_by_its_own_caller() -> None:
+    # If `stop()` swallowed cancellation aimed at it, `wait_for(session.stop(), ...)` could never
+    # time out and a cancelled caller would see a normal return instead of `CancelledError`.
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        await asyncio.wait_for(session.stop(), timeout=1.0)
+        assert session.state is SessionState.STOPPED
+
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        stop_task = asyncio.create_task(session.stop())
+        # Let `stop()` actually start and reach its own first await, so the cancellation below
+        # arrives while it is suspended there - not before the coroutine has run at all.
+        await asyncio.sleep(0)
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        await session.stop()
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_stop_returns_promptly_after_the_server_drops_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Reproduces a probe where the server dropped the connection and `stop()` landed while the
+    # supervisor was inside its own `close()` call: the cancellation-swallowing bug there made
+    # `stop()` wait out the whole backoff instead of returning promptly. The heartbeat task is
+    # made slow to react to its own cancellation, to hold the supervisor inside that window for
+    # long enough that `stop()` reliably lands in it.
+    original_heartbeat_loop = CTraderConnection._heartbeat_loop
+    heartbeat_cancelled = asyncio.Event()
+
+    async def slow_to_cancel_heartbeat_loop(self: CTraderConnection) -> None:
+        try:
+            await original_heartbeat_loop(self)
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            await asyncio.sleep(0.2)
+            raise
+
+    monkeypatch.setattr(CTraderConnection, "_heartbeat_loop", slow_to_cancel_heartbeat_loop)
+
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server, backoff_base_secs=5.0)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        await server.drop_connections()
+        await wait_until(
+            lambda: heartbeat_cancelled.is_set(),
+            description="supervisor inside close()",
+        )
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await session.stop()
+        assert loop.time() - started < 1.0
     finally:
         await session.stop()
         await server.stop()

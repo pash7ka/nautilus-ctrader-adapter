@@ -125,13 +125,16 @@ class CTraderConnection:
 
     async def close(self) -> None:
         self._connected = False
-        for task in (self._heartbeat_task, self._read_task):
-            if task is not None:
-                task.cancel()
-        for task in (self._heartbeat_task, self._read_task):
-            if task is not None:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+        tasks = {t for t in (self._heartbeat_task, self._read_task) if t is not None}
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # Not a per-task suppress: that would also catch a cancellation of the caller of
+            # `close()` itself and let it slip past unnoticed.
+            await asyncio.wait(tasks)
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                task.exception()  # fetch it so it is not reported as never retrieved
         self._heartbeat_task = None
         self._read_task = None
 

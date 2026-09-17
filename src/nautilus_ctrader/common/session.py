@@ -8,7 +8,6 @@ every path rather than subtly different per client.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import random
 import ssl
 import time
@@ -169,19 +168,23 @@ class CTraderSession:
     async def stop(self) -> None:
         self._stopping = True
         self._lost.set()
-        if self._supervisor is not None:
-            self._supervisor.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._supervisor
-            self._supervisor = None
-        if self._refresh_task is not None:
-            self._refresh_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._refresh_task
-            self._refresh_task = None
-        await self._connection.close()
-        self._state = SessionState.STOPPED
-        self._ready.clear()
+        tasks = {t for t in (self._supervisor, self._refresh_task) if t is not None}
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # Not a per-task suppress: that would also catch a cancellation of the caller of
+            # `stop()` itself and let it slip past unnoticed.
+            await asyncio.wait(tasks)
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                task.exception()  # fetch it so it is not reported as never retrieved
+        self._supervisor = None
+        self._refresh_task = None
+        try:
+            await self._connection.close()
+        finally:
+            self._state = SessionState.STOPPED
+            self._ready.clear()
 
     async def request(
         self,
