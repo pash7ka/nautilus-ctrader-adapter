@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MESSAGES_DIR = ROOT / "src" / "nautilus_ctrader" / "messages"
 PACKAGE = "nautilus_ctrader.messages"
+# Changes together with the grpcio-tools pin in pyproject.toml.
 REQUIRED_PROTOBUF_MAJOR_MINOR = (5, 29)
 
 _PROTO_IMPORT = re.compile(r'^import "(OpenApi\w+)\.proto";', re.MULTILINE)

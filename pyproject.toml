@@ -33,6 +33,7 @@ dev = [
     # generated code newer than the runtime, and nautilus-trader pins protobuf==5.29.6
     # under its `ib` extra. An unpinned grpcio-tools resolves to protobuf 7.x, whose
     # output would fail to import for anyone using interactive_brokers.
+    # Changes together with REQUIRED_PROTOBUF_MAJOR_MINOR in scripts/gen_protobuf.py.
     "grpcio-tools~=1.68.0",
 ]
 
