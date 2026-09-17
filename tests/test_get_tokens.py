@@ -704,6 +704,144 @@ def test_exchange_code_raises_on_non_positive_expires_in(stub_token_server) -> N
         )
 
 
+def test_exchange_code_raises_on_a_nan_expires_in(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "RT", "expiresIn": float("nan")},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+    assert "AT" not in str(exc_info.value)
+
+
+def test_exchange_code_raises_on_an_infinite_expires_in(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "RT", "expiresIn": float("inf")},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError):
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+
+def test_exchange_code_raises_on_a_boolean_expires_in(stub_token_server) -> None:
+    """`bool` is a subclass of `int` in Python; `True`/`False` must not be accepted as a
+    seconds count."""
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "RT", "expiresIn": True},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError):
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+
+def test_exchange_code_raises_on_a_sub_one_expires_in(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "RT", "expiresIn": 0.5},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError):
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+
+def test_exchange_code_raises_on_a_null_access_token(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": None, "refreshToken": "RT", "expiresIn": 3600},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError):
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+
+def test_exchange_code_raises_on_an_empty_refresh_token(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT", "refreshToken": "", "expiresIn": 3600},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError):
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+
+def test_exchange_code_raises_on_an_access_token_containing_a_newline(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {"accessToken": "AT\nInjected", "refreshToken": "RT", "expiresIn": 3600},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+    assert "Injected" not in str(exc_info.value)
+
+
+def test_exchange_code_sanitizes_error_code_and_description(stub_token_server) -> None:
+    _server, token_url = stub_token_server
+    nasty = "bad\x07\x1b[31mtext"
+    _StubTokenHandler.response_body = json.dumps(
+        {"errorCode": nasty, "description": nasty},
+    ).encode()
+
+    with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
+        get_tokens.exchange_code(
+            "the-code",
+            client_id="cid",
+            client_secret="csecret",
+            redirect_uri="http://localhost:8080/callback",
+            token_url=token_url,
+        )
+
+    message = str(exc_info.value)
+    assert all(ch.isprintable() for ch in message)
+
+
 # --------------------------------------------------------------------------------------
 # update_env_file
 # --------------------------------------------------------------------------------------
@@ -872,20 +1010,101 @@ async def test_list_accounts_surfaces_a_rejected_application_auth() -> None:
     assert exc_info.value.error_code == "CH_CLIENT_AUTH_FAILURE"
 
 
-def test_main_refuses_a_non_loopback_redirect_uri(tmp_path: Path) -> None:
+def _write_minimal_env(tmp_path: Path) -> Path:
     env_file = tmp_path / ".env"
     env_file.write_text(
         "CTRADER_CLIENT_ID=cid\nCTRADER_CLIENT_SECRET=csecret\n",
         encoding="utf-8",
     )
+    return env_file
+
+
+def test_main_refuses_a_redirect_uri_with_the_wrong_scheme_alone(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env_file = _write_minimal_env(tmp_path)
+
+    rc = get_tokens.main(
+        ["--env-file", str(env_file), "--redirect-uri", "https://localhost:8080/callback"],
+    )
+
+    assert rc == 2
+    message = capsys.readouterr().err
+    assert "http" in message
+
+
+def test_main_refuses_a_redirect_uri_with_the_wrong_host_alone(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env_file = _write_minimal_env(tmp_path)
+
+    rc = get_tokens.main(
+        ["--env-file", str(env_file), "--redirect-uri", "http://example.com:8080/callback"],
+    )
+
+    assert rc == 2
+    message = capsys.readouterr().err
+    assert "localhost" in message
+
+
+def test_main_refuses_an_ipv6_loopback_redirect_uri(tmp_path: Path) -> None:
+    """The callback server only ever binds IPv4 `127.0.0.1`; `::1` would parse as a loopback
+    host but never actually receive the redirect. A short deadline bounds the test in case the
+    check is broken and main() falls through to actually waiting for a redirect."""
+    env_file = _write_minimal_env(tmp_path)
 
     rc = get_tokens.main(
         [
             "--env-file",
             str(env_file),
             "--redirect-uri",
-            "https://example.com/callback",
+            "http://[::1]:8080/callback",
+            "--timeout-secs",
+            "2",
         ],
+    )
+
+    assert rc == 2
+
+
+def test_main_refuses_a_redirect_uri_with_an_embedded_credential(tmp_path: Path) -> None:
+    """`urlsplit(...).hostname` reads `evil.com\\@localhost` as host `localhost`, so the
+    loopback check alone would accept it; the raw netloc must be checked for '@' and '\\'
+    first. A short deadline bounds the test in case the check is bypassed."""
+    env_file = _write_minimal_env(tmp_path)
+
+    rc = get_tokens.main(
+        [
+            "--env-file",
+            str(env_file),
+            "--redirect-uri",
+            "http://evil.com\\@localhost/cb",
+            "--timeout-secs",
+            "2",
+        ],
+    )
+
+    assert rc == 2
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "http://localhost:99999/callback",
+        "http://localhost:abc/callback",
+        "http://localhost:0/callback",
+    ],
+)
+def test_main_refuses_a_bad_redirect_port(tmp_path: Path, redirect_uri: str) -> None:
+    env_file = _write_minimal_env(tmp_path)
+
+    # A short deadline bounds this test in case the port check is broken and main() falls
+    # through to actually binding a socket and waiting for a redirect (e.g. port 0 silently
+    # becoming port 80).
+    rc = get_tokens.main(
+        ["--env-file", str(env_file), "--redirect-uri", redirect_uri, "--timeout-secs", "2"],
     )
 
     assert rc == 2

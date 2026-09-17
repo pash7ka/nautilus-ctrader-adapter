@@ -19,6 +19,7 @@ import contextlib
 import html
 import http.server
 import json
+import math
 import os
 import re
 import secrets
@@ -52,9 +53,10 @@ ACCESS_TOKEN_KEY = "CTRADER_ACCESS_TOKEN"
 REFRESH_TOKEN_KEY = "CTRADER_REFRESH_TOKEN"
 TOKEN_EXPIRES_AT_KEY = "CTRADER_TOKEN_EXPIRES_AT"
 
-# The callback server always binds 127.0.0.1 regardless of the redirect host, so only these
-# are accepted as --redirect-uri hosts: a wider host could bind and expose the callback port.
-_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+# The callback server always binds IPv4 127.0.0.1 regardless of the redirect host, so only
+# these are accepted as --redirect-uri hosts: a wider host could bind and expose the callback
+# port, and "::1" would parse as loopback but never actually receive the redirect.
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1"})
 
 
 class AuthorizationError(RuntimeError):
@@ -296,6 +298,12 @@ def wait_for_authorization_code(
     return outcome["code"]
 
 
+def _is_clean_token(value: object) -> bool:
+    """True for a non-empty `str` with no CR or LF - what an access/refresh token must be to
+    be written into an env file line and never split it or smuggle a second assignment."""
+    return isinstance(value, str) and bool(value) and "\r" not in value and "\n" not in value
+
+
 def exchange_code(
     code: str,
     *,
@@ -340,19 +348,34 @@ def exchange_code(
 
     error_code = data.get("errorCode")
     if error_code:
-        raise TokenExchangeError(
-            f"token endpoint rejected the code: {error_code}: {data.get('description')}",
+        description = data.get("description")
+        safe_code = _sanitize_for_terminal(str(error_code))
+        safe_description = (
+            _sanitize_for_terminal(str(description)) if description is not None else None
         )
-    if "accessToken" not in data or "refreshToken" not in data:
-        raise TokenExchangeError("token endpoint response is missing accessToken/refreshToken")
+        raise TokenExchangeError(
+            f"token endpoint rejected the code: {safe_code}: {safe_description}",
+        )
+
+    access_token = data.get("accessToken")
+    refresh_token = data.get("refreshToken")
+    if not _is_clean_token(access_token):
+        raise TokenExchangeError("token endpoint response has an invalid accessToken")
+    if not _is_clean_token(refresh_token):
+        raise TokenExchangeError("token endpoint response has an invalid refreshToken")
 
     expires_in = data.get("expiresIn")
-    if not isinstance(expires_in, int | float) or expires_in <= 0:
-        raise TokenExchangeError("token endpoint response has a missing or non-positive expiresIn")
+    if (
+        not isinstance(expires_in, int | float)
+        or isinstance(expires_in, bool)
+        or not math.isfinite(expires_in)
+        or expires_in < 1
+    ):
+        raise TokenExchangeError("token endpoint response has an invalid expiresIn")
 
     return TokenResponse(
-        access_token=data["accessToken"],
-        refresh_token=data["refreshToken"],
+        access_token=access_token,
+        refresh_token=refresh_token,
         expires_in=int(expires_in),
         token_type=data.get("tokenType"),
     )
@@ -515,14 +538,38 @@ def main(argv: list[str] | None = None) -> int:
     client_secret = env[CLIENT_SECRET_KEY]
 
     redirect = urllib.parse.urlsplit(args.redirect_uri)
-    if redirect.scheme != "http" or redirect.hostname not in _LOOPBACK_HOSTNAMES:
+    # '@' shifts host parsing to whatever follows it (userinfo@host), and a backslash is
+    # treated as a literal netloc character by urlsplit but as a path/host separator by some
+    # browsers; either lets a netloc like "evil.com\@localhost" parse as host "localhost" while
+    # actually addressing something else. Reject both before trusting `.hostname` at all.
+    if "@" in redirect.netloc or "\\" in redirect.netloc:
         print(
-            f"Refusing --redirect-uri {args.redirect_uri!r}: scheme must be http and host "
-            "must be localhost, 127.0.0.1 or ::1.",
+            f"Refusing --redirect-uri {args.redirect_uri!r}: host must not contain '@' or '\\'.",
             file=sys.stderr,
         )
         return 2
-    redirect_port = redirect.port or 80
+    if redirect.scheme != "http" or redirect.hostname not in _LOOPBACK_HOSTNAMES:
+        print(
+            f"Refusing --redirect-uri {args.redirect_uri!r}: scheme must be http and host "
+            "must be localhost or 127.0.0.1.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        redirect_port = redirect.port
+    except ValueError:
+        print(
+            f"Refusing --redirect-uri {args.redirect_uri!r}: invalid port.",
+            file=sys.stderr,
+        )
+        return 2
+    if redirect_port == 0:
+        print(
+            f"Refusing --redirect-uri {args.redirect_uri!r}: port must not be 0.",
+            file=sys.stderr,
+        )
+        return 2
+    redirect_port = redirect_port or 80
     redirect_path = redirect.path or "/"
 
     state = secrets.token_urlsafe(32)
