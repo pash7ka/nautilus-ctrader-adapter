@@ -36,6 +36,7 @@ from nautilus_ctrader.constants import (
     DEFAULT_REQUEST_TIMEOUT_SECS,
     HEARTBEAT_IDLE_SECS,
     HISTORICAL_RATE_LIMIT_PER_SEC,
+    INBOUND_SILENCE_SECS,
     MIN_TOKEN_REFRESH_INTERVAL_SECS,
     RECONNECT_FAILURE_THRESHOLD,
     STABLE_SESSION_SECS,
@@ -72,6 +73,7 @@ class CTraderSession:
         tls: ssl.SSLContext | bool = True,
         rate_limiter: RateLimiter | None = None,
         heartbeat_idle_secs: float = HEARTBEAT_IDLE_SECS,
+        inbound_silence_secs: float = INBOUND_SILENCE_SECS,
         request_timeout_secs: float = DEFAULT_REQUEST_TIMEOUT_SECS,
         connect_timeout_secs: float = CONNECT_TIMEOUT_SECS,
         backoff_base_secs: float = BACKOFF_BASE_SECS,
@@ -109,6 +111,7 @@ class CTraderSession:
             logger=logger,
             rate_limiter=rate_limiter,
             heartbeat_idle_secs=heartbeat_idle_secs,
+            inbound_silence_secs=inbound_silence_secs,
             request_timeout_secs=request_timeout_secs,
             connect_timeout_secs=connect_timeout_secs,
             tls=tls,
@@ -432,6 +435,7 @@ class CTraderSession:
             # than relying on the venue to end the old session.
             # TODO(verify): whether the venue also sends ProtoOAAccountsTokenInvalidatedEvent
             # after our own refresh; if it does, that costs one extra, harmless reconnect.
+            # _loss_cause stays None here: it was cleared by the bring-up that just completed.
             self._reauth_requested = True
             self._lost.set()
 

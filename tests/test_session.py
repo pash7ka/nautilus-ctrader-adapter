@@ -147,6 +147,25 @@ async def test_a_dropped_connection_reauthenticates_and_replays_restores() -> No
         await server.stop()
 
 
+async def test_a_silent_venue_makes_the_session_reconnect() -> None:
+    # The fake server answers only auth requests; after authentication it goes silent, which is
+    # exactly the half-open-connection case. Our own heartbeats get no answer either, but that
+    # does not matter here - the inbound-silence watchdog is what must notice and reconnect.
+    server = _authenticating_server()
+    server.answer_heartbeats = False
+    await server.start()
+    session = _session(server, inbound_silence_secs=0.3, backoff_base_secs=0.05)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        await wait_until(lambda: server.connection_count >= 2, description="reconnect")
+        await session.wait_ready(timeout_secs=3.0)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_a_removed_restore_is_not_replayed() -> None:
     server = _authenticating_server()
     server.on(

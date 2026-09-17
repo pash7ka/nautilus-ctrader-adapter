@@ -20,6 +20,7 @@ from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
+from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
 
@@ -138,6 +139,60 @@ async def test_a_heartbeat_is_sent_when_idle_and_never_loops() -> None:
     try:
         await asyncio.sleep(0.5)
         assert 2 <= server.heartbeats_received <= 10
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_a_silent_venue_is_treated_as_a_lost_connection() -> None:
+    # Our own heartbeats go out on the 50ms idle timer, but the server never answers and never
+    # sends anything of its own: a stand-in for a half-open TCP connection, where writes keep
+    # succeeding while nothing ever arrives.
+    server = FakeCTraderServer()
+    server.answer_heartbeats = False
+    await server.start()
+    connection = await _connected(server, heartbeat_idle_secs=0.05, inbound_silence_secs=0.3)
+    losses: list[Exception] = []
+    connection.set_disconnect_handler(losses.append)
+    try:
+        await wait_until(lambda: len(losses) >= 1, timeout_secs=2.0, description="loss reported")
+        # Give any duplicate report a chance to show up before asserting there is only one.
+        await asyncio.sleep(0.1)
+        assert len(losses) == 1
+        assert isinstance(losses[0], CTraderConnectionError)
+        assert connection.is_connected is False
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_inbound_traffic_keeps_the_connection_alive() -> None:
+    server = FakeCTraderServer()
+    await server.start()
+    connection = await _connected(server, heartbeat_idle_secs=0.05, inbound_silence_secs=0.3)
+    losses: list[Exception] = []
+    connection.set_disconnect_handler(losses.append)
+    try:
+        # A fixed wait is correct here: this checks that a loss never happens.
+        await asyncio.sleep(1.0)
+        assert losses == []
+        assert connection.is_connected is True
+        assert server.heartbeats_received >= 1
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_a_long_heartbeat_interval_does_not_delay_the_silence_check() -> None:
+    server = FakeCTraderServer()
+    server.answer_heartbeats = False
+    await server.start()
+    connection = await _connected(server, heartbeat_idle_secs=3600.0, inbound_silence_secs=0.3)
+    losses: list[Exception] = []
+    connection.set_disconnect_handler(losses.append)
+    try:
+        await wait_until(lambda: len(losses) >= 1, timeout_secs=2.0, description="loss reported")
+        assert isinstance(losses[0], CTraderConnectionError)
     finally:
         await connection.close()
         await server.stop()

@@ -32,6 +32,7 @@ from nautilus_ctrader.constants import (
     CONNECT_TIMEOUT_SECS,
     DEFAULT_REQUEST_TIMEOUT_SECS,
     HEARTBEAT_IDLE_SECS,
+    INBOUND_SILENCE_SECS,
     LENGTH_PREFIX_BYTES,
 )
 from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
@@ -47,6 +48,7 @@ class CTraderConnection:
         logger: Logger,
         rate_limiter: RateLimiter | None = None,
         heartbeat_idle_secs: float = HEARTBEAT_IDLE_SECS,
+        inbound_silence_secs: float = INBOUND_SILENCE_SECS,
         request_timeout_secs: float = DEFAULT_REQUEST_TIMEOUT_SECS,
         connect_timeout_secs: float = CONNECT_TIMEOUT_SECS,
         tls: ssl.SSLContext | bool = True,
@@ -61,6 +63,7 @@ class CTraderConnection:
         self._log = logger
         self._rate_limiter = rate_limiter
         self._heartbeat_idle_secs = heartbeat_idle_secs
+        self._inbound_silence_secs = inbound_silence_secs
         self._request_timeout_secs = request_timeout_secs
         self._connect_timeout_secs = connect_timeout_secs
         self._tls = tls
@@ -71,6 +74,7 @@ class CTraderConnection:
         self._heartbeat_task: asyncio.Task | None = None
         self._pending: dict[str, asyncio.Future[Message]] = {}
         self._last_send = 0.0
+        self._last_receive = 0.0
         self._connected = False
         self._generation = 0
 
@@ -105,7 +109,9 @@ class CTraderConnection:
 
         self._generation += 1
         self._connected = True
-        self._last_send = asyncio.get_running_loop().time()
+        now = asyncio.get_running_loop().time()
+        self._last_send = now
+        self._last_receive = now
         self._read_task = asyncio.create_task(self._read_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._log.info(f"Connected to {self._host}:{self._port}")
@@ -219,6 +225,7 @@ class CTraderConnection:
             while True:
                 prefix = await self._reader.readexactly(LENGTH_PREFIX_BYTES)
                 body = await self._reader.readexactly(codec.decode_length(prefix))
+                self._last_receive = asyncio.get_running_loop().time()
                 self._dispatch(codec.decode_envelope(body))
         except asyncio.CancelledError:
             raise
@@ -268,12 +275,29 @@ class CTraderConnection:
         self._call_handler("Event", self._event_handler, payload)
 
     async def _heartbeat_loop(self) -> None:
-        interval = max(self._heartbeat_idle_secs / 2.0, 0.01)
+        """Watch both directions: send a heartbeat on outbound idle, fail on inbound silence.
+
+        Ticks at half the shorter of the two bounds, so a long heartbeat interval can never
+        delay noticing that the venue has gone quiet.
+        """
+        interval = max(min(self._heartbeat_idle_secs, self._inbound_silence_secs) / 2.0, 0.01)
         while True:
             await asyncio.sleep(interval)
             if not self._connected or self._writer is None:
                 return
-            idle = asyncio.get_running_loop().time() - self._last_send
+            now = asyncio.get_running_loop().time()
+            if now - self._last_receive >= self._inbound_silence_secs:
+                self._log.warning(
+                    f"No data from the venue for {self._inbound_silence_secs:g}s, "
+                    "treating the connection as lost",
+                )
+                self._fail(
+                    CTraderConnectionError(
+                        f"no inbound data for {self._inbound_silence_secs:g}s",
+                    ),
+                )
+                return
+            idle = now - self._last_send
             if idle >= self._heartbeat_idle_secs:
                 self._write_now(codec.encode_frame(common.ProtoHeartbeatEvent()))
 
