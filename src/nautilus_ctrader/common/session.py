@@ -168,11 +168,12 @@ class CTraderSession:
     async def start(self) -> None:
         """Start the supervisor. Returns before the first authentication completes.
 
-        Waits for any `stop()` still in progress, so a restart never overlaps its teardown.
+        Waits for any `stop()` still in progress, so a restart never overlaps its teardown, and
+        does nothing if a `stop()` is issued meanwhile: the last call wins.
         """
         epoch = self._stop_epoch
         await self._stop_idle.wait()
-        # A stop() issued while this start() was waiting takes precedence over it.
+        # A `stop()` issued while this `start()` was waiting takes precedence over it.
         if self._stop_epoch != epoch:
             return
         if self._supervisor is not None and not self._supervisor.done():

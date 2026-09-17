@@ -1032,6 +1032,8 @@ async def test_a_stop_after_a_waiting_start_wins_as_separate_tasks() -> None:
         await asyncio.sleep(0)
         start_task = asyncio.create_task(session.start())
         await asyncio.sleep(0)
+        # The race this test depends on: the start is still waiting for the first stop.
+        assert not start_task.done()
         second_stop = asyncio.create_task(session.stop())
         await asyncio.gather(first_stop, start_task, second_stop)
 
