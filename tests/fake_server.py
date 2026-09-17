@@ -92,7 +92,7 @@ class FakeCTraderServer:
     async def push_raw(self, data: bytes) -> None:
         """Send raw bytes to every connected client, bypassing the framing."""
         if not self._writers:
-            raise RuntimeError("push with no connected client; await wait_for_connections()")
+            raise RuntimeError("push_raw with no connected client; await wait_for_connections()")
         for writer in list(self._writers):
             writer.write(data)
             with contextlib.suppress(ConnectionError, OSError):
