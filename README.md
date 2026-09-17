@@ -77,6 +77,12 @@ Steps 2 and 3 are one-time steps you run yourself — step 2 needs a browser and
 URI — and the adapter performs neither. The adapter refreshes the access token while running
 and hands the new pair back to your application to persist.
 
+`scripts/get_tokens.py` performs steps 2 and 3 locally: run `uv run python scripts/get_tokens.py`.
+It reads `CTRADER_CLIENT_ID` and `CTRADER_CLIENT_SECRET` from a `.env` file (ignored by git),
+writes the resulting tokens back into it, and lists the accounts the token grants. The
+application's redirect URI must be `http://localhost:8080/callback`, or whatever
+`--redirect-uri` says.
+
 The adapter receives these values from the host application (environment variables or a
 token store you control). `clientSecret` and both tokens are treated as secrets and are
 never written to logs: the transport logs no payload bytes at all.
