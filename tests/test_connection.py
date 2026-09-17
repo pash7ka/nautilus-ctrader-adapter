@@ -7,6 +7,7 @@ import struct
 import pytest
 from nautilus_trader.common.component import Logger
 
+from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
@@ -166,6 +167,41 @@ async def test_a_silent_venue_is_treated_as_a_lost_connection() -> None:
         await server.stop()
 
 
+async def test_a_frame_arriving_after_a_silence_loss_is_not_delivered() -> None:
+    # The read loop outlives the loss until the owner closes the connection.
+    server = FakeCTraderServer()
+    server.answer_heartbeats = False
+    await server.start()
+    logger = RecordingLogger()
+    connection = CTraderConnection(
+        host=server.host,
+        port=server.port,
+        logger=logger,
+        tls=False,
+        heartbeat_idle_secs=0.05,
+        inbound_silence_secs=0.3,
+    )
+    await connection.connect()
+    seen: list[object] = []
+    losses: list[Exception] = []
+    connection.set_event_handler(seen.append)
+    connection.set_disconnect_handler(losses.append)
+    try:
+        await server.wait_for_connections()
+        await wait_until(lambda: len(losses) >= 1, timeout_secs=2.0, description="loss reported")
+
+        await server.push(oa.ProtoOAAccountsTokenInvalidatedEvent(reason="late"))
+        # The receive line is logged in the same synchronous step as any delivery.
+        await wait_until(
+            lambda: any(m.startswith("recv payloadType=") for _level, m in logger.lines),
+            description="late frame read",
+        )
+        assert seen == []
+    finally:
+        await connection.close()
+        await server.stop()
+
+
 async def test_inbound_traffic_keeps_the_connection_alive() -> None:
     server = FakeCTraderServer()
     await server.start()
@@ -183,11 +219,11 @@ async def test_inbound_traffic_keeps_the_connection_alive() -> None:
         await server.stop()
 
 
-async def test_a_long_heartbeat_interval_does_not_delay_the_silence_check() -> None:
+async def test_a_heartbeat_interval_near_the_threshold_still_detects_silence() -> None:
     server = FakeCTraderServer()
     server.answer_heartbeats = False
     await server.start()
-    connection = await _connected(server, heartbeat_idle_secs=3600.0, inbound_silence_secs=0.3)
+    connection = await _connected(server, heartbeat_idle_secs=0.25, inbound_silence_secs=0.3)
     losses: list[Exception] = []
     connection.set_disconnect_handler(losses.append)
     try:
@@ -201,7 +237,8 @@ async def test_a_long_heartbeat_interval_does_not_delay_the_silence_check() -> N
 async def test_an_inbound_heartbeat_is_neither_answered_nor_surfaced() -> None:
     server = FakeCTraderServer()
     await server.start()
-    connection = await _connected(server, heartbeat_idle_secs=3600.0)
+    # Long enough that no heartbeat of our own goes out during the test.
+    connection = await _connected(server, heartbeat_idle_secs=60.0)
     seen: list[object] = []
     connection.set_event_handler(seen.append)
     try:
@@ -350,7 +387,7 @@ async def _serve_bytes(data: bytes) -> tuple[asyncio.Server, int]:
         with contextlib.suppress(ConnectionError):
             await reader.read()
         writer.close()
-        with contextlib.suppress(ConnectionError):
+        with contextlib.suppress(ConnectionError, OSError):
             await writer.wait_closed()
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
@@ -428,7 +465,10 @@ async def test_an_oversized_frame_drops_the_connection_as_a_protocol_error() -> 
 async def test_an_unknown_payload_type_is_ignored_and_the_connection_survives() -> None:
     # The schema grows; a message type we do not know must not take the connection down.
     envelope = common.ProtoMessage(payloadType=999_999, payload=b"").SerializeToString()
-    server, port = await _serve_bytes(struct.pack(LENGTH_PREFIX_FORMAT, len(envelope)) + envelope)
+    unknown = struct.pack(LENGTH_PREFIX_FORMAT, len(envelope)) + envelope
+    # A known frame right behind it marks the point by which the unknown one was handled.
+    known = codec.encode_frame(oa.ProtoOAAccountsTokenInvalidatedEvent(reason="marker"))
+    server, port = await _serve_bytes(unknown + known)
     connection = CTraderConnection(host="127.0.0.1", port=port, logger=Logger("test"), tls=False)
     seen: list[object] = []
     losses: list[Exception] = []
@@ -436,9 +476,10 @@ async def test_an_unknown_payload_type_is_ignored_and_the_connection_survives() 
     connection.set_disconnect_handler(losses.append)
     await connection.connect()
     try:
-        await asyncio.sleep(0.2)
+        await wait_until(lambda: len(seen) >= 1, description="known frame delivered")
+        assert len(seen) == 1
+        assert isinstance(seen[0], oa.ProtoOAAccountsTokenInvalidatedEvent)
         assert connection.is_connected is True
-        assert seen == []
         assert losses == []
     finally:
         await connection.close()
@@ -539,6 +580,25 @@ async def test_send_without_a_client_msg_id_sends_none() -> None:
     finally:
         await connection.close()
         await server.stop()
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_idle_secs", "inbound_silence_secs"),
+    [(10.0, 0.0), (10.0, -1.0), (10.0, 10.0), (10.0, 5.0)],
+)
+def test_an_invalid_silence_threshold_is_rejected(
+    heartbeat_idle_secs: float,
+    inbound_silence_secs: float,
+) -> None:
+    with pytest.raises(ValueError, match="inbound_silence_secs"):
+        CTraderConnection(
+            host="127.0.0.1",
+            port=1,
+            logger=Logger("test"),
+            tls=False,
+            heartbeat_idle_secs=heartbeat_idle_secs,
+            inbound_silence_secs=inbound_silence_secs,
+        )
 
 
 async def test_send_before_connecting_fails_fast() -> None:

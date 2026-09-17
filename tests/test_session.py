@@ -154,7 +154,12 @@ async def test_a_silent_venue_makes_the_session_reconnect() -> None:
     server = _authenticating_server()
     server.answer_heartbeats = False
     await server.start()
-    session = _session(server, inbound_silence_secs=0.3, backoff_base_secs=0.05)
+    session = _session(
+        server,
+        heartbeat_idle_secs=0.05,
+        inbound_silence_secs=0.3,
+        backoff_base_secs=0.05,
+    )
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)

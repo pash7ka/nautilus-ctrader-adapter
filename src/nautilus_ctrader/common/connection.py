@@ -57,7 +57,14 @@ class CTraderConnection:
         `tls` is passed to `asyncio.open_connection` as `ssl`: `True` (a verifying default
         context) is the only safe choice against a real venue; `False` (plaintext) is for tests
         against the local fake server.
+
+        `inbound_silence_secs` must exceed `heartbeat_idle_secs`, or the connection could be
+        declared lost between two of our own heartbeats.
         """
+        if inbound_silence_secs <= 0:
+            raise ValueError("inbound_silence_secs must be positive")
+        if inbound_silence_secs <= heartbeat_idle_secs:
+            raise ValueError("inbound_silence_secs must exceed heartbeat_idle_secs")
         self._host = host
         self._port = port
         self._log = logger
@@ -143,7 +150,11 @@ class CTraderConnection:
         timeout_secs: float | None = None,
         bucket: str = BUCKET_DEFAULT,
     ) -> Message:
-        """Send a request and await its correlated response."""
+        """Send a request and await its correlated response.
+
+        `timeout_secs` bounds only the wait for the response. Time spent waiting on the rate
+        limiter, including a venue-ordered pause, comes on top of it.
+        """
         if not self._connected:
             raise CTraderConnectionError("not connected")
 
@@ -239,7 +250,7 @@ class CTraderConnection:
         except Exception as e:
             # Anything unexpected must still mark the connection down, or it would keep
             # reporting connected with no reader behind it.
-            self._log.error(f"Read loop failed: {e!r}")
+            self._log.exception("Read loop failed", e)
             self._fail(CTraderConnectionError(f"read loop failed: {e!r}"))
 
     def _dispatch(self, envelope: common.ProtoMessage) -> None:
@@ -247,6 +258,9 @@ class CTraderConnection:
             f"recv payloadType={envelope.payloadType} "
             f"clientMsgId={envelope.clientMsgId or '-'} bytes={len(envelope.payload)}",
         )
+        # After a loss the read loop runs until the owner closes us; late frames go nowhere.
+        if not self._connected:
+            return
 
         if envelope.payloadType == common_model.HEARTBEAT_EVENT:
             # Not answered. Spotware's SDK replies to every inbound heartbeat, but the schema
@@ -308,7 +322,7 @@ class CTraderConnection:
         try:
             handler(arg)
         except Exception as e:
-            self._log.error(f"{name} handler raised {e!r}; continuing")
+            self._log.exception(f"{name} handler raised; continuing", e)
 
     def _fail(self, error: Exception) -> None:
         was_connected = self._connected

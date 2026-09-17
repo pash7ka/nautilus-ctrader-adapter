@@ -23,5 +23,8 @@ class RecordingLogger:
     def error(self, message: str) -> None:
         self.lines.append(("error", message))
 
+    def exception(self, message: str, ex: BaseException) -> None:
+        self.lines.append(("error", message))
+
     def errors(self) -> list[str]:
         return [message for level, message in self.lines if level == "error"]
