@@ -206,6 +206,41 @@ def test_wait_for_authorization_code_times_out() -> None:
         get_tokens.wait_for_authorization_code("127.0.0.1", port, "/callback", 0.2)
 
 
+def test_wait_for_authorization_code_survives_an_idle_connection() -> None:
+    """A connection that opens and sends nothing (a browser's speculative preconnect) must
+    not block the real request that follows it."""
+    port = _free_port()
+    idle_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result: dict[str, str] = {}
+
+    def send_real_request() -> None:
+        # The server may be busy dropping the idle connection for a few seconds before it
+        # accepts this one, so give the response more room than `_get`'s default 2s.
+        with contextlib.suppress(urllib.error.URLError, TimeoutError):
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/callback?code=the-code", timeout=10)
+
+    def on_listening() -> None:
+        idle_sock.connect(("127.0.0.1", port))
+        threading.Thread(target=send_real_request).start()
+
+    def run() -> None:
+        result["code"] = get_tokens.wait_for_authorization_code(
+            "127.0.0.1",
+            port,
+            "/callback",
+            10.0,
+            on_listening=on_listening,
+        )
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=8.0)
+    idle_sock.close()
+
+    assert not thread.is_alive(), "the idle connection blocked the real request"
+    assert result.get("code") == "the-code"
+
+
 # --------------------------------------------------------------------------------------
 # exchange_code
 # --------------------------------------------------------------------------------------
@@ -467,6 +502,57 @@ async def test_list_accounts_surfaces_a_rejected_application_auth() -> None:
 # --------------------------------------------------------------------------------------
 # main() end to end
 # --------------------------------------------------------------------------------------
+
+
+async def test_main_reports_a_connection_refused_while_listing_accounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stub_token_server,
+) -> None:
+    """`list_accounts` can fail with more than `CTraderRequestError` - a closed port raises
+    `CTraderConnectionError`, which must be caught too, not left to print a traceback."""
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "CTRADER_CLIENT_ID=cid\nCTRADER_CLIENT_SECRET=csecret\n",
+        encoding="utf-8",
+    )
+
+    _server, token_url = stub_token_server
+    _StubTokenHandler.response_body = json.dumps(
+        {
+            "accessToken": "the-access-token",
+            "refreshToken": "the-refresh-token",
+            "expiresIn": 2419200,
+            "tokenType": "bearer",
+        },
+    ).encode()
+    monkeypatch.setattr(get_tokens, "TOKEN_URL", token_url)
+
+    # Nothing listens here, so the connection is refused.
+    closed_port = _free_port()
+    monkeypatch.setattr(get_tokens, "DEMO_HOST", "127.0.0.1")
+    monkeypatch.setattr(get_tokens, "PROTOBUF_PORT", closed_port)
+
+    redirect_port = _free_port()
+    redirect_uri = f"http://127.0.0.1:{redirect_port}/callback"
+
+    def fake_open(_url: str) -> bool:
+        threading.Thread(target=_get, args=(f"{redirect_uri}?code=the-auth-code",)).start()
+        return True
+
+    monkeypatch.setattr(get_tokens.webbrowser, "open", fake_open)
+
+    rc = await asyncio.to_thread(
+        get_tokens.main,
+        ["--env-file", str(env_file), "--redirect-uri", redirect_uri, "--timeout-secs", "5"],
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "saved" in output.lower()
+    assert "Traceback" not in output
 
 
 async def test_main_writes_tokens_and_never_prints_secrets(

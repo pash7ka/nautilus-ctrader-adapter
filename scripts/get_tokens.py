@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from nautilus_ctrader.common.connection import CTraderConnection
-from nautilus_ctrader.common.errors import CTraderRequestError
+from nautilus_ctrader.common.errors import CTraderError, CTraderRequestError
 from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -182,6 +182,12 @@ def wait_for_authorization_code(
     outcome: dict[str, str] = {}
 
     class _Handler(http.server.BaseHTTPRequestHandler):
+        # A connection that opens and sends nothing - browsers do this for speculative
+        # preconnects - would otherwise block handle_request() forever, since the base class
+        # leaves this as None. Dropping it after a few seconds lets the loop move on to the
+        # next connection while the overall timeout_secs deadline is still tracked below.
+        timeout = 5
+
         def do_GET(self) -> None:
             parsed = urllib.parse.urlsplit(self.path)
             if parsed.path != path:
@@ -502,6 +508,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     except CTraderRequestError as e:
         print(f"Could not list accounts: {e.error_code}", file=sys.stderr)
+        print(
+            "Tokens were saved even though the account list could not be retrieved.",
+            file=sys.stderr,
+        )
+        return 1
+    except (CTraderError, OSError) as e:
+        print(f"Could not list accounts: {type(e).__name__}", file=sys.stderr)
         print(
             "Tokens were saved even though the account list could not be retrieved.",
             file=sys.stderr,
