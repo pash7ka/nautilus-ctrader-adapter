@@ -565,12 +565,17 @@ def test_exchange_code_returns_parsed_tokens(stub_token_server) -> None:
 def test_exchange_code_raises_on_error_code(stub_token_server) -> None:
     _server, token_url = stub_token_server
     _StubTokenHandler.response_body = json.dumps(
-        {"errorCode": "INVALID_GRANT", "description": "code expired"},
+        {
+            "errorCode": "INVALID_GRANT",
+            "description": "code expired",
+            "accessToken": "AT-should-not-appear",
+            "refreshToken": "RT-should-not-appear",
+        },
     ).encode()
 
     with pytest.raises(get_tokens.TokenExchangeError) as exc_info:
         get_tokens.exchange_code(
-            "the-code",
+            "the-code-should-not-appear",
             client_id="cid",
             client_secret="csecret",
             redirect_uri="http://localhost:8080/callback",
@@ -581,6 +586,9 @@ def test_exchange_code_raises_on_error_code(stub_token_server) -> None:
     assert "INVALID_GRANT" in message
     assert "code expired" in message
     assert "csecret" not in message
+    assert "AT-should-not-appear" not in message
+    assert "RT-should-not-appear" not in message
+    assert "the-code-should-not-appear" not in message
 
 
 def test_exchange_code_raises_on_http_error(stub_token_server) -> None:
@@ -1235,6 +1243,9 @@ async def test_main_reports_a_connection_refused_while_listing_accounts(
     output = captured.out + captured.err
     assert "saved" in output.lower()
     assert "Traceback" not in output
+    assert "csecret" not in output
+    assert "the-access-token" not in output
+    assert "the-refresh-token" not in output
 
 
 async def test_main_writes_tokens_and_never_prints_secrets(
@@ -1299,9 +1310,11 @@ async def test_main_writes_tokens_and_never_prints_secrets(
     # browser had followed it and cTrader had redirected back with a code.
     redirect_port = _free_port()
     redirect_uri = f"http://127.0.0.1:{redirect_port}/callback"
+    captured_state: dict[str, str] = {}
 
     def fake_open(url: str) -> bool:
         state = _state_from_authorization_url(url)
+        captured_state["state"] = state
         threading.Thread(
             target=_get,
             args=(f"{redirect_uri}?code=the-auth-code&state={state}",),
@@ -1345,3 +1358,4 @@ async def test_main_writes_tokens_and_never_prints_secrets(
     assert "csecret" not in output
     assert "the-auth-code" not in output
     assert "the-distinctive-client-id" not in output
+    assert captured_state["state"] not in output
