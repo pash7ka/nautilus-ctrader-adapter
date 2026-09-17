@@ -877,11 +877,12 @@ async def test_stop_survives_repeated_cancellation(monkeypatch: pytest.MonkeyPat
         await server.stop()
 
 
-async def test_a_loss_while_stop_waits_keeps_the_session_stopped(
+async def test_a_server_drop_during_stop_changes_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A heartbeat task slow to react to cancellation keeps `stop()` waiting while the venue
-    # drops the connection.
+    # drops the connection. `stop()` already closed the connection before this point, so the
+    # drop is not a loss it reacts to - this only proves it does not disturb the teardown.
     original_heartbeat_loop = CTraderConnection._heartbeat_loop
     heartbeat_cancelled = asyncio.Event()
 
@@ -906,7 +907,7 @@ async def test_a_loss_while_stop_waits_keeps_the_session_stopped(
         await wait_until(heartbeat_cancelled.is_set, description="stop waiting on its tasks")
         await server.drop_connections()
         await asyncio.sleep(0.05)
-        assert not stop_task.done(), "the loss must land while stop() still waits"
+        assert not stop_task.done(), "the drop must land while stop() still waits"
         await stop_task
 
         assert session.state is SessionState.STOPPED
@@ -949,6 +950,8 @@ async def test_start_during_stop_ends_healthy() -> None:
         await asyncio.sleep(0)
         assert not stop_task.done()
         await session.start()
+        # `start()` waits out the in-progress `stop()` before doing anything else.
+        assert stop_task.done()
         await session.wait_ready(timeout_secs=3.0)
 
         assert session.is_ready

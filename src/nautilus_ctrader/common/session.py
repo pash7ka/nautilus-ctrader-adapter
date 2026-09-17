@@ -374,8 +374,8 @@ class CTraderSession:
         self.last_error = error
         self._loss_cause = error
         if self._stopping:
-            # `stop()` has already settled the state; a loss reported while it waits must not
-            # revive it.
+            # Defensive: `stop()` closes the connection before it awaits, so no loss is
+            # dispatched while it waits. Kept in case that ordering ever changes.
             return
         self._state = SessionState.CONNECTING
         self._ready.clear()
@@ -522,6 +522,7 @@ class CTraderSession:
             # the pair in a late reply is the only valid one and should be adopted, not dropped.
             self._log.warning("Dropped a late token refresh response")
             return
+        # `not self._stopping` is defensive here too, for the same reason as in `_on_disconnect`.
         if self._ends_our_authentication(payload) and not self._stopping:
             self._state = SessionState.CONNECTING
             self._ready.clear()
