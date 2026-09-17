@@ -43,7 +43,11 @@ def _server() -> FakeCTraderServer:
     return server
 
 
-def _session(server: FakeCTraderServer, **kwargs) -> CTraderSession:
+def _session(
+    server: FakeCTraderServer,
+    logger: Logger | RecordingLogger | None = None,
+    **kwargs,
+) -> CTraderSession:
     return CTraderSession(
         host=server.host,
         port=server.port,
@@ -52,7 +56,7 @@ def _session(server: FakeCTraderServer, **kwargs) -> CTraderSession:
         account_id=ACCOUNT_ID,
         access_token="old-access",
         refresh_token="old-refresh",
-        logger=Logger("test"),
+        logger=Logger("test") if logger is None else logger,
         tls=False,
         **kwargs,
     )
@@ -364,7 +368,8 @@ async def test_a_persistent_token_rejection_refreshes_at_most_once() -> None:
         lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID", description="revoked"),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    logger = RecordingLogger()
+    session = _session(server, logger=logger, backoff_base_secs=0.05)
     try:
         await session.start()
         await wait_until(
@@ -374,6 +379,31 @@ async def test_a_persistent_token_rejection_refreshes_at_most_once() -> None:
 
         assert len(_refreshes(server)) == 1
         assert isinstance(session.last_error, CTraderAuthError)
+        # The attempt that refreshed failed on the retry with the new token.
+        first = next(m for _level, m in logger.lines if "bring-up failed (attempt 1)" in m)
+        assert "account auth rejected after refresh" in first
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_token_rejection_refreshes_again_once_the_interval_has_passed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.MIN_TOKEN_REFRESH_INTERVAL_SECS", 0.01)
+    server = _server()
+    server.on(
+        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
+        lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID", description="revoked"),
+    )
+    await server.start()
+    session = _session(server, backoff_base_secs=0.05)
+    try:
+        await session.start()
+        await wait_until(
+            lambda: len(_refreshes(server)) >= 2,
+            description="a second reactive refresh",
+        )
     finally:
         await session.stop()
         await server.stop()
