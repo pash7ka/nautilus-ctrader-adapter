@@ -297,6 +297,37 @@ async def test_a_lost_connection_rejects_pending_requests_and_notifies() -> None
         await server.stop()
 
 
+async def test_a_cancelled_close_still_releases_everything() -> None:
+    server = FakeCTraderServer()
+    await server.start()
+    connection = await _connected(server, request_timeout_secs=30.0)
+    try:
+        await server.wait_for_connections()
+        # No handler: the request stays pending.
+        pending = asyncio.create_task(
+            connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1)),
+        )
+        await wait_until(lambda: bool(server.received), description="request in flight")
+
+        close_task = asyncio.create_task(connection.close())
+        # One yield puts `close()` inside its wait for the cancelled tasks.
+        await asyncio.sleep(0)
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        with pytest.raises(CTraderConnectionError):
+            await asyncio.wait_for(pending, timeout=2.0)
+        assert connection.is_connected is False
+        await wait_until(
+            lambda: server.open_connection_count == 0,
+            description="server sees the connection closed",
+        )
+    finally:
+        await connection.close()
+        await server.stop()
+
+
 async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
     # A request that failed must not reach the next connection: for an order that would be
     # a duplicate the caller never knows about.

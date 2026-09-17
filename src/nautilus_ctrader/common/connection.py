@@ -124,27 +124,33 @@ class CTraderConnection:
         self._log.info(f"Connected to {self._host}:{self._port}")
 
     async def close(self) -> None:
+        # State first, awaits last: a cancellation landing in an await below can only cut the
+        # wait short, never leave the socket open or requests pending.
         self._connected = False
         tasks = {t for t in (self._heartbeat_task, self._read_task) if t is not None}
         for task in tasks:
             task.cancel()
-        if tasks:
-            # Not a per-task suppress: that would also catch a cancellation of the caller of
-            # `close()` itself and let it slip past unnoticed.
-            await asyncio.wait(tasks)
-        for task in tasks:
-            if task.done() and not task.cancelled():
-                task.exception()  # fetch it so it is not reported as never retrieved
+        writer = self._writer
+        if writer is not None:
+            writer.close()
+        self._reject_pending(CTraderConnectionError("connection closed"))
         self._heartbeat_task = None
         self._read_task = None
-
-        if self._writer is not None:
-            self._writer.close()
-            with contextlib.suppress(ConnectionError, OSError):
-                await self._writer.wait_closed()
         self._writer = None
         self._reader = None
-        self._reject_pending(CTraderConnectionError("connection closed"))
+
+        try:
+            if tasks:
+                # Not a per-task suppress: that would also catch a cancellation of the caller of
+                # `close()` itself and let it slip past unnoticed.
+                await asyncio.wait(tasks)
+            for task in tasks:
+                if task.done() and not task.cancelled():
+                    task.exception()  # fetch it so it is not reported as never retrieved
+        finally:
+            if writer is not None:
+                with contextlib.suppress(ConnectionError, OSError):
+                    await writer.wait_closed()
 
     async def request(
         self,

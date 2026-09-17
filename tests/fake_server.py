@@ -46,6 +46,11 @@ class FakeCTraderServer:
     def connection_count(self) -> int:
         return self._connection_count
 
+    @property
+    def open_connection_count(self) -> int:
+        """Clients connected now; drops once the server has seen a client close."""
+        return len(self._writers)
+
     def on(self, payload_type: int, handler: Handler) -> None:
         """Register what the venue does when it receives `payload_type`."""
         self._handlers[payload_type] = handler
