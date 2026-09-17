@@ -50,7 +50,9 @@ that the venue expects no reply to its own heartbeats.
 Outbound silence is only half the picture: on a half-open TCP connection (network loss without
 a reset, a NAT timeout), writes keep succeeding into the kernel buffer long after nothing is
 actually arriving. This adapter also treats 90 seconds with no inbound frame — three missed
-server heartbeats at the 30-second tolerance — as a lost connection and reconnects.
+server heartbeats at the 30-second tolerance — as a lost connection and reconnects. Silence is
+checked periodically, so the loss is detected within a few seconds after the 90 seconds, not at
+exactly 90 seconds.
 **Unconfirmed**: that the server sends heartbeats when it has nothing else to send; if it stays
 silent on an otherwise idle connection instead, this reconnects an idle session every 90
 seconds.

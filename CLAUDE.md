@@ -75,7 +75,10 @@ unsatisfiable alongside a current Nautilus stack, and its Twisted reactor is the
 deliberately avoiding. Reusing the *protocol definitions* is correct; taking the *package* is
 not.
 
-Generated `*_pb2.py` files are build output. Never hand-edit them; regenerate instead.
+Generated `*_pb2.py` files are build output. Never hand-edit them; regenerate instead with
+`scripts/gen_protobuf.py`, which also rewrites the two bare imports protoc emits into
+package-absolute ones. Its protobuf version check and the `grpcio-tools` pin in
+`pyproject.toml` move together.
 
 ## 5. Layout
 
@@ -135,7 +138,8 @@ assumption to a fact.
 
 - `clientId`, `clientSecret`, access and refresh tokens, and account identifiers never appear
   in the repository, in test fixtures, in log output, or in error messages.
-- Masking is implemented once, in the transport layer, so it cannot be forgotten at a call
+- The transport layer never logs payload bytes, only payload type, correlation id and
+  length. That one structural guarantee replaces masking, so it cannot be forgotten at a call
   site.
 - Use the Nautilus `Logger`. Choose the level by the reaction required, not by how
   interesting the event feels: **ERROR** = a human must intervene; **WARNING** = unusual but

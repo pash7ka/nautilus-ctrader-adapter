@@ -4,9 +4,10 @@ A [cTrader Open API](https://help.ctrader.com/open-api/) adapter for
 [NautilusTrader](https://github.com/nautechsystems/nautilus_trader): market data and order
 execution against any broker that exposes cTrader Open API.
 
-> **Status: early development (pre-alpha).** The transport layer is being built first. The
-> public API is not stable, there is no PyPI release yet, and nothing here should be pointed
-> at a live account. See [Roadmap](#roadmap).
+> **Status: early development (pre-alpha).** The transport layer is in place and tested
+> offline; the instrument provider, data client and execution client come next. The public API
+> is not stable, there is no PyPI release yet, and nothing here should be pointed at a live
+> account yet. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -111,7 +112,7 @@ node.build()
 - A heartbeat must be sent if the connection would otherwise be idle for more than 30
   seconds. This adapter sends one after 10 seconds of outbound silence and does not answer
   the server's own heartbeats. 90 seconds without any data from the server is treated as a
-  lost connection.
+  lost connection, detected within a few seconds after the 90 seconds.
 - After any reconnect, both authentication levels and all subscriptions must be
   re-established.
 - Outbound requests are rate-limited, with a separate and much tighter budget for historical
