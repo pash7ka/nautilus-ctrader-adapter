@@ -242,12 +242,16 @@ def wait_for_authorization_code(
                 self.end_headers()
                 return
             if "code" in params:
-                self._respond("Authorization received. You can close this tab.")
+                # Record before answering the browser: `_respond` writes to the socket, and if
+                # that write fails (peer gone, RST, a full send window against the 5s socket
+                # timeout), the code must already be captured so the caller gets it instead of
+                # timing out.
                 self._record(code=params["code"][0])
+                self._respond("Authorization received. You can close this tab.")
             elif "error" in params:
                 error = _sanitize_for_terminal(params["error"][0])
-                self._respond(f"Authorization failed: {html.escape(error)}")
                 self._record(error=error)
+                self._respond(f"Authorization failed: {html.escape(error)}")
             else:
                 self.send_response(400)
                 self.end_headers()

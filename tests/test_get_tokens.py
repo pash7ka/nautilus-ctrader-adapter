@@ -450,6 +450,94 @@ def test_wait_for_authorization_code_returns_promptly_despite_a_slow_drip_client
     assert elapsed < 1.5, f"took {elapsed:.2f}s, expected the drip to never block the real request"
 
 
+def test_wait_for_authorization_code_returns_the_code_even_if_the_response_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_respond` writes to the socket after the outcome is recorded; if that write raises (the
+    peer is gone, an RST, or the per-connection timeout against a full send window), the code
+    must already be recorded so the caller still gets it instead of timing out.
+
+    Patches `http.server.BaseHTTPRequestHandler.send_response` - the first call `_respond`
+    makes - to raise `OSError`, standing in for a failed socket write. `_Handler` is defined
+    locally inside `wait_for_authorization_code` and never overrides `send_response`, so
+    patching it on the base class reaches every `_Handler` instance for the duration of this
+    test only.
+    """
+    port = _free_port()
+
+    def _raise(self, *args: object, **kwargs: object) -> None:
+        raise OSError("simulated: peer gone")
+
+    monkeypatch.setattr(
+        get_tokens.http.server.BaseHTTPRequestHandler,
+        "send_response",
+        _raise,
+    )
+
+    def _get_ignoring_the_broken_response(url: str) -> None:
+        # The server closes the connection without ever writing a response (the patched
+        # `send_response` raises before anything is sent), so the client side of this
+        # simulated failure raises too; only the server-side outcome matters here.
+        with contextlib.suppress(OSError):
+            urllib.request.urlopen(url, timeout=2)
+
+    def on_listening() -> None:
+        threading.Thread(
+            target=_get_ignoring_the_broken_response,
+            args=(f"http://127.0.0.1:{port}/callback?code=the-code&state=s",),
+        ).start()
+
+    code = get_tokens.wait_for_authorization_code(
+        "127.0.0.1",
+        port,
+        "/callback",
+        2.0,
+        state="s",
+        on_listening=on_listening,
+    )
+
+    assert code == "the-code"
+
+
+def test_wait_for_authorization_code_raises_the_error_even_if_the_response_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same as above, for the `?error=` branch: the error must still be recorded and raised,
+    not lost to a timeout, if answering the browser fails."""
+    port = _free_port()
+
+    def _raise(self, *args: object, **kwargs: object) -> None:
+        raise OSError("simulated: peer gone")
+
+    monkeypatch.setattr(
+        get_tokens.http.server.BaseHTTPRequestHandler,
+        "send_response",
+        _raise,
+    )
+
+    def _get_ignoring_the_broken_response(url: str) -> None:
+        with contextlib.suppress(OSError):
+            urllib.request.urlopen(url, timeout=2)
+
+    def on_listening() -> None:
+        threading.Thread(
+            target=_get_ignoring_the_broken_response,
+            args=(f"http://127.0.0.1:{port}/callback?error=access_denied&state=s",),
+        ).start()
+
+    with pytest.raises(get_tokens.AuthorizationError) as exc_info:
+        get_tokens.wait_for_authorization_code(
+            "127.0.0.1",
+            port,
+            "/callback",
+            2.0,
+            state="s",
+            on_listening=on_listening,
+        )
+
+    assert "access_denied" in str(exc_info.value)
+
+
 def test_wait_for_authorization_code_times_out_close_to_the_deadline() -> None:
     """With only an idle connection present, the timeout must fire close to `timeout_secs`,
     not be stretched out by the idle connection's own per-connection read timeout."""
