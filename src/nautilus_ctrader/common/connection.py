@@ -119,6 +119,9 @@ class CTraderConnection:
         self._disconnect_handler = handler
 
     async def connect(self) -> None:
+        """Open the socket. Raises `CTraderConnectionError` if one is still open: close it first."""
+        if self._connected or self._writer is not None:
+            raise CTraderConnectionError("already connected")
         try:
             async with asyncio.timeout(self._connect_timeout_secs):
                 self._reader, self._writer = await asyncio.open_connection(

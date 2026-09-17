@@ -328,6 +328,56 @@ async def test_a_cancelled_close_still_releases_everything() -> None:
         await server.stop()
 
 
+async def test_connect_over_a_live_connection_is_refused() -> None:
+    server = FakeCTraderServer()
+    server.on(
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda request: oa.ProtoOASubscribeSpotsRes(
+            ctidTraderAccountId=request.ctidTraderAccountId,
+        ),
+    )
+    await server.start()
+    connection = await _connected(server, request_timeout_secs=2.0)
+    try:
+        await server.wait_for_connections()
+        with pytest.raises(CTraderConnectionError):
+            await connection.connect()
+
+        assert connection.is_connected
+        assert server.connection_count == 1
+        response = await connection.request(
+            oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=7, symbolId=[1]),
+        )
+        assert response.ctidTraderAccountId == 7
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_close_then_connect_gives_a_working_connection() -> None:
+    server = FakeCTraderServer()
+    server.on(
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda request: oa.ProtoOASubscribeSpotsRes(
+            ctidTraderAccountId=request.ctidTraderAccountId,
+        ),
+    )
+    await server.start()
+    connection = await _connected(server, request_timeout_secs=2.0)
+    try:
+        await connection.close()
+        await connection.connect()
+
+        assert connection.is_connected
+        response = await connection.request(
+            oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=7, symbolId=[1]),
+        )
+        assert response.ctidTraderAccountId == 7
+    finally:
+        await connection.close()
+        await server.stop()
+
+
 async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
     # A request that failed must not reach the next connection: for an order that would be
     # a duplicate the caller never knows about.
