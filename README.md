@@ -110,7 +110,8 @@ node.build()
   correlated to requests by `clientMsgId`.
 - A heartbeat must be sent if the connection would otherwise be idle for more than 30
   seconds. This adapter sends one after 10 seconds of outbound silence and does not answer
-  the server's own heartbeats.
+  the server's own heartbeats. 90 seconds without any data from the server is treated as a
+  lost connection.
 - After any reconnect, both authentication levels and all subscriptions must be
   re-established.
 - Outbound requests are rate-limited, with a separate and much tighter budget for historical

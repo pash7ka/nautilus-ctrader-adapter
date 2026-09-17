@@ -47,6 +47,14 @@ the schema describes heartbeats as a keep-alive signal, not a ping/pong exchange
 replying to one removes any way for a peer to drive a heartbeat reply loop. **Unconfirmed**:
 that the venue expects no reply to its own heartbeats.
 
+Outbound silence is only half the picture: on a half-open TCP connection (network loss without
+a reset, a NAT timeout), writes keep succeeding into the kernel buffer long after nothing is
+actually arriving. This adapter also treats 90 seconds with no inbound frame — three missed
+server heartbeats at the 30-second tolerance — as a lost connection and reconnects.
+**Unconfirmed**: that the server sends heartbeats when it has nothing else to send; if it stays
+silent on an otherwise idle connection instead, this reconnects an idle session every 90
+seconds.
+
 ## 4. Authentication
 
 Authentication has two independent levels, each its own request:
