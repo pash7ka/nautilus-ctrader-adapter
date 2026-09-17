@@ -44,6 +44,25 @@ async def test_pause_for_never_shortens_an_existing_pause() -> None:
     assert asyncio.get_running_loop().time() - start >= 0.15
 
 
+async def test_a_pause_resumes_with_one_token_not_a_burst() -> None:
+    # A burst right after a venue-ordered pause could re-trigger the block.
+    loop = asyncio.get_running_loop()
+    bucket = TokenBucket(rate_per_sec=20.0, capacity=10.0)
+    for _ in range(10):
+        await bucket.acquire()
+
+    start = loop.time()
+    bucket.pause_for(0.1)
+    await bucket.acquire()
+    first = loop.time() - start
+    await bucket.acquire()
+    second = loop.time() - start
+
+    # Measured from the pause, not from the first acquire, so a late wake-up cannot skew it.
+    assert 0.1 <= first < 0.15
+    assert 0.149 <= second < 0.5  # the next token at 20/s is 50 ms after the pause ends
+
+
 def test_a_non_positive_rate_is_rejected() -> None:
     with pytest.raises(ValueError, match="positive"):
         TokenBucket(rate_per_sec=0.0)

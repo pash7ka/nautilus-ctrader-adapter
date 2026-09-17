@@ -1,6 +1,7 @@
 """Outbound rate limiting.
 
-Spotware's SDK drains a send queue on a one-second timer. Here each named bucket is a token
+Spotware's SDK drains a send queue on a one-second timer (`TcpProtocol._sendStrings`, run by
+`LoopingCall(...).start(1)`). Here each named bucket is a token
 bucket that callers await, so a caller is delayed rather than parked behind a timer, and a
 message is either sent or its caller sees an error.
 
@@ -54,12 +55,16 @@ class TokenBucket:
     def pause_for(self, seconds: float) -> None:
         """Block the bucket for `seconds`, as instructed by the venue.
 
-        Never shortens a pause already in effect.
+        Never shortens a pause already in effect. Nothing accrues while paused: the bucket
+        resumes with one token and refills at the normal rate from there.
         """
         self._paused_until = max(
             self._paused_until,
             asyncio.get_running_loop().time() + seconds,
         )
+        # A full burst on resume could re-trigger the block.
+        self._tokens = min(self._capacity, 1.0)
+        self._updated = self._paused_until
 
 
 class RateLimiter:
