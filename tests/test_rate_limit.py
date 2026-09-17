@@ -1,6 +1,7 @@
 """Outbound rate limiting."""
 
 import asyncio
+import math
 
 import pytest
 
@@ -68,9 +69,20 @@ def test_a_non_positive_rate_is_rejected() -> None:
         TokenBucket(rate_per_sec=0.0)
 
 
+def test_a_nan_rate_is_rejected() -> None:
+    # `nan <= 0` is false, so a naive check would let it through.
+    with pytest.raises(ValueError, match="positive"):
+        TokenBucket(rate_per_sec=math.nan)
+
+
 def test_an_explicit_sub_unit_capacity_is_rejected() -> None:
     with pytest.raises(ValueError, match="capacity"):
         TokenBucket(rate_per_sec=1.0, capacity=0.5)
+
+
+def test_an_explicit_nan_capacity_is_rejected() -> None:
+    with pytest.raises(ValueError, match="capacity"):
+        TokenBucket(rate_per_sec=1.0, capacity=math.nan)
 
 
 async def test_a_sub_unit_rate_still_holds_a_whole_token() -> None:
@@ -89,6 +101,13 @@ def test_pause_for_rejects_a_negative_duration() -> None:
     bucket = TokenBucket(rate_per_sec=10.0)
     with pytest.raises(ValueError, match="seconds"):
         bucket.pause_for(-1.0)
+
+
+def test_pause_for_rejects_a_nan_duration() -> None:
+    # `nan < 0` is false, so a naive check would let it through.
+    bucket = TokenBucket(rate_per_sec=10.0)
+    with pytest.raises(ValueError, match="seconds"):
+        bucket.pause_for(math.nan)
 
 
 async def test_buckets_are_independent() -> None:

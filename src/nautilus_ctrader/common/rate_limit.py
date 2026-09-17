@@ -22,9 +22,9 @@ class TokenBucket:
     """
 
     def __init__(self, rate_per_sec: float, capacity: float | None = None) -> None:
-        if rate_per_sec <= 0:
+        if not (rate_per_sec > 0):
             raise ValueError("rate_per_sec must be positive")
-        if capacity is not None and capacity < 1:
+        if capacity is not None and not (capacity >= 1):
             raise ValueError("capacity must be at least 1, or a token could never be held")
         self._rate = rate_per_sec
         # A capacity below 1 could never hold a whole token, so acquire() would hang forever
@@ -62,7 +62,7 @@ class TokenBucket:
         Never shortens a pause already in effect. Nothing accrues while paused: the bucket
         resumes with one token and refills at the normal rate from there.
         """
-        if seconds < 0:
+        if not (seconds >= 0):
             raise ValueError("seconds must not be negative")
         self._paused_until = max(
             self._paused_until,
