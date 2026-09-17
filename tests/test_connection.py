@@ -219,11 +219,11 @@ async def test_inbound_traffic_keeps_the_connection_alive() -> None:
         await server.stop()
 
 
-async def test_a_heartbeat_interval_near_the_threshold_still_detects_silence() -> None:
+async def test_a_long_heartbeat_interval_does_not_delay_the_silence_check() -> None:
     server = FakeCTraderServer()
     server.answer_heartbeats = False
     await server.start()
-    connection = await _connected(server, heartbeat_idle_secs=0.25, inbound_silence_secs=0.3)
+    connection = await _connected(server, heartbeat_idle_secs=3600.0, inbound_silence_secs=0.3)
     losses: list[Exception] = []
     connection.set_disconnect_handler(losses.append)
     try:
@@ -584,7 +584,7 @@ async def test_send_without_a_client_msg_id_sends_none() -> None:
 
 @pytest.mark.parametrize(
     ("heartbeat_idle_secs", "inbound_silence_secs"),
-    [(10.0, 0.0), (10.0, -1.0), (10.0, 10.0), (10.0, 5.0)],
+    [(10.0, 0.0), (10.0, -1.0)],
 )
 def test_an_invalid_silence_threshold_is_rejected(
     heartbeat_idle_secs: float,

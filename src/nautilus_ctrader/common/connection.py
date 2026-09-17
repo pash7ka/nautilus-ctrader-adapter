@@ -58,13 +58,13 @@ class CTraderConnection:
         context) is the only safe choice against a real venue; `False` (plaintext) is for tests
         against the local fake server.
 
-        `inbound_silence_secs` must exceed `heartbeat_idle_secs`, or the connection could be
-        declared lost between two of our own heartbeats.
+        `inbound_silence_secs` only has to outlast the venue's own send rhythm - we never get a
+        reply to our heartbeats, so `heartbeat_idle_secs` does not bound it.
         """
         if inbound_silence_secs <= 0:
             raise ValueError("inbound_silence_secs must be positive")
-        if inbound_silence_secs <= heartbeat_idle_secs:
-            raise ValueError("inbound_silence_secs must exceed heartbeat_idle_secs")
+        # TODO(verify): the server's own heartbeat rhythm; the threshold must stay comfortably
+        # above it.
         self._host = host
         self._port = port
         self._log = logger
