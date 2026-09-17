@@ -30,6 +30,40 @@ from tests.recording_logger import RecordingLogger
 ACCOUNT_ID = 1234567
 
 
+class _SlowRestore:
+    """A restore that blocks until cancelled, then dawdles before honouring it.
+
+    Holds a bring-up inside `RESTORING` long enough for another `start()`/`stop()` call to land
+    while the bring-up's own `stop()` is still waiting on it. Inert until `blocking` is set, so
+    it can be registered before the session first becomes ready.
+    """
+
+    def __init__(self) -> None:
+        self.blocking = False
+        self.entered = asyncio.Event()
+
+    async def __call__(self) -> None:
+        if not self.blocking:
+            return
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.sleep(0.3)
+            raise
+
+
+def _owned_tasks(name: str) -> list[asyncio.Task]:
+    """Live tasks running `CTraderConnection.<name>` (e.g. `_heartbeat_loop`, `_read_loop`)."""
+    qualname = f"CTraderConnection.{name}"
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if not task.done() and task.get_coro().__qualname__.endswith(qualname)
+    ]
+
+
 def _authenticating_server() -> FakeCTraderServer:
     server = FakeCTraderServer()
     server.on(
@@ -895,41 +929,21 @@ async def test_start_during_stop_ends_healthy() -> None:
     # A fast limiter, so the new bring-up finishes well inside the restore's cancellation delay.
     limiter = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
     session = _session(server, backoff_base_secs=0.01, rate_limiter=limiter)
-    block_restore = False
-    restore_entered = asyncio.Event()
-
-    async def slow_to_cancel_restore() -> None:
-        if not block_restore:
-            return
-        restore_entered.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.sleep(0.3)
-            raise
+    slow_restore = _SlowRestore()
 
     def subscribe_request() -> oa.ProtoOASubscribeSpotsReq:
         return oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1])
 
-    def owned_tasks(name: str) -> list[asyncio.Task]:
-        qualname = f"CTraderConnection.{name}"
-        return [
-            task
-            for task in asyncio.all_tasks()
-            if not task.done() and task.get_coro().__qualname__.endswith(qualname)
-        ]
-
     try:
-        session.add_restore("slow", slow_to_cancel_restore)
+        session.add_restore("slow", slow_restore)
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
 
         # Hold the next bring-up inside the restore.
-        block_restore = True
+        slow_restore.blocking = True
         await server.drop_connections()
-        await wait_until(restore_entered.is_set, description="bring-up inside the restore")
-        block_restore = False
+        await wait_until(slow_restore.entered.is_set, description="bring-up inside the restore")
+        slow_restore.blocking = False
 
         stop_task = asyncio.create_task(session.stop())
         await asyncio.sleep(0)
@@ -945,8 +959,84 @@ async def test_start_during_stop_ends_healthy() -> None:
         assert session.is_ready
         assert session._connection.is_connected
         await session.request(subscribe_request(), timeout_secs=2.0)
-        assert len(owned_tasks("_heartbeat_loop")) == 1
-        assert len(owned_tasks("_read_loop")) == 1
+        assert len(_owned_tasks("_heartbeat_loop")) == 1
+        assert len(_owned_tasks("_read_loop")) == 1
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def _break_session_into_a_slow_restore(
+    session: CTraderSession,
+    server: FakeCTraderServer,
+    slow_restore: _SlowRestore,
+) -> None:
+    """Get `session` ready, then force a reconnect that parks its supervisor inside `slow_restore`.
+
+    Cancelling that supervisor afterwards takes the restore's own dawdle, wide enough for other
+    calls to land while a `stop()` waits on it.
+    """
+    await session.start()
+    await session.wait_ready(timeout_secs=2.0)
+    slow_restore.blocking = True
+    await server.drop_connections()
+    await wait_until(slow_restore.entered.is_set, description="bring-up inside the restore")
+    slow_restore.blocking = False
+
+
+async def test_a_stop_after_a_waiting_start_wins() -> None:
+    # Reproduces: stop() A cancels a supervisor slow to die; start() S is called and waits on
+    # A; stop() C lands while the supervisor is already captured by A, so C returns almost at
+    # once, decrementing the in-progress count without reaching zero. When A finally finishes
+    # and wakes S, C - not S - must be the call the session ends up reflecting.
+    server = _authenticating_server()
+    await server.start()
+    limiter = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
+    session = _session(server, backoff_base_secs=0.01, rate_limiter=limiter)
+    slow_restore = _SlowRestore()
+    try:
+        session.add_restore("slow", slow_restore)
+        await _break_session_into_a_slow_restore(session, server, slow_restore)
+
+        await asyncio.gather(session.stop(), session.start(), session.stop())
+
+        # A fixed wait, not polling: this checks that a supervisor never comes back, and absence
+        # of an event can only be confirmed by waiting it out.
+        await asyncio.sleep(0.5)
+        assert session.state is SessionState.STOPPED
+        assert session._connection.is_connected is False
+        assert _owned_tasks("_heartbeat_loop") == []
+        assert _owned_tasks("_read_loop") == []
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_stop_after_a_waiting_start_wins_as_separate_tasks() -> None:
+    # Same race as above, as separate tasks with a yield between each call - the shape Nautilus
+    # uses when disconnect/connect/disconnect are scheduled from unrelated call sites rather
+    # than awaited together in one coroutine.
+    server = _authenticating_server()
+    await server.start()
+    limiter = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
+    session = _session(server, backoff_base_secs=0.01, rate_limiter=limiter)
+    slow_restore = _SlowRestore()
+    try:
+        session.add_restore("slow", slow_restore)
+        await _break_session_into_a_slow_restore(session, server, slow_restore)
+
+        first_stop = asyncio.create_task(session.stop())
+        await asyncio.sleep(0)
+        start_task = asyncio.create_task(session.start())
+        await asyncio.sleep(0)
+        second_stop = asyncio.create_task(session.stop())
+        await asyncio.gather(first_stop, start_task, second_stop)
+
+        await asyncio.sleep(0.5)
+        assert session.state is SessionState.STOPPED
+        assert session._connection.is_connected is False
+        assert _owned_tasks("_heartbeat_loop") == []
+        assert _owned_tasks("_read_loop") == []
     finally:
         await session.stop()
         await server.stop()

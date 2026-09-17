@@ -131,6 +131,9 @@ class CTraderSession:
         self._stop_idle = asyncio.Event()
         self._stop_idle.set()
         self._stops_in_progress = 0
+        # Bumped by every `stop()`, so a `start()` that waited on `_stop_idle` can tell whether
+        # a later `stop()` started after it and must win.
+        self._stop_epoch = 0
         self.last_error: Exception | None = None
         # The cause of the current loss only, so a bring-up failure never chains to a stale one.
         self._loss_cause: Exception | None = None
@@ -167,7 +170,11 @@ class CTraderSession:
 
         Waits for any `stop()` still in progress, so a restart never overlaps its teardown.
         """
+        epoch = self._stop_epoch
         await self._stop_idle.wait()
+        # A stop() issued while this start() was waiting takes precedence over it.
+        if self._stop_epoch != epoch:
+            return
         if self._supervisor is not None and not self._supervisor.done():
             return
         self._stopping = False
@@ -176,6 +183,7 @@ class CTraderSession:
 
     async def stop(self) -> None:
         self._stops_in_progress += 1
+        self._stop_epoch += 1
         self._stop_idle.clear()
         try:
             # State first, awaits last: repeated cancellation can only cut a wait short, never
