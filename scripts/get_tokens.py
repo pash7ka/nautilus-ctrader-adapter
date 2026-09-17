@@ -362,7 +362,7 @@ def update_env_file(path: Path, updates: dict[str, str]) -> None:
 
     new_text = "".join(f"{line}{newline}" for line in lines)
     if has_bom:
-        new_text = "﻿" + new_text
+        new_text = "\ufeff" + new_text
     _write_atomically(path, new_text)
 
 
