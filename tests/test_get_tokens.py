@@ -17,6 +17,7 @@ import json
 import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -371,6 +372,109 @@ def test_wait_for_authorization_code_survives_an_idle_connection() -> None:
 
     assert not thread.is_alive(), "the idle connection blocked the real request"
     assert result.get("code") == "the-code"
+
+
+def test_wait_for_authorization_code_returns_promptly_with_an_idle_connection() -> None:
+    """Connections are served concurrently, so an idle preconnect must not delay the real
+    redirect at all - the code must come back in well under the deadline, not just before it
+    times out."""
+    port = _free_port()
+    idle_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    def on_listening() -> None:
+        idle_sock.connect(("127.0.0.1", port))
+        threading.Thread(
+            target=_get,
+            args=(f"http://127.0.0.1:{port}/callback?code=the-code&state=s",),
+        ).start()
+
+    start = time.monotonic()
+    try:
+        code = get_tokens.wait_for_authorization_code(
+            "127.0.0.1",
+            port,
+            "/callback",
+            2.0,
+            state="s",
+            on_listening=on_listening,
+        )
+    finally:
+        idle_sock.close()
+    elapsed = time.monotonic() - start
+
+    assert code == "the-code"
+    assert elapsed < 1.0, f"took {elapsed:.2f}s, expected well under the 2s deadline"
+
+
+def test_wait_for_authorization_code_returns_promptly_despite_a_slow_drip_client() -> None:
+    """A client sending one byte every 0.5s occupies its own connection indefinitely; it must
+    not block the real redirect that arrives concurrently."""
+    port = _free_port()
+    drip_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    stop_drip = threading.Event()
+
+    def drip() -> None:
+        try:
+            drip_sock.connect(("127.0.0.1", port))
+            while not stop_drip.is_set():
+                with contextlib.suppress(OSError):
+                    drip_sock.send(b"x")
+                stop_drip.wait(0.5)
+        except OSError:
+            pass
+
+    def on_listening() -> None:
+        threading.Thread(target=drip, daemon=True).start()
+        threading.Thread(
+            target=_get,
+            args=(f"http://127.0.0.1:{port}/callback?code=the-code&state=s",),
+        ).start()
+
+    start = time.monotonic()
+    try:
+        code = get_tokens.wait_for_authorization_code(
+            "127.0.0.1",
+            port,
+            "/callback",
+            3.0,
+            state="s",
+            on_listening=on_listening,
+        )
+    finally:
+        stop_drip.set()
+        with contextlib.suppress(OSError):
+            drip_sock.close()
+    elapsed = time.monotonic() - start
+
+    assert code == "the-code"
+    assert elapsed < 1.5, f"took {elapsed:.2f}s, expected the drip to never block the real request"
+
+
+def test_wait_for_authorization_code_times_out_close_to_the_deadline() -> None:
+    """With only an idle connection present, the timeout must fire close to `timeout_secs`,
+    not be stretched out by the idle connection's own per-connection read timeout."""
+    port = _free_port()
+    idle_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    def on_listening() -> None:
+        idle_sock.connect(("127.0.0.1", port))
+
+    start = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            get_tokens.wait_for_authorization_code(
+                "127.0.0.1",
+                port,
+                "/callback",
+                1.0,
+                state="s",
+                on_listening=on_listening,
+            )
+    finally:
+        idle_sock.close()
+    elapsed = time.monotonic() - start
+
+    assert abs(elapsed - 1.0) < 0.5, f"took {elapsed:.2f}s, expected close to the 1.0s deadline"
 
 
 # --------------------------------------------------------------------------------------

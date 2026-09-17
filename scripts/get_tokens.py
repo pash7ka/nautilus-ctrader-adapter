@@ -22,9 +22,11 @@ import json
 import os
 import re
 import secrets
+import socketserver
 import ssl
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -178,7 +180,11 @@ def _sanitize_for_terminal(value: str, *, max_len: int = 200) -> str:
     return "".join(ch for ch in value if ch.isprintable())[:max_len]
 
 
-class _CallbackServer(http.server.HTTPServer):
+class _CallbackServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """Serves each connection on its own daemon thread, so one idle or slow-drip connection can
+    never hold up the real redirect behind it."""
+
+    daemon_threads = True
     # HTTPServer defaults this on; on Windows SO_REUSEADDR lets another process share or steal
     # the port instead of just permitting reuse of one still in TIME_WAIT.
     allow_reuse_address = sys.platform != "win32"
@@ -195,23 +201,30 @@ def wait_for_authorization_code(
 ) -> str:
     """Serve exactly `path` until the redirect carries a code, an error, or the timeout ends.
 
+    Every connection is handled on its own daemon thread (`_CallbackServer`), so an idle
+    connection (a browser's speculative preconnect) or a slow-drip client can never delay the
+    real redirect that arrives alongside it; `timeout_secs` is therefore an exact deadline
+    measured from this call, not stretched by whatever a concurrent connection is doing.
+
     A request to any other path gets 404 and does not end the wait: browsers probe things
     like `/favicon.ico` on their own. So does a request whose `state` is missing or does not
-    match `state` exactly - it could be a stray page rather than the real redirect, and must
-    not be able to inject a code or abort the run. `on_listening`, if given, runs once the
-    socket is bound and listening - the caller's cue to open the browser (or, in a test, to
-    drive a request).
+    match `state` exactly (compared in constant time) - it could be a stray page rather than
+    the real redirect, and must not be able to inject a code or abort the run. `on_listening`,
+    if given, runs once the socket is bound and listening - the caller's cue to open the
+    browser (or, in a test, to drive a request).
 
     TODO(verify): that the authorization endpoint echoes `state` back on the redirect; if it
     doesn't, every real callback will be rejected as a state mismatch.
     """
     outcome: dict[str, str] = {}
+    outcome_lock = threading.Lock()
+    outcome_ready = threading.Event()
 
     class _Handler(http.server.BaseHTTPRequestHandler):
-        # A connection that opens and sends nothing - browsers do this for speculative
-        # preconnects - would otherwise block handle_request() forever, since the base class
-        # leaves this as None. Dropping it after a few seconds lets the loop move on to the
-        # next connection while the overall timeout_secs deadline is still tracked below.
+        # A connection that opens and sends nothing, or trickles bytes in slowly - browsers do
+        # the former for speculative preconnects - would otherwise block its handler thread
+        # forever, since the base class leaves this as None. Each connection now has its own
+        # thread, so this only ends that one thread; it never affects the deadline below.
         timeout = 5
 
         def do_GET(self) -> None:
@@ -221,20 +234,29 @@ def wait_for_authorization_code(
                 self.end_headers()
                 return
             params = urllib.parse.parse_qs(parsed.query)
-            if params.get("state", [None])[0] != state:
+            request_state = params.get("state", [""])[0]
+            if not secrets.compare_digest(request_state, state):
                 self.send_response(400)
                 self.end_headers()
                 return
             if "code" in params:
-                outcome["code"] = params["code"][0]
                 self._respond("Authorization received. You can close this tab.")
+                self._record(code=params["code"][0])
             elif "error" in params:
                 error = _sanitize_for_terminal(params["error"][0])
-                outcome["error"] = error
                 self._respond(f"Authorization failed: {html.escape(error)}")
+                self._record(error=error)
             else:
                 self.send_response(400)
                 self.end_headers()
+
+        def _record(self, **result: str) -> None:
+            # The first valid result wins; a later or concurrent connection must not overwrite
+            # it, so the caller's return value can't be raced.
+            with outcome_lock:
+                if not outcome:
+                    outcome.update(result)
+                    outcome_ready.set()
 
         def _respond(self, message: str) -> None:
             body = f"<html><body>{message}</body></html>".encode()
@@ -248,18 +270,26 @@ def wait_for_authorization_code(
             pass  # the default access log would echo the redirect's query string
 
     server = _CallbackServer((host, port), _Handler)
+    # A short poll_interval keeps shutdown() (and so the deadline below) precise; the default
+    # 0.5s would otherwise let a pending accept-loop iteration add up to half a second of its
+    # own on top of timeout_secs.
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.1},
+        daemon=True,
+    )
     try:
+        server_thread.start()
         if on_listening is not None:
             on_listening()
         deadline = time.monotonic() + timeout_secs
-        while "code" not in outcome and "error" not in outcome:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"no authorization redirect received within {timeout_secs:g}s")
-            server.timeout = remaining
-            server.handle_request()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not outcome_ready.wait(remaining):
+            raise TimeoutError(f"no authorization redirect received within {timeout_secs:g}s")
     finally:
+        server.shutdown()
         server.server_close()
+        server_thread.join(timeout=5)
 
     if "error" in outcome:
         raise AuthorizationError(outcome["error"])
