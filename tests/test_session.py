@@ -36,7 +36,11 @@ def _authenticating_server() -> FakeCTraderServer:
     return server
 
 
-def _session(server: FakeCTraderServer, **kwargs) -> CTraderSession:
+def _session(
+    server: FakeCTraderServer,
+    logger: Logger | RecordingLogger | None = None,
+    **kwargs,
+) -> CTraderSession:
     return CTraderSession(
         host=server.host,
         port=server.port,
@@ -44,7 +48,7 @@ def _session(server: FakeCTraderServer, **kwargs) -> CTraderSession:
         client_secret="client-secret",
         account_id=ACCOUNT_ID,
         access_token="access-token",
-        logger=Logger("test"),
+        logger=Logger("test") if logger is None else logger,
         tls=False,
         **kwargs,
     )
@@ -358,7 +362,8 @@ async def test_a_protocol_error_during_a_restore_is_a_bring_up_failure() -> None
     # socket ready and reconnect immediately.
     server = _authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=0.5)
+    logger = RecordingLogger()
+    session = _session(server, logger=logger, backoff_base_secs=0.5)
     attempts: list[int] = []
 
     async def restore() -> None:
@@ -372,12 +377,15 @@ async def test_a_protocol_error_during_a_restore_is_a_bring_up_failure() -> None
                 oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1]),
             ),
         )
-        await wait_until(
-            lambda: any(isinstance(m, oa.ProtoOASubscribeSpotsReq) for m in server.received),
-            description="restore request reaching the server",
-        )
-        await server.push_raw(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
-        await pending
+        try:
+            await wait_until(
+                lambda: any(isinstance(m, oa.ProtoOASubscribeSpotsReq) for m in server.received),
+                description="restore request reaching the server",
+            )
+            await server.push_raw(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
+            await pending
+        finally:
+            pending.cancel()
 
     try:
         session.add_restore("corrupted", restore)
@@ -390,6 +398,8 @@ async def test_a_protocol_error_during_a_restore_is_a_bring_up_failure() -> None
         assert loop.time() - started >= 0.4
         assert server.connection_count >= 2
         assert len(attempts) == 2
+        # The loss is the cause, and the connection has already logged it.
+        assert not any("Restore" in line for line in logger.errors())
     finally:
         await session.stop()
         await server.stop()
@@ -499,12 +509,15 @@ async def test_a_bring_up_failure_chains_the_real_disconnect_reason() -> None:
                 oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1]),
             ),
         )
-        await wait_until(
-            lambda: any(isinstance(m, oa.ProtoOASubscribeSpotsReq) for m in server.received),
-            description="restore request reaching the server",
-        )
-        await server.push_raw(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
-        await pending
+        try:
+            await wait_until(
+                lambda: any(isinstance(m, oa.ProtoOASubscribeSpotsReq) for m in server.received),
+                description="restore request reaching the server",
+            )
+            await server.push_raw(struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1))
+            await pending
+        finally:
+            pending.cancel()
 
     try:
         session.add_restore("corrupted", restore)
@@ -586,3 +599,130 @@ async def test_connect_timeout_secs_is_forwarded_to_the_connection() -> None:
         await session.stop()
         server.close()
         await server.wait_closed()
+
+
+async def test_failed_restores_reports_the_keys_that_failed_in_the_last_bring_up() -> None:
+    server = _authenticating_server()
+    replies = iter([oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone")])
+    server.on(
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda _r: next(replies, oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID)),
+    )
+    await server.start()
+    session = _session(server, backoff_base_secs=0.05)
+
+    async def subscribe() -> None:
+        await session.request(
+            oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1]),
+        )
+
+    async def succeed() -> None:
+        pass
+
+    try:
+        assert session.failed_restores == frozenset()
+        session.add_restore(("spots", 1), subscribe)
+        session.add_restore("ok", succeed)
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        assert session.failed_restores == frozenset({("spots", 1)})
+
+        await server.drop_connections()
+        await wait_until(lambda: server.connection_count >= 2)
+        await session.wait_ready(timeout_secs=3.0)
+        assert session.failed_restores == frozenset()
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_loss_after_the_last_restore_fails_the_bring_up() -> None:
+    # The restore's own request succeeded, so only the loss check after the loop stands between
+    # this bring-up and a session marked ready on a dead socket.
+    server = _authenticating_server()
+    server.on(
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(server, logger=logger, backoff_base_secs=0.05)
+    attempts: list[int] = []
+
+    async def subscribe_then_lose() -> None:
+        attempts.append(1)
+        await session.request(
+            oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1]),
+        )
+        if len(attempts) == 1:
+            await server.drop_connections()
+            await wait_until(session._lost.is_set, description="loss reaching the session")
+
+    try:
+        session.add_restore(("spots", 1), subscribe_then_lose)
+        await session.start()
+        await wait_until(lambda: server.connection_count >= 2, description="reconnect")
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert len(attempts) == 2
+        failures = [m for _level, m in logger.lines if "bring-up failed (attempt 1)" in m]
+        assert failures, f"bring-up failure was never logged; lines were {logger.lines}"
+        assert "lost during bring-up" in failures[0]
+        assert not any("soon after becoming ready" in m for _level, m in logger.lines)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_bring_up_failures_escalate_to_error_at_the_threshold() -> None:
+    server = FakeCTraderServer()
+    server.on(
+        oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
+        lambda _r: oa.ProtoOAErrorRes(errorCode="INVALID_REQUEST"),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(server, logger=logger, backoff_base_secs=0.05, failure_threshold=2)
+    try:
+        await session.start()
+        await wait_until(lambda: bool(logger.errors()), description="an ERROR line")
+
+        failures = [(level, m) for level, m in logger.lines if "bring-up failed" in m]
+        assert failures[0][0] == "warning"
+        assert "(attempt 1)" in failures[0][1]
+        assert failures[1][0] == "error"
+        assert "(attempt 2)" in failures[1][1]
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_stop_during_bring_up_returns_promptly() -> None:
+    # No handler: the application auth request is never answered.
+    server = FakeCTraderServer()
+    await server.start()
+    session = _session(server, request_timeout_secs=30.0)
+    try:
+        await session.start()
+        await wait_until(
+            lambda: session.state is SessionState.AUTHENTICATING and bool(server.received),
+            description="authentication in flight",
+        )
+
+        # Timed directly: `stop()` suppresses cancellation, which would hide a `wait_for` timeout.
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await session.stop()
+        assert loop.time() - started < 1.0
+
+        assert session.state is SessionState.STOPPED
+        owned = ("CTraderSession.", "CTraderConnection.")
+        leftovers = [
+            task
+            for task in asyncio.all_tasks()
+            if not task.done() and task.get_coro().__qualname__.startswith(owned)
+        ]
+        assert leftovers == []
+    finally:
+        await session.stop()
+        await server.stop()

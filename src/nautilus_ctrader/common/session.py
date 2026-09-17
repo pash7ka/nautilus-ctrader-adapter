@@ -80,8 +80,6 @@ class CTraderSession:
         backoff_max_secs: float = BACKOFF_MAX_SECS,
         failure_threshold: int = RECONNECT_FAILURE_THRESHOLD,
     ) -> None:
-        self._host = host
-        self._port = port
         self._client_id = client_id
         self._client_secret = client_secret
         self._account_id = account_id
@@ -121,6 +119,7 @@ class CTraderSession:
 
         self._state = SessionState.STOPPED
         self._restores: dict[Hashable, Callable[[], Awaitable[None]]] = {}
+        self._failed_restores: set[Hashable] = set()
         self._event_handler: Callable[[Message], None] | None = None
         self._ready = asyncio.Event()
         self._lost = asyncio.Event()
@@ -140,6 +139,11 @@ class CTraderSession:
     @property
     def is_ready(self) -> bool:
         return self._state is SessionState.READY
+
+    @property
+    def failed_restores(self) -> frozenset[Hashable]:
+        """Keys whose restore failed in the most recent bring-up."""
+        return frozenset(self._failed_restores)
 
     def set_event_handler(self, handler: Callable[[Message], None]) -> None:
         self._event_handler = handler
@@ -188,8 +192,9 @@ class CTraderSession:
     ) -> Message:
         """Issue a request, failing fast when the session is not ready.
 
-        Subscriptions survive a reconnect through the restore registry, so anything else is
-        better refused than silently delayed.
+        Also accepted while `RESTORING`, since restore actions issue their requests through
+        here. Subscriptions survive a reconnect through the restore registry, so anything else
+        is better refused than silently delayed.
         """
         if self._state not in (SessionState.READY, SessionState.RESTORING):
             raise CTraderConnectionError(f"session not ready (state={self._state.name})")
@@ -251,6 +256,7 @@ class CTraderSession:
         self._lost.clear()
         self._loss_cause = None
         self._ready.clear()
+        self._failed_restores.clear()
         self._state = SessionState.CONNECTING
         await self._connection.connect()
 
@@ -267,10 +273,13 @@ class CTraderSession:
                 # The connection itself is gone: a bring-up failure, not a bad restore.
                 raise
             except Exception as e:
+                # A loss can surface as another error type; the connection has logged it.
+                self._raise_if_lost()
                 # One rejected restore must not keep the whole session down. It is logged, and
                 # the key stays registered so the next reconnect retries it.
                 detail = e.error_code if isinstance(e, CTraderRequestError) else repr(e)
                 self._log.error(f"Restore {key!r} failed: {detail}")
+                self._failed_restores.add(key)
 
         self._raise_if_lost()
 
@@ -431,11 +440,15 @@ class CTraderSession:
                 else:
                     self._log.error(f"Proactive token refresh failed: {e!r}")
                 continue
+            if self._lost.is_set():
+                # A real loss landed while the refresh completed; it keeps its backoff.
+                continue
             # Re-authenticate with the new token through the ordinary reconnect path, rather
             # than relying on the venue to end the old session.
             # TODO(verify): whether the venue also sends ProtoOAAccountsTokenInvalidatedEvent
             # after our own refresh; if it does, that costs one extra, harmless reconnect.
-            # _loss_cause stays None here: it was cleared by the bring-up that just completed.
+            # _loss_cause stays None: no loss has happened since the last bring-up cleared it,
+            # and this loop only refreshes while ready.
             self._reauth_requested = True
             self._lost.set()
 

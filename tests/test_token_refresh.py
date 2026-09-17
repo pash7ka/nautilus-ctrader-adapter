@@ -7,7 +7,7 @@ import time
 import pytest
 from nautilus_trader.common.component import Logger
 
-from nautilus_ctrader.common.errors import CTraderAuthError
+from nautilus_ctrader.common.errors import CTraderAuthError, CTraderConnectionError
 from nautilus_ctrader.common.session import CTraderSession, SessionState
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -546,6 +546,48 @@ async def test_a_proactive_reauth_is_not_treated_as_a_failed_session() -> None:
         assert elapsed < 2.0, f"re-authentication took {elapsed:.2f}s, a backoff appears to apply"
         assert not any("soon after becoming ready" in message for _level, message in logger.lines)
         assert ("info", "Re-authenticating with the refreshed token") in logger.lines
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_loss_during_a_proactive_refresh_keeps_its_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A real loss that lands while the refresh completes is a failure, not a deliberate
+    # re-authentication, and must not be counted as recovery.
+    server = _server()
+    await server.start()
+    logger = RecordingLogger()
+    session = CTraderSession(
+        host=server.host,
+        port=server.port,
+        client_id="client-id",
+        client_secret="client-secret",
+        account_id=ACCOUNT_ID,
+        access_token="old-access",
+        refresh_token="old-refresh",
+        expires_at_secs=time.time() + 1.0,
+        logger=logger,
+        tls=False,
+        backoff_base_secs=0.05,
+    )
+    original_refresh = CTraderSession.refresh_tokens
+
+    async def refresh_then_lose(self: CTraderSession) -> None:
+        await original_refresh(self)
+        # No await before the refresh loop's next line, so the ordering is fixed.
+        self._on_disconnect(CTraderConnectionError("lost while refreshing"))
+
+    monkeypatch.setattr(CTraderSession, "refresh_tokens", refresh_then_lose)
+    try:
+        await session.start()
+        await wait_until(
+            lambda: any("soon after becoming ready" in m for _level, m in logger.lines),
+            description="the loss taking the backoff path",
+        )
+
+        assert ("info", "Re-authenticating with the refreshed token") not in logger.lines
     finally:
         await session.stop()
         await server.stop()
