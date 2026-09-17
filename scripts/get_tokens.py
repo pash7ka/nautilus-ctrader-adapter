@@ -44,10 +44,6 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 AUTHORIZATION_URL = "https://openapi.ctrader.com/apps/auth"
 TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 
-# Overridable only by tests, to point the account-listing step at a local fake server instead
-# of a real venue. Never exposed on the command line: production use always wants TLS.
-PROTOBUF_TLS: bool | ssl.SSLContext = True
-
 CLIENT_ID_KEY = "CTRADER_CLIENT_ID"
 CLIENT_SECRET_KEY = "CTRADER_CLIENT_SECRET"
 ACCESS_TOKEN_KEY = "CTRADER_ACCESS_TOKEN"
@@ -565,7 +561,6 @@ def main(argv: list[str] | None = None) -> int:
                 client_secret,
                 host=account_host,
                 port=PROTOBUF_PORT,
-                tls=PROTOBUF_TLS,
                 logger=_PrintLogger(),
             ),
         )

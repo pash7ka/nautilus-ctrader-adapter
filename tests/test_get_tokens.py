@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import http.server
 import importlib.util
 import json
@@ -786,6 +787,73 @@ def test_main_refuses_a_non_loopback_redirect_uri(tmp_path: Path) -> None:
     assert rc == 2
 
 
+def test_main_exits_2_on_missing_keys(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("CTRADER_CLIENT_ID=cid\n", encoding="utf-8")
+
+    rc = get_tokens.main(["--env-file", str(env_file)])
+
+    assert rc == 2
+
+
+async def test_main_reports_an_authorization_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "CTRADER_CLIENT_ID=cid\nCTRADER_CLIENT_SECRET=csecret\n",
+        encoding="utf-8",
+    )
+
+    redirect_port = _free_port()
+    redirect_uri = f"http://127.0.0.1:{redirect_port}/callback"
+
+    def fake_open(url: str) -> bool:
+        state = _state_from_authorization_url(url)
+        threading.Thread(
+            target=_get,
+            args=(f"{redirect_uri}?error=access_denied&state={state}",),
+        ).start()
+        return True
+
+    monkeypatch.setattr(get_tokens.webbrowser, "open", fake_open)
+
+    rc = await asyncio.to_thread(
+        get_tokens.main,
+        ["--env-file", str(env_file), "--redirect-uri", redirect_uri, "--timeout-secs", "5"],
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "access_denied" in output
+    assert "Traceback" not in output
+
+
+def test_print_accounts_warns_on_a_live_demo_mismatch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = get_tokens.AccountsResult(
+        permission_scope=oa_model.SCOPE_TRADE,
+        accounts=[
+            get_tokens.AccountRecord(
+                ctid_trader_account_id=1,
+                is_live=True,
+                trader_login=None,
+                broker_title_short=None,
+            ),
+        ],
+    )
+
+    get_tokens._print_accounts(result, live=False)
+
+    captured = capsys.readouterr()
+    assert "warning" in captured.err.lower()
+    assert "1" in captured.err
+
+
 # --------------------------------------------------------------------------------------
 # main() end to end
 # --------------------------------------------------------------------------------------
@@ -895,7 +963,14 @@ async def test_main_writes_tokens_and_never_prints_secrets(
     await fake_server.start()
     monkeypatch.setattr(get_tokens, "DEMO_HOST", fake_server.host)
     monkeypatch.setattr(get_tokens, "PROTOBUF_PORT", fake_server.port)
-    monkeypatch.setattr(get_tokens, "PROTOBUF_TLS", False)
+    # main() calls list_accounts() without a tls argument, so its True default applies; the
+    # fake server speaks plaintext, so the plaintext switch is bound here instead, kept out
+    # of the script itself.
+    monkeypatch.setattr(
+        get_tokens,
+        "list_accounts",
+        functools.partial(get_tokens.list_accounts, tls=False),
+    )
 
     # The redirect: webbrowser.open is patched to perform the request itself, as if a real
     # browser had followed it and cTrader had redirected back with a code.
