@@ -26,6 +26,8 @@ from tests.recording_logger import RecordingLogger
 
 EURUSD = 1
 GBPUSD = 2
+# Pushed last to prove every earlier spot has been dispatched.
+BARRIER = 41
 M15 = oa_model.M15
 
 _SUBSCRIPTION_TYPES = (
@@ -80,6 +82,15 @@ def _spot(symbol_id: int) -> oa.ProtoOASpotEvent:
     event = for_account(RECORDED["spot_events"][0], 1)
     event.symbolId = symbol_id
     return event
+
+
+async def _pass_barrier(server: FakeCTraderServer, client: CTraderAccountClient) -> None:
+    """Return once a spot pushed now is delivered, so every spot pushed before it is too."""
+    arrived = []
+    client.subscriptions.add_spot_listener(BARRIER, arrived.append)
+    await server.push(_spot(BARRIER))
+    await wait_until(lambda: arrived, description="barrier spot delivered")
+    client.subscriptions.remove_spot_listener(BARRIER, arrived.append)
 
 
 @pytest.fixture
@@ -409,6 +420,7 @@ async def test_an_unknown_trendbar_outcome_is_recorded_and_cleaned_up_by_unsubsc
                 await subscribing
         else:
             await subscribing
+        assert ("trendbar", EURUSD, M15) in client.session.failed_restores
 
         await registry.unsubscribe_trendbars(EURUSD, M15, "bars")
 
@@ -419,6 +431,61 @@ async def test_an_unknown_trendbar_outcome_is_recorded_and_cleaned_up_by_unsubsc
         assert client.session.failed_restores == frozenset()
     finally:
         await client.disconnect()
+
+
+async def test_a_timed_out_subscribe_is_retried_by_the_restore_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    server: FakeCTraderServer,
+    logger: RecordingLogger,
+) -> None:
+    monkeypatch.setattr(
+        account_module,
+        "CTraderSession",
+        functools.partial(account_module.CTraderSession, request_timeout_secs=0.2),
+    )
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ,
+        lambda r: oa.ProtoOASubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+    )
+    client = account_client(server, logger=logger)
+    await client.connect()
+    try:
+        await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars")
+        assert client.session.failed_restores == frozenset({("trendbar", EURUSD, M15)})
+
+        await held.stop_holding()
+        await client.session.retry_failed_restores()
+
+        assert client.session.failed_restores == frozenset()
+        assert len(received(server, oa.ProtoOASubscribeLiveTrendbarReq)) == 2
+    finally:
+        await client.disconnect()
+
+
+async def test_a_cancelled_spots_leg_is_released_by_unsubscribe_trendbars(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+    )
+    registry = client.subscriptions
+    subscribing = asyncio.create_task(registry.subscribe_trendbars(EURUSD, M15, "bars"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    subscribing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await subscribing
+
+    await registry.unsubscribe_trendbars(EURUSD, M15, "bars")
+
+    assert registry.consumers(EURUSD) == frozenset()
+    assert client.session.failed_restores == frozenset()
+    sent = _subscriptions(server)
+    assert ("ProtoOASubscribeLiveTrendbarReq", (EURUSD,), M15) not in sent
+    assert sent[-1] == ("ProtoOAUnsubscribeSpotsReq", (EURUSD,))
 
 
 async def test_a_loss_surfacing_as_another_error_records_the_intent(
@@ -498,7 +565,7 @@ async def test_a_refused_restore_is_reported_and_the_others_still_work(
     assert client.session.failed_restores == frozenset({("trendbar", EURUSD, M15)})
     await server.push(_spot(GBPUSD))
     await wait_until(lambda: len(spots) == 1, description="spot delivered after reconnect")
-    await asyncio.sleep(0.05)
+    await _pass_barrier(server, client)
     assert len(spots) == 1
 
 
@@ -542,7 +609,7 @@ async def test_live_keys_survive_a_disconnect_and_connect(
     client.subscriptions.add_spot_listener(EURUSD, spots.append)
     await server.push(_spot(EURUSD))
     await wait_until(lambda: len(spots) == 1, description="spot delivered on the new session")
-    await asyncio.sleep(0.05)
+    await _pass_barrier(server, client)
     assert len(spots) == 1
 
 
@@ -559,7 +626,7 @@ async def test_spots_reach_only_their_symbol_listener(
 
     await server.push(_spot(EURUSD))
     await wait_until(lambda: len(eurusd) == 1, description="spot delivered")
-    await asyncio.sleep(0.05)
+    await _pass_barrier(server, client)
     assert len(eurusd) == 1
 
     assert eurusd[0].symbolId == EURUSD

@@ -178,6 +178,15 @@ class CTraderSession:
         self._restores.pop(key, None)
         self._failed_restores.discard(key)
 
+    def mark_restore_failed(self, key: Hashable) -> None:
+        """Queue a registered restore for `retry_failed_restores`, as if it had failed.
+
+        For an action whose outcome is unknown while the session stays up, which the next
+        bring-up would otherwise be the first to repeat. An unregistered key is ignored.
+        """
+        if key in self._restores:
+            self._failed_restores.add(key)
+
     async def wait_ready(self, timeout_secs: float | None = None) -> None:
         await asyncio.wait_for(self._ready.wait(), timeout_secs)
 

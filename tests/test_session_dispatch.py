@@ -495,3 +495,31 @@ async def test_a_retry_spanning_a_reconnect_does_not_clear_a_newly_failed_key() 
     finally:
         await session.stop()
         await server.stop()
+
+
+async def test_mark_restore_failed_marks_only_a_registered_key() -> None:
+    server = _authenticating_server()
+    await server.start()
+    session = _session(server)
+    runs = []
+
+    async def restore() -> None:
+        runs.append("k")
+
+    try:
+        session.add_restore("k", restore)
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        runs.clear()
+
+        session.mark_restore_failed("k")
+        session.mark_restore_failed("unregistered")
+        assert session.failed_restores == frozenset({"k"})
+
+        await session.retry_failed_restores()
+
+        assert runs == ["k"]
+        assert session.failed_restores == frozenset()
+    finally:
+        await session.stop()
+        await server.stop()

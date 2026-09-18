@@ -94,11 +94,17 @@ class SubscriptionRegistry:
             session.remove_event_handler(oa.ProtoOASpotEvent, self._on_spot)
 
     async def subscribe_spots(self, symbol_id: int, consumer: str) -> None:
+        """Hold `symbol_id`'s spot subscription for `consumer`.
+
+        Raises `CTraderRequestError` only if the venue refuses it. A cancelled or timed-out
+        call is still recorded, so the caller must still call `unsubscribe_spots`.
+        """
         key = _spots_key(symbol_id)
         async with self._lock(key):
             await self._acquire(key, consumer)
 
     async def unsubscribe_spots(self, symbol_id: int, consumer: str) -> None:
+        """Release `consumer`'s spot reference; idempotent, so a cancelled call can be repeated."""
         key = _spots_key(symbol_id)
         async with self._lock(key):
             await self._release(key, consumer)
@@ -106,9 +112,9 @@ class SubscriptionRegistry:
     async def subscribe_trendbars(self, symbol_id: int, period: int, consumer: str) -> None:
         """Subscribe live trendbars, holding the spot subscription the venue requires for them.
 
-        If the venue refuses the trendbar, the spot reference is released again. Any other
-        failure (cancellation, timeout, connection loss) leaves the outcome unknown: both
-        references are kept as an intent, which `unsubscribe_trendbars` releases as usual.
+        Raises `CTraderRequestError` only if the venue refuses it, and then releases the spot
+        reference again. A cancelled or timed-out call is still recorded, possibly only its
+        spots leg, so the caller must still call `unsubscribe_trendbars`.
         """
         key = _trendbar_key(symbol_id, period)
         spots = _spots_key(symbol_id)
@@ -126,11 +132,14 @@ class SubscriptionRegistry:
                 raise
 
     async def unsubscribe_trendbars(self, symbol_id: int, period: int, consumer: str) -> None:
+        """Release both of `consumer`'s references; idempotent, so a cancelled call can be repeated.
+
+        The spot reference is released even without a trendbar reference, which a cancelled
+        `subscribe_trendbars` leaves behind when cut short in its spots leg.
+        """
         key = _trendbar_key(symbol_id, period)
         spots = _spots_key(symbol_id)
         async with self._lock(key):
-            if consumer not in self._consumers.get(key, ()):
-                return
             try:
                 # Trendbar first: the venue requires the spot subscription while it is live.
                 await self._release(key, consumer)
@@ -182,17 +191,26 @@ class SubscriptionRegistry:
         except CTraderRequestError:
             raise
         except (CTraderConnectionError, CTraderTimeoutError):
-            pass
+            self._record_unknown(session, key, consumer)
         except CTraderError:
             # A loss can surface as another error type.
             if self._accepting_session() is session:
                 raise
+            self._record_unknown(session, key, consumer)
         except asyncio.CancelledError:
-            self._record(key, consumer)
+            self._record_unknown(session, key, consumer)
             raise
-        # Recorded against whichever session is attached now: if that is no longer the one the
-        # request went through, its next bring-up restores the key.
+        else:
+            # Recorded against whichever session is attached now: if that is no longer the one
+            # the request went through, its next bring-up restores the key.
+            self._record(key, consumer)
+
+    def _record_unknown(self, session: CTraderSession, key: _Key, consumer: str) -> None:
         self._record(key, consumer)
+        # A session that stays up would not repeat the restore before its next bring-up; the
+        # account's retry loop runs it instead, and ALREADY_SUBSCRIBED keeps that idempotent.
+        if self._accepting_session() is session:
+            session.mark_restore_failed(key)
 
     def _record(self, key: _Key, consumer: str) -> None:
         # No await in here, so a bring-up either sees both the reference and its restore or
