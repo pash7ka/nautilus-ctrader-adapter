@@ -28,6 +28,7 @@ from nautilus_ctrader.common.errors import (
     CTraderTimeoutError,
 )
 from nautilus_ctrader.common.session import CTraderSession
+from nautilus_ctrader.common.subscriptions import SubscriptionRegistry
 from nautilus_ctrader.constants import (
     DEMO_HOST,
     LIVE_HOST,
@@ -99,6 +100,8 @@ class CTraderAccountClient:
         # Serialises `connect()` and `disconnect()`, so at most one session is ever brought up.
         self._lifecycle_lock = asyncio.Lock()
         self._retry_task: asyncio.Task | None = None
+        # Outlives sessions, so live subscriptions are restored on every later `connect()`.
+        self.subscriptions = SubscriptionRegistry(self, logger)
 
         self._deposit_asset: om.ProtoOAAsset | None = None
         self._money_digits: int | None = None
@@ -201,6 +204,8 @@ class CTraderAccountClient:
             async with deadline:
                 host = await self._resolve_host()
                 session = self._build_session(host)
+                # Before `start()`, so the first bring-up already restores live subscriptions.
+                self.subscriptions.attach(session)
                 self.session = session
                 await session.start()
                 await self._wait_ready(session)
@@ -209,6 +214,7 @@ class CTraderAccountClient:
         except BaseException as e:
             self.session = None
             if session is not None:
+                self.subscriptions.detach()
                 await session.stop()
             if isinstance(e, TimeoutError) and deadline.expired():
                 cause = session.last_error if session is not None else None
@@ -220,6 +226,7 @@ class CTraderAccountClient:
         self._log.info("Account session ready")
 
     async def _stop(self, session: CTraderSession | None) -> None:
+        self.subscriptions.detach()
         retry_task, self._retry_task = self._retry_task, None
         if retry_task is not None:
             retry_task.cancel()
