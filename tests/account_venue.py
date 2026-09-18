@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections.abc import Callable
 
 from google.protobuf.message import Message
 
@@ -113,3 +115,56 @@ def account_client(
 
 def received(server: FakeCTraderServer, cls: type[Message]) -> list[Message]:
     return [m for m in server.received if isinstance(m, cls)]
+
+
+class HeldReplies:
+    """Leaves requests of one payload type unanswered until `release()`, holding the caller open.
+
+    The first `answer_first` requests are answered at once; after `stop_holding()` every
+    request is.
+    """
+
+    def __init__(
+        self,
+        server: FakeCTraderServer,
+        payload_type: int,
+        reply: Callable[[Message], Message],
+        *,
+        answer_first: int = 0,
+    ) -> None:
+        self._server = server
+        self._reply = reply
+        self._answer_first = answer_first
+        self._holding = True
+        self.pending: list[tuple[str, Message]] = []
+        self.arrived = asyncio.Event()
+        server.on(payload_type, self._handle)
+
+    def _handle(self, request: Message) -> Message | None:
+        if not self._holding:
+            return self._reply(request)
+        if self._answer_first > 0:
+            self._answer_first -= 1
+            return self._reply(request)
+        self.pending.append((self._server.received_client_msg_ids[-1], request))
+        self.arrived.set()
+        return None
+
+    async def release(self) -> None:
+        pending, self.pending = self.pending, []
+        self.arrived.clear()
+        for client_msg_id, request in pending:
+            await self._server.push(self._reply(request), client_msg_id=client_msg_id)
+
+    async def stop_holding(self) -> None:
+        self._holding = False
+        await self.release()
+
+
+def hold_account_auth(server: FakeCTraderServer, **kwargs) -> HeldReplies:
+    return HeldReplies(
+        server,
+        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
+        lambda r: oa.ProtoOAAccountAuthRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        **kwargs,
+    )

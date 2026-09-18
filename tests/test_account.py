@@ -18,21 +18,24 @@ from nautilus_ctrader.common.errors import (
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
-from tests.account_venue import ACCOUNT_ID, RECORDED
-from tests.account_venue import account_client as _client
-from tests.account_venue import account_list as _account_list
-from tests.account_venue import credentials as _credentials
-from tests.account_venue import received as _received
-from tests.account_venue import venue as _venue
-from tests.fake_server import FakeCTraderServer
+from tests.account_venue import (
+    ACCOUNT_ID,
+    RECORDED,
+    account_client,
+    account_list,
+    credentials,
+    hold_account_auth,
+    received,
+    venue,
+)
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
 
 async def test_auto_connects_to_the_listed_account_and_closes_the_pre_connection() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         await client.connect()
 
@@ -41,7 +44,7 @@ async def test_auto_connects_to_the_listed_account_and_closes_the_pre_connection
         assert isinstance(response, oa.ProtoOATraderRes)
         assert server.connection_count == 2
         await wait_until(lambda: server.open_connection_count == 1, description="pre-conn closed")
-        assert _received(server, oa.ProtoOAGetAccountListByAccessTokenReq)[0].accessToken == (
+        assert received(server, oa.ProtoOAGetAccountListByAccessTokenReq)[0].accessToken == (
             "access-token"
         )
     finally:
@@ -58,7 +61,7 @@ async def test_auto_picks_the_host_from_the_is_live_flag(
     hosts = []
     real_session = account_module.CTraderSession
 
-    server = _venue(is_live=is_live)
+    server = venue(is_live=is_live)
 
     # The live name does not resolve; the session is pointed back at the one fake server.
     def recording_session(**kwargs):
@@ -69,7 +72,7 @@ async def test_auto_picks_the_host_from_the_is_live_flag(
     await server.start()
     client = CTraderAccountClient(
         account_id=ACCOUNT_ID,
-        credentials=_credentials(),
+        credentials=credentials(),
         environment="auto",
         logger=RecordingLogger(),
         demo_host=server.host,
@@ -87,9 +90,9 @@ async def test_auto_picks_the_host_from_the_is_live_flag(
 
 
 async def test_auto_rejects_an_account_the_token_does_not_grant() -> None:
-    server = _venue(listed=False)
+    server = venue(listed=False)
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         with pytest.raises(CTraderAuthError, match="account not granted to this token") as info:
             await client.connect()
@@ -103,16 +106,16 @@ async def test_auto_rejects_an_account_the_token_does_not_grant() -> None:
 
 
 async def test_auto_refreshes_a_rejected_token_once_and_notifies_listeners() -> None:
-    server = _venue()
+    server = venue()
     calls = []
 
-    def account_list(request: oa.ProtoOAGetAccountListByAccessTokenReq) -> Message:
+    def list_accounts(request: oa.ProtoOAGetAccountListByAccessTokenReq) -> Message:
         calls.append(request.accessToken)
         if request.accessToken == "access-token":
             return oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID")
-        return _account_list(is_live=True)
+        return account_list(is_live=True)
 
-    server.on(oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, account_list)
+    server.on(oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, list_accounts)
     server.on(
         oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
         lambda _r: oa.ProtoOARefreshTokenRes(
@@ -123,7 +126,7 @@ async def test_auto_refreshes_a_rejected_token_once_and_notifies_listeners() -> 
         ),
     )
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     notified = []
     client.add_token_listener(lambda a, r, e: notified.append((a, r, e)))
     try:
@@ -131,7 +134,7 @@ async def test_auto_refreshes_a_rejected_token_once_and_notifies_listeners() -> 
         await client.connect()
 
         assert calls == ["access-token", "new-access"]
-        assert [r.refreshToken for r in _received(server, oa.ProtoOARefreshTokenReq)] == [
+        assert [r.refreshToken for r in received(server, oa.ProtoOARefreshTokenReq)] == [
             "refresh-token",
         ]
         assert len(notified) == 1
@@ -139,37 +142,37 @@ async def test_auto_refreshes_a_rejected_token_once_and_notifies_listeners() -> 
         assert (access, refresh) == ("new-access", "new-refresh")
         assert before + 3600 <= expires_at <= time.time() + 3600
         # The session is built with the refreshed token.
-        assert _received(server, oa.ProtoOAAccountAuthReq)[0].accessToken == "new-access"
+        assert received(server, oa.ProtoOAAccountAuthReq)[0].accessToken == "new-access"
     finally:
         await client.disconnect()
         await server.stop()
 
 
 async def test_auto_without_a_refresh_token_fails_on_a_rejected_token() -> None:
-    server = _venue()
+    server = venue()
     server.on(
         oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
         lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID"),
     )
     await server.start()
-    client = _client(server, credentials=_credentials(refresh_token=None))
+    client = account_client(server, credentials=credentials(refresh_token=None))
     try:
         with pytest.raises(CTraderAuthError, match="no refresh token"):
             await client.connect()
-        assert not _received(server, oa.ProtoOARefreshTokenReq)
+        assert not received(server, oa.ProtoOARefreshTokenReq)
     finally:
         await server.stop()
 
 
 @pytest.mark.parametrize("environment", ["auto", "demo"])
 async def test_wrong_client_secret_fails_fast(environment: str) -> None:
-    server = _venue()
+    server = venue()
     server.on(
         oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
         lambda _r: oa.ProtoOAErrorRes(errorCode="CH_CLIENT_AUTH_FAILURE"),
     )
     await server.start()
-    client = _client(server, environment=environment, connect_timeout_secs=30.0)
+    client = account_client(server, environment=environment, connect_timeout_secs=30.0)
     try:
         started = time.monotonic()
         with pytest.raises(CTraderAuthError, match="CH_CLIENT_AUTH_FAILURE"):
@@ -182,30 +185,30 @@ async def test_wrong_client_secret_fails_fast(environment: str) -> None:
 
 
 async def test_explicit_environment_that_cannot_route_names_the_problem() -> None:
-    server = _venue()
+    server = venue()
     server.on(
         oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
         lambda _r: oa.ProtoOAErrorRes(errorCode="CANT_ROUTE_REQUEST"),
     )
     await server.start()
-    client = _client(server, environment="live", connect_timeout_secs=30.0)
+    client = account_client(server, environment="live", connect_timeout_secs=30.0)
     try:
         started = time.monotonic()
         with pytest.raises(CTraderAuthError, match="use 'auto'") as info:
             await client.connect()
         assert time.monotonic() - started < 2.0
         assert str(ACCOUNT_ID) not in str(info.value)
-        assert not _received(server, oa.ProtoOAGetAccountListByAccessTokenReq)
+        assert not received(server, oa.ProtoOAGetAccountListByAccessTokenReq)
         await wait_until(lambda: server.open_connection_count == 0, description="all closed")
     finally:
         await server.stop()
 
 
 async def test_a_session_that_never_becomes_ready_times_out() -> None:
-    server = _venue()
+    server = venue()
     server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, lambda _r: None)
     await server.start()
-    client = _client(server, environment="demo", connect_timeout_secs=0.6)
+    client = account_client(server, environment="demo", connect_timeout_secs=0.6)
     try:
         with pytest.raises(CTraderTimeoutError):
             await client.connect()
@@ -216,10 +219,10 @@ async def test_a_session_that_never_becomes_ready_times_out() -> None:
 
 
 async def test_missing_token_expiry_logs_a_warning() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
     logger = RecordingLogger()
-    client = _client(server, logger=logger, credentials=_credentials(token_expires_at=None))
+    client = account_client(server, logger=logger, credentials=credentials(token_expires_at=None))
     try:
         await client.connect()
 
@@ -233,10 +236,10 @@ async def test_missing_token_expiry_logs_a_warning() -> None:
 
 
 async def test_account_details_never_reach_the_log() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
     logger = RecordingLogger()
-    client = _client(server, logger=logger)
+    client = account_client(server, logger=logger)
     try:
         await client.connect()
     finally:
@@ -252,9 +255,9 @@ async def test_account_details_never_reach_the_log() -> None:
 
 
 async def test_reference_data_is_loaded_on_connect() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         await client.connect()
 
@@ -264,22 +267,22 @@ async def test_reference_data_is_loaded_on_connect() -> None:
         assert client.light_symbols["EURUSD"].symbolId == 1
         chain = await client.conversion_chain(5, 15)
         assert [s.symbolName for s in chain] == ["EURUSD"]
-        assert _received(server, oa.ProtoOASymbolsForConversionReq)[0].firstAssetId == 5
+        assert received(server, oa.ProtoOASymbolsForConversionReq)[0].firstAssetId == 5
     finally:
         await client.disconnect()
         await server.stop()
 
 
 async def test_reference_data_is_not_refetched_by_a_second_user() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         await client.connect()
         await client.connect()
 
-        assert len(_received(server, oa.ProtoOATraderReq)) == 1
-        assert len(_received(server, oa.ProtoOASymbolsListReq)) == 1
+        assert len(received(server, oa.ProtoOATraderReq)) == 1
+        assert len(received(server, oa.ProtoOASymbolsListReq)) == 1
     finally:
         await client.disconnect()
         await client.disconnect()
@@ -288,31 +291,31 @@ async def test_reference_data_is_not_refetched_by_a_second_user() -> None:
 
 async def test_symbol_specs_are_batched_and_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(account_module, "SYMBOL_BY_ID_BATCH", 2)
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         await client.connect()
 
         specs = await client.symbol_specs([41, 275, 279, 1])
 
         assert sorted(specs) == [1, 41, 275, 279]
-        requests = _received(server, oa.ProtoOASymbolByIdReq)
+        requests = received(server, oa.ProtoOASymbolByIdReq)
         assert [list(r.symbolId) for r in requests] == [[41, 275], [279, 1]]
 
         again = await client.symbol_specs([1, 41])
 
         assert again == {1: specs[1], 41: specs[41]}
-        assert len(_received(server, oa.ProtoOASymbolByIdReq)) == 2
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == 2
     finally:
         await client.disconnect()
         await server.stop()
 
 
 async def test_request_before_connect_fails() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         with pytest.raises(CTraderConnectionError):
             await client.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
@@ -323,19 +326,19 @@ async def test_request_before_connect_fails() -> None:
 def test_cached_client_is_shared_per_account_and_application() -> None:
     first = get_cached_ctrader_account_client(
         account_id=ACCOUNT_ID,
-        credentials=_credentials(),
+        credentials=credentials(),
         environment="auto",
         logger=RecordingLogger(),
     )
     same = get_cached_ctrader_account_client(
         account_id=ACCOUNT_ID,
-        credentials=_credentials(access_token="other"),
+        credentials=credentials(access_token="other"),
         environment="live",
         logger=RecordingLogger(),
     )
     other_app = get_cached_ctrader_account_client(
         account_id=ACCOUNT_ID,
-        credentials=_credentials(client_id="other-client"),
+        credentials=credentials(client_id="other-client"),
         environment="auto",
         logger=RecordingLogger(),
     )
@@ -348,16 +351,16 @@ def test_unknown_environment_is_rejected() -> None:
     with pytest.raises(ValueError, match="environment"):
         CTraderAccountClient(
             account_id=ACCOUNT_ID,
-            credentials=_credentials(),
+            credentials=credentials(),
             environment="paper",
             logger=RecordingLogger(),
         )
 
 
 async def test_the_last_disconnect_closes_the_session() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         await client.connect()
         await client.connect()
@@ -378,14 +381,14 @@ async def test_the_last_disconnect_closes_the_session() -> None:
 
 
 async def test_concurrent_connects_share_one_attempt() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         await asyncio.gather(client.connect(), client.connect(), client.connect())
 
-        assert len(_received(server, oa.ProtoOAGetAccountListByAccessTokenReq)) == 1
-        assert len(_received(server, oa.ProtoOAAccountAuthReq)) == 1
+        assert len(received(server, oa.ProtoOAGetAccountListByAccessTokenReq)) == 1
+        assert len(received(server, oa.ProtoOAAccountAuthReq)) == 1
 
         await client.disconnect()
         await client.disconnect()
@@ -397,16 +400,16 @@ async def test_concurrent_connects_share_one_attempt() -> None:
 
 
 async def test_a_failed_connect_leaves_the_client_reusable() -> None:
-    server = _venue(listed=False)
+    server = venue(listed=False)
     await server.start()
-    client = _client(server)
+    client = account_client(server)
     try:
         with pytest.raises(CTraderAuthError):
             await client.connect()
 
         server.on(
             oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
-            lambda _r: _account_list(is_live=True),
+            lambda _r: account_list(is_live=True),
         )
         await client.connect()
 
@@ -418,13 +421,13 @@ async def test_a_failed_connect_leaves_the_client_reusable() -> None:
 
 
 async def test_a_cancelled_sole_connect_stops_the_attempt() -> None:
-    server = _venue()
+    server = venue()
     server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, lambda _r: None)
     await server.start()
-    client = _client(server, environment="demo")
+    client = account_client(server, environment="demo")
     try:
         task = asyncio.create_task(client.connect())
-        await wait_until(lambda: _received(server, oa.ProtoOAAccountAuthReq), description="auth")
+        await wait_until(lambda: received(server, oa.ProtoOAAccountAuthReq), description="auth")
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -436,9 +439,9 @@ async def test_a_cancelled_sole_connect_stops_the_attempt() -> None:
 
 
 async def test_failed_restores_are_retried_while_ready() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server, restore_retry_interval_secs=0.05)
+    client = account_client(server, restore_retry_interval_secs=0.05)
     try:
         await client.connect()
         session = client.session
@@ -460,10 +463,10 @@ async def test_failed_restores_are_retried_while_ready() -> None:
 
 
 async def test_a_persistently_failing_restore_logs_one_error() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
     logger = RecordingLogger()
-    client = _client(server, logger=logger, restore_retry_interval_secs=0.02)
+    client = account_client(server, logger=logger, restore_retry_interval_secs=0.02)
     try:
         await client.connect()
         session = client.session
@@ -484,10 +487,10 @@ async def test_a_persistently_failing_restore_logs_one_error() -> None:
 
 
 async def test_an_exception_in_the_retry_loop_is_logged_and_the_loop_continues() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
     logger = RecordingLogger()
-    client = _client(server, logger=logger, restore_retry_interval_secs=0.02)
+    client = account_client(server, logger=logger, restore_retry_interval_secs=0.02)
     try:
         await client.connect()
         calls = []
@@ -506,46 +509,23 @@ async def test_an_exception_in_the_retry_loop_is_logged_and_the_loop_continues()
 
 
 def test_credentials_repr_hides_secrets() -> None:
-    credentials = _credentials(
+    sample = credentials(
         client_secret="secret-value",
         access_token="access-value",
         refresh_token="refresh-value",
     )
 
-    text = repr(credentials)
+    text = repr(sample)
 
     for secret in ("secret-value", "access-value", "refresh-value"):
         assert secret not in text
 
 
-class _HeldAccountAuth:
-    """Holds the session's account auth unanswered until `release()`, keeping bring-up open."""
-
-    def __init__(self, server: FakeCTraderServer) -> None:
-        self._server = server
-        self.pending: list[str] = []
-        self.arrived = asyncio.Event()
-        server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, self._handle)
-
-    def _handle(self, _request: Message) -> None:
-        self.pending.append(self._server.received_client_msg_ids[-1])
-        self.arrived.set()
-
-    async def release(self) -> None:
-        pending, self.pending = self.pending, []
-        self.arrived.clear()
-        for client_msg_id in pending:
-            await self._server.push(
-                oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID),
-                client_msg_id=client_msg_id,
-            )
-
-
 async def test_two_concurrent_connects_start_one_session() -> None:
-    server = _venue()
-    held = _HeldAccountAuth(server)
+    server = venue()
+    held = hold_account_auth(server)
     await server.start()
-    client = _client(server, environment="demo")
+    client = account_client(server, environment="demo")
     try:
         first = asyncio.create_task(client.connect())
         second = asyncio.create_task(client.connect())
@@ -562,9 +542,9 @@ async def test_two_concurrent_connects_start_one_session() -> None:
 
 
 async def test_a_connect_right_after_the_first_completes_reuses_the_session() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server, environment="demo")
+    client = account_client(server, environment="demo")
     try:
         await client.connect()
         session = client.session
@@ -579,10 +559,10 @@ async def test_a_connect_right_after_the_first_completes_reuses_the_session() ->
 
 
 async def test_cancelling_the_caller_running_bring_up_lets_a_queued_caller_connect() -> None:
-    server = _venue()
-    held = _HeldAccountAuth(server)
+    server = venue()
+    held = hold_account_auth(server)
     await server.start()
-    client = _client(server, environment="demo")
+    client = account_client(server, environment="demo")
     try:
         first = asyncio.create_task(client.connect())
         await asyncio.wait_for(held.arrived.wait(), 2.0)
@@ -608,10 +588,10 @@ async def test_cancelling_the_caller_running_bring_up_lets_a_queued_caller_conne
 
 
 async def test_cancelling_a_queued_caller_leaves_the_first_connected() -> None:
-    server = _venue()
-    held = _HeldAccountAuth(server)
+    server = venue()
+    held = hold_account_auth(server)
     await server.start()
-    client = _client(server, environment="demo")
+    client = account_client(server, environment="demo")
     try:
         first = asyncio.create_task(client.connect())
         await asyncio.wait_for(held.arrived.wait(), 2.0)
@@ -632,9 +612,9 @@ async def test_cancelling_a_queued_caller_leaves_the_first_connected() -> None:
 
 
 async def test_disconnect_stops_the_session_only_after_the_last_user() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server, environment="demo")
+    client = account_client(server, environment="demo")
     try:
         await client.connect()
         await client.connect()
@@ -655,10 +635,10 @@ async def test_disconnect_stops_the_session_only_after_the_last_user() -> None:
 async def test_a_connect_landing_as_the_first_attempt_finishes_starts_no_second_session(
     extra_ticks: int,
 ) -> None:
-    server = _venue()
-    held = _HeldAccountAuth(server)
+    server = venue()
+    held = hold_account_auth(server)
     await server.start()
-    client = _client(server, environment="demo")
+    client = account_client(server, environment="demo")
     late = None
 
     async def connect_as_soon_as_ready() -> None:
@@ -691,9 +671,9 @@ async def test_a_connect_landing_as_the_first_attempt_finishes_starts_no_second_
 
 
 async def test_a_cancelled_disconnect_still_stops_the_session() -> None:
-    server = _venue()
+    server = venue()
     await server.start()
-    client = _client(server, environment="demo")
+    client = account_client(server, environment="demo")
     try:
         await client.connect()
 
@@ -728,10 +708,10 @@ async def test_a_cancelled_disconnect_still_stops_the_session() -> None:
     [oa_model.PROTO_OA_APPLICATION_AUTH_REQ, oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ],
 )
 async def test_connect_timeout_bounds_the_whole_connect(unanswered: int) -> None:
-    server = _venue()
+    server = venue()
     server.on(unanswered, lambda _r: None)
     await server.start()
-    client = _client(server, connect_timeout_secs=0.5)
+    client = account_client(server, connect_timeout_secs=0.5)
     try:
         started = time.monotonic()
         with pytest.raises(CTraderTimeoutError, match=r"connect did not complete within 0\.5s"):

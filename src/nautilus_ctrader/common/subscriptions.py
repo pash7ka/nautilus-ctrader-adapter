@@ -8,7 +8,8 @@ every reconnect. Keys and log lines carry the symbol id and period only, never t
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import contextlib
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from google.protobuf.message import Message
@@ -19,6 +20,7 @@ from nautilus_ctrader.common.errors import (
     CTraderError,
     CTraderRequestError,
 )
+from nautilus_ctrader.common.session import SessionState
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 
 if TYPE_CHECKING:
@@ -32,6 +34,7 @@ _Key = tuple[str, int] | tuple[str, int, int]
 # TODO(verify): the venue answers a duplicate subscribe with ALREADY_SUBSCRIBED rather than
 # silently accepting it or failing with another code.
 _ALREADY_SUBSCRIBED = "ALREADY_SUBSCRIBED"
+_ACCEPTING = (SessionState.READY, SessionState.RESTORING)
 
 
 def _spots_key(symbol_id: int) -> _Key:
@@ -50,9 +53,13 @@ class SubscriptionRegistry:
     """
     The account's spot and trendbar subscriptions, shared by consumer name.
 
-    - A consumer is counted only once the venue has accepted the subscription; the same
-      consumer subscribing twice counts once.
-    - (Un)subscribing needs a ready session and raises `CTraderConnectionError` otherwise.
+    - While the session accepts requests, the venue request goes first and the reference is
+      counted once it succeeds. Otherwise (no session, or reconnecting) only the intent is
+      recorded, and the next bring-up's restores act on it; (un)subscribing never raises for
+      want of a connection.
+    - The same consumer subscribing twice counts once.
+    - A consumer joining a key whose restore is in the session's `failed_restores` gets no
+      data until the restore retry succeeds.
     - It outlives sessions: the account client `attach`es each new session before starting it
       and `detach`es it when dropping it.
     """
@@ -62,9 +69,11 @@ class SubscriptionRegistry:
         self._log = logger
         self._session: CTraderSession | None = None
         self._consumers: dict[_Key, set[str]] = {}
-        # Serialise the first-subscribe and last-unsubscribe requests of each key.
+        # Per key; a trendbar operation takes its trendbar lock before its spots lock, never
+        # the other way round.
         self._locks: dict[_Key, asyncio.Lock] = {}
         self._spot_listeners: dict[int, list[SpotListener]] = {}
+        self._failing_listeners: set[SpotListener] = set()
 
     def attach(self, session: CTraderSession) -> None:
         """Route `session`'s spot events here and register a restore for every live key."""
@@ -80,29 +89,50 @@ class SubscriptionRegistry:
             session.remove_event_handler(oa.ProtoOASpotEvent, self._on_spot)
 
     async def subscribe_spots(self, symbol_id: int, consumer: str) -> None:
-        await self._acquire(_spots_key(symbol_id), consumer)
+        key = _spots_key(symbol_id)
+        async with self._lock(key):
+            await self._acquire(key, consumer)
 
     async def unsubscribe_spots(self, symbol_id: int, consumer: str) -> None:
-        self._ready_session()
-        await self._release(_spots_key(symbol_id), consumer)
+        key = _spots_key(symbol_id)
+        async with self._lock(key):
+            await self._release(key, consumer)
 
     async def subscribe_trendbars(self, symbol_id: int, period: int, consumer: str) -> None:
-        """Subscribe live trendbars, holding the spot subscription the venue requires for them."""
-        spot_consumer = _trendbar_spot_consumer(period, consumer)
+        """Subscribe live trendbars, holding the spot subscription the venue requires for them.
+
+        If the venue refuses the trendbar, the spot reference is released again. If the call
+        is cancelled or times out, whether the trendbar reached the venue is unknown, and the
+        spot reference is kept: spots without trendbars are harmless, trendbars without spots
+        are not.
+        """
         key = _trendbar_key(symbol_id, period)
-        await self._acquire(_spots_key(symbol_id), spot_consumer)
-        try:
-            await self._acquire(key, consumer)
-        except BaseException:
-            if consumer not in self._consumers.get(key, ()):
-                await self._release(_spots_key(symbol_id), spot_consumer)
-            raise
+        spots = _spots_key(symbol_id)
+        spot_consumer = _trendbar_spot_consumer(period, consumer)
+        async with self._lock(key):
+            if consumer in self._consumers.get(key, ()):
+                return
+            async with self._lock(spots):
+                await self._acquire(spots, spot_consumer)
+            try:
+                await self._acquire(key, consumer)
+            except CTraderRequestError:
+                async with self._lock(spots):
+                    await self._release(spots, spot_consumer)
+                raise
 
     async def unsubscribe_trendbars(self, symbol_id: int, period: int, consumer: str) -> None:
-        self._ready_session()
-        # Trendbar first: the venue requires the spot subscription while it is live.
-        await self._release(_trendbar_key(symbol_id, period), consumer)
-        await self._release(_spots_key(symbol_id), _trendbar_spot_consumer(period, consumer))
+        key = _trendbar_key(symbol_id, period)
+        spots = _spots_key(symbol_id)
+        async with self._lock(key):
+            if consumer not in self._consumers.get(key, ()):
+                return
+            try:
+                # Trendbar first: the venue requires the spot subscription while it is live.
+                await self._release(key, consumer)
+            finally:
+                async with self._lock(spots):
+                    await self._release(spots, _trendbar_spot_consumer(period, consumer))
 
     def add_spot_listener(self, symbol_id: int, listener: SpotListener) -> None:
         self._spot_listeners.setdefault(symbol_id, []).append(listener)
@@ -112,6 +142,7 @@ class SubscriptionRegistry:
         if listeners is None or listener not in listeners:
             return
         listeners.remove(listener)
+        self._failing_listeners.discard(listener)
         if not listeners:
             del self._spot_listeners[symbol_id]
 
@@ -119,62 +150,75 @@ class SubscriptionRegistry:
         """The consumers holding `symbol_id`'s spot subscription, trendbar holders included."""
         return frozenset(self._consumers.get(_spots_key(symbol_id), ()))
 
-    def _ready_session(self) -> CTraderSession:
-        session = self._session
-        if session is None or not session.is_ready:
-            raise CTraderConnectionError("account session not ready")
-        return session
-
     def _lock(self, key: _Key) -> asyncio.Lock:
         return self._locks.setdefault(key, asyncio.Lock())
 
+    def _accepting_session(self) -> CTraderSession | None:
+        session = self._session
+        if session is not None and session.state in _ACCEPTING:
+            return session
+        return None
+
     async def _acquire(self, key: _Key, consumer: str) -> None:
-        async with self._lock(key):
-            session = self._ready_session()
-            consumers = self._consumers.get(key)
-            if consumers is not None:
-                consumers.add(consumer)
-                return
-            await _subscribe(session, [self._subscribe_request(key)])
-            self._consumers[key] = {consumer}
-            # The session attached now, which may not be the one the request went through.
-            if self._session is not None:
-                self._session.add_restore(key, self._restore(self._session, key))
+        """Count `consumer` on `key`, subscribing first if it is new. Caller holds the key lock."""
+        consumers = self._consumers.get(key)
+        if consumers is not None:
+            consumers.add(consumer)
+            return
+        session = self._accepting_session()
+        if session is not None:
+            # Lost mid-request: left to the next bring-up, like any other intent.
+            with contextlib.suppress(CTraderConnectionError):
+                await _subscribe(session, [self._subscribe_request(key)])
+        self._record(key, consumer)
+
+    def _record(self, key: _Key, consumer: str) -> None:
+        # No await in here, so a bring-up either sees both the reference and its restore or
+        # neither.
+        self._consumers.setdefault(key, set()).add(consumer)
+        if self._session is not None:
+            self._session.add_restore(key, self._restore(self._session, key))
 
     async def _release(self, key: _Key, consumer: str) -> None:
-        """Drop `consumer`'s reference; the last one also unsubscribes, if a session is ready.
+        """Drop `consumer`'s reference; the last one also unsubscribes. Caller holds the key lock.
 
         The reference is dropped even if the unsubscribe fails: its consumer is gone either
         way, and spots the venue keeps sending are dropped for want of a listener.
         """
-        async with self._lock(key):
-            consumers = self._consumers.get(key)
-            if consumers is None or consumer not in consumers:
-                return
+        consumers = self._consumers.get(key)
+        if consumers is None or consumer not in consumers:
+            return
+        if len(consumers) > 1:
             consumers.discard(consumer)
-            if consumers:
-                return
-            del self._consumers[key]
-            session = self._session
-            if session is None:
-                return
-            session.remove_restore(key)
-            if not session.is_ready:
-                return
-            try:
+            return
+        try:
+            session = self._accepting_session()
+            # TODO(verify): the venue drops all subscriptions when the connection drops, so a
+            # key released while not connected needs no unsubscribe.
+            if session is not None:
                 await session.request(self._unsubscribe_request(key))
-            except CTraderError as e:
-                detail = e.error_code if isinstance(e, CTraderRequestError) else type(e).__name__
-                self._log.warning(f"Unsubscribe {key!r} failed: {detail}")
+        except CTraderError as e:
+            detail = e.error_code if isinstance(e, CTraderRequestError) else type(e).__name__
+            self._log.warning(f"Unsubscribe {key!r} failed: {detail}")
+        finally:
+            del self._consumers[key]
+            if self._session is not None:
+                self._session.remove_restore(key)
 
-    def _restore(self, session: CTraderSession, key: _Key):
+    def _restore(self, session: CTraderSession, key: _Key) -> Callable[[], Awaitable[None]]:
         requests = [self._subscribe_request(key)]
         if key[0] == "trendbar":
             # Spots first, so the trendbar restore works whatever order the restores run in.
             requests.insert(0, self._subscribe_request(_spots_key(key[1])))
 
         async def restore() -> None:
-            await _subscribe(session, requests)
+            # The lock is retaken per request, so a release queued meanwhile runs in between
+            # and the next request sees the key gone.
+            for request in requests:
+                async with self._lock(key):
+                    if key not in self._consumers:
+                        return
+                    await _subscribe(session, [request])
 
         return restore
 
@@ -211,7 +255,13 @@ class SubscriptionRegistry:
             try:
                 listener(event)
             except Exception as e:
-                self._log.exception(f"Spot listener for symbol {event.symbolId} raised", e)
+                message = f"Spot listener for symbol {event.symbolId} raised"
+                # ERROR once per listener; a listener failing on every tick would flood it.
+                if listener in self._failing_listeners:
+                    self._log.debug(f"{message} {type(e).__name__} again")
+                else:
+                    self._failing_listeners.add(listener)
+                    self._log.exception(message, e)
 
 
 async def _subscribe(session: CTraderSession, requests: list[Message]) -> None:
