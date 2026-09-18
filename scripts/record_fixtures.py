@@ -65,6 +65,7 @@ _GET_TOKENS_SPEC.loader.exec_module(get_tokens)
 FAKE_ACCOUNT_ID = 1_000_001
 FAKE_TRADER_LOGIN = 2_000_002
 FAKE_TOKEN = "scrubbed-token"
+FAKE_BALANCE = 1_000_000
 
 SYMBOLS = ("EURUSD", "XAUUSD", "GER40.cash", "US100.cash")
 SPOT_RECORD_SECS = 150.0  # covers at least one M1 bar-to-bar transition
@@ -89,6 +90,11 @@ _CLEARED_FIELDS = frozenset(
 
 _IDENTIFYING_INT_TYPES = (FieldDescriptor.TYPE_INT64, FieldDescriptor.TYPE_UINT64)
 
+# proto2 `required` fields cannot just be cleared: an unset required field makes the whole
+# message fail SerializeToString(). Cleared fields that turn out to be required get one of
+# these fixed fake values instead (0 for any not listed here) so the message stays valid.
+_FAKE_REQUIRED_VALUES: dict[str, object] = {"balance": FAKE_BALANCE}
+
 
 class ScrubError(RuntimeError):
     """`assert_clean` found a forbidden identifier left in the data about to be written."""
@@ -100,8 +106,10 @@ def scrub(message: Message, real_account_id: int, real_login: int | None) -> Mes
     Recursively walks every field of a `CopyFrom` copy: any int64/uint64 field named
     `ctidTraderAccountId` becomes `FAKE_ACCOUNT_ID`, `traderLogin` becomes `FAKE_TRADER_LOGIN`,
     `accessToken`/`refreshToken` become `FAKE_TOKEN`, and `_CLEARED_FIELDS` are cleared -
-    wherever any of these occur, at any nesting depth. As a second pass, independent of field
-    name, any other int64/uint64 scalar still carrying exactly `real_account_id` or
+    wherever any of these occur, at any nesting depth. A `_CLEARED_FIELDS` entry that is
+    `required` in the schema is set to a fake value instead of cleared, since an unset
+    required field would make the message fail to serialize. As a second pass, independent of
+    field name, any other int64/uint64 scalar still carrying exactly `real_account_id` or
     `real_login` is replaced too, so a field this function does not yet know the name of can
     never carry a real identifier through unnoticed.
     """
@@ -127,12 +135,27 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
         elif name in ("accessToken", "refreshToken"):
             setattr(message, name, FAKE_TOKEN)
         elif name in _CLEARED_FIELDS:
-            message.ClearField(name)
+            if field.label == FieldDescriptor.LABEL_REQUIRED:
+                # Clearing would leave it unset and break serialization; give it a fake value
+                # that still satisfies the required-field constraint instead.
+                setattr(message, name, _FAKE_REQUIRED_VALUES.get(name, 0))
+            else:
+                message.ClearField(name)
         elif field.type in _IDENTIFYING_INT_TYPES and field.label != FieldDescriptor.LABEL_REPEATED:
             if real_account_id is not None and value == real_account_id:
                 setattr(message, name, FAKE_ACCOUNT_ID)
             elif real_login is not None and value == real_login:
                 setattr(message, name, FAKE_TRADER_LOGIN)
+
+
+def _verify_scrubs_cleanly(message: Message, account_id: int, real_login: int | None) -> None:
+    """Scrub `message` and serialize the result, right away.
+
+    Called as each message is recorded, not just once at the very end, so a message that
+    `scrub` cannot turn back into something serializable (a required field cleared instead of
+    faked) fails before any further network time is spent on later requests.
+    """
+    scrub(message, account_id, real_login).SerializeToString()
 
 
 def assert_clean(blob: bytes, forbidden: Iterable[bytes]) -> None:
@@ -307,6 +330,7 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
         raise RuntimeError("the access token does not grant the requested account id")
     real_login = target.traderLogin if target.HasField("traderLogin") else None
     host = LIVE_HOST if target.isLive else DEMO_HOST
+    _verify_scrubs_cleanly(account_list_res, account_id, real_login)
 
     recorded: dict[str, list[Message]] = {
         "account_list": [account_list_res],
@@ -338,11 +362,13 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
         )
 
         trader_res = await connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=account_id))
+        _verify_scrubs_cleanly(trader_res, account_id, real_login)
         recorded["trader"].append(trader_res)
 
         assets_res = await connection.request(
             oa.ProtoOAAssetListReq(ctidTraderAccountId=account_id),
         )
+        _verify_scrubs_cleanly(assets_res, account_id, real_login)
         recorded["assets"].append(assets_res)
         asset_id_by_name = {asset.name: asset.assetId for asset in assets_res.asset}
         eur_asset_id = asset_id_by_name["EUR"]
@@ -355,6 +381,7 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
                 lastAssetId=usd_asset_id,
             ),
         )
+        _verify_scrubs_cleanly(conversion_res, account_id, real_login)
         recorded["conversion_eur_usd"].append(conversion_res)
         chain_symbol_ids = {_light_symbol_id(s) for s in conversion_res.symbol}
 
@@ -370,6 +397,7 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
             ctidTraderAccountId=account_id,
             symbol=wanted_symbols,
         )
+        _verify_scrubs_cleanly(filtered_symbols_res, account_id, real_login)
         recorded["symbols"].append(filtered_symbols_res)
 
         target_symbol_id_by_name = {
@@ -379,6 +407,7 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
         symbol_specs_res = await connection.request(
             oa.ProtoOASymbolByIdReq(ctidTraderAccountId=account_id, symbolId=all_wanted_ids),
         )
+        _verify_scrubs_cleanly(symbol_specs_res, account_id, real_login)
         recorded["symbol_specs"].append(symbol_specs_res)
 
         now_ms = int(time.time() * 1000)
@@ -398,6 +427,7 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
                 bucket=BUCKET_HISTORICAL,
                 rate_limit_retries=rate_limit_retries,
             )
+            _verify_scrubs_cleanly(m15_res, account_id, real_login)
             recorded["trendbars_m15"].append(m15_res)
 
             h1_res = await _request_with_retry(
@@ -413,6 +443,7 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
                 bucket=BUCKET_HISTORICAL,
                 rate_limit_retries=rate_limit_retries,
             )
+            _verify_scrubs_cleanly(h1_res, account_id, real_login)
             recorded["trendbars_h1"].append(h1_res)
 
         spot_symbol_ids = [
@@ -444,6 +475,8 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
             )
 
         await asyncio.sleep(SPOT_RECORD_SECS)
+        for spot_event in spot_events:
+            _verify_scrubs_cleanly(spot_event, account_id, real_login)
         recorded["spot_events"] = list(spot_events)
 
         for symbol_id in spot_symbol_ids:
