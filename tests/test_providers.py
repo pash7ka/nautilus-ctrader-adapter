@@ -17,7 +17,7 @@ from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
-from tests.account_venue import RECORDED, account_client, venue
+from tests.account_venue import RECORDED, account_client, received, venue
 from tests.recording_logger import RecordingLogger
 
 LIGHT = {s.symbolName: s for s in RECORDED["symbols"][0].symbol}
@@ -169,6 +169,66 @@ async def test_conversion_instruments_for_raises_when_the_chain_is_empty() -> No
         await server.stop()
 
 
+async def test_a_broken_conversion_leg_is_recorded_as_a_failure() -> None:
+    server = venue()
+    eurusd_symbol_id = LIGHT["EURUSD"].symbolId
+
+    def symbol_by_id(request: oa.ProtoOASymbolByIdReq) -> oa.ProtoOASymbolByIdRes:
+        wanted = set(request.symbolId)
+        symbols = []
+        for spec in RECORDED["symbol_specs"][0].symbol:
+            if spec.symbolId not in wanted:
+                continue
+            copy = om.ProtoOASymbol()
+            copy.CopyFrom(spec)
+            if copy.symbolId == eurusd_symbol_id:
+                copy.digits = 6  # unrepresentable at the 1/100000 price scale
+            symbols.append(copy)
+        return oa.ProtoOASymbolByIdRes(
+            ctidTraderAccountId=request.ctidTraderAccountId,
+            symbol=symbols,
+        )
+
+    server.on(om.PROTO_OA_SYMBOL_BY_ID_REQ, symbol_by_id)
+    await server.start()
+    client = account_client(server)
+    logger = RecordingLogger()
+    try:
+        await client.connect()
+        provider = _provider(client, logger=logger)
+        await provider.load_ids_async([GER40_ID])
+        ger40 = provider.find(GER40_ID)
+
+        with pytest.raises(InstrumentLoadError):
+            await provider.conversion_instruments_for(ger40)
+
+        assert any(f.symbol == "EURUSD" for f in provider.failures)
+        assert any("Instrument EURUSD not loaded" in e for e in logger.errors())
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_conversion_instruments_for_is_cached() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        provider = _provider(client)
+        await provider.load_ids_async([GER40_ID])
+        ger40 = provider.find(GER40_ID)
+
+        first = await provider.conversion_instruments_for(ger40)
+        second = await provider.conversion_instruments_for(ger40)
+
+        assert len(first) == 1 and first[0] is second[0]
+        assert len(received(server, oa.ProtoOASymbolsForConversionReq)) == 1
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_asset_class_override_ignored_for_a_currency_pair() -> None:
     server = venue()
     await server.start()
@@ -301,4 +361,24 @@ async def test_using_the_provider_before_connect_fails_clearly() -> None:
         with pytest.raises(CTraderConnectionError):
             await provider.load_ids_async([EURUSD_ID])
     finally:
+        await server.stop()
+
+
+async def test_a_later_failure_for_the_same_symbol_replaces_the_earlier_one() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        provider = _provider(client)
+        nope_id = InstrumentId(Symbol("NOPE"), CTRADER_VENUE)
+        wrong_venue_id = InstrumentId(Symbol("NOPE"), Venue("OTHER"))
+
+        await provider.load_ids_async([nope_id])
+        await provider.load_ids_async([wrong_venue_id])
+
+        assert len(provider.failures) == 1
+        assert provider.failures[0].reason == "not a CTRADER instrument"
+    finally:
+        await client.disconnect()
         await server.stop()
