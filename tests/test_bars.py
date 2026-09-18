@@ -1023,11 +1023,19 @@ async def test_probe_h_hitting_the_round_cap_skips_no_bar() -> None:
     clock.t = T0 + 200
 
     await closer.backfill(hist.fetch_range)
+    assert hist.range_calls[-1] == (T0 + 720, T0 + 780)  # the one final fetch after the cap
+    assert len(hist.range_calls) == 6
+    assert offsets(emitted) == list(range(60, 781, 60))
+
+    # The final fetch ran until T0+980: 840 and 900 closed meanwhile and go to history alone.
+    assert clock.t == T0 + 980
     await clock.advance(0)
     await clock.advance(1)
     await clock.advance(1)
 
-    assert hist.range_calls[-1] == (T0 + 720, T0 + 780)  # the one final fetch after the cap
-    assert len(hist.range_calls) == 6
-    assert offsets(emitted) == list(range(60, 781, 60))
+    assert hist.calls == [T0 + 840, T0 + 900]
+    assert offsets(emitted) == list(range(60, 901, 60))
     assert len(warnings_of(logger)) == 1
+    assert debugs_of(logger) == [
+        "L: queued 2 bars that closed during the final backfill fetch for history"
+    ]

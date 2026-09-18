@@ -189,6 +189,8 @@ class BarCloser:
         - History can lag behind a just-closed bar, so if the newest closed boundary is still
           missing afterwards, it is queued for history alone. Earlier gaps in a served range
           are genuinely empty periods and are not retried.
+        - After a capped final fetch, every boundary that closed while it ran is also queued
+          for history alone, since no fetch covered it.
         - Stream updates are held meanwhile; the latest is replayed afterwards.
         """
         if self._closed:
@@ -198,11 +200,17 @@ class BarCloser:
         self._cancel_timer()
         self._current = None
         try:
-            end = await self._backfill_rounds(fetch_range)
+            end, capped = await self._backfill_rounds(fetch_range)
             if self._closed:
                 return
-            if end >= self._floor and not self._is_covered(end):
-                self._enqueue(end, None, needs_history=True)
+            newest = self._last_closed_boundary() if capped else end
+            for boundary in range(end, newest + 1, self._period):
+                self._enqueue(boundary, None, needs_history=True)
+            if newest > end:
+                self._log.debug(
+                    f"{self._label}: queued {(newest - end) // self._period} bars that closed "
+                    "during the final backfill fetch for history"
+                )
         finally:
             self._holding = False
             self._baseline = True
@@ -212,16 +220,16 @@ class BarCloser:
 
     async def _backfill_rounds(
         self, fetch_range: Callable[[int, int], Awaitable[list[RawBar]]]
-    ) -> int:
-        """Run the fetch rounds; return the last `end` fetched up to."""
+    ) -> tuple[int, bool]:
+        """Run the fetch rounds; return the last `end` fetched up to and whether the cap hit."""
         rounds = 0
         while True:
             end = self._last_closed_boundary()
             if not await self._fetch_and_drain(fetch_range, end) or self._closed:
-                return end
+                return end, False
             rounds += 1
             if self._last_closed_boundary() <= end:
-                return end
+                return end, False
             if rounds >= _MAX_BACKFILL_ROUNDS:
                 self._log.warning(
                     f"{self._label}: history fetch is slower than the bar period; "
@@ -229,7 +237,7 @@ class BarCloser:
                 )
                 end = self._last_closed_boundary()
                 await self._fetch_and_drain(fetch_range, end)
-                return end
+                return end, True
 
     async def _fetch_and_drain(
         self, fetch_range: Callable[[int, int], Awaitable[list[RawBar]]], end: int
