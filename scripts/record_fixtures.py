@@ -33,9 +33,24 @@ from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message
 
 from nautilus_ctrader.common.connection import CTraderConnection
-from nautilus_ctrader.constants import BUCKET_HISTORICAL, DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
+from nautilus_ctrader.common.errors import CTraderRequestError
+from nautilus_ctrader.common.rate_limit import RateLimiter
+from nautilus_ctrader.constants import (
+    BUCKET_DEFAULT,
+    BUCKET_HISTORICAL,
+    DEMO_HOST,
+    LIVE_HOST,
+    PROTOBUF_PORT,
+)
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+
+# Conservative outbound rates for the recorder's connection: the historical bucket in
+# particular is much tighter than the default one, and a burst of trendbar requests (one per
+# symbol, M15 and H1) is exactly what triggered a live BLOCKED_PAYLOAD_TYPE rejection.
+_RATE_LIMITS = {BUCKET_DEFAULT: 5.0, BUCKET_HISTORICAL: 1.0}
+_MAX_RATE_LIMIT_RETRIES = 3
+_RATE_LIMIT_FALLBACK_WAIT_SECS = 2.0
 
 # scripts/ is not a package; get_tokens.py is loaded by file path, exactly as
 # tests/test_get_tokens.py does, to reuse its load_env() without duplicating it.
@@ -202,9 +217,47 @@ class RecordedSecrets:
 class RecordResult:
     """Same non-`@dataclass` constraint as `RecordedSecrets` applies here."""
 
-    def __init__(self, messages: dict[str, list[Message]], secrets: RecordedSecrets) -> None:
+    def __init__(
+        self,
+        messages: dict[str, list[Message]],
+        secrets: RecordedSecrets,
+        rate_limit_retries: list[float | None],
+    ) -> None:
         self.messages = messages
         self.secrets = secrets
+        self.rate_limit_retries = rate_limit_retries
+
+
+async def _request_with_retry(
+    connection: CTraderConnection,
+    payload: Message,
+    *,
+    bucket: str,
+    rate_limit_retries: list[float | None],
+) -> Message:
+    """Send `payload`, retrying up to `_MAX_RATE_LIMIT_RETRIES` times on `BLOCKED_PAYLOAD_TYPE`.
+
+    Waits the venue's own `retryAfter` before each retry, or `_RATE_LIMIT_FALLBACK_WAIT_SECS`
+    if the venue didn't send one. Every observed `retryAfter` (`None` included) is appended to
+    `rate_limit_retries` - a real protocol fact worth keeping, regardless of whether the retry
+    that follows it succeeds.
+    """
+    for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            return await connection.request(payload, bucket=bucket)
+        except CTraderRequestError as e:
+            if e.error_code != "BLOCKED_PAYLOAD_TYPE":
+                raise
+            rate_limit_retries.append(e.retry_after_secs)
+            if attempt == _MAX_RATE_LIMIT_RETRIES:
+                raise
+            wait_secs = (
+                e.retry_after_secs
+                if e.retry_after_secs is not None
+                else _RATE_LIMIT_FALLBACK_WAIT_SECS
+            )
+            await asyncio.sleep(wait_secs)
+    raise AssertionError("unreachable: the loop above always returns or raises")
 
 
 async def _fetch_account_list(
@@ -267,7 +320,14 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
         "spot_events": [],
     }
 
-    connection = CTraderConnection(host, PROTOBUF_PORT, logger=_QuietLogger(), tls=True)
+    rate_limit_retries: list[float | None] = []
+    connection = CTraderConnection(
+        host,
+        PROTOBUF_PORT,
+        logger=_QuietLogger(),
+        tls=True,
+        rate_limiter=RateLimiter(_RATE_LIMITS),
+    )
     await connection.connect()
     try:
         await connection.request(
@@ -325,7 +385,8 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
         day_ms = 24 * 60 * 60 * 1000
         for symbol_name in SYMBOLS:
             symbol_id = target_symbol_id_by_name[symbol_name]
-            m15_res = await connection.request(
+            m15_res = await _request_with_retry(
+                connection,
                 oa.ProtoOAGetTrendbarsReq(
                     ctidTraderAccountId=account_id,
                     symbolId=symbol_id,
@@ -335,10 +396,12 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
                     toTimestamp=now_ms,
                 ),
                 bucket=BUCKET_HISTORICAL,
+                rate_limit_retries=rate_limit_retries,
             )
             recorded["trendbars_m15"].append(m15_res)
 
-            h1_res = await connection.request(
+            h1_res = await _request_with_retry(
+                connection,
                 oa.ProtoOAGetTrendbarsReq(
                     ctidTraderAccountId=account_id,
                     symbolId=symbol_id,
@@ -348,6 +411,7 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
                     toTimestamp=now_ms,
                 ),
                 bucket=BUCKET_HISTORICAL,
+                rate_limit_retries=rate_limit_retries,
             )
             recorded["trendbars_h1"].append(h1_res)
 
@@ -409,7 +473,11 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
             target.brokerTitleShort if target.HasField("brokerTitleShort") else None
         ),
     )
-    return RecordResult(messages=recorded, secrets=secrets)
+    return RecordResult(
+        messages=recorded,
+        secrets=secrets,
+        rate_limit_retries=rate_limit_retries,
+    )
 
 
 def _encode(message: Message) -> dict:
@@ -436,6 +504,10 @@ async def _run(account_id: int, env: dict[str, str]) -> None:
 
     for key, messages in scrubbed.items():
         print(f"{key}: {len(messages)}")
+    print(
+        f"rate-limit blocks: {len(result.rate_limit_retries)}, "
+        f"retryAfter values: {result.rate_limit_retries}",
+    )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
