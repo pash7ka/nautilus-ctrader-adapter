@@ -1,9 +1,10 @@
-"""Tests for the fixture recorder's scrubbing.
+"""Tests for the fixture recorder's scrubbing, and a sanity check on the recorded fixtures.
 
 `scripts/record_fixtures.py` is developer tooling, not part of the installed package, so it is
 imported by file path rather than as `nautilus_ctrader.*` - the same pattern
-`tests/test_get_tokens.py` uses. Only the pure `scrub`/`assert_clean` functions are exercised
-here, offline; the recording flow itself needs a live broker connection and is not run in CI.
+`tests/test_get_tokens.py` uses. The `scrub`/`assert_clean` tests run purely offline; the
+recording flow itself needs a live broker connection and is not run in CI - only its already
+recorded, already-scrubbed output (`tests/fixtures/m2_recorded.json`) is checked here.
 """
 
 import importlib.util
@@ -11,6 +12,7 @@ import pathlib
 
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+from tests.fixtures import FAKE_ACCOUNT_ID, load_recorded
 
 _SPEC = importlib.util.spec_from_file_location(
     "record_fixtures",
@@ -109,3 +111,28 @@ def test_assert_clean_rejects_any_leftover_identifier() -> None:
     except record_fixtures.ScrubError:
         return
     raise AssertionError("leftover identifier not detected")
+
+
+def test_recorded_fixtures_are_scrubbed_and_complete() -> None:
+    rec = load_recorded()
+    for key in (
+        "trader",
+        "assets",
+        "symbols",
+        "symbol_specs",
+        "conversion_eur_usd",
+        "trendbars_m15",
+        "trendbars_h1",
+        "spot_events",
+        "account_list",
+    ):
+        assert rec[key], key
+    assert rec["trader"][0].trader.ctidTraderAccountId == FAKE_ACCOUNT_ID
+    assert not rec["trader"][0].trader.HasField("brokerName")
+    m1 = [
+        tb.utcTimestampInMinutes
+        for ev in rec["spot_events"]
+        for tb in ev.trendbar
+        if tb.period == 1
+    ]
+    assert len(set(m1)) >= 2, "capture must contain an M1 bar transition"
