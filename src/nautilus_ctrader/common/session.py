@@ -34,6 +34,7 @@ from nautilus_ctrader.constants import (
     DEFAULT_RATE_LIMIT_PER_SEC,
     DEFAULT_REQUEST_TIMEOUT_SECS,
     HEARTBEAT_IDLE_SECS,
+    HISTORICAL_PAYLOAD_TYPES,
     HISTORICAL_RATE_LIMIT_PER_SEC,
     INBOUND_SILENCE_SECS,
     MIN_TOKEN_REFRESH_INTERVAL_SECS,
@@ -43,6 +44,8 @@ from nautilus_ctrader.constants import (
     TOKEN_REFRESH_MARGIN_SECS,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
+
+EventHandler = Callable[[Message], None]
 
 
 class SessionState(Enum):
@@ -119,7 +122,7 @@ class CTraderSession:
         self._state = SessionState.STOPPED
         self._restores: dict[Hashable, Callable[[], Awaitable[None]]] = {}
         self._failed_restores: set[Hashable] = set()
-        self._event_handler: Callable[[Message], None] | None = None
+        self._event_handlers: dict[type[Message], list[EventHandler]] = {}
         self._ready = asyncio.Event()
         self._lost = asyncio.Event()
         self._supervisor: asyncio.Task | None = None
@@ -151,8 +154,17 @@ class CTraderSession:
         """Keys whose restore failed in the most recent bring-up."""
         return frozenset(self._failed_restores)
 
-    def set_event_handler(self, handler: Callable[[Message], None]) -> None:
-        self._event_handler = handler
+    def add_event_handler(self, payload_class: type[Message], handler: EventHandler) -> None:
+        """Register `handler` to receive every event of `payload_class`, in registration order."""
+        self._event_handlers.setdefault(payload_class, []).append(handler)
+
+    def remove_event_handler(self, payload_class: type[Message], handler: EventHandler) -> None:
+        handlers = self._event_handlers.get(payload_class)
+        if handlers is None or handler not in handlers:
+            return
+        handlers.remove(handler)
+        if not handlers:
+            del self._event_handlers[payload_class]
 
     def add_restore(self, key: Hashable, factory: Callable[[], Awaitable[None]]) -> None:
         """Register an action to replay after every successful authentication."""
@@ -220,16 +232,22 @@ class CTraderSession:
         payload: Message,
         *,
         timeout_secs: float | None = None,
-        bucket: str = BUCKET_DEFAULT,
+        bucket: str | None = None,
     ) -> Message:
         """Issue a request, failing fast when the session is not ready.
 
         Also accepted while `RESTORING`, since restore actions issue their requests through
         here. Subscriptions survive a reconnect through the restore registry, so anything else
         is better refused than silently delayed.
+
+        `bucket` defaults to `BUCKET_HISTORICAL` for the payload types that carry historical
+        data, `BUCKET_DEFAULT` otherwise; an explicit value overrides that choice.
         """
         if self._state not in (SessionState.READY, SessionState.RESTORING):
             raise CTraderConnectionError(f"session not ready (state={self._state.name})")
+        if bucket is None:
+            is_historical = type(payload) in HISTORICAL_PAYLOAD_TYPES
+            bucket = BUCKET_HISTORICAL if is_historical else BUCKET_DEFAULT
         return await self._connection.request(
             payload,
             timeout_secs=timeout_secs,
@@ -299,17 +317,10 @@ class CTraderSession:
         self._state = SessionState.RESTORING
         for key, factory in list(self._restores.items()):
             self._log.info(f"Restoring {key!r}")
-            try:
-                await factory()
-            except CTraderConnectionError:
-                # The connection itself is gone: a bring-up failure, not a bad restore.
-                raise
-            except Exception as e:
-                # A loss can surface as another error type; it is already logged.
-                self._raise_if_lost()
+            detail = await self._run_restore(key, factory)
+            if detail is not None:
                 # One rejected restore must not keep the whole session down. It is logged, and
                 # the key stays registered so the next reconnect retries it.
-                detail = e.error_code if isinstance(e, CTraderRequestError) else repr(e)
                 self._log.error(f"Restore {key!r} failed: {detail}")
                 self._failed_restores.add(key)
 
@@ -322,6 +333,46 @@ class CTraderSession:
         self.last_error = None
         self._ready.set()
         self._log.info("Session ready")
+
+    async def _run_restore(
+        self,
+        key: Hashable,
+        factory: Callable[[], Awaitable[None]],
+    ) -> str | None:
+        """Run one restore factory. Returns `None` on success, else a failure detail string.
+
+        Raises `CTraderConnectionError` if the connection was lost during or right after the
+        call, so the caller's own loss handling takes over rather than this being treated as a
+        rejected restore.
+        """
+        try:
+            await factory()
+        except CTraderConnectionError:
+            raise
+        except Exception as e:
+            # A loss can surface as another error type; it is already logged.
+            self._raise_if_lost()
+            return e.error_code if isinstance(e, CTraderRequestError) else repr(e)
+        return None
+
+    async def retry_failed_restores(self) -> None:
+        """Re-run each failed restore once while READY; success removes it from failed_restores."""
+        for key in list(self._failed_restores):
+            if self._state is not SessionState.READY:
+                return
+            factory = self._restores.get(key)
+            if factory is None:
+                # Removed concurrently via `remove_restore()`.
+                self._failed_restores.discard(key)
+                continue
+            try:
+                detail = await self._run_restore(key, factory)
+            except CTraderConnectionError:
+                return
+            if detail is None:
+                self._failed_restores.discard(key)
+            else:
+                self._log.warning(f"Restore {key!r} failed: {detail}")
 
     def _raise_if_lost(self) -> None:
         """Fail bring-up if the connection or authentication was lost mid-flight.
@@ -529,5 +580,15 @@ class CTraderSession:
             self._ready.clear()
             self._loss_cause = None
             self._lost.set()
-        if self._event_handler is not None:
-            self._event_handler(payload)
+        self._dispatch_event(payload)
+
+    def _dispatch_event(self, payload: Message) -> None:
+        handlers = self._event_handlers.get(type(payload))
+        if not handlers:
+            self._log.debug(f"No handler registered for {type(payload).__name__}")
+            return
+        for handler in handlers:
+            try:
+                handler(payload)
+            except Exception as e:
+                self._log.exception(f"Event handler for {type(payload).__name__} raised", e)
