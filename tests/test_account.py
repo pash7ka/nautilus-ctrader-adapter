@@ -609,3 +609,188 @@ async def test_an_exception_in_the_retry_loop_is_logged_and_the_loop_continues()
     finally:
         await client.disconnect()
         await server.stop()
+
+
+def test_credentials_repr_hides_secrets() -> None:
+    credentials = _credentials(
+        client_secret="secret-value",
+        access_token="access-value",
+        refresh_token="refresh-value",
+    )
+
+    text = repr(credentials)
+
+    for secret in ("secret-value", "access-value", "refresh-value"):
+        assert secret not in text
+
+
+class _HeldAccountAuth:
+    """Holds the session's account auth unanswered until `release()`, keeping bring-up open."""
+
+    def __init__(self, server: FakeCTraderServer) -> None:
+        self._server = server
+        self.pending: list[str] = []
+        self.arrived = asyncio.Event()
+        server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, self._handle)
+
+    def _handle(self, _request: Message) -> None:
+        self.pending.append(self._server.received_client_msg_ids[-1])
+        self.arrived.set()
+
+    async def release(self) -> None:
+        pending, self.pending = self.pending, []
+        self.arrived.clear()
+        for client_msg_id in pending:
+            await self._server.push(
+                oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID),
+                client_msg_id=client_msg_id,
+            )
+
+
+async def test_two_concurrent_connects_start_one_session() -> None:
+    server = _venue()
+    held = _HeldAccountAuth(server)
+    await server.start()
+    client = _client(server, environment="demo")
+    try:
+        first = asyncio.create_task(client.connect())
+        second = asyncio.create_task(client.connect())
+        await asyncio.wait_for(held.arrived.wait(), 2.0)
+        await held.release()
+        await asyncio.gather(first, second)
+
+        assert server.connection_count == 1
+        assert client._users == 2
+    finally:
+        await client.disconnect()
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_connect_right_after_the_first_completes_reuses_the_session() -> None:
+    server = _venue()
+    await server.start()
+    client = _client(server, environment="demo")
+    try:
+        await client.connect()
+        session = client.session
+        await client.connect()
+
+        assert client.session is session
+        assert server.connection_count == 1
+    finally:
+        await client.disconnect()
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_cancelling_the_caller_running_bring_up_lets_a_queued_caller_connect() -> None:
+    server = _venue()
+    held = _HeldAccountAuth(server)
+    await server.start()
+    client = _client(server, environment="demo")
+    try:
+        first = asyncio.create_task(client.connect())
+        await asyncio.wait_for(held.arrived.wait(), 2.0)
+        second = asyncio.create_task(client.connect())
+        await asyncio.sleep(0)
+        # The first attempt's account auth is never answered.
+        held.pending.clear()
+        held.arrived.clear()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        await asyncio.wait_for(held.arrived.wait(), 2.0)
+        await held.release()
+        await second
+
+        assert client._users == 1
+        assert client.session is not None and client.session.is_ready
+        await wait_until(lambda: server.open_connection_count == 1, description="one session")
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_cancelling_a_queued_caller_leaves_the_first_connected() -> None:
+    server = _venue()
+    held = _HeldAccountAuth(server)
+    await server.start()
+    client = _client(server, environment="demo")
+    try:
+        first = asyncio.create_task(client.connect())
+        await asyncio.wait_for(held.arrived.wait(), 2.0)
+        second = asyncio.create_task(client.connect())
+        await asyncio.sleep(0)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+
+        await held.release()
+        await first
+
+        assert client._users == 1
+        assert server.connection_count == 1
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_disconnect_stops_the_session_only_after_the_last_user() -> None:
+    server = _venue()
+    await server.start()
+    client = _client(server, environment="demo")
+    try:
+        await client.connect()
+        await client.connect()
+        session = client.session
+
+        await client.disconnect()
+        assert session.is_ready
+        assert server.open_connection_count == 1
+
+        await client.disconnect()
+        assert not session.is_ready
+        await wait_until(lambda: server.open_connection_count == 0, description="closed")
+    finally:
+        await server.stop()
+
+
+@pytest.mark.parametrize("extra_ticks", [0, 1, 2, 3])
+async def test_a_connect_landing_as_the_first_attempt_finishes_starts_no_second_session(
+    extra_ticks: int,
+) -> None:
+    server = _venue()
+    held = _HeldAccountAuth(server)
+    await server.start()
+    client = _client(server, environment="demo")
+    late = None
+
+    async def connect_as_soon_as_ready() -> None:
+        # Checked on every loop tick, then a few more ticks, so the call lands in each of the
+        # ticks between bring-up finishing and the first caller counting itself.
+        # A bare `sleep(0)` per tick rather than an Event: the timing must be exact to the tick.
+        while True:
+            if client._users > 0 or client._money_digits is not None:
+                break
+            await asyncio.sleep(0)
+        for _ in range(extra_ticks):
+            await asyncio.sleep(0)
+        await client.connect()
+
+    try:
+        first = asyncio.create_task(client.connect())
+        await asyncio.wait_for(held.arrived.wait(), 2.0)
+        late = asyncio.create_task(connect_as_soon_as_ready())
+        await held.release()
+        await asyncio.wait_for(asyncio.gather(first, late), 5.0)
+
+        assert server.connection_count == 1
+        assert client._users == 2
+    finally:
+        if late is not None and not late.done():
+            late.cancel()
+        await client.disconnect()
+        await client.disconnect()
+        await server.stop()

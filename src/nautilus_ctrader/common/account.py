@@ -8,11 +8,12 @@ it resolves - its id, login or broker - is ever logged or put into an error mess
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import ssl
 import time
 from collections.abc import Callable, Hashable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from google.protobuf.message import Message
@@ -48,9 +49,9 @@ _RESTORE_RETRY_ERROR_ATTEMPTS = 3
 @dataclass(frozen=True)
 class AccountCredentials:
     client_id: str
-    client_secret: str
-    access_token: str
-    refresh_token: str | None
+    client_secret: str = field(repr=False)
+    access_token: str = field(repr=False)
+    refresh_token: str | None = field(repr=False)
     # Unix seconds; `None` disables proactive refresh.
     token_expires_at: float | None
 
@@ -95,8 +96,8 @@ class CTraderAccountClient:
         self.session: CTraderSession | None = None
         self._token_listeners: list[TokenListener] = []
         self._users = 0
-        self._connect_task: asyncio.Task | None = None
-        self._connect_waiters = 0
+        # Serialises `connect()` and `disconnect()`, so at most one session is ever brought up.
+        self._lifecycle_lock = asyncio.Lock()
         self._retry_task: asyncio.Task | None = None
 
         self._deposit_asset: om.ProtoOAAsset | None = None
@@ -129,45 +130,30 @@ class CTraderAccountClient:
     async def connect(self) -> None:
         """Become a user of the account's session, bringing it up if this is the first user.
 
-        Concurrent callers share one attempt. A failed attempt leaves the user count unchanged
-        and the client reusable.
+        Calls are serialised: a caller queued behind a successful attempt only counts itself,
+        and one queued behind a failed attempt tries again. A failed or cancelled attempt
+        stops what it started and leaves the user count unchanged.
         """
-        if self._users > 0:
+        async with self._lifecycle_lock:
+            if self._users > 0:
+                self._users += 1
+                return
+            await self._bring_up()
+            # No await between a successful bring-up and this, so a cancellation cannot leave
+            # a running session without a user.
             self._users += 1
-            return
-        if self._connect_task is None:
-            task = asyncio.create_task(self._bring_up())
-            task.add_done_callback(self._on_connect_done)
-            self._connect_task = task
-        task = self._connect_task
-        self._connect_waiters += 1
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            # Only the last waiter to leave abandons the attempt; the others still want it.
-            if self._connect_waiters == 1 and not task.done():
-                task.cancel()
-            raise
-        finally:
-            self._connect_waiters -= 1
-        self._users += 1
-
-    def _on_connect_done(self, task: asyncio.Task) -> None:
-        if self._connect_task is task:
-            self._connect_task = None
-        if not task.cancelled():
-            task.exception()
 
     async def disconnect(self) -> None:
         """Release one user; the last one stops the session."""
-        if self._users == 0:
-            return
-        self._users -= 1
-        if self._users > 0:
-            return
-        session, self.session = self.session, None
-        await self._stop(session)
-        self._log.info("Account session closed")
+        async with self._lifecycle_lock:
+            if self._users == 0:
+                return
+            self._users -= 1
+            if self._users > 0:
+                return
+            session, self.session = self.session, None
+            await self._stop(session)
+            self._log.info("Account session closed")
 
     async def request(self, payload: Message, *, timeout_secs: float | None = None) -> Message:
         if self.session is None:
@@ -293,6 +279,8 @@ class CTraderAccountClient:
             raise CTraderAuthError(f"account list rejected after refresh: {e.error_code}") from e
 
     async def _refresh_over(self, connection: CTraderConnection) -> None:
+        # TODO(verify): ProtoOARefreshTokenReq over an app-only-authenticated pre-connection on
+        # the demo host works for a live account's token.
         try:
             response = await connection.request(
                 oa.ProtoOARefreshTokenReq(refreshToken=self._credentials.refresh_token),
@@ -349,18 +337,16 @@ class CTraderAccountClient:
         deadline = loop.time() + self._connect_timeout_secs
         while True:
             remaining = deadline - loop.time()
-            try:
+            with contextlib.suppress(TimeoutError):
                 await session.wait_ready(timeout_secs=max(0.0, min(_READY_POLL_SECS, remaining)))
                 return
-            except TimeoutError:
-                pass
             error = session.last_error
             if isinstance(error, CTraderAuthError):
                 if self._environment != "auto" and _is_cant_route(error):
                     raise CTraderAuthError(
                         "configured environment does not match the account; use 'auto'",
                     ) from error
-                raise error
+                raise CTraderAuthError(str(error)) from error
             if loop.time() >= deadline:
                 raise CTraderTimeoutError(
                     f"session not ready within {self._connect_timeout_secs:g}s",
@@ -398,6 +384,8 @@ class CTraderAccountClient:
             except Exception as e:
                 self._log.exception("Restore retry failed", e)
                 continue
+            # A key that recovers drops out and restarts from zero, so a key that keeps
+            # flapping can log the ERROR again.
             failures = {key: failures.get(key, 0) + 1 for key in session.failed_restores}
             for key, attempts in failures.items():
                 if attempts == _RESTORE_RETRY_ERROR_ATTEMPTS:
