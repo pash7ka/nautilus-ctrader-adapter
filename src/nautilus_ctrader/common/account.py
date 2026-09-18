@@ -163,12 +163,19 @@ class CTraderAccountClient:
             raise CTraderConnectionError("account client not connected")
         return await self.session.request(payload, timeout_secs=timeout_secs)
 
-    async def symbol_specs(self, symbol_ids: Sequence[int]) -> dict[int, om.ProtoOASymbol]:
+    async def symbol_specs(
+        self,
+        symbol_ids: Sequence[int],
+        *,
+        refresh: bool = False,
+    ) -> dict[int, om.ProtoOASymbol]:
         """Full symbol entities by id, fetched once each and cached.
 
-        Ids the venue does not return are absent from the result.
+        `refresh` bypasses the cache for every id in `symbol_ids`, re-fetching and replacing
+        the cached entry. Ids the venue does not return are absent from the result.
         """
-        missing = [i for i in dict.fromkeys(symbol_ids) if i not in self._symbol_specs]
+        ids = list(dict.fromkeys(symbol_ids))
+        missing = ids if refresh else [i for i in ids if i not in self._symbol_specs]
         for start in range(0, len(missing), SYMBOL_BY_ID_BATCH):
             response = await self.request(
                 oa.ProtoOASymbolByIdReq(

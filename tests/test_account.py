@@ -312,6 +312,25 @@ async def test_symbol_specs_are_batched_and_cached(monkeypatch: pytest.MonkeyPat
         await server.stop()
 
 
+async def test_symbol_specs_refresh_bypasses_the_cache() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        await client.symbol_specs([1])
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == 1
+
+        await client.symbol_specs([1], refresh=True)
+
+        requests = received(server, oa.ProtoOASymbolByIdReq)
+        assert len(requests) == 2
+        assert list(requests[-1].symbolId) == [1]
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_request_before_connect_fails() -> None:
     server = venue()
     await server.start()
