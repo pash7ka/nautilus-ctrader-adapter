@@ -66,9 +66,9 @@ Open API application:
 
 1. Register an application under your cTID at
    <https://openapi.ctrader.com/> and obtain a `clientId` / `clientSecret` pair.
-2. Send yourself through `https://openapi.ctrader.com/apps/auth` with your `client_id`,
-   a `redirect_uri` and `scope=trading`, sign in with your cTID and select the accounts to
-   expose. The redirect carries back an authorization code.
+2. Send yourself through `https://id.ctrader.com/my/settings/openapi/grantingaccess/` with
+   your `client_id`, a `redirect_uri`, `scope=trading` and `product=web`, sign in with your
+   cTID and select the accounts to expose. The redirect carries back an authorization code.
 3. Exchange the code at `https://openapi.ctrader.com/apps/token` for an `accessToken` /
    `refreshToken` pair; the access token is refreshed from the refresh token before it
    expires.

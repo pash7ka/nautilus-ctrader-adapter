@@ -44,7 +44,9 @@ from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 
-AUTHORIZATION_URL = "https://openapi.ctrader.com/apps/auth"
+# The documented authorization page (help.ctrader.com/open-api/account-authentication). The
+# official SDK uses openapi.ctrader.com/apps/auth instead; the documented one is preferred.
+AUTHORIZATION_URL = "https://id.ctrader.com/my/settings/openapi/grantingaccess/"
 TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 
 CLIENT_ID_KEY = "CTRADER_CLIENT_ID"
@@ -170,6 +172,7 @@ def build_authorization_url(client_id: str, redirect_uri: str, state: str) -> st
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "scope": "trading",
+            "product": "web",
             "state": state,
         },
     )
@@ -323,10 +326,10 @@ def exchange_code(
 ) -> TokenResponse:
     """Exchange an authorization code for an access/refresh token pair.
 
-    GET with query parameters, exactly as Spotware's own SDK does it
-    (`ctrader_open_api/auth.py`).
-    TODO(verify): confirm GET-vs-POST and the response field names against a live exchange;
-    this endpoint is outside the protobuf schema this repository vendors.
+    GET with query parameters, as documented (help.ctrader.com/open-api/account-authentication)
+    and as Spotware's own SDK does it; the documented response fields are `accessToken`,
+    `tokenType`, `expiresIn`, `refreshToken`, `errorCode` and `description`.
+    TODO(verify): not yet exercised against the live endpoint.
     """
     query = urllib.parse.urlencode(
         {

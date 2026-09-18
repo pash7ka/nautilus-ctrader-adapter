@@ -125,13 +125,14 @@ def test_build_authorization_url_encodes_parameters() -> None:
 
     parsed = urllib.parse.urlsplit(url)
     assert parsed.scheme == "https"
-    assert parsed.netloc == "openapi.ctrader.com"
-    assert parsed.path == "/apps/auth"
+    assert parsed.netloc == "id.ctrader.com"
+    assert parsed.path == "/my/settings/openapi/grantingaccess/"
     params = urllib.parse.parse_qs(parsed.query)
     assert params == {
         "client_id": ["my client"],
         "redirect_uri": ["http://localhost:8080/callback"],
         "scope": ["trading"],
+        "product": ["web"],
         "state": ["the-state"],
     }
 
