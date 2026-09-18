@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from decimal import Decimal
 
+from google.protobuf.internal.enum_type_wrapper import EnumTypeWrapper
+from google.protobuf.message import Message
 from nautilus_trader.model.data import Bar, BarType, QuoteTick
 from nautilus_trader.model.enums import AssetClass, CurrencyType
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
@@ -85,18 +87,35 @@ def bar_boundary_secs(utc_minutes: int, period_secs: int) -> int:
     return secs - secs % period_secs
 
 
-def _optional_field(message, field: str):
+def _optional_field(message: Message, field: str) -> object | None:
     return getattr(message, field) if message.HasField(field) else None
 
 
-def _optional_enum_field(message, field: str, enum_type):
+def _optional_enum_field(message: Message, field: str, enum_type: EnumTypeWrapper) -> str | None:
     return enum_type.Name(getattr(message, field)) if message.HasField(field) else None
 
 
-def _optional_quantity(symbol: om.ProtoOASymbol, field: str, precision: int) -> Quantity | None:
+def _optional_exact_quantity(
+    symbol_name: str,
+    symbol: om.ProtoOASymbol,
+    field: str,
+    precision: int,
+) -> Quantity | None:
+    """A cents-of-a-unit volume field as a `Quantity`, refusing silent rounding.
+
+    `precision` comes from `stepVolume`; a `minVolume`/`maxVolume`/`lotSize` finer than that
+    step would otherwise round away, in the worst case to zero.
+    """
     if not symbol.HasField(field):
         return None
-    return Quantity(volume_to_units(getattr(symbol, field)), precision)
+    raw = getattr(symbol, field)
+    units = volume_to_units(raw)
+    if _precision(units) > precision:
+        raise CTraderProtocolError(
+            f"{symbol_name}: {field}={raw} ({units} units) is not exact at the symbol's "
+            f"size precision of {precision} (derived from stepVolume)",
+        )
+    return Quantity(units, precision)
 
 
 def _info_for(symbol: om.ProtoOASymbol, light: om.ProtoOALightSymbol) -> dict[str, object]:
@@ -131,6 +150,15 @@ def _info_for(symbol: om.ProtoOASymbol, light: om.ProtoOALightSymbol) -> dict[st
     }
 
 
+def _asset_name(assets: Mapping[int, om.ProtoOAAsset], asset_id: int, symbol_name: str) -> str:
+    asset = assets.get(asset_id)
+    if asset is None:
+        raise CTraderProtocolError(
+            f"{symbol_name}: asset id {asset_id} not found in the asset table",
+        )
+    return asset.name
+
+
 def instrument_from_symbol(
     symbol: om.ProtoOASymbol,
     light: om.ProtoOALightSymbol,
@@ -143,25 +171,36 @@ def instrument_from_symbol(
     `asset_class_overrides` is keyed by symbol name and applies to `Cfd` results only; an
     override for a symbol that resolves to a `CurrencyPair` is ignored (currency pairs derive
     their class from their currencies), not reported here — the caller logs that case.
+
+    Raises `CTraderProtocolError` if a base/quote asset id is missing from `assets`, if the
+    quote asset does not resolve to a known `Currency`, if `digits` exceeds the 1/100000 price
+    scale, or if `minVolume`/`maxVolume`/`lotSize` is not exact at the precision `stepVolume`
+    implies.
     """
     name = light.symbolName
     raw_symbol = Symbol(name)
     instrument_id = InstrumentId(raw_symbol, CTRADER_VENUE)
 
-    base_name = assets[light.baseAssetId].name
-    quote_name = assets[light.quoteAssetId].name
+    digits = symbol.digits
+    if digits > 5:
+        raise CTraderProtocolError(
+            f"{name}: digits={digits} exceeds the supported 1/100000 price scale",
+        )
+    price_increment = Price(Decimal(1).scaleb(-digits), digits)
+
+    base_name = _asset_name(assets, light.baseAssetId, name)
+    quote_name = _asset_name(assets, light.quoteAssetId, name)
     base_currency = _currency(base_name)
     quote_currency = _currency(quote_name)
-
-    digits = symbol.digits
-    price_increment = Price(Decimal(1).scaleb(-digits), digits)
+    if quote_currency is None:
+        raise CTraderProtocolError(f"{name}: quote asset {quote_name!r} is not a known currency")
 
     step = volume_to_units(symbol.stepVolume)
     size_precision = _precision(step)
     size_increment = Quantity(step, size_precision)
-    lot_size = _optional_quantity(symbol, "lotSize", size_precision)
-    min_quantity = _optional_quantity(symbol, "minVolume", size_precision)
-    max_quantity = _optional_quantity(symbol, "maxVolume", size_precision)
+    lot_size = _optional_exact_quantity(name, symbol, "lotSize", size_precision)
+    min_quantity = _optional_exact_quantity(name, symbol, "minVolume", size_precision)
+    max_quantity = _optional_exact_quantity(name, symbol, "maxVolume", size_precision)
 
     info = _info_for(symbol, light)
 
@@ -221,14 +260,25 @@ def bar_from_trendbar(
     The period comes from `bar_type`, not `tb.period`: recorded historical responses leave
     `ProtoOATrendbar.period` unset on every individual bar (the real period is only carried on
     the enclosing `ProtoOAGetTrendbarsRes`), so reading it here would silently default to M1.
+    Live bars (from a spot event subscription) do set `tb.period`; when they do, it must agree
+    with `bar_type`, or `CTraderProtocolError` is raised rather than silently trusting one over
+    the other.
     """
+    period = trendbar_period_for(bar_type)
+    if tb.HasField("period") and tb.period != period:
+        raise CTraderProtocolError(
+            f"{bar_type}: trendbar period {tb.period} does not match the bar type's period "
+            f"{period}",
+        )
+
     open_price = price_from_raw(tb.low + tb.deltaOpen, price_precision)
     high_price = price_from_raw(tb.low + tb.deltaHigh, price_precision)
     low_price = price_from_raw(tb.low, price_precision)
     close_price = price_from_raw(tb.low + tb.deltaClose, price_precision)
+    # TODO(verify): trendbar volume is a tick count, not scaled.
     volume = Quantity(tb.volume, size_precision)
 
-    period_secs = PERIOD_SECS[trendbar_period_for(bar_type)]
+    period_secs = PERIOD_SECS[period]
     boundary = bar_boundary_secs(tb.utcTimestampInMinutes, period_secs)
     ts_event = (boundary + period_secs) * 1_000_000_000
 

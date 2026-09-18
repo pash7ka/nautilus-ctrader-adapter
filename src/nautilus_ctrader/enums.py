@@ -9,25 +9,38 @@ from __future__ import annotations
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import AggregationSource, BarAggregation, PriceType
 
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+
+_period = om.ProtoOATrendbarPeriod.Value
+
 # ProtoOATrendbarPeriod value -> period length in seconds.
 PERIOD_SECS: dict[int, int] = {
-    1: 60,  # M1
-    2: 120,  # M2
-    3: 180,  # M3
-    4: 240,  # M4
-    5: 300,  # M5
-    6: 600,  # M10
-    7: 900,  # M15
-    8: 1_800,  # M30
-    9: 3_600,  # H1
-    10: 14_400,  # H4
-    11: 43_200,  # H12
-    12: 86_400,  # D1
+    _period("M1"): 60,
+    _period("M2"): 120,
+    _period("M3"): 180,
+    _period("M4"): 240,
+    _period("M5"): 300,
+    _period("M10"): 600,
+    _period("M15"): 900,
+    _period("M30"): 1_800,
+    _period("H1"): 3_600,
+    _period("H4"): 14_400,
+    _period("H12"): 43_200,
+    _period("D1"): 86_400,
 }
 
-_MINUTE_STEPS: dict[int, int] = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 10: 6, 15: 7, 30: 8}
-_HOUR_STEPS: dict[int, int] = {1: 9, 4: 10, 12: 11}
-_DAY_STEPS: dict[int, int] = {1: 12}
+_MINUTE_STEPS: dict[int, int] = {
+    1: _period("M1"),
+    2: _period("M2"),
+    3: _period("M3"),
+    4: _period("M4"),
+    5: _period("M5"),
+    10: _period("M10"),
+    15: _period("M15"),
+    30: _period("M30"),
+}
+_HOUR_STEPS: dict[int, int] = {1: _period("H1"), 4: _period("H4"), 12: _period("H12")}
+_DAY_STEPS: dict[int, int] = {1: _period("D1")}
 
 _STEPS_BY_AGGREGATION: dict[BarAggregation, dict[int, int]] = {
     BarAggregation.MINUTE: _MINUTE_STEPS,
