@@ -794,3 +794,57 @@ async def test_a_connect_landing_as_the_first_attempt_finishes_starts_no_second_
         await client.disconnect()
         await client.disconnect()
         await server.stop()
+
+
+async def test_a_cancelled_disconnect_still_stops_the_session() -> None:
+    server = _venue()
+    await server.start()
+    client = _client(server, environment="demo")
+    try:
+        await client.connect()
+
+        # A retry task whose shutdown dawdles, so the disconnect can be cancelled mid-way.
+        async def slow_to_stop() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.5)
+
+        client._retry_task.cancel()
+        client._retry_task = asyncio.create_task(slow_to_stop())
+        await asyncio.sleep(0)
+
+        disconnecting = asyncio.create_task(client.disconnect())
+        await asyncio.sleep(0.05)
+        disconnecting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await disconnecting
+
+        await wait_until(lambda: server.open_connection_count == 0, description="session closed")
+
+        await client.connect()
+        assert client.session is not None and client.session.is_ready
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+@pytest.mark.parametrize(
+    "unanswered",
+    [oa_model.PROTO_OA_APPLICATION_AUTH_REQ, oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ],
+)
+async def test_connect_timeout_bounds_the_whole_connect(unanswered: int) -> None:
+    server = _venue()
+    server.on(unanswered, lambda _r: None)
+    await server.start()
+    client = _client(server, connect_timeout_secs=0.5)
+    try:
+        started = time.monotonic()
+        with pytest.raises(CTraderTimeoutError, match=r"connect did not complete within 0\.5s"):
+            await client.connect()
+
+        assert time.monotonic() - started < 1.5
+        assert client.session is None
+        await wait_until(lambda: server.open_connection_count == 0, description="all closed")
+    finally:
+        await server.stop()

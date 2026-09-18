@@ -193,17 +193,28 @@ class CTraderAccountClient:
         return list(response.symbol)
 
     async def _bring_up(self) -> None:
-        host = await self._resolve_host()
-        session = self._build_session(host)
-        self.session = session
+        # One bound for the whole bring-up, so a `disconnect()` queued behind a hanging
+        # `connect()` waits no longer than `connect_timeout_secs`.
+        deadline = asyncio.timeout(self._connect_timeout_secs)
+        session: CTraderSession | None = None
         try:
-            await session.start()
-            await self._wait_ready(session)
-            if self._deposit_asset is None:
-                await self._load_reference_data()
-        except BaseException:
+            async with deadline:
+                host = await self._resolve_host()
+                session = self._build_session(host)
+                self.session = session
+                await session.start()
+                await self._wait_ready(session)
+                if self._deposit_asset is None:
+                    await self._load_reference_data()
+        except BaseException as e:
             self.session = None
-            await session.stop()
+            if session is not None:
+                await session.stop()
+            if isinstance(e, TimeoutError) and deadline.expired():
+                cause = session.last_error if session is not None else None
+                raise CTraderTimeoutError(
+                    f"connect did not complete within {self._connect_timeout_secs:g}s",
+                ) from (cause or e)
             raise
         self._retry_task = asyncio.create_task(self._retry_restores_loop(session))
         self._log.info("Account session ready")
@@ -212,9 +223,14 @@ class CTraderAccountClient:
         retry_task, self._retry_task = self._retry_task, None
         if retry_task is not None:
             retry_task.cancel()
-            await asyncio.wait({retry_task})
-        if session is not None:
-            await session.stop()
+        # The session is stopped even if this is cancelled while the retry task winds down;
+        # otherwise it would run on with nothing left to reach it.
+        try:
+            if retry_task is not None:
+                await asyncio.wait({retry_task})
+        finally:
+            if session is not None:
+                await session.stop()
 
     async def _resolve_host(self) -> str:
         if self._environment == "demo":
@@ -332,13 +348,11 @@ class CTraderAccountClient:
 
     async def _wait_ready(self, session: CTraderSession) -> None:
         # Polled rather than awaited in one go, so a rejected authentication - which the
-        # session would otherwise retry forever - fails the connect at once.
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._connect_timeout_secs
+        # session would otherwise retry forever - fails the connect at once. The caller bounds
+        # the total wait.
         while True:
-            remaining = deadline - loop.time()
             with contextlib.suppress(TimeoutError):
-                await session.wait_ready(timeout_secs=max(0.0, min(_READY_POLL_SECS, remaining)))
+                await session.wait_ready(timeout_secs=_READY_POLL_SECS)
                 return
             error = session.last_error
             if isinstance(error, CTraderAuthError):
@@ -347,10 +361,6 @@ class CTraderAccountClient:
                         "configured environment does not match the account; use 'auto'",
                     ) from error
                 raise CTraderAuthError(str(error)) from error
-            if loop.time() >= deadline:
-                raise CTraderTimeoutError(
-                    f"session not ready within {self._connect_timeout_secs:g}s",
-                ) from error
 
     async def _load_reference_data(self) -> None:
         trader = (
