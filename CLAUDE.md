@@ -37,11 +37,24 @@ Concrete consequences:
 - The adapter never reads application config files. It takes a typed config object.
 - Instrument definitions come from the broker, not from a table in this repo.
 
-Two safety behaviours are protocol translation, not strategy, and therefore *do* belong here:
-in cTrader, stop-loss and take-profit are attributes of a position rather than standalone
-orders, so (a) cancelling "orders" while a position is open must not silently strip its
-protection, and (b) whether the account is hedging or netting is read from the broker and
-mapped to `OmsType`, never assumed.
+In cTrader, stop-loss and take-profit are attributes of a position rather than standalone
+orders. Translating between that model and Nautilus orders is protocol work and belongs here;
+it is done **literally**, without guessing what the strategy intends:
+
+- a bracket (entry, stop, take-profit) goes out as one order carrying both levels; the stop and
+  take-profit legs are accepted once the position exists with them;
+- cancelling a leg removes that level from the position at the broker and is reported as
+  `OrderCanceled`, or `OrderCancelRejected` if the broker refuses;
+- when a position closes, for any reason, its remaining legs are reported as `OrderCanceled`;
+- what the venue model cannot express (a second stop on one position, a protective stop with no
+  position to attach to) is rejected with a clear reason.
+
+Keeping an open position protected is the strategy's job: close first, then clean up the
+remaining legs. The adapter never refuses or ignores a cancel to keep a stop in place; that
+would break the Nautilus contract for every other strategy.
+
+Whether the account is hedging or netting is read from the broker and mapped to `OmsType`,
+never assumed.
 
 ## 2. Language
 
