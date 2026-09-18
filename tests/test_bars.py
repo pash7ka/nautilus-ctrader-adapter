@@ -442,11 +442,11 @@ async def test_backfill_starts_from_the_bar_forming_at_creation_when_never_emitt
 
 
 async def test_backfill_skips_the_fetch_and_still_resets_baseline_when_nothing_has_closed() -> None:
-    clock = FakeClock(T0 + 200)
+    clock = FakeClock(T0 + 240)  # an aligned boundary
     fetch = FetchStub([])
     emitted: list[RawBar] = []
     closer = make_closer(clock, fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0 + 80)
+    closer.mark_emitted(T0 + 180)  # an aligned boundary
 
     calls: list[tuple[int, int]] = []
 
@@ -456,15 +456,18 @@ async def test_backfill_skips_the_fetch_and_still_resets_baseline_when_nothing_h
 
     await closer.backfill(fetch_range)
 
-    # end = T0+120; start = last_emitted + period = T0+140 > end -> nothing to fetch.
+    # end = T0+180; start = last_emitted + period = T0+240 > end -> nothing to fetch, and
+    # nothing closed since last_emitted, so no tail-boundary retry is armed either.
     assert calls == []
     assert emitted == []
+    assert clock.timers == []
 
-    closer.on_update(bar(T0 + 120, tag="stale"))  # past its end -> discarded, not forming
+    clock.t = T0 + 400  # time passes before the post-backfill baseline update arrives
+    closer.on_update(bar(T0 + 200, tag="stale"))  # past its end -> discarded, not forming
     assert emitted == []
-    closer.on_update(bar(T0 + 200, tag="live"))
-    closer.on_update(bar(T0 + 260, tag="live2"))
-    assert emitted == [bar(T0 + 200, tag="live")]
+    closer.on_update(bar(T0 + 400, tag="live"))
+    closer.on_update(bar(T0 + 460, tag="live2"))
+    assert emitted == [bar(T0 + 400, tag="live")]
 
 
 async def test_fallback_is_silent_and_preserves_the_warn_once_flag_when_already_covered() -> None:
@@ -548,3 +551,205 @@ async def test_an_emit_callback_exception_from_the_history_path_is_caught_and_lo
     errors = [line for level, line in logger.lines if level == "error"]
     assert len(errors) == 1
     assert closer.last_emitted == T0  # state stayed consistent despite the callback failing
+
+
+async def test_backfill_recovers_the_most_recent_boundary_when_history_still_lags() -> None:
+    """Reviewer's probe D: history lags 3 s behind a bar's close."""
+    lag = 3
+
+    clock = FakeClock(T0 + 241)
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+
+    def history_bar(boundary: int) -> RawBar:
+        return bar(boundary, tag=f"h{boundary - T0}")
+
+    async def fetch(boundary_secs: int) -> RawBar | None:
+        if boundary_secs + PERIOD + lag <= clock.now():
+            return history_bar(boundary_secs)
+        return None
+
+    gate = asyncio.Event()
+    calls: list[tuple[int, int]] = []
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        calls.append((start, end))
+        await gate.wait()
+        return [
+            history_bar(b) for b in range(start, end + 1, PERIOD) if b + PERIOD + lag <= clock.now()
+        ]
+
+    closer = make_closer(clock, fetch, emitted, logger)
+    closer.mark_emitted(T0)
+
+    task = asyncio.create_task(closer.backfill(fetch_range))
+    await asyncio.sleep(0)  # backfill starts, suspends on the gate
+
+    assert calls == [(T0 + 60, T0 + 180)]
+
+    closer.on_update(bar(T0 + 180, tag="stream-180"))  # held; the closing snapshot of T0+180
+
+    gate.set()
+    await task
+
+    # History served 60 and 120; 180 lagged behind by 3s and was not in the response.
+    assert emitted == [history_bar(T0 + 60), history_bar(T0 + 120)]
+    assert closer.last_emitted == T0 + 120
+
+    # The kept update for exactly the missing tail boundary becomes `current`, retried via
+    # history immediately (delay 0) rather than discarded by the baseline rule.
+    pending = [e for e in clock.timers if not e[2]]
+    assert len(pending) == 1
+    assert pending[0][0] == clock.t  # armed at delay 0
+
+    await clock.advance(0)  # let the immediate retry fire; history still lags at this instant
+    assert emitted == [history_bar(T0 + 60), history_bar(T0 + 120)]  # not yet -- still lagging
+
+    clock.t = T0 + 245  # history catches up, and the next retry (`grace` after the first) is due
+    await clock.advance(0)
+
+    assert emitted == [
+        history_bar(T0 + 60),
+        history_bar(T0 + 120),
+        history_bar(T0 + 180),
+    ]
+    assert closer.last_emitted == T0 + 180
+
+    closer.on_update(bar(T0 + 240, tag="live"))
+    closer.on_update(bar(T0 + 300, tag="live2"))
+    assert emitted == [
+        history_bar(T0 + 60),
+        history_bar(T0 + 120),
+        history_bar(T0 + 180),
+        bar(T0 + 240, tag="live"),
+    ]
+
+
+async def test_backfill_arms_a_history_only_retry_for_a_missing_tail_with_no_held_update() -> None:
+    clock = FakeClock(T0 + 130)
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+
+    async def fetch(boundary_secs: int) -> RawBar | None:
+        return None  # the bar never shows up in history: it had no ticks
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        return []  # nothing closed has been served yet
+
+    closer = make_closer(clock, fetch, emitted, logger)
+    closer.mark_emitted(T0)
+
+    await closer.backfill(fetch_range)
+
+    # end = floor(130/60)*60-60 = T0+60, which is above last_emitted -> a tail retry is armed.
+    pending = [e for e in clock.timers if not e[2]]
+    assert len(pending) == 1
+    assert pending[0][0] == clock.t
+
+    await clock.advance(0)  # first attempt: empty
+    await clock.advance(GRACE)  # second attempt: empty, retries exhausted
+
+    assert emitted == []  # a bar with no ticks does not exist
+    warnings = [line for level, line in logger.lines if level == "warning"]
+    debugs = [line for level, line in logger.lines if level == "debug"]
+    assert warnings == []  # silent: there was never a streamed state to report giving up on
+    assert debugs == []
+
+
+async def test_backfill_stops_refining_after_the_round_cap_and_warns() -> None:
+    clock = FakeClock(T0)
+    fetch = FetchStub([])
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+    closer = make_closer(clock, fetch, emitted, logger)
+
+    clock.t = T0 + 500  # give it a real gap to work through
+
+    calls: list[tuple[int, int]] = []
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        calls.append((start, end))
+        clock.t += PERIOD  # history is perpetually one period further behind
+        return []
+
+    await closer.backfill(fetch_range)
+
+    assert len(calls) == 5  # capped, rather than looping forever
+    assert emitted == []
+    warnings = [line for level, line in logger.lines if level == "warning"]
+    assert len(warnings) == 1
+    assert "slower than the bar period" in warnings[0]
+
+
+async def test_the_warn_once_flag_is_separate_per_fallback_kind() -> None:
+    clock = FakeClock(T0)
+    fetch = FetchStub([RuntimeError("boom")])  # first bar: a failure; second: empty history
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+    closer = make_closer(clock, fetch, emitted, logger)
+
+    first_bar = bar(T0, tag="first")
+    closer.on_update(first_bar)
+    await clock.advance(61)  # fails immediately, no retries -> WARNING (failed kind)
+
+    second_bar = bar(T0 + 60, tag="second")
+    closer.on_update(second_bar)
+    await clock.advance(60)  # boundary+period+grace - now(T0+61); the failure had no retries
+    await clock.advance(1)
+    await clock.advance(1)  # empty history, exhausted -> WARNING (empty kind, still fresh)
+
+    assert emitted == [first_bar, second_bar]
+    warnings = [line for level, line in logger.lines if level == "warning"]
+    assert len(warnings) == 2  # one kind's warning does not silence the other's
+
+
+async def test_an_emit_callback_exception_during_backfill_is_caught_and_replay_continues() -> None:
+    clock = FakeClock(T0 + 200)
+    fetch = FetchStub([])
+    logger = RecordingLogger()
+    emitted: list[RawBar] = []
+
+    bad_boundary = T0 + 60
+    b1 = bar(bad_boundary, tag="bad")
+    b2 = bar(T0 + 120, tag="good")
+
+    def emit(b: RawBar) -> None:
+        if b.boundary_secs == bad_boundary:
+            raise RuntimeError("emit blew up")
+        emitted.append(b)
+
+    closer = BarCloser(
+        period_secs=PERIOD,
+        grace_secs=GRACE,
+        history_retries=RETRIES,
+        clock=clock,
+        fetch=fetch,
+        emit=emit,
+        logger=logger,
+        label="L",
+    )
+    closer.mark_emitted(T0)
+
+    gate = asyncio.Event()
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        await gate.wait()
+        return [b1, b2]
+
+    task = asyncio.create_task(closer.backfill(fetch_range))
+    await asyncio.sleep(0)
+
+    closer.on_update(bar(T0 + 300, tag="held"))  # a still-forming bar, held during backfill
+
+    gate.set()
+    await task
+
+    errors = [line for level, line in logger.lines if level == "error"]
+    assert len(errors) == 1
+    assert "emit callback raised during backfill" in errors[0]
+    assert emitted == [b2]  # the rest of the range was still emitted
+    assert closer.last_emitted == T0 + 120  # `_emit` recorded it despite the callback failing
+
+    # The held update was still replayed once backfill released the hold.
+    closer.on_update(bar(T0 + 360, tag="held2"))
+    assert emitted == [b2, bar(T0 + 300, tag="held")]

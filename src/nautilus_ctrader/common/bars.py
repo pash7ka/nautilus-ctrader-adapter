@@ -38,10 +38,15 @@ class Logger(Protocol):
     def info(self, message: str) -> None: ...
     def warning(self, message: str) -> None: ...
     def error(self, message: str) -> None: ...
+    def exception(self, message: str, ex: BaseException) -> None: ...
 
 
 Fetch = Callable[[int], Awaitable[RawBar | None]]
 Emit = Callable[[RawBar], None]
+
+# How many times `backfill` re-fetches a growing range before giving up on catching up and
+# leaving the rest to the tail-boundary retry and ordinary live streaming.
+_MAX_BACKFILL_ROUNDS = 5
 
 
 class BarCloser:
@@ -58,8 +63,9 @@ class BarCloser:
     - `close()` stops all of it permanently: further updates, timers and `backfill` calls are
       no-ops.
 
-    The warn-once fallback flag is per closer instance, i.e. per subscription: one bar type's
-    history gaps do not silence another's.
+    The warn-once fallback flags - one for a failed history request, one for history simply
+    having no bar - are per closer instance, i.e. per subscription: one bar type's history
+    gaps do not silence another's, and one kind of failure does not silence the other.
     """
 
     def __init__(
@@ -90,7 +96,8 @@ class BarCloser:
         self._baseline = True
         self._holding = False
         self._held_update: RawBar | None = None
-        self._fallback_warned = False
+        self._fallback_warned_failed = False
+        self._fallback_warned_empty = False
         self._closed = False
 
     @property
@@ -140,7 +147,8 @@ class BarCloser:
     async def backfill(self, fetch_range: Callable[[int, int], Awaitable[list[RawBar]]]) -> None:
         """Emit every bar closed since the last one, then resume the stream as a baseline.
 
-        `fetch_range(start, end)` returns bars for the **inclusive** range `[start, end]`;
+        `fetch_range(start, end)` returns bars for the **inclusive** range `[start, end]`, in
+        ascending boundary order (the result is defensively re-sorted here regardless);
         `start` and `end` are both period-aligned boundaries. `end` is the last boundary already
         closed by the clock. `start` continues from `last_emitted`, or, if nothing has been
         emitted yet, from the bar that was forming when this closer was constructed - so a bar
@@ -148,8 +156,15 @@ class BarCloser:
         subscription existed is emitted.
 
         If the closed range advances again while a fetch is in flight, it is fetched again from
-        where the previous one left off, until stable. Stream updates are held while this runs;
-        the latest one is replayed afterwards through the normal `on_update` path.
+        where the previous one left off, until stable, for up to `_MAX_BACKFILL_ROUNDS`; past
+        that, a WARNING is logged and refining stops. Either way, if the most recent closed
+        boundary still has no bar afterwards, history may simply not have served it yet (it can
+        lag behind a bar's close): a stream update held for exactly that boundary is promoted to
+        `_current` and retried through the normal history path instead of being discarded by the
+        baseline rule; with no such update, a history-only retry is armed, emitting nothing if it
+        stays empty, since a bar with no ticks does not exist. Earlier gaps in the range are
+        treated as genuinely empty periods. Stream updates are held while this runs; the latest
+        one still unused afterwards is replayed through the normal `on_update` path.
         """
         if self._closed:
             return
@@ -158,6 +173,7 @@ class BarCloser:
         self._holding = True
         self._held_update = None
         try:
+            rounds = 0
             while True:
                 end = self._last_closed_boundary()
                 start = (
@@ -170,15 +186,28 @@ class BarCloser:
                 closed_bars = await fetch_range(start, end)
                 if self._closed:
                     return
-                for closed_bar in closed_bars:
+                for closed_bar in sorted(closed_bars, key=lambda b: b.boundary_secs):
                     if closed_bar.boundary_secs + self._period <= self._clock.now():
-                        self._emit(closed_bar)
+                        self._emit_during_backfill(closed_bar)
+                rounds += 1
                 if self._last_closed_boundary() <= end:
+                    break
+                if rounds >= _MAX_BACKFILL_ROUNDS:
+                    self._log.warning(
+                        f"{self._label}: history fetch is slower than the bar period; "
+                        f"stopped refining the backfill range after {rounds} rounds"
+                    )
                     break
         finally:
             self._holding = False
             self._baseline = True
         held, self._held_update = self._held_update, None
+        tail = self._last_closed_boundary()
+        if self._last_emitted is None or tail > self._last_emitted:
+            if held is not None and held.boundary_secs == tail:
+                self._current = held
+                held = None
+            self._arm_immediately(tail)
         if held is not None:
             self.on_update(held)
 
@@ -195,10 +224,17 @@ class BarCloser:
         delay = boundary + self._period + self._grace - self._clock.now()
         self._timer = self._clock.call_later(max(delay, 0.0), lambda: self._on_timer(boundary, 0))
 
+    def _arm_immediately(self, boundary: int) -> None:
+        """Like `_arm`, but for a boundary that is already overdue: retry history right away."""
+        self._cancel()
+        self._timer = self._clock.call_later(0.0, lambda: self._on_timer(boundary, 0))
+
     def _on_timer(self, boundary: int, attempt: int) -> None:
         if self._closed or self._holding:
             return
-        if self._current is None or self._current.boundary_secs != boundary:
+        # `_current` may be `None` here: a history-only tail retry (see `backfill`) has no
+        # streamed state to track, only a boundary to keep asking history about.
+        if self._current is not None and self._current.boundary_secs != boundary:
             return
         loop = asyncio.get_running_loop()
         self._task = loop.create_task(self._close_from_history(boundary, attempt))
@@ -245,11 +281,14 @@ class BarCloser:
             later_line = (
                 f"{self._label}: closed bar from streamed state (history request failed: {error!r})"
             )
+            already_warned = self._fallback_warned_failed
+            self._fallback_warned_failed = True
         else:
             first_line = f"{self._label}: history had no closed bar; emitting the streamed state"
             later_line = f"{self._label}: closed bar from streamed state"
-        if not self._fallback_warned:
-            self._fallback_warned = True
+            already_warned = self._fallback_warned_empty
+            self._fallback_warned_empty = True
+        if not already_warned:
             self._log.warning(first_line)
         else:
             self._log.debug(later_line)
@@ -273,6 +312,14 @@ class BarCloser:
             self._emit(bar)
         except Exception as e:
             self._log.error(f"{self._label}: emit callback raised {e!r}")
+
+    def _emit_during_backfill(self, bar: RawBar) -> None:
+        # A bad callback must not abort the rest of the range or the held-update replay that
+        # follows `backfill`'s loop.
+        try:
+            self._emit(bar)
+        except Exception as e:
+            self._log.exception(f"{self._label}: emit callback raised during backfill", e)
 
     def _cancel(self) -> None:
         if self._timer is not None:
