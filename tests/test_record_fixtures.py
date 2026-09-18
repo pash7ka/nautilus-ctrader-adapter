@@ -113,6 +113,36 @@ def test_assert_clean_rejects_any_leftover_identifier() -> None:
     raise AssertionError("leftover identifier not detected")
 
 
+def test_varint_matches_known_encodings() -> None:
+    assert record_fixtures._varint(0) == b"\x00"
+    assert record_fixtures._varint(127) == b"\x7f"
+    assert record_fixtures._varint(128) == b"\x80\x01"
+    assert record_fixtures._varint(300) == b"\xac\x02"
+
+
+def test_scrub_miss_in_raw_bytes_is_caught_by_the_byte_level_check() -> None:
+    """`scrub` only knows to fix specific field names/types; a real identifier smuggled into a
+    field it never touches - here, a light symbol's `symbolName`, a plain string field - must
+    still be caught downstream by checking the scrubbed message's own raw serialized bytes.
+
+    The base64-encoded JSON built from those bytes can never contain this leak as a literal
+    decimal match, which is exactly why the raw-bytes check exists.
+    """
+    leaky = oa.ProtoOASymbolsListRes(
+        ctidTraderAccountId=REAL_ACCOUNT,
+        symbol=[om.ProtoOALightSymbol(symbolId=1, symbolName=str(REAL_ACCOUNT))],
+    )
+    scrubbed = record_fixtures.scrub(leaky, REAL_ACCOUNT, REAL_LOGIN)
+    assert scrubbed.ctidTraderAccountId == record_fixtures.FAKE_ACCOUNT_ID
+    assert scrubbed.symbol[0].symbolName == str(REAL_ACCOUNT)  # the miss
+
+    try:
+        record_fixtures.assert_clean(scrubbed.SerializeToString(), [str(REAL_ACCOUNT).encode()])
+    except record_fixtures.ScrubError:
+        return
+    raise AssertionError("scrub miss inside the raw serialized bytes was not detected")
+
+
 def test_recorded_fixtures_are_scrubbed_and_complete() -> None:
     rec = load_recorded()
     for key in (

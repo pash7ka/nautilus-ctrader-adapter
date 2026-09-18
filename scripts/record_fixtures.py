@@ -90,6 +90,27 @@ _CLEARED_FIELDS = frozenset(
 
 _IDENTIFYING_INT_TYPES = (FieldDescriptor.TYPE_INT64, FieldDescriptor.TYPE_UINT64)
 
+
+def _varint(n: int) -> bytes:
+    """Encode `n` as a protobuf varint - the wire encoding of an int64/uint64 scalar field.
+
+    Used to search for a real account id or trader login inside a message's raw serialized
+    bytes: the base64-encoded JSON built from those bytes can never contain a literal decimal
+    match for a value that is actually encoded as binary.
+    """
+    if n < 0:
+        raise ValueError("_varint does not support negative numbers")
+    out = bytearray()
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
 # proto2 `required` fields cannot just be cleared: an unset required field makes the whole
 # message fail SerializeToString(). Cleared fields that turn out to be required get one of
 # these fixed fake values instead (0 for any not listed here) so the message stays valid.
@@ -110,8 +131,9 @@ def scrub(message: Message, real_account_id: int, real_login: int | None) -> Mes
     `required` in the schema is set to a fake value instead of cleared, since an unset
     required field would make the message fail to serialize. As a second pass, independent of
     field name, any other int64/uint64 scalar still carrying exactly `real_account_id` or
-    `real_login` is replaced too, so a field this function does not yet know the name of can
-    never carry a real identifier through unnoticed.
+    `real_login` is replaced too - including each element of a repeated int64/uint64 field -
+    so a field this function does not yet know the name of can never carry a real identifier
+    through unnoticed.
     """
     result = type(message)()
     result.CopyFrom(message)
@@ -141,8 +163,14 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
                 setattr(message, name, _FAKE_REQUIRED_VALUES.get(name, 0))
             else:
                 message.ClearField(name)
-        elif field.type in _IDENTIFYING_INT_TYPES and field.label != FieldDescriptor.LABEL_REPEATED:
-            if real_account_id is not None and value == real_account_id:
+        elif field.type in _IDENTIFYING_INT_TYPES:
+            if field.label == FieldDescriptor.LABEL_REPEATED:
+                for i, item in enumerate(value):
+                    if real_account_id is not None and item == real_account_id:
+                        value[i] = FAKE_ACCOUNT_ID
+                    elif real_login is not None and item == real_login:
+                        value[i] = FAKE_TRADER_LOGIN
+            elif real_account_id is not None and value == real_account_id:
                 setattr(message, name, FAKE_ACCOUNT_ID)
             elif real_login is not None and value == real_login:
                 setattr(message, name, FAKE_TRADER_LOGIN)
@@ -224,7 +252,15 @@ class RecordedSecrets:
         self.broker_name = broker_name
         self.broker_title_short = broker_title_short
 
-    def forbidden_bytes(self) -> list[bytes]:
+    def forbidden_bytes(self, *, include_varints: bool = False) -> list[bytes]:
+        """The text form of every real identifying value, as bytes.
+
+        With `include_varints=True`, also includes the protobuf varint encoding of the
+        account id and trader login - the wire form an int64/uint64 field actually leaks as,
+        which a decimal-text search can never match. Meant for checking a message's own raw
+        `SerializeToString()` bytes; the varints are pointless noise against the base64 JSON,
+        so that check stays text-only.
+        """
         values = [
             str(self.account_id),
             str(self.real_login) if self.real_login is not None else None,
@@ -234,7 +270,12 @@ class RecordedSecrets:
             self.broker_name,
             self.broker_title_short,
         ]
-        return [v.encode() for v in values if v]
+        forbidden = [v.encode() for v in values if v]
+        if include_varints:
+            forbidden.append(_varint(self.account_id))
+            if self.real_login is not None:
+                forbidden.append(_varint(self.real_login))
+        return forbidden
 
 
 class RecordResult:
@@ -528,6 +569,16 @@ async def _run(account_id: int, env: dict[str, str]) -> None:
         key: [scrub(message, account_id, real_login) for message in messages]
         for key, messages in result.messages.items()
     }
+
+    # Checked per message, on its own raw serialized bytes: this is where a real identifier
+    # actually leaks (an int64/uint64 field as a varint, a string field as literal text). The
+    # base64-encoded JSON built below is checked separately, but a decimal identifier can
+    # never appear literally inside base64, so that check alone would miss exactly this.
+    raw_forbidden = result.secrets.forbidden_bytes(include_varints=True)
+    for messages in scrubbed.values():
+        for message in messages:
+            assert_clean(message.SerializeToString(), raw_forbidden)
+
     output = {key: [_encode(message) for message in messages] for key, messages in scrubbed.items()}
     output_bytes = json.dumps(output, indent=2).encode("utf-8")
 
@@ -556,7 +607,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     env = get_tokens.load_env(_REPO_ROOT / ".env")
-    asyncio.run(_run(args.account_id, env))
+    try:
+        asyncio.run(_run(args.account_id, env))
+    except Exception as e:
+        # A raised CTraderRequestError carries the venue's own description; an uncaught
+        # traceback would print it. Only the exception's type name reaches the terminal.
+        print(f"error: {type(e).__name__}: recording failed", file=sys.stderr)
+        return 1
     return 0
 
 
