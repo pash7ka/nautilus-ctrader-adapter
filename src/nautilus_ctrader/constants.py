@@ -48,7 +48,8 @@ BUCKET_HISTORICAL: str = "historical"
 DEFAULT_RATE_LIMIT_PER_SEC: float = 50.0
 HISTORICAL_RATE_LIMIT_PER_SEC: float = 5.0
 
-# Requests routed to the historical bucket regardless of the caller's own `bucket` argument.
+# Payload types that `CTraderSession.request()` defaults to the historical bucket for; an
+# explicit `bucket` argument still overrides this.
 HISTORICAL_PAYLOAD_TYPES: frozenset[type] = frozenset(
     {_oa.ProtoOAGetTrendbarsReq, _oa.ProtoOAGetTickDataReq},
 )
