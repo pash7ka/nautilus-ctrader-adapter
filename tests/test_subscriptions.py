@@ -1,12 +1,14 @@
 """The subscription registry: reference counts, reconnect restores and spot routing."""
 
 import asyncio
+import functools
 
 import pytest
 from google.protobuf.message import Message
 
+from nautilus_ctrader.common import account as account_module
 from nautilus_ctrader.common.account import CTraderAccountClient
-from nautilus_ctrader.common.errors import CTraderRequestError
+from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.account_venue import (
@@ -322,6 +324,7 @@ async def test_a_restore_racing_the_last_unsubscribe_leaves_no_subscription(
     monkeypatch: pytest.MonkeyPatch,
     server: FakeCTraderServer,
     client: CTraderAccountClient,
+    logger: RecordingLogger,
 ) -> None:
     monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
     registry = client.subscriptions
@@ -333,12 +336,17 @@ async def test_a_restore_racing_the_last_unsubscribe_leaves_no_subscription(
         lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
         answer_first=1,
     )
+    # The new connection never had them, so the venue refuses the unsubscribes.
+    server.refuse[oa.ProtoOAUnsubscribeLiveTrendbarReq] = "NOT_SUBSCRIBED_TO_SPOTS"
+    server.refuse[oa.ProtoOAUnsubscribeSpotsReq] = "NOT_SUBSCRIBED_TO_SPOTS"
     server.received.clear()
     await server.drop_connections()
     await asyncio.wait_for(held.arrived.wait(), 2.0)
 
     unsubscribing = asyncio.create_task(registry.unsubscribe_trendbars(EURUSD, M15, "bars"))
-    await asyncio.sleep(0.05)
+    # One tick suffices: the task blocks on the key lock at its first statement.
+    await asyncio.sleep(0)
+    assert not unsubscribing.done()
     await held.stop_holding()
     await unsubscribing
     await wait_until(lambda: client.session.is_ready, description="session ready again")
@@ -347,6 +355,7 @@ async def test_a_restore_racing_the_last_unsubscribe_leaves_no_subscription(
     sent = _subscriptions(server)
     assert ("ProtoOASubscribeLiveTrendbarReq", (EURUSD,), M15) not in sent
     assert sent[-1] == ("ProtoOAUnsubscribeSpotsReq", (EURUSD,))
+    assert [m for level, m in logger.lines if level == "warning" and "Unsubscribe" in m] == []
 
 
 async def test_interleaved_trendbar_unsubscribe_and_subscribe_end_subscribed(
@@ -368,27 +377,75 @@ async def test_interleaved_trendbar_unsubscribe_and_subscribe_end_subscribed(
     assert [n for n in sent if "Spots" in n][-1] == "ProtoOASubscribeSpotsReq"
 
 
-async def test_a_cancelled_trendbar_subscribe_keeps_its_spot_reference(
+@pytest.mark.parametrize("outcome", ["cancelled", "timed out"])
+async def test_an_unknown_trendbar_outcome_is_recorded_and_cleaned_up_by_unsubscribe(
+    monkeypatch: pytest.MonkeyPatch,
     server: FakeCTraderServer,
-    client: CTraderAccountClient,
+    logger: RecordingLogger,
+    outcome: str,
 ) -> None:
-    held = HeldReplies(
+    monkeypatch.setattr(
+        account_module,
+        "CTraderSession",
+        functools.partial(account_module.CTraderSession, request_timeout_secs=0.2),
+    )
+    HeldReplies(
         server,
         oa_model.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ,
         lambda r: oa.ProtoOASubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
     )
-    subscribing = asyncio.create_task(
-        client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars"),
+    client = account_client(server, logger=logger)
+    await client.connect()
+    try:
+        registry = client.subscriptions
+        subscribing = asyncio.create_task(registry.subscribe_trendbars(EURUSD, M15, "bars"))
+        await wait_until(
+            lambda: bool(received(server, oa.ProtoOASubscribeLiveTrendbarReq)),
+            description="trendbar request sent",
+        )
+        if outcome == "cancelled":
+            subscribing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await subscribing
+        else:
+            await subscribing
+
+        await registry.unsubscribe_trendbars(EURUSD, M15, "bars")
+
+        assert registry.consumers(EURUSD) == frozenset()
+        sent = [entry[0] for entry in _subscriptions(server)]
+        assert [n for n in sent if "Trendbar" in n][-1] == "ProtoOAUnsubscribeLiveTrendbarReq"
+        assert [n for n in sent if "Spots" in n][-1] == "ProtoOAUnsubscribeSpotsReq"
+        assert client.session.failed_restores == frozenset()
+    finally:
+        await client.disconnect()
+
+
+async def test_a_loss_surfacing_as_another_error_records_the_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    session = client.session
+    real_request = session.request
+    lost: list[HeldReplies] = []
+
+    async def lost_on_first_subscribe(payload, **kwargs):
+        if isinstance(payload, oa.ProtoOASubscribeSpotsReq) and not lost:
+            lost.append(await _reconnect_held(server))
+            raise CTraderProtocolError("frame cut short")
+        return await real_request(payload, **kwargs)
+
+    monkeypatch.setattr(session, "request", lost_on_first_subscribe)
+    await client.subscriptions.subscribe_spots(EURUSD, "a")
+
+    assert client.subscriptions.consumers(EURUSD) == frozenset({"a"})
+    await lost[0].stop_holding()
+    await wait_until(
+        lambda: bool(received(server, oa.ProtoOASubscribeSpotsReq)) and session.is_ready,
+        description="subscription restored",
     )
-    await asyncio.wait_for(held.arrived.wait(), 2.0)
-
-    subscribing.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await subscribing
-
-    # The trendbar request may have reached the venue, which needs spots for it.
-    assert client.subscriptions.consumers(EURUSD) == frozenset({f"trendbar:{M15}:bars"})
-    assert received(server, oa.ProtoOAUnsubscribeSpotsReq) == []
 
 
 async def test_live_keys_are_restored_after_a_reconnect(
@@ -441,6 +498,8 @@ async def test_a_refused_restore_is_reported_and_the_others_still_work(
     assert client.session.failed_restores == frozenset({("trendbar", EURUSD, M15)})
     await server.push(_spot(GBPUSD))
     await wait_until(lambda: len(spots) == 1, description="spot delivered after reconnect")
+    await asyncio.sleep(0.05)
+    assert len(spots) == 1
 
 
 async def test_restores_accept_already_subscribed(
@@ -483,6 +542,8 @@ async def test_live_keys_survive_a_disconnect_and_connect(
     client.subscriptions.add_spot_listener(EURUSD, spots.append)
     await server.push(_spot(EURUSD))
     await wait_until(lambda: len(spots) == 1, description="spot delivered on the new session")
+    await asyncio.sleep(0.05)
+    assert len(spots) == 1
 
 
 async def test_spots_reach_only_their_symbol_listener(
@@ -498,6 +559,8 @@ async def test_spots_reach_only_their_symbol_listener(
 
     await server.push(_spot(EURUSD))
     await wait_until(lambda: len(eurusd) == 1, description="spot delivered")
+    await asyncio.sleep(0.05)
+    assert len(eurusd) == 1
 
     assert eurusd[0].symbolId == EURUSD
     assert gbpusd == []

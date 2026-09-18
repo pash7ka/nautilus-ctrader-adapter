@@ -8,7 +8,6 @@ every reconnect. Keys and log lines carry the symbol id and period only, never t
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
@@ -19,6 +18,7 @@ from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderError,
     CTraderRequestError,
+    CTraderTimeoutError,
 )
 from nautilus_ctrader.common.session import SessionState
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -35,6 +35,9 @@ _Key = tuple[str, int] | tuple[str, int, int]
 # silently accepting it or failing with another code.
 _ALREADY_SUBSCRIBED = "ALREADY_SUBSCRIBED"
 _ACCEPTING = (SessionState.READY, SessionState.RESTORING)
+# TODO(verify): the code the venue refuses an unsubscribe of a never-subscribed key with, for
+# live trendbars as well as spots.
+_NOT_SUBSCRIBED = frozenset({"NOT_SUBSCRIBED_TO_SPOTS"})
 
 
 def _spots_key(symbol_id: int) -> _Key:
@@ -54,9 +57,10 @@ class SubscriptionRegistry:
     The account's spot and trendbar subscriptions, shared by consumer name.
 
     - While the session accepts requests, the venue request goes first and the reference is
-      counted once it succeeds. Otherwise (no session, or reconnecting) only the intent is
-      recorded, and the next bring-up's restores act on it; (un)subscribing never raises for
-      want of a connection.
+      counted once it succeeds, or once its outcome is unknown (timeout, cancellation, loss);
+      only a venue refusal leaves it uncounted. Otherwise (no session, or reconnecting) only
+      the intent is recorded, and the next bring-up's restores act on it; (un)subscribing
+      never raises for want of a connection.
     - The same consumer subscribing twice counts once.
     - A consumer joining a key whose restore is in the session's `failed_restores` gets no
       data until the restore retry succeeds.
@@ -73,7 +77,8 @@ class SubscriptionRegistry:
         # the other way round.
         self._locks: dict[_Key, asyncio.Lock] = {}
         self._spot_listeners: dict[int, list[SpotListener]] = {}
-        self._failing_listeners: set[SpotListener] = set()
+        # `id()` of each listener that has raised, since listeners need not be hashable.
+        self._failing_listeners: set[int] = set()
 
     def attach(self, session: CTraderSession) -> None:
         """Route `session`'s spot events here and register a restore for every live key."""
@@ -101,10 +106,9 @@ class SubscriptionRegistry:
     async def subscribe_trendbars(self, symbol_id: int, period: int, consumer: str) -> None:
         """Subscribe live trendbars, holding the spot subscription the venue requires for them.
 
-        If the venue refuses the trendbar, the spot reference is released again. If the call
-        is cancelled or times out, whether the trendbar reached the venue is unknown, and the
-        spot reference is kept: spots without trendbars are harmless, trendbars without spots
-        are not.
+        If the venue refuses the trendbar, the spot reference is released again. Any other
+        failure (cancellation, timeout, connection loss) leaves the outcome unknown: both
+        references are kept as an intent, which `unsubscribe_trendbars` releases as usual.
         """
         key = _trendbar_key(symbol_id, period)
         spots = _spots_key(symbol_id)
@@ -141,8 +145,9 @@ class SubscriptionRegistry:
         listeners = self._spot_listeners.get(symbol_id)
         if listeners is None or listener not in listeners:
             return
-        listeners.remove(listener)
-        self._failing_listeners.discard(listener)
+        # The stored object, not `listener`: an equal bound method is a different object.
+        stored = listeners.pop(listeners.index(listener))
+        self._failing_listeners.discard(id(stored))
         if not listeners:
             del self._spot_listeners[symbol_id]
 
@@ -166,10 +171,27 @@ class SubscriptionRegistry:
             consumers.add(consumer)
             return
         session = self._accepting_session()
-        if session is not None:
-            # Lost mid-request: left to the next bring-up, like any other intent.
-            with contextlib.suppress(CTraderConnectionError):
-                await _subscribe(session, [self._subscribe_request(key)])
+        if session is None:
+            self._record(key, consumer)
+            return
+        # Only a venue refusal is a definite "no". Any other failure leaves the outcome unknown
+        # and is recorded as an intent, so the consumer's unsubscribe still cleans it up and
+        # the next bring-up makes the venue consistent.
+        try:
+            await _subscribe(session, [self._subscribe_request(key)])
+        except CTraderRequestError:
+            raise
+        except (CTraderConnectionError, CTraderTimeoutError):
+            pass
+        except CTraderError:
+            # A loss can surface as another error type.
+            if self._accepting_session() is session:
+                raise
+        except asyncio.CancelledError:
+            self._record(key, consumer)
+            raise
+        # Recorded against whichever session is attached now: if that is no longer the one the
+        # request went through, its next bring-up restores the key.
         self._record(key, consumer)
 
     def _record(self, key: _Key, consumer: str) -> None:
@@ -191,15 +213,20 @@ class SubscriptionRegistry:
         if len(consumers) > 1:
             consumers.discard(consumer)
             return
+        session = self._accepting_session()
+        restoring = session is not None and session.state is SessionState.RESTORING
         try:
-            session = self._accepting_session()
             # TODO(verify): the venue drops all subscriptions when the connection drops, so a
             # key released while not connected needs no unsubscribe.
             if session is not None:
                 await session.request(self._unsubscribe_request(key))
         except CTraderError as e:
             detail = e.error_code if isinstance(e, CTraderRequestError) else type(e).__name__
-            self._log.warning(f"Unsubscribe {key!r} failed: {detail}")
+            if restoring and detail in _NOT_SUBSCRIBED:
+                # Expected: the new connection had not re-subscribed the key yet.
+                self._log.debug(f"Unsubscribe {key!r} during restore: {detail}")
+            else:
+                self._log.warning(f"Unsubscribe {key!r} failed: {detail}")
         finally:
             del self._consumers[key]
             if self._session is not None:
@@ -212,8 +239,9 @@ class SubscriptionRegistry:
             requests.insert(0, self._subscribe_request(_spots_key(key[1])))
 
         async def restore() -> None:
-            # The lock is retaken per request, so a release queued meanwhile runs in between
-            # and the next request sees the key gone.
+            # The lock is retaken per request. `asyncio.Lock` hands off to its queued waiters
+            # in FIFO order, so a release queued meanwhile runs in between and the next
+            # request sees the key gone.
             for request in requests:
                 async with self._lock(key):
                     if key not in self._consumers:
@@ -257,10 +285,10 @@ class SubscriptionRegistry:
             except Exception as e:
                 message = f"Spot listener for symbol {event.symbolId} raised"
                 # ERROR once per listener; a listener failing on every tick would flood it.
-                if listener in self._failing_listeners:
+                if id(listener) in self._failing_listeners:
                     self._log.debug(f"{message} {type(e).__name__} again")
                 else:
-                    self._failing_listeners.add(listener)
+                    self._failing_listeners.add(id(listener))
                     self._log.exception(message, e)
 
 
