@@ -24,7 +24,7 @@ ASSETS = {a.assetId: a for a in REC["assets"][0].asset}
 LIGHT = {s.symbolName: s for s in REC["symbols"][0].symbol}
 SPECS = {s.symbolId: s for s in REC["symbol_specs"][0].symbol}
 
-# The flat, snake_case `info` keys `instrument_from_symbol` must always populate (spec §4).
+# The flat, snake_case `info` keys `instrument_from_symbol` must always populate.
 _INFO_KEYS = (
     "symbol_id",
     "lot_size_cents",
@@ -89,6 +89,23 @@ def test_xauusd_is_a_commodity_cfd_with_xau_base() -> None:
     assert isinstance(i, Cfd) and i.asset_class == AssetClass.COMMODITY
     assert i.base_currency.code == "XAU" and i.price_precision == 2
     assert i.lot_size == Quantity(100, 0) and i.min_quantity == Quantity(1, 0)
+
+
+@pytest.mark.parametrize(
+    ("base", "quote", "expected"),
+    [
+        # `FX` is reachable only from here: through `instrument_from_symbol`, two
+        # currencies build a `CurrencyPair`, which derives its own asset class.
+        ("EUR", "USD", AssetClass.FX),
+        ("XAU", "USD", AssetClass.COMMODITY),
+        ("BTC", "USD", AssetClass.CRYPTOCURRENCY),
+        ("BTC", "ETH", AssetClass.CRYPTOCURRENCY),
+        ("USD", "BTC", AssetClass.ALTERNATIVE),
+        ("GER40", "EUR", AssetClass.ALTERNATIVE),
+    ],
+)
+def test_asset_class_for_covers_every_branch(base: str, quote: str, expected: AssetClass) -> None:
+    assert parsing.asset_class_for(base, quote) == expected
 
 
 @pytest.mark.parametrize("name", ["EURUSD", "GER40.cash"])

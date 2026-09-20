@@ -43,7 +43,11 @@ def _is_pair_currency(currency: Currency | None) -> bool:
 
 
 def asset_class_for(base_name: str, quote_name: str) -> AssetClass:
-    """`AssetClass` for a CFD symbol, from its base and quote asset names."""
+    """`AssetClass` for a CFD symbol, from its base and quote asset names.
+
+    `instrument_from_symbol` never reaches the `FX` branch: a currency-against-currency
+    symbol is built as a `CurrencyPair`, which derives its own asset class.
+    """
     base, quote = _currency(base_name), _currency(quote_name)
     if (
         base is not None

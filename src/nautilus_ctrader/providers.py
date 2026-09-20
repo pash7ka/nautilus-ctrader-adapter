@@ -124,10 +124,11 @@ class CTraderInstrumentProvider(InstrumentProvider):
 
     async def conversion_instruments_for(self, instrument: Instrument) -> list[Instrument]:
         """Chain instruments needed to convert `instrument`'s quote currency into the deposit
-        currency (empty if they are already equal). Loads them (they are `CurrencyPair`s by
-        the D2 rule). The chain is cached per `(quote_asset_id, deposit_asset_id)`, and a leg
-        already loaded is reused rather than rebuilt. Raises `InstrumentLoadError` if the chain
-        cannot be built, or `instrument` was not loaded by this provider.
+        currency (empty if they are already equal). Loads them (both legs are currencies, so
+        they build as `CurrencyPair`s, the instrument kind `Cache.get_xrate` reads rates from).
+        The chain is cached per `(quote_asset_id, deposit_asset_id)`, and a leg already loaded
+        is reused rather than rebuilt. Raises `InstrumentLoadError` if the chain cannot be
+        built, or `instrument` was not loaded by this provider.
         """
         self._require_connected()
         quote_asset_id = self._quote_asset_id.get(instrument.id)
@@ -198,7 +199,7 @@ class CTraderInstrumentProvider(InstrumentProvider):
         return bool(stale)
 
     def remove_failed(self, instrument_id: InstrumentId, reason: str) -> None:
-        """Unload an instrument that must not be traded, recording it as a D6 failure.
+        """Unload an instrument that must not be traded, recording it as a load failure.
 
         For a failure the loader itself cannot see, such as a conversion chain that cannot be
         resolved for an instrument that otherwise built fine.
@@ -237,7 +238,7 @@ class CTraderInstrumentProvider(InstrumentProvider):
         spec: om.ProtoOASymbol | None,
         light: om.ProtoOALightSymbol,
     ) -> Instrument:
-        """Build the instrument for `light`/`spec`, or record the D6 failure and raise.
+        """Build the instrument for `light`/`spec`, or record the failure and raise.
 
         Every place that can fail to build an instrument routes through here, so a failure is
         never raised without first landing in `failures` with an ERROR line.

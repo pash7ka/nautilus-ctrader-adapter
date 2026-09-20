@@ -440,7 +440,8 @@ def get_cached_ctrader_account_client(
     """The one client per `(account_id, credentials.client_id)`.
 
     Later calls with the same key return the first instance; their other arguments are ignored.
-    A differing `environment` is logged at WARNING, because it would have picked another host.
+    A differing `environment` or credential is reported in one WARNING: the first client's
+    host and tokens win, and the second config would otherwise be ignored in silence.
     """
     key = (account_id, credentials.client_id)
     client = _ACCOUNT_CLIENTS.get(key)
@@ -453,10 +454,31 @@ def get_cached_ctrader_account_client(
             **kwargs,
         )
         _ACCOUNT_CLIENTS[key] = client
-    elif environment != client._environment:
+        return client
+
+    cached = client._credentials
+    differences: list[str] = []
+    if environment != client._environment:
+        differences.append(
+            f"environment (built {client._environment!r}, requested {environment!r})",
+        )
+    # Field names only: a credential value, or any part or measure of one, never reaches a log.
+    changed = [
+        label
+        for label, old_value, new_value in (
+            ("client secret", cached.client_secret, credentials.client_secret),
+            ("access token", cached.access_token, credentials.access_token),
+            ("refresh token", cached.refresh_token, credentials.refresh_token),
+            ("token expiry", cached.token_expires_at, credentials.token_expires_at),
+        )
+        if old_value != new_value
+    ]
+    if changed:
+        differences.append(f"credentials ({', '.join(changed)})")
+    if differences:
         logger.warning(
-            f"Account client already built for environment {client._environment!r}; "
-            f"requested {environment!r} is ignored",
+            "Account client already built; these differing settings are ignored: "
+            + "; ".join(differences),
         )
     return client
 

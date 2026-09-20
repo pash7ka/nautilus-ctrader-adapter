@@ -378,8 +378,8 @@ class CTraderDataClient(LiveMarketDataClient):
         nothing to do, or `None` if the chain is not usable, for one of two reasons:
 
         - the chain does not exist, or a leg cannot be built. The instrument can never be
-          priced in the account currency, so it is dropped from the provider (D6), and
-          `fail_on_instrument_error` raises instead of returning.
+          priced in the account currency, so it is unloaded rather than left tradable by
+          accident, and `fail_on_instrument_error` raises instead of returning.
         - the venue refused the subscription. The instrument is still tradable, so it stays
           loaded and unconverted and the next subscribe tries the chain again - unless this is
           the bring-up and `fail_on_instrument_error` is set, which asks for an instrument that

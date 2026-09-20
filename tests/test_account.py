@@ -31,6 +31,10 @@ from tests.account_venue import (
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
+# `credentials()` defaults the expiry to "now + an hour", so the cache tests pin it to keep
+# two calls byte-identical.
+_EXPIRES_AT = 1_700_000_000.0
+
 
 async def test_auto_connects_to_the_listed_account_and_closes_the_pre_connection() -> None:
     server = venue()
@@ -369,7 +373,7 @@ def test_cached_client_is_shared_per_account_and_application() -> None:
 def test_a_cached_client_warns_when_another_environment_is_asked_for() -> None:
     get_cached_ctrader_account_client(
         account_id=ACCOUNT_ID,
-        credentials=credentials(),
+        credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="demo",
         logger=RecordingLogger(),
     )
@@ -377,7 +381,7 @@ def test_a_cached_client_warns_when_another_environment_is_asked_for() -> None:
 
     get_cached_ctrader_account_client(
         account_id=ACCOUNT_ID,
-        credentials=credentials(),
+        credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="live",
         logger=logger,
     )
@@ -389,10 +393,10 @@ def test_a_cached_client_warns_when_another_environment_is_asked_for() -> None:
     assert str(ACCOUNT_ID) not in warnings[0]
 
 
-def test_a_cached_client_for_the_same_environment_logs_nothing() -> None:
+def test_a_cached_client_warns_once_when_the_credentials_differ() -> None:
     get_cached_ctrader_account_client(
         account_id=ACCOUNT_ID,
-        credentials=credentials(),
+        credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="demo",
         logger=RecordingLogger(),
     )
@@ -400,7 +404,35 @@ def test_a_cached_client_for_the_same_environment_logs_nothing() -> None:
 
     get_cached_ctrader_account_client(
         account_id=ACCOUNT_ID,
-        credentials=credentials(),
+        credentials=credentials(
+            access_token="second-access-token",
+            refresh_token="second-refresh-token",
+            token_expires_at=_EXPIRES_AT,
+        ),
+        environment="demo",
+        logger=logger,
+    )
+
+    warnings = [message for level, message in logger.lines if level == "warning"]
+    assert len(warnings) == 1
+    assert "access token" in warnings[0] and "refresh token" in warnings[0]
+    assert "client secret" not in warnings[0] and "token expiry" not in warnings[0]
+    for secret in ("access-token", "refresh-token", "second-access-token", "second-refresh-token"):
+        assert secret not in warnings[0]
+
+
+def test_a_cached_client_for_the_same_environment_and_credentials_logs_nothing() -> None:
+    get_cached_ctrader_account_client(
+        account_id=ACCOUNT_ID,
+        credentials=credentials(token_expires_at=_EXPIRES_AT),
+        environment="demo",
+        logger=RecordingLogger(),
+    )
+    logger = RecordingLogger()
+
+    get_cached_ctrader_account_client(
+        account_id=ACCOUNT_ID,
+        credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="demo",
         logger=logger,
     )
