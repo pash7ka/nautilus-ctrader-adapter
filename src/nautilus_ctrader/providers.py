@@ -257,7 +257,10 @@ class CTraderInstrumentProvider(InstrumentProvider):
                 self._overrides,
                 ts_init=_now_ns(),
             )
-        except CTraderProtocolError as e:
+        except (CTraderProtocolError, ValueError, TypeError) as e:
+            # Nautilus validates the constructor arguments itself and reports what it rejects
+            # as a `ValueError` or a `TypeError`. Caught here so one unusable symbol is a
+            # recorded failure like any other, never the end of the batch it arrived in.
             self._record_failure(name, str(e))
             raise InstrumentLoadError(str(e)) from e
         self._finish_load(instrument, spec, light)

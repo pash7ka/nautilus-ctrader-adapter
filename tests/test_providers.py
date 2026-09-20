@@ -12,6 +12,7 @@ from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Cfd, CurrencyPair
 
+from nautilus_ctrader import providers
 from nautilus_ctrader.common.errors import CTraderConnectionError
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -287,6 +288,78 @@ async def test_close_only_mode_is_loaded_with_a_warning() -> None:
             level == "warning" and "GER40.cash is loaded but not tradable" in message
             for level, message in logger.lines
         )
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_symbol_without_a_step_volume_fails_alone() -> None:
+    # Schema-legal but unusable: Nautilus refuses a zero size increment, and that refusal must
+    # stay this symbol's failure rather than end the load every other symbol is part of.
+    server = venue()
+    ger40_symbol_id = LIGHT["GER40.cash"].symbolId
+
+    def symbol_by_id(request: oa.ProtoOASymbolByIdReq) -> oa.ProtoOASymbolByIdRes:
+        wanted = set(request.symbolId)
+        symbols = []
+        for spec in RECORDED["symbol_specs"][0].symbol:
+            if spec.symbolId not in wanted:
+                continue
+            copy = om.ProtoOASymbol()
+            copy.CopyFrom(spec)
+            if copy.symbolId == ger40_symbol_id:
+                # All four are optional in the schema; a symbol carrying none of them is legal.
+                for field in ("stepVolume", "minVolume", "maxVolume", "lotSize"):
+                    copy.ClearField(field)
+            symbols.append(copy)
+        return oa.ProtoOASymbolByIdRes(
+            ctidTraderAccountId=request.ctidTraderAccountId,
+            symbol=symbols,
+        )
+
+    server.on(om.PROTO_OA_SYMBOL_BY_ID_REQ, symbol_by_id)
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        provider = _provider(client)
+
+        await provider.load_ids_async([GER40_ID, EURUSD_ID])
+
+        assert provider.find(GER40_ID) is None
+        assert [f.symbol for f in provider.failures] == ["GER40.cash"]
+        assert provider.failures[0].reason == "GER40.cash: stepVolume is missing or zero"
+        assert provider.find(EURUSD_ID) is not None  # the rest of the batch still loaded
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_value_nautilus_itself_refuses_fails_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The converter cannot know every rule Nautilus enforces on its own arguments, so whatever
+    # it rejects has to be caught where an unbuildable symbol already is.
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    build = providers.instrument_from_symbol
+
+    def refuse_ger40(symbol, light, *args, **kwargs):
+        if light.symbolName == "GER40.cash":
+            raise ValueError("'size_increment' not a positive real")
+        return build(symbol, light, *args, **kwargs)
+
+    monkeypatch.setattr(providers, "instrument_from_symbol", refuse_ger40)
+    try:
+        await client.connect()
+        provider = _provider(client)
+
+        await provider.load_ids_async([GER40_ID, EURUSD_ID])
+
+        assert [f.symbol for f in provider.failures] == ["GER40.cash"]
+        assert provider.find(GER40_ID) is None
+        assert provider.find(EURUSD_ID) is not None
     finally:
         await client.disconnect()
         await server.stop()

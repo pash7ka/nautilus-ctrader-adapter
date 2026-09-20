@@ -228,6 +228,21 @@ def test_instrument_from_symbol_refuses_a_min_volume_finer_than_the_step() -> No
     assert "minVolume" in message
 
 
+@pytest.mark.parametrize("absent", [True, False], ids=["absent", "zero"])
+def test_instrument_from_symbol_refuses_a_symbol_without_a_step_volume(absent: bool) -> None:
+    # All four volume fields are optional in the schema, so a symbol carrying none of them is
+    # legal and still unusable: every size Nautilus wants is a multiple of the step.
+    light = LIGHT["GER40.cash"]
+    spec = om.ProtoOASymbol()
+    spec.CopyFrom(SPECS[light.symbolId])
+    for field in ("stepVolume", "minVolume", "maxVolume", "lotSize"):
+        spec.ClearField(field)
+    if not absent:
+        spec.stepVolume = 0
+    with pytest.raises(CTraderProtocolError, match="stepVolume is missing or zero"):
+        parsing.instrument_from_symbol(spec, light, ASSETS, {}, ts_init=0)
+
+
 def test_instrument_from_symbol_refuses_an_unknown_quote_currency() -> None:
     light = LIGHT["GER40.cash"]
     assets = dict(ASSETS)

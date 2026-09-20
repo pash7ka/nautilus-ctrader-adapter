@@ -178,8 +178,8 @@ def instrument_from_symbol(
 
     Raises `CTraderProtocolError` if a base/quote asset id is missing from `assets`, if the
     quote asset does not resolve to a known `Currency`, if `digits` exceeds the 1/100000 price
-    scale, or if `minVolume`/`maxVolume`/`lotSize` is not exact at the precision `stepVolume`
-    implies.
+    scale, if `stepVolume` is missing or zero, or if `minVolume`/`maxVolume`/`lotSize` is not
+    exact at the precision `stepVolume` implies.
     """
     name = light.symbolName
     raw_symbol = Symbol(name)
@@ -200,6 +200,9 @@ def instrument_from_symbol(
         raise CTraderProtocolError(f"{name}: quote asset {quote_name!r} is not a known currency")
 
     step = volume_to_units(symbol.stepVolume)
+    if step <= 0:
+        # `stepVolume` is optional in the schema, and every size here is a multiple of it.
+        raise CTraderProtocolError(f"{name}: stepVolume is missing or zero")
     size_precision = _precision(step)
     size_increment = Quantity(step, size_precision)
     lot_size = _optional_exact_quantity(name, symbol, "lotSize", size_precision)
