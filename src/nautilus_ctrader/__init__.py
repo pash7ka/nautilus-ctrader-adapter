@@ -14,7 +14,11 @@ from nautilus_ctrader.config import CTraderDataClientConfig
 from nautilus_ctrader.constants import CTRADER, CTRADER_VENUE
 from nautilus_ctrader.data import CTraderDataClient
 from nautilus_ctrader.factories import CTraderLiveDataClientFactory
-from nautilus_ctrader.providers import CTraderInstrumentProvider
+from nautilus_ctrader.providers import (
+    CTraderInstrumentProvider,
+    InstrumentLoadError,
+    InstrumentLoadFailure,
+)
 
 __version__ = "0.0.1"
 
@@ -27,6 +31,8 @@ __all__ = [
     "CTraderDataClientConfig",
     "CTraderInstrumentProvider",
     "CTraderLiveDataClientFactory",
+    "InstrumentLoadError",
+    "InstrumentLoadFailure",
     "__version__",
     "account_client_from_config",
     "get_cached_ctrader_account_client",

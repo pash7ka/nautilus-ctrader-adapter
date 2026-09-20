@@ -6,8 +6,9 @@ execution against any broker that exposes cTrader Open API.
 
 > **Status: early development (pre-alpha).** The transport layer, the instrument provider and
 > the market data client are in place and tested offline; the execution client comes next. The
-> public API is not stable, there is no PyPI release yet, and nothing here should be pointed at
-> a live account yet. See [Roadmap](#roadmap).
+> public API is not stable and there is no PyPI release yet. Nothing here trades: the adapter
+> sends no orders at all, and the scripts that do connect to a real account only read from it.
+> See [Roadmap](#roadmap).
 
 ## Why this exists
 
