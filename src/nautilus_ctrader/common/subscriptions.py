@@ -164,6 +164,10 @@ class SubscriptionRegistry:
         """The consumers holding `symbol_id`'s spot subscription, trendbar holders included."""
         return frozenset(self._consumers.get(_spots_key(symbol_id), ()))
 
+    def trendbar_consumers(self, symbol_id: int, period: int) -> frozenset[str]:
+        """The consumers holding `symbol_id`'s live trendbar subscription for `period`."""
+        return frozenset(self._consumers.get(_trendbar_key(symbol_id, period), ()))
+
     def _lock(self, key: _Key) -> asyncio.Lock:
         return self._locks.setdefault(key, asyncio.Lock())
 

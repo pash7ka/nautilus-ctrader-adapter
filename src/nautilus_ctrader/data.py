@@ -219,6 +219,9 @@ class CTraderDataClient(LiveMarketDataClient):
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
         self._bar_routes: dict[tuple[int, int], _BarSub] = {}
+        # Bar subscriptions whose unsubscribe is in flight, kept for the same reason as
+        # `_releasing`: a cancelled one must still be repeated.
+        self._releasing_bars: dict[BarType, _BarSub] = {}
         self._bar_clock: Clock = _LoopClock(loop)
         # Keys already reported as undeliverable; a repeat is logged at DEBUG, since a broken
         # scale would otherwise flood the log on every tick.
@@ -231,6 +234,9 @@ class CTraderDataClient(LiveMarketDataClient):
         return self._instrument_provider
 
     async def _connect(self) -> None:
+        # Nothing from an earlier connection may survive here: a `_disconnect` cut short would
+        # otherwise make a later subscribe a silent no-op against a session that is gone.
+        self._forget_subscriptions()
         # A chain is venue data that can change, so it is re-queried once per connection.
         self._instrument_provider.reset_conversion_cache()
         self._converted.clear()
@@ -267,7 +273,7 @@ class CTraderDataClient(LiveMarketDataClient):
                     self._on_symbol_changed,
                 )
                 session.remove_restore(_BOOK_RESET_RESTORE)
-            for bar_type in list(self._bars):
+            for bar_type in sorted(self._all_bars(), key=str):
                 await self._drop_bars(bar_type, session)
             # A snapshot: releasing a hold drops it from the mapping.
             for symbol_id, consumer in sorted(self._all_holds()):
@@ -276,6 +282,22 @@ class CTraderDataClient(LiveMarketDataClient):
             self._converted.clear()
         finally:
             await self._account.disconnect()
+
+    def _forget_subscriptions(self) -> None:
+        """Drop every record of what was subscribed, without touching the venue."""
+        for sub in self._bars.values():
+            sub.closer.close()
+        for sub in self._releasing_bars.values():
+            sub.closer.close()
+        self._bars.clear()
+        self._bar_routes.clear()
+        self._releasing_bars.clear()
+        self._spot_holds.clear()
+        self._releasing.clear()
+        for symbol_id, listener in self._spot_listeners.items():
+            self._account.subscriptions.remove_spot_listener(symbol_id, listener)
+        self._spot_listeners.clear()
+        self._books.clear()
 
     # -- Instruments ------------------------------------------------------------------------
 
@@ -558,34 +580,40 @@ class CTraderDataClient(LiveMarketDataClient):
         # forming at its construction, so building it afterwards would drop a bar that closed
         # while the request was in flight.
         sub = _BarSub(symbol_id, period, self._make_closer(bar_type, symbol_id, period))
+        consumer = _bar_consumer(bar_type)
         self._bars[bar_type] = sub
         self._bar_routes[(symbol_id, period)] = sub
         self._sync_listener(symbol_id)
         try:
-            await self._account.subscriptions.subscribe_trendbars(
-                symbol_id,
-                period,
-                _bar_consumer(bar_type),
-            )
-        except CTraderRequestError:
-            self._forget_bars(bar_type, sub)
-            raise
-        if self._session is not None:
-            # Registered after the registry's own restore for this key, and so run after it:
-            # the backfill's history requests need the reconnected subscription in place.
-            self._session.add_restore(
-                _bar_restore_key(bar_type),
-                functools.partial(self._restore_bars, sub),
-            )
+            await self._account.subscriptions.subscribe_trendbars(symbol_id, period, consumer)
+        finally:
+            # Whatever the outcome - success, refusal, cancellation, a lost connection - what
+            # is kept here must match what the registry counts. It counts a subscribe whose
+            # outcome is unknown, and those still need the restore; a refused or unrecorded one
+            # leaves nothing behind, and the bar type must stay free for another try.
+            if consumer in self._account.subscriptions.trendbar_consumers(symbol_id, period):
+                if self._session is not None:
+                    # Added after the registry's own restore for this key, and so run after it:
+                    # the backfill's history needs the reconnected subscription in place.
+                    self._session.add_restore(
+                        _bar_restore_key(bar_type),
+                        functools.partial(self._restore_bars, sub),
+                    )
+            else:
+                self._forget_bars(bar_type, sub)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
         await self._drop_bars(command.bar_type, self._session)
 
     async def _drop_bars(self, bar_type: BarType, session: CTraderSession | None) -> None:
-        sub = self._bars.get(bar_type)
+        sub = self._bars.get(bar_type) or self._releasing_bars.get(bar_type)
         if sub is None:
             return
-        self._forget_bars(bar_type, sub)
+        if bar_type in self._bars:
+            self._forget_bars(bar_type, sub)
+        # Recorded until the request returns, so a cancelled unsubscribe is repeated at
+        # disconnect rather than leaving the venue sending trendbars nobody listens to.
+        self._releasing_bars[bar_type] = sub
         if session is not None:
             session.remove_restore(_bar_restore_key(bar_type))
         await self._account.subscriptions.unsubscribe_trendbars(
@@ -593,6 +621,7 @@ class CTraderDataClient(LiveMarketDataClient):
             sub.period,
             _bar_consumer(bar_type),
         )
+        self._releasing_bars.pop(bar_type, None)
 
     def _forget_bars(self, bar_type: BarType, sub: _BarSub) -> None:
         """Stop routing and closing `bar_type`, before its venue subscription is given up."""
@@ -600,6 +629,10 @@ class CTraderDataClient(LiveMarketDataClient):
         self._bar_routes.pop((sub.symbol_id, sub.period), None)
         sub.closer.close()
         self._sync_listener(sub.symbol_id)
+
+    def _all_bars(self) -> set[BarType]:
+        """Every bar type the registry may still count a trendbar reference for."""
+        return set(self._bars) | set(self._releasing_bars)
 
     def _make_closer(self, bar_type: BarType, symbol_id: int, period: int) -> BarCloser:
         return BarCloser(
@@ -671,12 +704,13 @@ class CTraderDataClient(LiveMarketDataClient):
 
         period_secs = PERIOD_SECS[period]
         now_secs = int(self._bar_clock.now())
-        served = await self._page_history(
+        served = await self._page_trendbars(
             instrument.info["symbol_id"],
             period,
             start_secs=None if request.start is None else int(request.start.timestamp()),
             end_secs=now_secs if request.end is None else int(request.end.timestamp()),
             limit=request.limit or None,
+            closed_secs=now_secs,
         )
         # History serves the forming bar too, which is not a bar yet.
         closed = [raw for raw in served if raw.boundary_secs + period_secs <= now_secs]
@@ -701,7 +735,7 @@ class CTraderDataClient(LiveMarketDataClient):
         ]
         self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)
 
-    async def _page_history(
+    async def _page_trendbars(
         self,
         symbol_id: int,
         period: int,
@@ -709,11 +743,17 @@ class CTraderDataClient(LiveMarketDataClient):
         start_secs: int | None,
         end_secs: int,
         limit: int | None,
+        closed_secs: int,
     ) -> list[RawBar]:
-        """Bars opening at or before `end_secs`, ascending, paging backwards from it.
+        """Bars opening before `end_secs`, ascending, paging backwards from it.
 
-        With neither a `start_secs` nor a `limit` exactly one page is asked for: the caller
-        wanted the most recent bars, not the whole history.
+        `limit` counts only bars closed by `closed_secs`, so the forming bar history also
+        serves never takes a closed bar's place. With neither a `start_secs` nor a `limit`
+        exactly one page is asked for: the caller wanted the most recent bars, not the whole
+        history.
+
+        A page the venue cut short is continued from the oldest boundary it actually served,
+        not from the window that was asked for, so the part it dropped is asked for again.
         """
         period_secs = PERIOD_SECS[period]
         # TODO(verify): the venue's cap on a request's time span, which may be shorter than
@@ -725,56 +765,77 @@ class CTraderDataClient(LiveMarketDataClient):
             from_secs = to_secs - span
             if start_secs is not None:
                 from_secs = max(start_secs, from_secs)
-            page = await self._get_trendbars(
+            page, truncated = await self._get_trendbars(
                 symbol_id,
                 period,
                 from_secs=from_secs,
                 to_secs=to_secs,
-                count=self._config.history_page_size,
+                count=self._page_count(),
             )
             for raw in page:
-                bars.setdefault(raw.boundary_secs, raw)
+                # An inclusive `toTimestamp` would otherwise carry a bar past the end in.
+                if raw.boundary_secs < end_secs:
+                    bars.setdefault(raw.boundary_secs, raw)
+            oldest = min((raw.boundary_secs for raw in page), default=None)
+            if truncated and oldest is not None:
+                self._log.debug(
+                    f"History cut a page short at {oldest} for symbol {symbol_id}; "
+                    f"continuing from there",
+                )
+                # Never above the window's own last boundary, so every page makes progress.
+                reached = min(oldest, to_secs - period_secs)
+            else:
+                reached = from_secs
             if start_secs is None and limit is None:
                 break
-            if limit is not None and len(bars) >= limit:
+            if limit is not None and self._closed_count(bars, period_secs, closed_secs) >= limit:
                 break
-            if start_secs is not None and from_secs <= start_secs:
+            if start_secs is not None and reached <= start_secs:
                 break
             if start_secs is None and not page:
                 # Without a lower bound, an empty page is the only sign history has run out.
                 break
-            to_secs = from_secs
+            to_secs = reached
         return [bars[boundary] for boundary in sorted(bars)]
+
+    @staticmethod
+    def _closed_count(bars: dict[int, RawBar], period_secs: int, closed_secs: int) -> int:
+        return sum(1 for boundary in bars if boundary + period_secs <= closed_secs)
+
+    def _page_count(self) -> int:
+        """One more than a full window holds, so a truncated page still covers the window.
+
+        The venue answers with the newest `count` bars ending at `toTimestamp`, so asking for
+        exactly as many as the window holds would silently drop the bar at its start.
+        """
+        return self._config.history_page_size + 1
 
     async def _fetch_bar(self, symbol_id: int, period: int, boundary_secs: int) -> RawBar | None:
         """The one closed bar opening at `boundary_secs`, or `None` if history has none yet."""
         period_secs = PERIOD_SECS[period]
-        bars = await self._get_trendbars(
+        bars, _ = await self._get_trendbars(
             symbol_id,
             period,
             from_secs=boundary_secs,
             to_secs=boundary_secs + period_secs,
-            count=1,
+            # Two for a one-bar window, for the same reason as `_page_count`.
+            count=2,
         )
         return next((raw for raw in bars if raw.boundary_secs == boundary_secs), None)
 
     async def _fetch_bar_range(self, sub: _BarSub, start_secs: int, end_secs: int) -> list[RawBar]:
         """Every bar history has for the inclusive range `[start_secs, end_secs]`."""
         period_secs = PERIOD_SECS[sub.period]
-        span = self._config.history_page_size * period_secs
-        bars: list[RawBar] = []
-        cursor = start_secs
-        while cursor <= end_secs:
-            to_secs = min(end_secs + period_secs, cursor + span)
-            bars += await self._get_trendbars(
-                sub.symbol_id,
-                sub.period,
-                from_secs=cursor,
-                to_secs=to_secs,
-                count=self._config.history_page_size,
-            )
-            cursor = to_secs
-        return bars
+        # Paged backwards, like every other historical request, because that is the end the
+        # venue counts `count` from.
+        return await self._page_trendbars(
+            sub.symbol_id,
+            sub.period,
+            start_secs=start_secs,
+            end_secs=end_secs + period_secs,
+            limit=None,
+            closed_secs=end_secs + period_secs,
+        )
 
     async def _get_trendbars(
         self,
@@ -784,10 +845,14 @@ class CTraderDataClient(LiveMarketDataClient):
         from_secs: int,
         to_secs: int,
         count: int,
-    ) -> list[RawBar]:
+    ) -> tuple[list[RawBar], bool]:
+        """The window's bars, and whether the venue served fewer than the window holds."""
         session = self._session
         if session is None:
             raise CTraderConnectionError("data client is not connected")
+        # TODO(verify): whether toTimestamp is inclusive and what the venue's per-request cap
+        # is. Both are absorbed here - an inclusive edge only repeats a boundary the caller
+        # dedupes, and a cap is read back off `hasMore`.
         response = await session.request(
             oa.ProtoOAGetTrendbarsReq(
                 ctidTraderAccountId=self._account.account_id,
@@ -802,7 +867,8 @@ class CTraderDataClient(LiveMarketDataClient):
         # The period is the response's, not each bar's: a historical trendbar leaves its own
         # `period` unset.
         period_secs = PERIOD_SECS[period]
-        return [_raw_bar(trendbar, period_secs) for trendbar in response.trendbar]
+        bars = [_raw_bar(trendbar, period_secs) for trendbar in response.trendbar]
+        return bars, response.hasMore or len(bars) >= count
 
     # -- Subscription bookkeeping -----------------------------------------------------------
 
@@ -850,9 +916,12 @@ class CTraderDataClient(LiveMarketDataClient):
 
     def _sync_listener(self, symbol_id: int) -> None:
         """Keep exactly one listener on `symbol_id` while a quote hold or a bar needs it."""
-        wanted = symbol_id in self._spot_holds or any(
-            sub.symbol_id == symbol_id for sub in self._bars.values()
-        )
+        quoting = symbol_id in self._spot_holds
+        if not quoting:
+            # Tied to the quote holds, not to the listener a bar subscription also keeps alive:
+            # a side from before a gap in the subscription must never be paired with one after.
+            self._books.pop(symbol_id, None)
+        wanted = quoting or any(sub.symbol_id == symbol_id for sub in self._bars.values())
         listener = self._spot_listeners.get(symbol_id)
         if wanted and listener is None:
             listener = functools.partial(self._on_spot, symbol_id)
@@ -861,7 +930,6 @@ class CTraderDataClient(LiveMarketDataClient):
         elif not wanted and listener is not None:
             del self._spot_listeners[symbol_id]
             self._account.subscriptions.remove_spot_listener(symbol_id, listener)
-            self._books.pop(symbol_id, None)
 
     def _on_spot(self, symbol_id: int, event: oa.ProtoOASpotEvent) -> None:
         """Route one spot event: its prices to the quote path, its trendbars to the closers."""

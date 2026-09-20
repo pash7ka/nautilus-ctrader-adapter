@@ -12,6 +12,7 @@ against the formatter that produces it and log *effects* against what the venue 
 from __future__ import annotations
 
 import asyncio
+import functools
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -38,7 +39,7 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from nautilus_ctrader.common.account import CTraderAccountClient
-from nautilus_ctrader.common.errors import CTraderRequestError
+from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.data import CONVERSION_CONSUMER, CTraderDataClient, _conversion_message
@@ -274,24 +275,36 @@ RECORDED_HISTORY: dict[tuple[int, int], dict[int, om.ProtoOATrendbar]] = {
 }
 
 
-def _serve_trendbars(request: oa.ProtoOAGetTrendbarsReq) -> oa.ProtoOAGetTrendbarsRes:
+def _serve_trendbars(
+    request: oa.ProtoOAGetTrendbarsReq,
+    *,
+    inclusive_to: bool,
+    chunk: int | None,
+) -> oa.ProtoOAGetTrendbarsRes:
+    """Serve the recorded bars in the requested window, keeping the newest when capped.
+
+    `inclusive_to` and `chunk` stand in for the two things the live endpoint has not settled:
+    whether `toTimestamp` is inclusive, and a per-request cap below the asked-for `count`.
+    """
     source = RECORDED_HISTORY.get((request.symbolId, request.period), {})
     bars = [
         trendbar
         for minute, trendbar in sorted(source.items())
-        if request.fromTimestamp <= minute * 60_000 < request.toTimestamp
+        if request.fromTimestamp <= minute * 60_000 <= request.toTimestamp
+        and (inclusive_to or minute * 60_000 != request.toTimestamp)
     ]
-    if request.count:
-        bars = bars[-request.count :]
+    cap = min(request.count or len(bars), len(bars) if chunk is None else chunk)
+    truncated = len(bars) > cap
     return oa.ProtoOAGetTrendbarsRes(
         ctidTraderAccountId=request.ctidTraderAccountId,
         symbolId=request.symbolId,
         period=request.period,
-        trendbar=bars,
+        trendbar=bars[-cap:],
+        hasMore=truncated,
     )
 
 
-def trendbar_venue() -> FakeCTraderServer:
+def trendbar_venue(*, inclusive_to: bool = False, chunk: int | None = None) -> FakeCTraderServer:
     """The data venue, also accepting live trendbar subscriptions and serving recorded history."""
     server = data_venue()
     for payload_type, response_class in (
@@ -302,7 +315,10 @@ def trendbar_venue() -> FakeCTraderServer:
             payload_type,
             lambda r, cls=response_class: cls(ctidTraderAccountId=r.ctidTraderAccountId),
         )
-    server.on(om.PROTO_OA_GET_TRENDBARS_REQ, _serve_trendbars)
+    server.on(
+        om.PROTO_OA_GET_TRENDBARS_REQ,
+        functools.partial(_serve_trendbars, inclusive_to=inclusive_to, chunk=chunk),
+    )
     return server
 
 
@@ -809,6 +825,36 @@ async def test_a_change_of_open_time_closes_exactly_one_bar() -> None:
         bar = h.bars()[0]
         assert bar.bar_type == EURUSD_M1
         assert bar.ts_event == close_ns(FIRST_M1_MINUTE, 60)
+        # The recorded closing state of that minute, field by field.
+        assert [str(bar.open), str(bar.high), str(bar.low), str(bar.close)] == [
+            "1.14814",
+            "1.14818",
+            "1.14809",
+            "1.14809",
+        ]
+        assert float(bar.volume) == 84.0
+
+
+async def test_a_quote_unsubscribe_forgets_the_book_although_the_bars_go_on() -> None:
+    # No conversion, so the quote subscription is the symbol's only spot hold.
+    client_config = config(
+        subscribe_conversion_quotes=False,
+        instrument_provider=InstrumentProviderConfig(load_ids=frozenset({EURUSD_ID})),
+    )
+    async with harness(client_config=client_config, server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        # The bar subscription keeps the symbol's listener attached throughout.
+        await subscribe_bars(h, EURUSD_M1)
+        await subscribe_quotes(h, EURUSD_ID)
+        await push_spot(h, BID_ONLY)
+
+        await unsubscribe_quotes(h, EURUSD_ID)
+        await subscribe_quotes(h, EURUSD_ID)
+        await push_spot(h, ASK_ONLY)
+
+        # The bid is from before the gap in the subscription, so it may not be paired.
+        assert not h.quotes()
 
 
 async def test_subscribing_bars_holds_the_trendbar_subscription() -> None:
@@ -859,6 +905,114 @@ async def test_unsubscribing_bars_releases_the_subscription_and_stops_the_bars()
         for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
             await push_spot(h, event)
         assert not h.bars()
+
+
+async def test_a_cancelled_subscribe_still_gets_its_backfill_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ,
+            lambda r: oa.ProtoOASubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+
+        cancelled = asyncio.create_task(subscribe_bars(h, EURUSD_M1))
+        await held.arrived.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await held.stop_holding()
+
+        # The registry counts a subscribe whose outcome is unknown, so the bars are live and
+        # the reconnect must still drop the partial bar and backfill.
+        assert EURUSD_M1 in h.client._bars
+        await h.server.drop_connections()
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await wait_until(
+            lambda: len(h.bars()) >= 3,
+            timeout_secs=10.0,
+            description="the missed bars were backfilled",
+        )
+
+
+async def test_a_subscribe_the_registry_did_not_record_frees_the_bar_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+
+        async def raise_protocol_error(*_args: object) -> None:
+            raise CTraderProtocolError("unreadable response")
+
+        monkeypatch.setattr(
+            h.account.subscriptions,
+            "subscribe_trendbars",
+            raise_protocol_error,
+        )
+        with pytest.raises(CTraderProtocolError):
+            await subscribe_bars(h, EURUSD_M1)
+        assert EURUSD_M1 not in h.client._bars
+
+        # Nothing was recorded anywhere, so the next subscribe must not be a silent no-op.
+        monkeypatch.undo()
+        await subscribe_bars(h, EURUSD_M1)
+
+        assert received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+
+
+async def test_a_cancelled_bar_unsubscribe_is_repeated_at_disconnect() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQ,
+            lambda r: oa.ProtoOAUnsubscribeLiveTrendbarRes(
+                ctidTraderAccountId=r.ctidTraderAccountId,
+            ),
+        )
+
+        cancelled = asyncio.create_task(unsubscribe_bars(h, EURUSD_M1))
+        await held.arrived.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await held.stop_holding()
+
+        assert EURUSD_M1 not in h.client._bars  # no longer routed or closed
+        assert EURUSD_M1 in h.client._releasing_bars  # still on record for the repeat
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+        assert not h.bars()
+
+        await h.client._disconnect()
+
+        assert not h.client._releasing_bars
+
+
+async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconnect() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        await subscribe_quotes(h, GER40_ID)
+        await h.account.disconnect()  # a disconnect that never reached the client
+
+        await h.client._connect()
+
+        # Nothing from the old connection is left to make a later subscribe a silent no-op;
+        # only what this connect subscribed itself is on record.
+        assert not h.client._bars
+        assert not h.client._bar_routes
+        assert GER40_SYMBOL_ID not in h.client._spot_holds
+        assert h.client._spot_holds == {EURUSD_SYMBOL_ID: {CONVERSION_CONSUMER}}
 
 
 async def test_disconnect_releases_the_trendbar_subscription() -> None:
@@ -916,6 +1070,103 @@ async def test_request_bars_stops_at_the_requested_start() -> None:
             close_ns(LAST_H1_MINUTE - 60, 3600),
             close_ns(LAST_H1_MINUTE, 3600),
         ]
+
+
+async def test_request_bars_counts_only_closed_bars_towards_the_limit() -> None:
+    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+        await h.client._connect()
+        # Half way into the bar opening at LAST_H1_MINUTE, which is therefore still forming.
+        h.client._bar_clock = PinnedClock(LAST_H1_MINUTE * 60 + 1800)
+
+        bars = await request_bars(h, EURUSD_H1, limit=20)
+
+        assert len(bars) == 20
+        assert bars[-1].ts_event == close_ns(LAST_H1_MINUTE - 60, 3600)
+
+
+async def test_an_inclusive_to_timestamp_neither_duplicates_nor_skips_a_bar() -> None:
+    client_config = config(history_page_size=20)
+    async with harness(client_config=client_config, server=trendbar_venue(inclusive_to=True)) as h:
+        await h.client._connect()
+
+        bars = await request_bars(h, EURUSD_H1, limit=30, end=at_minute(LAST_H1_MINUTE + 60))
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(30))
+        ]
+
+
+async def test_a_page_the_venue_cuts_short_is_continued_from_what_it_served() -> None:
+    client_config = config(history_page_size=20)
+    async with harness(client_config=client_config, server=trendbar_venue(chunk=5)) as h:
+        await h.client._connect()
+
+        bars = await request_bars(h, EURUSD_H1, limit=30, end=at_minute(LAST_H1_MINUTE + 60))
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(30))
+        ]
+
+
+async def test_a_one_bar_page_on_an_inclusive_edge_still_walks_backwards() -> None:
+    client_config = config(history_page_size=20)
+    server = trendbar_venue(inclusive_to=True, chunk=1)
+    async with harness(client_config=client_config, server=server) as h:
+        await h.client._connect()
+
+        bars = await request_bars(h, EURUSD_H1, limit=3, end=at_minute(LAST_H1_MINUTE + 60))
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(3))
+        ]
+
+
+async def test_a_bar_the_stream_did_not_close_is_fetched_from_history() -> None:
+    client_config = config(bar_close_grace_secs=0.05, bar_close_history_retries=0)
+    async with harness(client_config=client_config, server=trendbar_venue()) as h:
+        await h.client._connect()
+        # Just short of the close, so the closer's timer is due almost at once.
+        h.client._bar_clock = PinnedClock(FIRST_M1_MINUTE * 60 + 59.9)
+        await subscribe_bars(h, EURUSD_M1)
+
+        await push_spot(h, SPOTS[2])  # the forming bar, never closed by a later open time
+        await wait_until(lambda: bool(h.bars()), description="the closed bar was fetched")
+
+        request = received(h.server, oa.ProtoOAGetTrendbarsReq)[-1]
+        assert request.symbolId == EURUSD_SYMBOL_ID
+        assert request.period == M1
+        assert request.fromTimestamp == FIRST_M1_MINUTE * 60 * 1_000
+        assert request.toTimestamp == (FIRST_M1_MINUTE * 60 + 60) * 1_000
+        # One more than the window holds, so the bar wanted is never the one truncated away.
+        assert request.count == 2
+        assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE, 60)]
+        assert float(h.bars()[0].volume) == 84.0  # history's state, not the first tick's
+
+
+async def test_a_history_bar_for_another_boundary_is_discarded() -> None:
+    client_config = config(bar_close_grace_secs=0.05, bar_close_history_retries=0)
+    server = trendbar_venue()
+    # Whatever is asked for, the venue answers with the next minute's bar.
+    server.on(
+        om.PROTO_OA_GET_TRENDBARS_REQ,
+        lambda r: oa.ProtoOAGetTrendbarsRes(
+            ctidTraderAccountId=r.ctidTraderAccountId,
+            symbolId=r.symbolId,
+            period=r.period,
+            trendbar=[RECORDED_HISTORY[(EURUSD_SYMBOL_ID, M1)][FIRST_M1_MINUTE + 1]],
+        ),
+    )
+    async with harness(client_config=client_config, server=server) as h:
+        await h.client._connect()
+        h.client._bar_clock = PinnedClock(FIRST_M1_MINUTE * 60 + 59.9)
+        await subscribe_bars(h, EURUSD_M1)
+
+        await push_spot(h, SPOTS[2])
+        await wait_until(lambda: bool(h.bars()), description="the closed bar was emitted")
+
+        # The streamed state of the right minute, never the wrong bar history offered.
+        assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE, 60)]
+        assert float(h.bars()[0].volume) == float(SPOTS[2].trendbar[0].volume)
 
 
 async def test_a_warm_up_request_is_not_repeated_by_the_stream() -> None:
