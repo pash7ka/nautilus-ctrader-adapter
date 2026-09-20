@@ -1090,6 +1090,41 @@ async def test_disconnect_releases_the_trendbar_subscription() -> None:
         assert not h.client._bars
 
 
+async def test_subscribing_bars_alone_still_prepares_the_conversion_chain() -> None:
+    # A bars-driven subscriber never asks for a quote tick, and the account would be valued
+    # wrongly without the chain's quotes just the same.
+    client_config = config(instrument_provider=InstrumentProviderConfig(load_all=True))
+    async with harness(client_config=client_config, server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+
+        await subscribe_bars(h, GER40_M1)
+
+        assert GER40_ID in h.client._converted
+        assert CONVERSION_CONSUMER in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert EURUSD_ID in {i.id for i in h.instruments()}  # the leg reaches the cache
+
+
+async def test_bars_are_not_subscribed_for_an_instrument_the_chain_could_not_be_built_for() -> None:
+    client_config = config(instrument_provider=InstrumentProviderConfig(load_all=True))
+    server = trendbar_venue()
+    server.on(
+        om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ,
+        lambda r: oa.ProtoOASymbolsForConversionRes(ctidTraderAccountId=r.ctidTraderAccountId),
+    )
+    async with harness(client_config=client_config, server=server) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+
+        await subscribe_bars(h, GER40_M1)
+
+        # Nothing was recorded, so the bar type is free for another try once it can be valued.
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+        assert GER40_M1 not in h.client._bars
+        assert not h.client._bar_routes
+        assert GER40_SYMBOL_ID not in h.client._spot_holds
+
+
 # -- Historical bars ------------------------------------------------------------------------
 
 

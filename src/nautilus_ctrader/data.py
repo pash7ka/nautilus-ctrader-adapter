@@ -476,29 +476,38 @@ class CTraderDataClient(LiveMarketDataClient):
             self._log.error(f"Cannot subscribe quotes: {instrument_id} is not loaded")
             return
 
-        if self._config.subscribe_conversion_quotes:
-            # Before the venue subscription, so no quote is ever published for an instrument
-            # that cannot be priced in the account currency.
-            chain = await self._prepare_conversion(instrument)
-            if chain is None:
-                self._report_missing_conversion(instrument_id)
-                return
-            for leg in chain:
-                self._handle_data(leg)
+        if not await self._convert_before_subscribing(instrument, "quotes"):
+            return
 
         await self._hold_spots(instrument.info["symbol_id"], _quote_consumer(instrument_id))
 
-    def _report_missing_conversion(self, instrument_id: InstrumentId) -> None:
+    async def _convert_before_subscribing(self, instrument: Instrument, what: str) -> bool:
+        """Resolve and publish `instrument`'s conversion chain; report and refuse if it fails.
+
+        Run before the venue subscription, so nothing is ever published for an instrument that
+        cannot be priced in the account currency. `what` names the subscription being refused.
+        """
+        if not self._config.subscribe_conversion_quotes:
+            return True
+        chain = await self._prepare_conversion(instrument)
+        if chain is None:
+            self._report_missing_conversion(instrument.id, what)
+            return False
+        for leg in chain:
+            self._handle_data(leg)
+        return True
+
+    def _report_missing_conversion(self, instrument_id: InstrumentId, what: str) -> None:
         """Say which of the two ways the conversion failed, because they need different acts."""
         if self._instrument_provider.find(instrument_id) is None:
             self._log.error(
-                f"Cannot subscribe quotes: {instrument_id} cannot be priced in the account "
+                f"Cannot subscribe {what}: {instrument_id} cannot be priced in the account "
                 f"currency and has been dropped",
             )
         else:
             self._log.warning(
-                f"Not subscribing quotes for {instrument_id}: the venue refused its conversion "
-                f"chain; subscribe again to retry",
+                f"Not subscribing {what} for {instrument_id}: its conversion chain was not "
+                f"subscribed; subscribe again to retry",
             )
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
@@ -593,6 +602,10 @@ class CTraderDataClient(LiveMarketDataClient):
         instrument = self._instrument_provider.find(bar_type.instrument_id)
         if instrument is None:
             self._log.error(f"Cannot subscribe bars: {bar_type.instrument_id} is not loaded")
+            return
+        # A bars-only subscriber needs the account valued just as much as a quote subscriber
+        # does. Before anything below is recorded, so a refused chain leaves nothing behind.
+        if not await self._convert_before_subscribing(instrument, "bars"):
             return
 
         symbol_id = instrument.info["symbol_id"]
