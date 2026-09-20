@@ -8,12 +8,11 @@ never logged.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal
 
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.model.enums import AssetClass
 
-from nautilus_ctrader.common.account import AccountCredentials
+from nautilus_ctrader.common.account import ENVIRONMENTS, AccountCredentials, Environment
 
 
 def parse_asset_class_overrides(overrides: Mapping[str, str]) -> dict[str, AssetClass]:
@@ -81,7 +80,8 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     Raises
     ------
     ValueError
-        If `history_page_size` is below 1.
+        If `history_page_size` is below 1, or `environment` is not one of "auto", "demo",
+        "live".
 
     """
 
@@ -91,7 +91,7 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     account_id: int
     refresh_token: str | None = None
     token_expires_at: float | None = None
-    environment: Literal["auto", "demo", "live"] = "auto"
+    environment: Environment = "auto"
     subscribe_conversion_quotes: bool = True
     fail_on_instrument_error: bool = False
     asset_class_overrides: dict[str, str] = {}  # noqa: RUF012
@@ -108,6 +108,12 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
         if self.history_page_size < 1:
             raise ValueError(
                 f"history_page_size must be at least 1, got {self.history_page_size}",
+            )
+        # msgspec does not enforce the `Literal` on direct construction, and the account
+        # client checks it only when it is the one building the client.
+        if self.environment not in ENVIRONMENTS:
+            raise ValueError(
+                f"environment must be one of {ENVIRONMENTS}, got {self.environment!r}",
             )
 
     def credentials(self) -> AccountCredentials:

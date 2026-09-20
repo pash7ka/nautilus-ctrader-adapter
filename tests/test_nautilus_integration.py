@@ -14,8 +14,8 @@ from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.currencies import EUR, JPY, USD
 from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.enums import BookType
-from nautilus_trader.model.instruments import CurrencyPair, Instrument
+from nautilus_trader.model.enums import AssetClass, BookType
+from nautilus_trader.model.instruments import Cfd, CurrencyPair, Instrument
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from nautilus_ctrader.common import parsing
@@ -45,6 +45,23 @@ def _usdjpy_light() -> om.ProtoOALightSymbol:
     light.baseAssetId = USD_ASSET_ID
     light.quoteAssetId = JPY_ASSET_ID
     return light
+
+
+def _as_cfd(pair: CurrencyPair) -> Cfd:
+    """The pair's currencies on the type every symbol outside FX is mapped to."""
+    return Cfd(
+        instrument_id=pair.id,
+        raw_symbol=pair.raw_symbol,
+        asset_class=AssetClass.FX,
+        quote_currency=pair.quote_currency,
+        price_precision=pair.price_precision,
+        size_precision=pair.size_precision,
+        price_increment=pair.price_increment,
+        size_increment=pair.size_increment,
+        ts_event=0,
+        ts_init=0,
+        base_currency=pair.base_currency,
+    )
 
 
 def _quote(instrument: Instrument, bid_raw: int, ask_raw: int, size: Decimal) -> QuoteTick:
@@ -78,6 +95,14 @@ def test_get_xrate_reads_a_currency_pair_quote_in_both_directions() -> None:
 
     assert cache.get_xrate(CTRADER_VENUE, EUR, USD) == expected
     assert cache.get_xrate(CTRADER_VENUE, USD, EUR) == 1 / expected
+
+    # The other half of the same decision: a `Cfd` is not a source of rates, whatever its
+    # `base_currency`, so only symbols mapped to a `CurrencyPair` can price a position.
+    cfd_cache = TestComponentStubs.cache()
+    cfd_cache.add_instrument(_as_cfd(eurusd))
+    cfd_cache.add_quote_tick(_quote(eurusd, EURUSD_SPOT.bid, EURUSD_SPOT.ask, Decimal(0)))
+
+    assert cfd_cache.get_xrate(CTRADER_VENUE, EUR, USD) is None
 
 
 def test_get_xrate_walks_a_two_symbol_chain() -> None:

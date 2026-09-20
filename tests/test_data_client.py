@@ -448,6 +448,11 @@ def test_a_history_page_size_below_one_is_rejected() -> None:
         config(history_page_size=0)
 
 
+def test_an_unknown_environment_is_rejected() -> None:
+    with pytest.raises(ValueError, match="environment"):
+        config(environment="paper")
+
+
 async def test_an_unknown_asset_class_override_fails_construction() -> None:
     async with harness(client_config=config()) as h:
         with pytest.raises(ValueError, match="NOT_A_CLASS"):

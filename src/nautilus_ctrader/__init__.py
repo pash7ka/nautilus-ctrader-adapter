@@ -7,6 +7,7 @@ the NautilusTrader live client interfaces. It holds no trading logic of any kind
 from nautilus_ctrader.common.account import (
     AccountCredentials,
     CTraderAccountClient,
+    account_client_from_config,
     get_cached_ctrader_account_client,
 )
 from nautilus_ctrader.config import CTraderDataClientConfig
@@ -27,5 +28,6 @@ __all__ = [
     "CTraderInstrumentProvider",
     "CTraderLiveDataClientFactory",
     "__version__",
+    "account_client_from_config",
     "get_cached_ctrader_account_client",
 ]

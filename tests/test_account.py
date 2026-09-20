@@ -366,6 +366,48 @@ def test_cached_client_is_shared_per_account_and_application() -> None:
     assert other_app is not first
 
 
+def test_a_cached_client_warns_when_another_environment_is_asked_for() -> None:
+    get_cached_ctrader_account_client(
+        account_id=ACCOUNT_ID,
+        credentials=credentials(),
+        environment="demo",
+        logger=RecordingLogger(),
+    )
+    logger = RecordingLogger()
+
+    get_cached_ctrader_account_client(
+        account_id=ACCOUNT_ID,
+        credentials=credentials(),
+        environment="live",
+        logger=logger,
+    )
+
+    warnings = [message for level, message in logger.lines if level == "warning"]
+    assert len(warnings) == 1
+    assert "'demo'" in warnings[0]
+    assert "'live'" in warnings[0]
+    assert str(ACCOUNT_ID) not in warnings[0]
+
+
+def test_a_cached_client_for_the_same_environment_logs_nothing() -> None:
+    get_cached_ctrader_account_client(
+        account_id=ACCOUNT_ID,
+        credentials=credentials(),
+        environment="demo",
+        logger=RecordingLogger(),
+    )
+    logger = RecordingLogger()
+
+    get_cached_ctrader_account_client(
+        account_id=ACCOUNT_ID,
+        credentials=credentials(),
+        environment="demo",
+        logger=logger,
+    )
+
+    assert logger.lines == []
+
+
 def test_unknown_environment_is_rejected() -> None:
     with pytest.raises(ValueError, match="environment"):
         CTraderAccountClient(

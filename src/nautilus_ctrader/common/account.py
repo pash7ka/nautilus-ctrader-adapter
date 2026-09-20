@@ -14,7 +14,7 @@ import ssl
 import time
 from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Protocol, get_args
 
 from google.protobuf.message import Message
 from nautilus_trader.common.component import Logger
@@ -41,7 +41,8 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
 TokenListener = Callable[[str, str, float], None]
 
-_ENVIRONMENTS = ("auto", "demo", "live")
+Environment = Literal["auto", "demo", "live"]
+ENVIRONMENTS: tuple[Environment, ...] = get_args(Environment)
 _READY_POLL_SECS = 0.5
 # A restore still failing after this many background retries is reported once at ERROR.
 _RESTORE_RETRY_ERROR_ATTEMPTS = 3
@@ -72,7 +73,7 @@ class CTraderAccountClient:
         *,
         account_id: int,
         credentials: AccountCredentials,
-        environment: Literal["auto", "demo", "live"],
+        environment: Environment,
         logger: Logger,
         connect_timeout_secs: float = 60.0,
         restore_retry_interval_secs: float = 30.0,
@@ -81,8 +82,8 @@ class CTraderAccountClient:
         port: int = PROTOBUF_PORT,
         tls: ssl.SSLContext | bool = True,
     ) -> None:
-        if environment not in _ENVIRONMENTS:
-            raise ValueError(f"environment must be one of {_ENVIRONMENTS}, got {environment!r}")
+        if environment not in ENVIRONMENTS:
+            raise ValueError(f"environment must be one of {ENVIRONMENTS}, got {environment!r}")
         self.account_id = account_id
         self._credentials = credentials
         self._environment = environment
@@ -439,6 +440,7 @@ def get_cached_ctrader_account_client(
     """The one client per `(account_id, credentials.client_id)`.
 
     Later calls with the same key return the first instance; their other arguments are ignored.
+    A differing `environment` is logged at WARNING, because it would have picked another host.
     """
     key = (account_id, credentials.client_id)
     client = _ACCOUNT_CLIENTS.get(key)
@@ -451,7 +453,45 @@ def get_cached_ctrader_account_client(
             **kwargs,
         )
         _ACCOUNT_CLIENTS[key] = client
+    elif environment != client._environment:
+        logger.warning(
+            f"Account client already built for environment {client._environment!r}; "
+            f"requested {environment!r} is ignored",
+        )
     return client
+
+
+class AccountClientConfig(Protocol):
+    """What `account_client_from_config` reads from a client config.
+
+    Structural, so every client config satisfies it without importing this module's types.
+    """
+
+    account_id: int
+    environment: Environment
+    connect_timeout_secs: float
+    restore_retry_interval_secs: float
+
+    def credentials(self) -> AccountCredentials: ...
+
+
+def account_client_from_config(
+    config: AccountClientConfig,
+    logger: Logger,
+) -> CTraderAccountClient:
+    """The cached account client a client config asks for.
+
+    An application that persists refreshed tokens calls this with the same config object the
+    node config holds, before building the node, and registers its listener on the result.
+    """
+    return get_cached_ctrader_account_client(
+        account_id=config.account_id,
+        credentials=config.credentials(),
+        environment=config.environment,
+        logger=logger,
+        connect_timeout_secs=config.connect_timeout_secs,
+        restore_retry_interval_secs=config.restore_retry_interval_secs,
+    )
 
 
 def _clear_account_cache() -> None:

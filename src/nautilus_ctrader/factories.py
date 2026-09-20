@@ -5,9 +5,9 @@ host selection, authentication, token refresh - hangs off the account client beh
 `get_cached_ctrader_account_client`, so every client configured for the same account shares
 one connection.
 
-An application that persists refreshed tokens must call `get_cached_ctrader_account_client`
-itself and register its listener **before** building the node; the factory then finds that
-same instance.
+An application that persists refreshed tokens must call `account_client_from_config` itself
+and register its listener **before** building the node; the factory then finds that same
+instance.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, Logger, MessageBus
 from nautilus_trader.live.factories import LiveDataClientFactory
 
-from nautilus_ctrader.common.account import get_cached_ctrader_account_client
+from nautilus_ctrader.common.account import account_client_from_config
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.data import CTraderDataClient
 from nautilus_ctrader.providers import CTraderInstrumentProvider
@@ -63,24 +63,19 @@ class CTraderLiveDataClientFactory(LiveDataClientFactory):
         Raises
         ------
         ValueError
-            If `config.asset_class_overrides` holds a value that is not an `AssetClass` name,
-            or `config.environment` is not one of "auto", "demo", "live".
+            If `config.asset_class_overrides` holds a value that is not an `AssetClass` name.
 
         Notes
         -----
-        An account client already cached for this account is returned as it is: the connection
-        settings of the second config for one account are ignored.
+        An account client already cached for this account is returned as is, and the
+        application's own `account_client_from_config` call is the authoritative one: the
+        connection settings of every later config for that account are ignored, and the
+        client keeps the `Logger(name)` of the first `create`, so its account-level lines
+        carry that client's component name.
 
         """
         logger = Logger(name)
-        account = get_cached_ctrader_account_client(
-            account_id=config.account_id,
-            credentials=config.credentials(),
-            environment=config.environment,
-            logger=logger,
-            connect_timeout_secs=config.connect_timeout_secs,
-            restore_retry_interval_secs=config.restore_retry_interval_secs,
-        )
+        account = account_client_from_config(config, logger)
         provider = CTraderInstrumentProvider(
             account,
             config.instrument_provider,

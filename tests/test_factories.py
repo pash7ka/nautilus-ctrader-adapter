@@ -117,6 +117,22 @@ async def test_create_builds_a_data_client_over_the_cached_account() -> None:
         assert client._account is account
 
 
+async def test_create_builds_the_account_from_the_config_when_none_is_cached() -> None:
+    """No `seed_account()`: the factory's own arguments reach `CTraderAccountClient`."""
+    client_config = config(
+        environment="demo",
+        connect_timeout_secs=11.0,
+        restore_retry_interval_secs=7.0,
+    )
+
+    account = create(client_config)._account
+
+    assert account.account_id == ACCOUNT_ID
+    assert account._environment == "demo"
+    assert account._connect_timeout_secs == 11.0
+    assert account._restore_retry_interval_secs == 7.0
+
+
 async def test_create_honours_the_client_name() -> None:
     async with running_server() as server:
         client_config = config()
@@ -168,6 +184,7 @@ def test_the_package_exports_what_an_application_needs() -> None:
         "CTraderDataClientConfig",
         "CTraderInstrumentProvider",
         "CTraderLiveDataClientFactory",
+        "account_client_from_config",
         "get_cached_ctrader_account_client",
     }
 
