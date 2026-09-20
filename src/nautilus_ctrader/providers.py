@@ -164,11 +164,24 @@ class CTraderInstrumentProvider(InstrumentProvider):
                 instruments.append(self._build_or_fail(specs.get(leg.symbolId), leg))
         return instruments
 
+    @property
+    def conversion_generation(self) -> int:
+        """Bumped by every `reset_conversion_cache()`.
+
+        A caller that resolves a chain across an await reads this first and compares after, to
+        tell whether what it resolved is still current.
+        """
+        return self._chain_generation
+
     def reset_conversion_cache(self, symbol_id: int | None = None) -> bool:
         """Drop cached conversion chains, keeping the loaded instruments; returns whether any went.
 
         `symbol_id` limits it to chains that use that symbol. A chain is venue data that the
         broker can change, so the caller decides how long to trust one.
+
+        The full form also clears the instruments blocked by `remove_failed`, since it marks a
+        fresh start; the per-symbol form deliberately keeps them, because one symbol changing
+        at the venue says nothing about why another was dropped.
         """
         stale = [
             key

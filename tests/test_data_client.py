@@ -528,13 +528,62 @@ async def test_a_refused_quote_subscribe_can_be_retried() -> None:
         assert f"quotes:{GER40_ID}" in h.account.subscriptions.consumers(GER40_SYMBOL_ID)
 
 
-async def test_a_refused_conversion_leg_leaves_the_instrument_unconverted() -> None:
+async def test_a_refused_conversion_leg_keeps_the_instrument_and_retries() -> None:
     async with harness(server=refusing_venue(EURUSD_SYMBOL_ID)) as h:
         await h.client._connect()
 
-        assert h.provider.find(GER40_ID) is None
-        assert not h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        # A refusal is the venue saying no to one request, not a reason to drop the instrument.
+        assert h.provider.find(GER40_ID) is not None
+        assert not any(f.symbol == "GER40.cash" for f in h.provider.failures)
         assert GER40_ID not in h.client._converted
+        assert not h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+
+        h.server.on(
+            om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+            lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+        await subscribe_quotes(h, GER40_ID)
+
+        assert "conversion" in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_ID in h.client._converted
+
+
+async def test_a_conversion_leg_that_is_also_subscribed_emits_one_quote() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await subscribe_quotes(h, EURUSD_ID)
+
+        await push_spot(h, TWO_SIDED)
+
+        assert len(h.quotes()) == 1
+        assert len(h.cache.quote_ticks(EURUSD_ID)) == 1
+
+
+async def test_a_subscribed_symbol_pulled_in_as_a_leg_emits_one_quote() -> None:
+    client_config = config(instrument_provider=InstrumentProviderConfig(load_all=True))
+    async with harness(client_config=client_config) as h:
+        await h.client._connect()
+        await subscribe_quotes(h, EURUSD_ID)
+        # GER40.cash is EUR-quoted, so this adds EURUSD a second time, as a conversion leg.
+        await subscribe_quotes(h, GER40_ID)
+
+        await push_spot(h, TWO_SIDED)
+
+        assert len(h.quotes()) == 1
+        assert len(h.cache.quote_ticks(EURUSD_ID)) == 1
+
+
+async def test_dropping_one_hold_on_a_symbol_leaves_the_other_emitting() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await subscribe_quotes(h, EURUSD_ID)
+
+        await unsubscribe_quotes(h, EURUSD_ID)
+        await push_spot(h, TWO_SIDED)
+
+        # Still held for the conversion chain, so still exactly one tick.
+        assert "conversion" in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert len(h.quotes()) == 1
 
 
 async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(

@@ -65,15 +65,6 @@ class _Book:
     ask: int | None = None
 
 
-@dataclass(frozen=True)
-class _SpotHold:
-    """One consumer's spot subscription, with the listener turning its events into quotes."""
-
-    symbol_id: int
-    consumer: str
-    listener: SpotListener
-
-
 class CTraderDataClient(LiveMarketDataClient):
     """
     Market data for one cTrader account: instruments, currency conversion and quote ticks.
@@ -141,11 +132,14 @@ class CTraderDataClient(LiveMarketDataClient):
 
         self._session: CTraderSession | None = None
         self._books: dict[int, _Book] = {}
-        # Every hold the registry may still count for this client, keyed by (symbol id,
-        # consumer). A hold is recorded before its request goes out, because the registry
-        # counts a subscribe whose outcome is unknown, and dropped only once its unsubscribe
-        # has returned or the venue has refused the subscribe outright.
-        self._spot_holds: dict[tuple[int, str], _SpotHold] = {}
+        # Every `(symbol id, consumer)` the registry may still count for this client. A hold
+        # is recorded before its request goes out, because the registry counts a subscribe
+        # whose outcome is unknown, and dropped only once its unsubscribe has returned or the
+        # venue has refused the subscribe outright.
+        self._spot_holds: set[tuple[int, str]] = set()
+        # One listener per symbol however many holds it has: a symbol that is both subscribed
+        # and a conversion leg would otherwise emit every quote once per listener.
+        self._spot_listeners: dict[int, SpotListener] = {}
         self._converted: set[InstrumentId] = set()
         self._conversion_legs: dict[InstrumentId, frozenset[int]] = {}
         # Instruments whose prices have already been reported as unconvertible; a repeat is
@@ -161,6 +155,8 @@ class CTraderDataClient(LiveMarketDataClient):
         self._instrument_provider.reset_conversion_cache()
         self._converted.clear()
         self._conversion_legs.clear()
+        # A scale problem that survives a reconnect is worth an ERROR again.
+        self._quote_errors.clear()
 
         await self._account.connect()
         await self._instrument_provider.initialize()
@@ -267,28 +263,42 @@ class CTraderDataClient(LiveMarketDataClient):
         """Subscribe the chain pricing `instrument`'s quote currency in the deposit currency.
 
         Returns the chain's instruments for the caller to publish, an empty list if there was
-        nothing to do, or `None` if the chain could not be resolved or subscribed. In that last
-        case `instrument` has been dropped from the provider, so nothing downstream can trade
-        an instrument whose value in the account currency is unknown.
+        nothing to do, or `None` if the chain is not usable, for one of two reasons:
 
-        Raises `InstrumentLoadError` or `CTraderError` instead of returning `None` when
-        `fail_on_instrument_error` is set.
+        - the chain does not exist, or a leg cannot be built. The instrument can never be
+          priced in the account currency, so it is dropped from the provider (D6), and
+          `fail_on_instrument_error` raises instead of returning.
+        - the venue refused the subscription. The instrument is still tradable, so it stays
+          loaded and unconverted and the next subscribe tries the chain again.
         """
         if instrument.id in self._converted:
             return []
+        # Read before the first await: a symbol change during it resets the chain cache, and
+        # what this call resolved must then not be recorded as current.
+        generation = self._instrument_provider.conversion_generation
         try:
             chain = await self._instrument_provider.conversion_instruments_for(instrument)
-            await self._hold_chain(chain)
         except (InstrumentLoadError, CTraderError) as e:
             self._instrument_provider.remove_failed(instrument.id, f"conversion failed: {e}")
             if self._config.fail_on_instrument_error:
                 raise
             return None
+        try:
+            await self._hold_chain(chain)
+        except CTraderError as e:
+            detail = e.error_code if isinstance(e, CTraderRequestError) else type(e).__name__
+            self._log.warning(
+                f"Conversion for {instrument.id} not subscribed ({detail}); "
+                f"retrying on the next subscribe",
+            )
+            return None
 
-        # Only now: a half-subscribed chain must not count as converted.
-        self._converted.add(instrument.id)
         legs = frozenset(leg.info["symbol_id"] for leg in chain)
         await self._retire_old_legs(instrument.id, legs)
+        # Only now, and only if the chain is still the current one: neither a half-subscribed
+        # nor a stale chain may count as converted.
+        if generation == self._instrument_provider.conversion_generation:
+            self._converted.add(instrument.id)
         if not chain:
             return []
         self._log.info(
@@ -306,7 +316,7 @@ class CTraderDataClient(LiveMarketDataClient):
         try:
             for leg in chain:
                 symbol_id = leg.info["symbol_id"]
-                if await self._hold_spots(symbol_id, CONVERSION_CONSUMER, leg.id):
+                if await self._hold_spots(symbol_id, CONVERSION_CONSUMER):
                     added.append(symbol_id)
         except CTraderError:
             for symbol_id in added:
@@ -340,23 +350,22 @@ class CTraderDataClient(LiveMarketDataClient):
             for leg in chain:
                 self._handle_data(leg)
 
-        await self._hold_spots(
-            instrument.info["symbol_id"],
-            _quote_consumer(instrument_id),
-            instrument_id,
-        )
+        await self._hold_spots(instrument.info["symbol_id"], _quote_consumer(instrument_id))
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
+        # Found by consumer name rather than through the instrument's symbol id, because the
+        # instrument may have been dropped since and the hold must be released even then.
         consumer = _quote_consumer(command.instrument_id)
         key = next((k for k in self._spot_holds if k[1] == consumer), None)
         if key is not None:
             await self._release_spots(*key)
 
-    def _on_quote_spot(self, instrument_id: InstrumentId, event: oa.ProtoOASpotEvent) -> None:
+    def _on_quote_spot(self, symbol_id: int, event: oa.ProtoOASpotEvent) -> None:
         # Looked up per event rather than captured, so a reloaded instrument's precisions apply.
-        instrument = self._instrument_provider.find(instrument_id)
+        instrument = self._instrument_provider.instrument_for_symbol_id(symbol_id)
         if instrument is None:
             return
+        instrument_id = instrument.id
         book = self._books.setdefault(event.symbolId, _Book())
         if event.HasField("bid"):
             book.bid = event.bid
@@ -401,30 +410,19 @@ class CTraderDataClient(LiveMarketDataClient):
 
     # -- Subscription bookkeeping -----------------------------------------------------------
 
-    async def _hold_spots(
-        self,
-        symbol_id: int,
-        consumer: str,
-        instrument_id: InstrumentId,
-    ) -> bool:
-        """Subscribe `symbol_id`'s spots for `consumer`; returns whether this call added it.
-
-        The listener publishes quote ticks for `instrument_id`, which for a conversion leg is
-        the leg itself.
-        """
+    async def _hold_spots(self, symbol_id: int, consumer: str) -> bool:
+        """Subscribe `symbol_id`'s spots for `consumer`; returns whether this call added it."""
         key = (symbol_id, consumer)
         if key in self._spot_holds:
             return False
-        listener = functools.partial(self._on_quote_spot, instrument_id)
-        self._spot_holds[key] = _SpotHold(symbol_id, consumer, listener)
-        self._account.subscriptions.add_spot_listener(symbol_id, listener)
+        self._spot_holds.add(key)
+        self._sync_listener(symbol_id)
         try:
             await self._account.subscriptions.subscribe_spots(symbol_id, consumer)
         except CTraderRequestError:
             # A venue refusal is the one outcome the registry does not count.
-            self._detach(key)
-            self._spot_holds.pop(key, None)
-            self._forget_book(symbol_id)
+            self._spot_holds.discard(key)
+            self._sync_listener(symbol_id)
             raise
         return True
 
@@ -432,18 +430,21 @@ class CTraderDataClient(LiveMarketDataClient):
         key = (symbol_id, consumer)
         if key not in self._spot_holds:
             return
-        # Detached first, so nothing is published while the unsubscribe is in flight; the hold
+        # Detached before the request, so nothing is published while it is in flight; the hold
         # itself survives until the unsubscribe returns, so a cancelled one can be repeated.
-        self._detach(key)
+        self._sync_listener(symbol_id, releasing=key)
         await self._account.subscriptions.unsubscribe_spots(symbol_id, consumer)
-        self._spot_holds.pop(key, None)
-        self._forget_book(symbol_id)
+        self._spot_holds.discard(key)
 
-    def _detach(self, key: tuple[int, str]) -> None:
-        hold = self._spot_holds.get(key)
-        if hold is not None:
-            self._account.subscriptions.remove_spot_listener(hold.symbol_id, hold.listener)
-
-    def _forget_book(self, symbol_id: int) -> None:
-        if not any(key[0] == symbol_id for key in self._spot_holds):
+    def _sync_listener(self, symbol_id: int, releasing: tuple[int, str] | None = None) -> None:
+        """Keep exactly one listener on `symbol_id` while any hold but `releasing` remains."""
+        held = any(key[0] == symbol_id and key != releasing for key in self._spot_holds)
+        listener = self._spot_listeners.get(symbol_id)
+        if held and listener is None:
+            listener = functools.partial(self._on_quote_spot, symbol_id)
+            self._spot_listeners[symbol_id] = listener
+            self._account.subscriptions.add_spot_listener(symbol_id, listener)
+        elif not held and listener is not None:
+            del self._spot_listeners[symbol_id]
+            self._account.subscriptions.remove_spot_listener(symbol_id, listener)
             self._books.pop(symbol_id, None)
