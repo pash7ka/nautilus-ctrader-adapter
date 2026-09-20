@@ -72,6 +72,11 @@ class CTraderInstrumentProvider(InstrumentProvider):
         # so a name is not a safe key.
         self._quote_asset_id: dict[InstrumentId, int] = {}
         self._chains: dict[tuple[int, int], list[om.ProtoOALightSymbol]] = {}
+        # Bumped by every reset, so a chain fetched before one is not written back after it.
+        self._chain_generation = 0
+        # Symbol names dropped by `remove_failed`: refused until explicitly requested again,
+        # so a chain or a reload cannot quietly resurrect an instrument that must not trade.
+        self._blocked: set[str] = set()
 
     @property
     def failures(self) -> tuple[InstrumentLoadFailure, ...]:
@@ -108,6 +113,8 @@ class CTraderInstrumentProvider(InstrumentProvider):
                 )
                 continue
             names.append(instrument_id.symbol.value)
+        # An explicit request is the one thing that clears a block.
+        self._blocked.difference_update(names)
         failures.extend(await self._load_names(names))
         self._raise_if_configured(failures)
 
@@ -133,13 +140,15 @@ class CTraderInstrumentProvider(InstrumentProvider):
         cache_key = (quote_asset_id, deposit_asset_id)
         chain = self._chains.get(cache_key)
         if chain is None:
+            generation = self._chain_generation
             chain = await self._account.conversion_chain(quote_asset_id, deposit_asset_id)
             if not chain:
                 raise InstrumentLoadError(
                     f"no conversion chain from {instrument.quote_currency.code} to "
                     f"{self._account.deposit_asset.name}",
                 )
-            self._chains[cache_key] = chain
+            if generation == self._chain_generation:
+                self._chains[cache_key] = chain
 
         missing = [leg for leg in chain if self.instrument_for_symbol_id(leg.symbolId) is None]
         specs = (
@@ -168,6 +177,11 @@ class CTraderInstrumentProvider(InstrumentProvider):
         ]
         for key in stale:
             del self._chains[key]
+        self._chain_generation += 1
+        if symbol_id is None:
+            # A full reset is a fresh start for the connection, so a dropped instrument gets
+            # another chance to load.
+            self._blocked.clear()
         return bool(stale)
 
     def remove_failed(self, instrument_id: InstrumentId, reason: str) -> None:
@@ -176,6 +190,7 @@ class CTraderInstrumentProvider(InstrumentProvider):
         For a failure the loader itself cannot see, such as a conversion chain that cannot be
         resolved for an instrument that otherwise built fine.
         """
+        self._blocked.add(instrument_id.symbol.value)
         instrument = self._instruments.pop(instrument_id, None)
         if instrument is not None:
             self._by_symbol_id.pop(instrument.info["symbol_id"], None)
@@ -215,6 +230,9 @@ class CTraderInstrumentProvider(InstrumentProvider):
         never raised without first landing in `failures` with an ERROR line.
         """
         name = light.symbolName
+        if name in self._blocked:
+            # Already in `failures` from the drop that blocked it, so no second ERROR line.
+            raise InstrumentLoadError(f"{name}: dropped earlier and not requested again")
         try:
             if spec is None:
                 raise CTraderProtocolError(f"{name}: no symbol spec returned by the venue")

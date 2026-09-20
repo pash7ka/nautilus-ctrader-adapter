@@ -15,20 +15,24 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import pytest
+from nautilus_trader.cache.cache import Cache
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.data.messages import (
     RequestInstrument,
     RequestInstruments,
     SubscribeQuoteTicks,
     UnsubscribeQuoteTicks,
 )
+from nautilus_trader.model.currencies import EUR, USD
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from nautilus_ctrader.common.account import CTraderAccountClient
+from nautilus_ctrader.common.errors import CTraderRequestError
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.data import CTraderDataClient, _conversion_message
@@ -50,6 +54,7 @@ SPOTS = RECORDED["spot_events"]
 BID_ONLY = SPOTS[17]
 ASK_ONLY = SPOTS[19]
 TWO_SIDED = SPOTS[0]
+GER40_SPOT = SPOTS[1]
 
 
 def config(**overrides) -> CTraderDataClientConfig:
@@ -72,6 +77,7 @@ class Harness:
     account: CTraderAccountClient
     provider: CTraderInstrumentProvider
     client: CTraderDataClient
+    cache: Cache
     published: list
     responses: list
 
@@ -109,19 +115,32 @@ async def harness(
     published: list = []
     responses: list = []
     msgbus = TestComponentStubs.msgbus()
-    msgbus.register(endpoint="DataEngine.process", handler=published.append)
+    cache = TestComponentStubs.cache()
+    clock = TestComponentStubs.clock()
+    # The real engine, so published data lands in the cache exactly as it would in
+    # production, wrapped so the list also keeps what the client sent. Responses are only
+    # captured: routing one needs a request the engine never issued here.
+    engine = DataEngine(msgbus, cache, clock)
+
+    def process(data) -> None:
+        published.append(data)
+        engine.process(data)
+
+    msgbus.deregister(endpoint="DataEngine.process", handler=engine.process)
+    msgbus.deregister(endpoint="DataEngine.response", handler=engine.response)
+    msgbus.register(endpoint="DataEngine.process", handler=process)
     msgbus.register(endpoint="DataEngine.response", handler=responses.append)
     client = CTraderDataClient(
         loop=asyncio.get_running_loop(),
         account=account,
         msgbus=msgbus,
-        cache=TestComponentStubs.cache(),
-        clock=TestComponentStubs.clock(),
+        cache=cache,
+        clock=clock,
         instrument_provider=provider,
         config=client_config,
     )
     try:
-        yield Harness(server, account, provider, client, published, responses)
+        yield Harness(server, account, provider, client, cache, published, responses)
     finally:
         await account.disconnect()
         await server.stop()
@@ -172,6 +191,20 @@ def data_venue() -> FakeCTraderServer:
             payload_type,
             lambda r, cls=response_class: cls(ctidTraderAccountId=r.ctidTraderAccountId),
         )
+    return server
+
+
+def refusing_venue(symbol_id: int) -> FakeCTraderServer:
+    """A venue that refuses to subscribe one symbol's spots."""
+    server = data_venue()
+    server.on(
+        om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda r: (
+            oa.ProtoOAErrorRes(ctidTraderAccountId=r.ctidTraderAccountId, errorCode="NO_QUOTES")
+            if symbol_id in r.symbolId
+            else oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId)
+        ),
+    )
     return server
 
 
@@ -339,14 +372,15 @@ async def test_subscribing_quotes_holds_the_spot_subscription_for_that_instrumen
 
 
 async def test_unsubscribing_quotes_releases_the_subscription_and_stops_the_ticks() -> None:
+    # GER40.cash, because EURUSD keeps its own ticks as a conversion leg.
     async with harness() as h:
         await h.client._connect()
-        await subscribe_quotes(h, EURUSD_ID)
+        await subscribe_quotes(h, GER40_ID)
 
-        await unsubscribe_quotes(h, EURUSD_ID)
+        await unsubscribe_quotes(h, GER40_ID)
 
-        assert not h.account.subscriptions.consumers(EURUSD_SYMBOL_ID) - {"conversion"}
-        await push_spot(h, TWO_SIDED)
+        assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+        await push_spot(h, GER40_SPOT)
         assert not h.quotes()
 
 
@@ -461,3 +495,66 @@ async def test_request_instruments_answers_with_every_loaded_instrument() -> Non
         )
 
         assert {i.id for i in h.responses[-1].data} == {GER40_ID, EURUSD_ID}
+
+
+# -- Conversion quotes and rollback -----------------------------------------------------------
+
+
+async def test_conversion_quotes_price_the_deposit_currency() -> None:
+    async with harness() as h:
+        await h.client._connect()
+
+        await push_spot(h, TWO_SIDED)
+
+        assert [q.instrument_id for q in h.quotes()] == [EURUSD_ID]
+        assert h.cache.get_xrate(CTRADER_VENUE, EUR, USD) is not None
+
+
+async def test_a_refused_quote_subscribe_can_be_retried() -> None:
+    async with harness(server=refusing_venue(GER40_SYMBOL_ID)) as h:
+        await h.client._connect()
+
+        with pytest.raises(CTraderRequestError):
+            await subscribe_quotes(h, GER40_ID)
+        assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+
+        # The venue relents; the retry must not be a silent no-op.
+        h.server.on(
+            om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+            lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+        await subscribe_quotes(h, GER40_ID)
+
+        assert f"quotes:{GER40_ID}" in h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+
+
+async def test_a_refused_conversion_leg_leaves_the_instrument_unconverted() -> None:
+    async with harness(server=refusing_venue(EURUSD_SYMBOL_ID)) as h:
+        await h.client._connect()
+
+        assert h.provider.find(GER40_ID) is None
+        assert not h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_ID not in h.client._converted
+
+
+async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+    async with harness() as h:
+        await h.client._connect()
+        await subscribe_quotes(h, EURUSD_ID)
+        await push_spot(h, BID_ONLY)
+        assert not h.quotes()
+
+        await h.server.drop_connections()
+        await wait_until(
+            lambda: h.subscribed_symbol_ids().count(EURUSD_SYMBOL_ID) >= 2,
+            timeout_secs=10.0,
+            description="spots re-subscribed after the reconnect",
+        )
+
+        await push_spot(h, ASK_ONLY)
+
+        assert not h.quotes()

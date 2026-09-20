@@ -382,3 +382,42 @@ async def test_a_later_failure_for_the_same_symbol_replaces_the_earlier_one() ->
     finally:
         await client.disconnect()
         await server.stop()
+
+
+async def test_a_dropped_instrument_is_not_rebuilt_as_a_conversion_leg() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        provider = _provider(client)
+        await provider.load_ids_async([GER40_ID])
+        provider.remove_failed(EURUSD_ID, "dropped by the caller")
+        ger40 = provider.find(GER40_ID)
+
+        with pytest.raises(InstrumentLoadError, match="not requested again"):
+            await provider.conversion_instruments_for(ger40)
+
+        assert provider.find(EURUSD_ID) is None
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_full_conversion_cache_reset_lets_a_dropped_instrument_load_again() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        provider = _provider(client)
+        await provider.load_ids_async([GER40_ID])
+        provider.remove_failed(EURUSD_ID, "dropped by the caller")
+
+        provider.reset_conversion_cache()
+
+        chain = await provider.conversion_instruments_for(provider.find(GER40_ID))
+        assert [i.id for i in chain] == [EURUSD_ID]
+    finally:
+        await client.disconnect()
+        await server.stop()
