@@ -137,8 +137,10 @@ Two different failures are reported differently, because they need different res
 - The chain cannot be built at all — the venue has no route, or one of its symbols cannot be
   loaded. The instrument can never be valued in the account currency, so it is dropped from the
   provider and recorded as a load failure, at ERROR.
-- The venue refused the subscription. The instrument is fine; the request was not. It stays
-  loaded and unconverted, with a WARNING, and the next subscribe tries again.
+- The request was refused or never answered — a venue refusal, a timeout, or a session that is
+  reconnecting. The instrument is fine; the request was not, and nothing has been learned about
+  the chain. It stays loaded and unconverted, with a WARNING, and the next subscribe tries
+  again.
 
 ## `synthetic_quote_size`
 

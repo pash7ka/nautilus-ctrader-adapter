@@ -37,6 +37,7 @@ from nautilus_ctrader.common.errors import (
     CTraderError,
     CTraderProtocolError,
     CTraderRequestError,
+    CTraderTimeoutError,
 )
 from nautilus_ctrader.common.parsing import (
     bar_boundary_secs,
@@ -380,10 +381,10 @@ class CTraderDataClient(LiveMarketDataClient):
         - the chain does not exist, or a leg cannot be built. The instrument can never be
           priced in the account currency, so it is unloaded rather than left tradable by
           accident, and `fail_on_instrument_error` raises instead of returning.
-        - the venue refused the subscription. The instrument is still tradable, so it stays
-          loaded and unconverted and the next subscribe tries the chain again - unless this is
-          the bring-up and `fail_on_instrument_error` is set, which asks for an instrument that
-          cannot be priced to fail the connect rather than start unpriced.
+        - the request could not be made or was refused. Nothing is known about the chain yet,
+          so the instrument stays loaded and unconverted and the next subscribe tries again -
+          unless this is the bring-up and `fail_on_instrument_error` is set, which asks for an
+          instrument that cannot be priced to fail the connect rather than start unpriced.
         """
         if instrument.id in self._converted:
             return []
@@ -392,21 +393,22 @@ class CTraderDataClient(LiveMarketDataClient):
         generation = self._instrument_provider.conversion_generation
         try:
             chain = await self._instrument_provider.conversion_instruments_for(instrument)
-        except (InstrumentLoadError, CTraderError) as e:
+        except (InstrumentLoadError, CTraderRequestError, CTraderProtocolError) as e:
+            # Only these say something about the chain itself: no route, a leg that cannot be
+            # built, or an answer that could not be read.
             self._instrument_provider.remove_failed(instrument.id, f"conversion failed: {e}")
             if self._config.fail_on_instrument_error:
                 raise
             return None
+        except (CTraderConnectionError, CTraderTimeoutError) as e:
+            # A stalled or unsent request says nothing about the instrument, so dropping it
+            # would lose it for the whole process over one reconnect.
+            self._conversion_not_subscribed(instrument.id, e, during_connect=during_connect)
+            return None
         try:
             await self._hold_chain(chain)
         except CTraderError as e:
-            if during_connect and self._config.fail_on_instrument_error:
-                raise
-            detail = e.error_code if isinstance(e, CTraderRequestError) else type(e).__name__
-            self._log.warning(
-                f"Conversion for {instrument.id} not subscribed ({detail}); "
-                f"retrying on the next subscribe",
-            )
+            self._conversion_not_subscribed(instrument.id, e, during_connect=during_connect)
             return None
 
         legs = frozenset(leg.info["symbol_id"] for leg in chain)
@@ -425,6 +427,24 @@ class CTraderDataClient(LiveMarketDataClient):
             ),
         )
         return chain
+
+    def _conversion_not_subscribed(
+        self,
+        instrument_id: InstrumentId,
+        error: CTraderError,
+        *,
+        during_connect: bool,
+    ) -> None:
+        """Report a chain left unsubscribed; raise instead if the bring-up asked to fail on it."""
+        if during_connect and self._config.fail_on_instrument_error:
+            raise error
+        detail = (
+            error.error_code if isinstance(error, CTraderRequestError) else type(error).__name__
+        )
+        self._log.warning(
+            f"Conversion for {instrument_id} not subscribed ({detail}); "
+            f"retrying on the next subscribe",
+        )
 
     async def _hold_chain(self, chain: list[Instrument]) -> None:
         """Subscribe every leg's spots, releasing the ones this call added if one is refused."""

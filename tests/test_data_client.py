@@ -39,7 +39,12 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from nautilus_ctrader.common.account import CTraderAccountClient
-from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
+from nautilus_ctrader.common.errors import (
+    CTraderConnectionError,
+    CTraderProtocolError,
+    CTraderRequestError,
+    CTraderTimeoutError,
+)
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.data import CONVERSION_CONSUMER, CTraderDataClient, _conversion_message
@@ -766,6 +771,38 @@ async def test_a_refused_conversion_leg_keeps_the_instrument_and_retries() -> No
             om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
             lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
         )
+        await subscribe_quotes(h, GER40_ID)
+
+        assert "conversion" in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_ID in h.client._converted
+
+
+@pytest.mark.parametrize(
+    "error",
+    [CTraderConnectionError("session not ready"), CTraderTimeoutError("no response in time")],
+    ids=["disconnected", "timed out"],
+)
+async def test_an_unanswered_chain_request_keeps_the_instrument_and_retries(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client_config = config(instrument_provider=InstrumentProviderConfig(load_all=True))
+    async with harness(client_config=client_config) as h:
+        await h.client._connect()
+
+        async def unanswered(*_args: object) -> list[om.ProtoOALightSymbol]:
+            raise error
+
+        monkeypatch.setattr(h.account, "conversion_chain", unanswered)
+        await subscribe_quotes(h, GER40_ID)
+
+        # Nothing was learned about the chain, so the instrument is still what it was.
+        assert h.provider.find(GER40_ID) is not None
+        assert not h.provider.failures
+        assert GER40_ID not in h.client._converted
+        assert not h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+
+        monkeypatch.undo()
         await subscribe_quotes(h, GER40_ID)
 
         assert "conversion" in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
