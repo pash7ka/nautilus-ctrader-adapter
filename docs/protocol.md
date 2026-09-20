@@ -195,9 +195,14 @@ as the first enum value, which here is the one-minute period. Reading a historic
 `period` therefore produces a plausible wrong answer rather than an error, on every period
 except the one-minute one.
 
-Subscribing to live trendbars requires an **active spot subscription** for the same symbol
-(confirmed): without one the venue answers `NOT_SUBSCRIBED_TO_SPOTS`. A consumer that wants
-only bars still has to hold a spot subscription for as long as it wants them.
+**Unconfirmed**: whether subscribing to live trendbars requires an **active spot subscription**
+for the same symbol. A live-trendbar subscribe sent with no spot subscription for that symbol
+was refused — but with `INVALID_REQUEST`, not with the `NOT_SUBSCRIBED_TO_SPOTS` the schema
+carries for exactly this case. The probe ran while that symbol's market was closed, so it is not
+established whether `INVALID_REQUEST` answers the missing subscription or the shut market;
+repeating it on an open market would settle it. Either way this adapter holds a spot
+subscription for as long as it holds a live trendbar, so a consumer that asks only for bars
+still gets one.
 
 ### Historical trendbars
 
@@ -211,16 +216,31 @@ milliseconds and a `count`, and pages backwards: `count` is counted back from `t
   asked for" as "the history is exhausted"; this adapter continues the next window from the
   oldest bar a page actually served, rather than from where the window was asked to start, so a
   short page skips nothing.
+- **A window far wider than the page is truncated in silence** (confirmed). A request spanning
+  400 days, with `count = 500`, was accepted and answered with 500 one-minute bars — a few
+  hours of the 400 days — with no `INCORRECT_BOUNDARIES` and no other error. Nothing in the
+  response says the window's start was never reached, so "the page stopped short of
+  `fromTimestamp`" carries no information about whether older bars exist. The same rule as
+  above covers it: continue from the oldest boundary the page actually served.
+- **`count` is honoured well past a page** (confirmed): `count = 5000` was served in full, and
+  `hasMore` was still true. The cap near 500 that this adapter's default page size was chosen
+  around does not exist.
+- **A trendbar day is not a calendar day** (confirmed): daily bars open at 21:00 UTC, not at
+  00:00. The intraday periods behave as expected — observed M1, M15 and H1 open times are all
+  multiples of their own length — but a daily bar covers the venue's trading day, so its open
+  time is an offset into the calendar day rather than the start of one.
 
 **Unconfirmed**: whether `fromTimestamp` and `toTimestamp` are inclusive. The paging absorbs
 an inclusive `toTimestamp` harmlessly, since a repeated boundary is de-duplicated. An
 *exclusive* `fromTimestamp` would not be absorbed — the bar at each window's start would be
 lost on every page — which is why this is the first thing to check on a live connection.
 
-**Unconfirmed**: the venue's maximum `count` per request, and the maximum span a single
-request's window may cover. `INCORRECT_BOUNDARIES` exists in the schema, so a span cap is
-real, but its value is not known. Both show up as a page that did not reach its window's start,
-which the paging already handles, so the current values are conservative rather than correct.
+**Unconfirmed**: the venue's maximum `count` per request, and whether a maximum span exists at
+all. Neither limit has been reached: 5000 was served in full, and the 400-day window was
+answered without complaint by a page that simply stopped at its `count`. `INCORRECT_BOUNDARIES`
+exists in the schema but has never been seen, so a span cap may sit above the spans asked for,
+or may be enforced only by truncation. Both show up as a page that did not reach its window's
+start, which the paging already handles.
 
 ## 9. A known inconsistency: `maintenanceEndTimestamp`
 

@@ -884,12 +884,13 @@ class CTraderDataClient(LiveMarketDataClient):
         session = self._session
         if session is None:
             raise CTraderConnectionError("data client is not connected")
-        # TODO(verify): whether fromTimestamp and toTimestamp are inclusive, and what the
-        # venue's caps on `count` and on a request's time span are. The paging absorbs all of
-        # them: an inclusive `toTimestamp` only repeats a boundary the caller dedupes, and a
-        # cap shows up as a page that did not reach its window's start. An *exclusive*
-        # `fromTimestamp` would not be absorbed - the bar at the window's start would be lost
-        # on every page - which is why this is the assumption to check first.
+        # TODO(verify): whether fromTimestamp and toTimestamp are inclusive. An inclusive
+        # `toTimestamp` only repeats a boundary the caller dedupes, but an *exclusive*
+        # `fromTimestamp` would lose the bar at every window's start, so this is the
+        # assumption to check first. The venue's caps on `count` and on a window's span are
+        # unknown but harmless here: a live run served 5000 bars for one request and
+        # truncated a 400-day window without an error, and both look like a page that did
+        # not reach its window's start, which the paging continues from.
         response = await session.request(
             oa.ProtoOAGetTrendbarsReq(
                 ctidTraderAccountId=self._account.account_id,

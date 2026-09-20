@@ -35,8 +35,11 @@ _Key = tuple[str, int] | tuple[str, int, int]
 # silently accepting it or failing with another code.
 _ALREADY_SUBSCRIBED = "ALREADY_SUBSCRIBED"
 _ACCEPTING = (SessionState.READY, SessionState.RESTORING)
+# Only picks DEBUG over WARNING for an unsubscribe refused during a restore.
 # TODO(verify): the code the venue refuses an unsubscribe of a never-subscribed key with, for
-# live trendbars as well as spots.
+# live trendbars as well as spots. A live-trendbar subscribe without spots was refused with
+# INVALID_REQUEST rather than NOT_SUBSCRIBED_TO_SPOTS, but with that market closed, so which
+# of the two the venue means for a missing subscription is still open.
 _NOT_SUBSCRIBED = frozenset({"NOT_SUBSCRIBED_TO_SPOTS"})
 
 
