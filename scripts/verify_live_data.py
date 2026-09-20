@@ -46,6 +46,7 @@ from nautilus_ctrader.constants import (
     DEMO_HOST,
     LIVE_HOST,
     PROTOBUF_PORT,
+    SYMBOL_BY_ID_BATCH,
 )
 from nautilus_ctrader.enums import PERIOD_SECS
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -101,6 +102,12 @@ _HISTORY_REQUEST_TIMEOUT_SECS = 30.0
 # Item 2: a unit fits if it puts the venue's timestamp within this of the local clock.
 _TIMESTAMP_TOLERANCE_SECS = 5.0
 _TIMESTAMP_UNITS = (("milliseconds", 1e-3), ("seconds", 1.0), ("microseconds", 1e-6))
+# Items 2 and 4: how far into the past a closed market can leave the last tick it served. A
+# weekend plus a holiday fits in a week; anything older is a wrong unit, not a shut market.
+_STALE_STREAM_MAX_AGE_SECS = 7 * 86_400.0
+# Item 4: an M1 bar followed live is seconds old, so a much older one was replayed from a
+# stream that had stopped moving.
+_STALE_BAR_AGE_SECS = 3600.0
 
 # Item 3: bars per period, and how wide a window to ask for them over. Three periods' worth
 # covers a weekend without the window itself becoming the thing under test.
@@ -315,6 +322,15 @@ def decide_spot_timestamp(timestamp: int | None, local_secs: float) -> Decision:
         return OK, (f"timestamp present, {as_ms}",)
     if fitting:
         return DIFFERS, (f"timestamp present, the unit that fits is {fitting[0]}", as_ms)
+    age_secs = -skews["milliseconds"]
+    if _TIMESTAMP_TOLERANCE_SECS < age_secs <= _STALE_STREAM_MAX_AGE_SECS:
+        # A closed market keeps serving the last tick before the close, which is minutes to
+        # days old. The unit is not what is wrong then, and a stale stream cannot prove one.
+        return UNKNOWN, (
+            "the spot stream looks stale: the market was probably closed",
+            f"read as milliseconds the last tick is {age_secs / 3600:.1f} h before the run, "
+            "a plausible last trading time, so no unit is decided either way",
+        )
     return DIFFERS, ("timestamp present, no known unit lands within 5 s of local time", as_ms)
 
 
@@ -357,7 +373,7 @@ def decide_alignment(observations: Sequence[AlignmentObservation]) -> Decision:
     return (DIFFERS if differs else OK), tuple(detail)
 
 
-def decide_bar_closes(closes: Sequence[BarClose]) -> Decision:
+def decide_bar_closes(closes: Sequence[BarClose], local_secs: float) -> Decision:
     if not closes:
         return UNKNOWN, ("no M1 bar closed and was polled for during the run",)
     detail = [
@@ -372,6 +388,15 @@ def decide_bar_closes(closes: Sequence[BarClose]) -> Decision:
     ]
     if len(closes) > _MAX_LISTED_DETAILS:
         detail.append(f"... and {len(closes) - _MAX_LISTED_DETAILS} more")
+    newest_age_secs = local_secs - max(c.boundary_secs for c in closes)
+    if newest_age_secs > _STALE_BAR_AGE_SECS:
+        # Every bar followed was the last one before a close: how long history took to serve
+        # it is the age of that close, and says nothing about a bar closing in a live market.
+        detail.append(
+            f"the newest bar followed is {newest_age_secs / 3600:.1f} h older than the run: "
+            "the stream was stale and the market was probably closed",
+        )
+        return UNKNOWN, tuple(detail)
     timer_closed = sum(1 for c in closes if c.closed_by != "stream")
     unserved = sum(1 for c in closes if c.history_delay_secs is None)
     if timer_closed or unserved:
@@ -413,14 +438,23 @@ def decide_wide_boundaries(error_code: str | None, returned: int | None) -> Deci
     return DIFFERS, (f"a {days}-day window is accepted, {returned} bars served",)
 
 
-def decide_symbol_batch(requested: int, returned: int | None, error_code: str | None) -> Decision:
-    if requested < 1:
+def decide_symbol_batch(
+    wanted: int,
+    sent: int,
+    returned: int | None,
+    error_code: str | None,
+) -> Decision:
+    """`wanted` is the batch size asked for, `sent` the ids the account actually offers."""
+    if sent < 1:
         return UNKNOWN, ("no symbol ids were available to ask for",)
+    # An account with fewer symbols than the batch size still verifies everything up to its
+    # own count, which is the number worth reporting.
+    short = () if sent >= wanted else (f"only {sent} of the {wanted} ids asked for are offered",)
     if error_code is not None:
-        return DIFFERS, (f"{requested} ids in one request rejected with {error_code}",)
-    if returned != requested:
-        return DIFFERS, (f"{requested} ids asked for, {returned} symbols returned",)
-    return OK, (f"{requested} ids in one request accepted, {returned} symbols returned",)
+        return DIFFERS, (f"{sent} ids in one request rejected with {error_code}", *short)
+    if returned != sent:
+        return DIFFERS, (f"{sent} ids sent, {returned} symbols returned", *short)
+    return OK, (f"{sent} ids in one request accepted, {returned} symbols returned", *short)
 
 
 def decide_price_digits(checked: int, failures: Sequence[str]) -> Decision:
@@ -657,9 +691,10 @@ class Verifier:
 
     async def _probe_symbol_batch(self) -> Decision:
         """Item 6."""
-        batch = list(self._all_symbol_ids[: self._settings.symbol_batch])
-        if len(batch) < self._settings.symbol_batch:
-            return UNKNOWN, (f"only {len(batch)} enabled symbol ids are offered",)
+        wanted = self._settings.symbol_batch
+        batch = list(self._all_symbol_ids[:wanted])
+        if not batch:
+            return decide_symbol_batch(wanted, 0, None, None)
         try:
             response = await self._request(
                 oa.ProtoOASymbolByIdReq(
@@ -668,9 +703,9 @@ class Verifier:
                 ),
             )
         except CTraderRequestError as e:
-            return decide_symbol_batch(len(batch), None, e.error_code)
+            return decide_symbol_batch(wanted, len(batch), None, e.error_code)
         returned = len(response.symbol) + len(response.archivedSymbol)
-        return decide_symbol_batch(len(batch), returned, None)
+        return decide_symbol_batch(wanted, len(batch), returned, None)
 
     # -- The spot window: items 2, 4 and 7 --------------------------------------------------
 
@@ -697,7 +732,7 @@ class Verifier:
             (
                 "4",
                 "M1 bar closes and when history serves them",
-                decide_bar_closes(self._spots.bar_closes),
+                decide_bar_closes(self._spots.bar_closes, time.time()),
             ),
             (
                 "7",
@@ -1089,8 +1124,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--symbol-batch",
         type=int,
-        default=200,
-        help="how many symbol ids to ask for in one request (default: 200)",
+        default=SYMBOL_BY_ID_BATCH,
+        help=(
+            "how many symbol ids to ask for in one request; the default is the batch size the "
+            f"adapter itself uses ({SYMBOL_BY_ID_BATCH}). An account offering fewer ids is "
+            "probed with the ids it has"
+        ),
     )
     return parser
 

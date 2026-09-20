@@ -54,8 +54,33 @@ def _account_list() -> oa.ProtoOAGetAccountListByAccessTokenRes:
                 ctidTraderAccountId=REAL_ACCOUNT,
                 isLive=True,
                 traderLogin=REAL_LOGIN,
+                lastClosingDealTimestamp=1_700_000_000_000,
+                lastBalanceUpdateTimestamp=1_700_000_000_000,
                 brokerTitleShort="Some Broker",
             )
+        ],
+    )
+
+
+def _symbol() -> oa.ProtoOASymbolByIdRes:
+    return oa.ProtoOASymbolByIdRes(
+        ctidTraderAccountId=REAL_ACCOUNT,
+        symbol=[
+            om.ProtoOASymbol(
+                symbolId=1,
+                digits=5,
+                pipPosition=4,
+                holiday=[
+                    om.ProtoOAHoliday(
+                        holidayId=7,
+                        name="Some Holiday",
+                        description="A broker-authored note",
+                        scheduleTimeZone="Europe/Somewhere",
+                        holidayDate=20_000,
+                        isRecurring=True,
+                    ),
+                ],
+            ),
         ],
     )
 
@@ -93,13 +118,23 @@ def test_scrub_account_list_drops_token_and_broker_title() -> None:
     assert a.ctidTraderAccountId == record_fixtures.FAKE_ACCOUNT_ID
     assert a.traderLogin == record_fixtures.FAKE_TRADER_LOGIN
     assert not a.HasField("brokerTitleShort")
+    for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp"):
+        assert not a.HasField(field), field
     assert a.isLive is True
+
+
+def test_scrub_clears_the_brokers_holiday_schedule() -> None:
+    """A cleared field can be a whole repeated submessage, not only a scalar."""
+    scrubbed = record_fixtures.scrub(_symbol(), REAL_ACCOUNT, REAL_LOGIN)
+    symbol = scrubbed.symbol[0]
+    assert not symbol.holiday
+    assert (symbol.digits, symbol.pipPosition) == (5, 4)
 
 
 def test_scrub_produces_serializable_messages() -> None:
     """A message `scrub` cannot turn back into something valid (a required field cleared
     instead of faked) must be caught here, not discovered mid-recording against the broker."""
-    for message in (_trader(), _account_list()):
+    for message in (_trader(), _account_list(), _symbol()):
         scrubbed = record_fixtures.scrub(message, REAL_ACCOUNT, REAL_LOGIN)
         scrubbed.SerializeToString()
 

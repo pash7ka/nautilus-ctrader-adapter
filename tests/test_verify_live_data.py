@@ -21,7 +21,7 @@ import pytest
 
 from nautilus_ctrader.common.errors import CTraderRequestError
 from nautilus_ctrader.common.rate_limit import RateLimiter
-from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL
+from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL, SYMBOL_BY_ID_BATCH
 from nautilus_ctrader.enums import PERIOD_SECS
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -151,7 +151,8 @@ def test_the_defaults_watch_two_major_symbols_for_five_minutes() -> None:
     assert parsed.account_id == 42
     assert parsed.minutes == 5.0
     assert parsed.symbols == ("EURUSD", "XAUUSD")
-    assert parsed.symbol_batch == 200
+    # The batch the adapter itself uses, so a default run verifies the number it depends on.
+    assert parsed.symbol_batch == SYMBOL_BY_ID_BATCH
     assert parsed.history_budget > 0
 
 
@@ -210,8 +211,24 @@ def test_item_2_names_the_unit_that_actually_fits() -> None:
     assert "seconds" in detail[0]
 
 
-def test_item_2_reports_a_timestamp_no_unit_explains() -> None:
-    status, _ = v.decide_spot_timestamp(1, 1_700_000_000.0)
+def test_item_2_calls_a_plausibly_stale_stream_unknown_rather_than_a_wrong_unit() -> None:
+    """A market closed on Friday keeps serving that last tick; the unit was never wrong."""
+    local = 1_700_000_000.0
+    status, detail = v.decide_spot_timestamp(int((local - 150_800) * 1000), local)
+    assert status == UNKNOWN
+    assert "stale" in detail[0]
+    assert "41.9 h" in detail[1]
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        1,  # 1970, as far out as a unit can be
+        1_700_000_000_000_000_000,  # tens of thousands of years into the future
+    ],
+)
+def test_item_2_reports_a_timestamp_no_unit_explains(timestamp) -> None:
+    status, _ = v.decide_spot_timestamp(timestamp, 1_700_000_000.0)
     assert status == DIFFERS
 
 
@@ -264,7 +281,7 @@ def test_item_3_without_any_bars_is_unknown() -> None:
 
 def test_item_4_is_ok_when_the_stream_closed_every_bar_and_history_had_it() -> None:
     closes = [v.BarClose(EURUSD, 1_700_000_040, "stream", 0.5, 2)]
-    status, detail = v.decide_bar_closes(closes)
+    status, detail = v.decide_bar_closes(closes, 1_700_000_105.0)
     assert status == OK
     assert "closed by stream" in detail[0]
 
@@ -274,13 +291,21 @@ def test_item_4_flags_a_timer_close_and_a_bar_history_never_served() -> None:
         v.BarClose(EURUSD, 1_700_000_040, "stream", 0.5, 2),
         v.BarClose(EURUSD, 1_700_000_100, "timer", None, 40),
     ]
-    status, detail = v.decide_bar_closes(closes)
+    status, detail = v.decide_bar_closes(closes, 1_700_000_165.0)
     assert status == DIFFERS
     assert "1 of 2 needed the timer" in detail[-1]
 
 
+def test_item_4_calls_bars_far_older_than_the_run_unknown() -> None:
+    """With the market shut the run follows the last bar before it; that proves nothing."""
+    closes = [v.BarClose(EURUSD, 1_700_000_040, "timer", 150_800.0, 40)]
+    status, detail = v.decide_bar_closes(closes, 1_700_000_040 + 150_800.0)
+    assert status == UNKNOWN
+    assert "41.9 h older than the run" in detail[-1]
+
+
 def test_item_4_without_a_closed_bar_is_unknown() -> None:
-    assert v.decide_bar_closes([])[0] == UNKNOWN
+    assert v.decide_bar_closes([], 1_700_000_105.0)[0] == UNKNOWN
 
 
 def test_item_5a_takes_the_largest_count_served_in_full() -> None:
@@ -313,10 +338,17 @@ def test_item_5b_wants_the_wide_window_rejected() -> None:
 
 
 def test_item_6_wants_every_requested_id_answered() -> None:
-    assert v.decide_symbol_batch(200, 200, None)[0] == OK
-    assert v.decide_symbol_batch(200, 180, None)[0] == DIFFERS
-    assert v.decide_symbol_batch(200, None, "INVALID_REQUEST")[0] == DIFFERS
-    assert v.decide_symbol_batch(0, None, None)[0] == UNKNOWN
+    assert v.decide_symbol_batch(100, 100, 100, None)[0] == OK
+    assert v.decide_symbol_batch(100, 100, 80, None)[0] == DIFFERS
+    assert v.decide_symbol_batch(100, 100, None, "INVALID_REQUEST")[0] == DIFFERS
+    assert v.decide_symbol_batch(100, 0, None, None)[0] == UNKNOWN
+
+
+def test_item_6_reports_the_batch_an_account_with_fewer_symbols_did_reach() -> None:
+    status, detail = v.decide_symbol_batch(200, 166, 166, None)
+    assert status == OK
+    assert "166 ids in one request accepted" in detail[0]
+    assert "only 166 of the 200" in detail[1]
 
 
 def test_item_7_reports_the_prices_that_do_not_fit_the_symbols_digits() -> None:

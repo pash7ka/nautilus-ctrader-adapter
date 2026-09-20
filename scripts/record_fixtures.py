@@ -85,6 +85,13 @@ _CLEARED_FIELDS = frozenset(
         "ibBonus",
         "nonWithdrawableBonus",
         "registrationTimestamp",
+        # When the account last traded and was last credited: no name, but the pair dates one
+        # real account.
+        "lastClosingDealTimestamp",
+        "lastBalanceUpdateTimestamp",
+        # Broker-authored holiday names, descriptions and a schedule time zone. Nothing the
+        # protocol tests need, and between them they identify one broker's calendar.
+        "holiday",
     }
 )
 
@@ -127,9 +134,10 @@ def scrub(message: Message, real_account_id: int, real_login: int | None) -> Mes
     Recursively walks every field of a `CopyFrom` copy: any int64/uint64 field named
     `ctidTraderAccountId` becomes `FAKE_ACCOUNT_ID`, `traderLogin` becomes `FAKE_TRADER_LOGIN`,
     `accessToken`/`refreshToken` become `FAKE_TOKEN`, and `_CLEARED_FIELDS` are cleared -
-    wherever any of these occur, at any nesting depth. A `_CLEARED_FIELDS` entry that is
-    `required` in the schema is set to a fake value instead of cleared, since an unset
-    required field would make the message fail to serialize. As a second pass, independent of
+    wherever any of these occur, at any nesting depth, and whether the cleared field is a
+    scalar or a whole submessage. A `_CLEARED_FIELDS` entry that is `required` in the schema
+    is set to a fake value instead of cleared, since an unset required field would make the
+    message fail to serialize. As a second pass, independent of
     field name, any other int64/uint64 scalar still carrying exactly `real_account_id` or
     `real_login` is replaced too - including each element of a repeated int64/uint64 field -
     so a field this function does not yet know the name of can never carry a real identifier
@@ -144,6 +152,16 @@ def scrub(message: Message, real_account_id: int, real_login: int | None) -> Mes
 def _scrub_in_place(message: Message, real_account_id: int, real_login: int | None) -> None:
     for field, value in list(message.ListFields()):
         name = field.name
+        # Before the message branch below, so a cleared field can be a nested message too.
+        if name in _CLEARED_FIELDS:
+            if field.label == FieldDescriptor.LABEL_REQUIRED:
+                # Clearing would leave it unset and break serialization; give it a fake value
+                # that still satisfies the required-field constraint instead.
+                setattr(message, name, _FAKE_REQUIRED_VALUES.get(name, 0))
+            else:
+                message.ClearField(name)
+            continue
+
         if field.type == FieldDescriptor.TYPE_MESSAGE:
             items = value if field.label == FieldDescriptor.LABEL_REPEATED else (value,)
             for item in items:
@@ -156,13 +174,6 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
             setattr(message, name, FAKE_TRADER_LOGIN)
         elif name in ("accessToken", "refreshToken"):
             setattr(message, name, FAKE_TOKEN)
-        elif name in _CLEARED_FIELDS:
-            if field.label == FieldDescriptor.LABEL_REQUIRED:
-                # Clearing would leave it unset and break serialization; give it a fake value
-                # that still satisfies the required-field constraint instead.
-                setattr(message, name, _FAKE_REQUIRED_VALUES.get(name, 0))
-            else:
-                message.ClearField(name)
         elif field.type in _IDENTIFYING_INT_TYPES:
             if field.label == FieldDescriptor.LABEL_REPEATED:
                 for i, item in enumerate(value):
