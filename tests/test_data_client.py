@@ -35,11 +35,18 @@ from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import CTraderRequestError
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
-from nautilus_ctrader.data import CTraderDataClient, _conversion_message
+from nautilus_ctrader.data import CONVERSION_CONSUMER, CTraderDataClient, _conversion_message
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
-from tests.account_venue import ACCOUNT_ID, RECORDED, account_client, received, venue
+from tests.account_venue import (
+    ACCOUNT_ID,
+    RECORDED,
+    HeldReplies,
+    account_client,
+    received,
+    venue,
+)
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
@@ -607,3 +614,66 @@ async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(
         await push_spot(h, ASK_ONLY)
 
         assert not h.quotes()
+
+
+# -- Carry-over fixes -----------------------------------------------------------------------
+
+
+async def test_a_refused_conversion_fails_connect_when_configured_to() -> None:
+    async with harness(
+        client_config=config(fail_on_instrument_error=True),
+        server=refusing_venue(EURUSD_SYMBOL_ID),
+    ) as h:
+        with pytest.raises(CTraderRequestError):
+            await h.client._connect()
+
+
+async def test_a_refused_conversion_outside_connect_still_retries() -> None:
+    client_config = config(
+        fail_on_instrument_error=True,
+        instrument_provider=InstrumentProviderConfig(load_all=True),
+    )
+    async with harness(client_config=client_config, server=refusing_venue(EURUSD_SYMBOL_ID)) as h:
+        await h.client._connect()
+
+        await subscribe_quotes(h, GER40_ID)
+
+        assert h.provider.find(GER40_ID) is not None
+        assert GER40_ID not in h.client._converted
+
+
+async def test_a_cancelled_release_does_not_let_a_later_one_re_attach_the_listener() -> None:
+    async with harness() as h:
+        await h.client._connect()  # EURUSD is held for the conversion chain
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ,
+            lambda r: oa.ProtoOAUnsubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+
+        cancelled = asyncio.create_task(
+            h.client._release_spots(EURUSD_SYMBOL_ID, CONVERSION_CONSUMER),
+        )
+        await held.arrived.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await held.stop_holding()
+
+        # Another consumer comes and goes; with the cancelled one gone too, nobody is left.
+        await subscribe_quotes(h, EURUSD_ID)
+        await unsubscribe_quotes(h, EURUSD_ID)
+        await push_spot(h, TWO_SIDED)
+
+        assert not h.quotes()
+        # The cancelled release is still on record, so a disconnect repeats its unsubscribe.
+        assert (EURUSD_SYMBOL_ID, CONVERSION_CONSUMER) in h.client._all_holds()
+
+
+async def test_disconnect_forgets_which_instruments_were_converted() -> None:
+    async with harness() as h:
+        await h.client._connect()
+
+        await h.client._disconnect()
+
+        assert not h.client._converted
