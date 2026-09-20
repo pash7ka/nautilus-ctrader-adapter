@@ -752,13 +752,14 @@ class CTraderDataClient(LiveMarketDataClient):
         exactly one page is asked for: the caller wanted the most recent bars, not the whole
         history.
 
-        A page the venue cut short is continued from the oldest boundary it actually served,
-        not from the window that was asked for, so the part it dropped is asked for again.
+        Only an empty page proves a window holds nothing: whenever one comes back non-empty,
+        the next window ends at the oldest boundary it served rather than at the start of the
+        window asked for. A venue that cut the page short - whether it says so through
+        `hasMore` or not - therefore skips nothing, and a full page changes nothing, since its
+        oldest boundary is the window's own start.
         """
         period_secs = PERIOD_SECS[period]
-        # TODO(verify): the venue's cap on a request's time span, which may be shorter than
-        # `history_page_size` periods and would then silently truncate every page.
-        span = self._config.history_page_size * period_secs
+        span = self._page_size() * period_secs
         bars: dict[int, RawBar] = {}
         to_secs = end_secs
         while True:
@@ -770,29 +771,33 @@ class CTraderDataClient(LiveMarketDataClient):
                 period,
                 from_secs=from_secs,
                 to_secs=to_secs,
-                count=self._page_count(),
+                count=self._page_size() + 1,
             )
             for raw in page:
                 # An inclusive `toTimestamp` would otherwise carry a bar past the end in.
                 if raw.boundary_secs < end_secs:
                     bars.setdefault(raw.boundary_secs, raw)
             oldest = min((raw.boundary_secs for raw in page), default=None)
-            if truncated and oldest is not None:
-                self._log.debug(
-                    f"History cut a page short at {oldest} for symbol {symbol_id}; "
-                    f"continuing from there",
-                )
+            if oldest is None:
+                reached = from_secs
+            else:
                 # Never above the window's own last boundary, so every page makes progress.
                 reached = min(oldest, to_secs - period_secs)
-            else:
-                reached = from_secs
+                if reached > from_secs:
+                    self._log.debug(
+                        f"History served symbol {symbol_id} only back to {oldest}, not to "
+                        f"{from_secs}{' (cut short)' if truncated else ''}; continuing there",
+                    )
             if start_secs is None and limit is None:
                 break
             if limit is not None and self._closed_count(bars, period_secs, closed_secs) >= limit:
                 break
-            if start_secs is not None and reached <= start_secs:
-                break
-            if start_secs is None and not page:
+            if start_secs is not None:
+                # Only stop once a page has actually reached `start_secs`: one cut short above
+                # it leaves the bar at `start_secs` unserved.
+                if reached <= start_secs and (oldest is None or oldest <= start_secs):
+                    break
+            elif not page:
                 # Without a lower bound, an empty page is the only sign history has run out.
                 break
             to_secs = reached
@@ -802,13 +807,8 @@ class CTraderDataClient(LiveMarketDataClient):
     def _closed_count(bars: dict[int, RawBar], period_secs: int, closed_secs: int) -> int:
         return sum(1 for boundary in bars if boundary + period_secs <= closed_secs)
 
-    def _page_count(self) -> int:
-        """One more than a full window holds, so a truncated page still covers the window.
-
-        The venue answers with the newest `count` bars ending at `toTimestamp`, so asking for
-        exactly as many as the window holds would silently drop the bar at its start.
-        """
-        return self._config.history_page_size + 1
+    def _page_size(self) -> int:
+        return max(1, self._config.history_page_size)
 
     async def _fetch_bar(self, symbol_id: int, period: int, boundary_secs: int) -> RawBar | None:
         """The one closed bar opening at `boundary_secs`, or `None` if history has none yet."""
@@ -818,7 +818,8 @@ class CTraderDataClient(LiveMarketDataClient):
             period,
             from_secs=boundary_secs,
             to_secs=boundary_secs + period_secs,
-            # Two for a one-bar window, for the same reason as `_page_count`.
+            # Two for a one-bar window: the venue counts `count` back from `toTimestamp`, so
+            # asking for one could hand back a bar at the far edge instead of the one wanted.
             count=2,
         )
         return next((raw for raw in bars if raw.boundary_secs == boundary_secs), None)
@@ -850,9 +851,12 @@ class CTraderDataClient(LiveMarketDataClient):
         session = self._session
         if session is None:
             raise CTraderConnectionError("data client is not connected")
-        # TODO(verify): whether toTimestamp is inclusive and what the venue's per-request cap
-        # is. Both are absorbed here - an inclusive edge only repeats a boundary the caller
-        # dedupes, and a cap is read back off `hasMore`.
+        # TODO(verify): whether fromTimestamp and toTimestamp are inclusive, and what the
+        # venue's caps on `count` and on a request's time span are. The paging absorbs all of
+        # them: an inclusive `toTimestamp` only repeats a boundary the caller dedupes, and a
+        # cap shows up as a page that did not reach its window's start. An *exclusive*
+        # `fromTimestamp` would not be absorbed - the bar at the window's start would be lost
+        # on every page - which is why this is the assumption to check first.
         response = await session.request(
             oa.ProtoOAGetTrendbarsReq(
                 ctidTraderAccountId=self._account.account_id,

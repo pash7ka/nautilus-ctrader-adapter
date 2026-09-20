@@ -104,7 +104,11 @@ class SubscriptionRegistry:
             await self._acquire(key, consumer)
 
     async def unsubscribe_spots(self, symbol_id: int, consumer: str) -> None:
-        """Release `consumer`'s spot reference; idempotent, so a cancelled call can be repeated."""
+        """Release `consumer`'s spot reference.
+
+        Idempotent, and a cancelled call keeps the reference, so repeating it re-sends the
+        unsubscribe rather than finding nothing left to do.
+        """
         key = _spots_key(symbol_id)
         async with self._lock(key):
             await self._release(key, consumer)
@@ -132,7 +136,10 @@ class SubscriptionRegistry:
                 raise
 
     async def unsubscribe_trendbars(self, symbol_id: int, period: int, consumer: str) -> None:
-        """Release both of `consumer`'s references; idempotent, so a cancelled call can be repeated.
+        """Release both of `consumer`'s references.
+
+        Idempotent, and a cancelled call keeps whichever reference its request was still in
+        flight for, so repeating it re-sends that unsubscribe.
 
         The spot reference is released even without a trendbar reference, which a cancelled
         `subscribe_trendbars` leaves behind when cut short in its spots leg.
@@ -226,8 +233,10 @@ class SubscriptionRegistry:
     async def _release(self, key: _Key, consumer: str) -> None:
         """Drop `consumer`'s reference; the last one also unsubscribes. Caller holds the key lock.
 
-        The reference is dropped even if the unsubscribe fails: its consumer is gone either
-        way, and spots the venue keeps sending are dropped for want of a listener.
+        The reference is dropped once the request has run its course, failure included: its
+        consumer is gone either way, and spots the venue keeps sending are dropped for want of
+        a listener. A cancellation is the one outcome that keeps it, mirroring `_acquire`: the
+        venue may still be streaming the key, and only a repeated unsubscribe settles that.
         """
         consumers = self._consumers.get(key)
         if consumers is None or consumer not in consumers:
@@ -249,10 +258,9 @@ class SubscriptionRegistry:
                 self._log.debug(f"Unsubscribe {key!r} during restore: {detail}")
             else:
                 self._log.warning(f"Unsubscribe {key!r} failed: {detail}")
-        finally:
-            del self._consumers[key]
-            if self._session is not None:
-                self._session.remove_restore(key)
+        del self._consumers[key]
+        if self._session is not None:
+            self._session.remove_restore(key)
 
     def _restore(self, session: CTraderSession, key: _Key) -> Callable[[], Awaitable[None]]:
         requests = [self._subscribe_request(key)]

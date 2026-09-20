@@ -69,13 +69,19 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     bar_close_history_retries : int, default 3
         How many times to re-ask history for a bar it has not served yet.
     history_page_size : int, default 500
-        Bars per historical request.
+        Bars per historical request; at least 1, since it also sizes the window each request
+        covers.
     history_request_timeout_secs : float, default 30.0
         Response timeout for a historical request.
     connect_timeout_secs : float, default 60.0
         Bound on the whole account bring-up.
     restore_retry_interval_secs : float, default 30.0
         How often to retry subscriptions whose restore failed.
+
+    Raises
+    ------
+    ValueError
+        If `history_page_size` is below 1.
 
     """
 
@@ -97,6 +103,12 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     history_request_timeout_secs: float = 30.0
     connect_timeout_secs: float = 60.0
     restore_retry_interval_secs: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.history_page_size < 1:
+            raise ValueError(
+                f"history_page_size must be at least 1, got {self.history_page_size}",
+            )
 
     def credentials(self) -> AccountCredentials:
         return AccountCredentials(

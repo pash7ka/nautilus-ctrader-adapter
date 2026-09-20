@@ -463,6 +463,34 @@ async def test_a_timed_out_subscribe_is_retried_by_the_restore_retry(
         await client.disconnect()
 
 
+async def test_a_cancelled_unsubscribe_keeps_the_reference_and_a_repeat_re_sends_it(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a")
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ,
+        lambda r: oa.ProtoOAUnsubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+    )
+
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+
+    # The venue may or may not have processed it, so the reference stays until one does.
+    assert registry.consumers(EURUSD) == frozenset({"a"})
+
+    await held.stop_holding()
+    await registry.unsubscribe_spots(EURUSD, "a")
+
+    assert registry.consumers(EURUSD) == frozenset()
+    assert len(received(server, oa.ProtoOAUnsubscribeSpotsReq)) == 2
+
+
 async def test_a_cancelled_spots_leg_is_released_by_unsubscribe_trendbars(
     server: FakeCTraderServer,
     client: CTraderAccountClient,

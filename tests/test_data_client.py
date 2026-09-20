@@ -78,10 +78,12 @@ ASK_ONLY = SPOTS[19]
 TWO_SIDED = SPOTS[0]
 GER40_SPOT = SPOTS[1]
 
-# The first minute the recorded spot events carry a trendbar for, and the last bar of the
-# recorded H1 response. Both in `utcTimestampInMinutes`, as the venue reports them.
+# The first minute the recorded spot events carry a trendbar for, and the first and last bars
+# of the recorded H1 response. All in `utcTimestampInMinutes`, as the venue reports them.
 FIRST_M1_MINUTE = 29_829_284
+FIRST_H1_MINUTE = 29_826_300
 LAST_H1_MINUTE = 29_829_180
+RECORDED_H1_BARS = 49
 
 
 def config(**overrides) -> CTraderDataClientConfig:
@@ -280,11 +282,13 @@ def _serve_trendbars(
     *,
     inclusive_to: bool,
     chunk: int | None,
+    announce_more: bool,
 ) -> oa.ProtoOAGetTrendbarsRes:
     """Serve the recorded bars in the requested window, keeping the newest when capped.
 
-    `inclusive_to` and `chunk` stand in for the two things the live endpoint has not settled:
-    whether `toTimestamp` is inclusive, and a per-request cap below the asked-for `count`.
+    The three switches stand in for what the live endpoint has not settled: whether
+    `toTimestamp` is inclusive, a per-request cap below the asked-for `count`, and whether a
+    capped response says so through `hasMore`.
     """
     source = RECORDED_HISTORY.get((request.symbolId, request.period), {})
     bars = [
@@ -300,11 +304,16 @@ def _serve_trendbars(
         symbolId=request.symbolId,
         period=request.period,
         trendbar=bars[-cap:],
-        hasMore=truncated,
+        hasMore=truncated and announce_more,
     )
 
 
-def trendbar_venue(*, inclusive_to: bool = False, chunk: int | None = None) -> FakeCTraderServer:
+def trendbar_venue(
+    *,
+    inclusive_to: bool = False,
+    chunk: int | None = None,
+    announce_more: bool = True,
+) -> FakeCTraderServer:
     """The data venue, also accepting live trendbar subscriptions and serving recorded history."""
     server = data_venue()
     for payload_type, response_class in (
@@ -317,7 +326,12 @@ def trendbar_venue(*, inclusive_to: bool = False, chunk: int | None = None) -> F
         )
     server.on(
         om.PROTO_OA_GET_TRENDBARS_REQ,
-        functools.partial(_serve_trendbars, inclusive_to=inclusive_to, chunk=chunk),
+        functools.partial(
+            _serve_trendbars,
+            inclusive_to=inclusive_to,
+            chunk=chunk,
+            announce_more=announce_more,
+        ),
     )
     return server
 
@@ -427,6 +441,11 @@ def test_credentials_carry_the_configured_tokens() -> None:
     assert credentials.access_token == "access-token"
     assert credentials.refresh_token == "refresh-token"
     assert credentials.token_expires_at == 4_102_444_800.0
+
+
+def test_a_history_page_size_below_one_is_rejected() -> None:
+    with pytest.raises(ValueError, match="history_page_size"):
+        config(history_page_size=0)
 
 
 async def test_an_unknown_asset_class_override_fails_construction() -> None:
@@ -995,6 +1014,8 @@ async def test_a_cancelled_bar_unsubscribe_is_repeated_at_disconnect() -> None:
         await h.client._disconnect()
 
         assert not h.client._releasing_bars
+        # The repeat reaches the venue: the cancelled one settled nothing.
+        assert len(received(h.server, oa.ProtoOAUnsubscribeLiveTrendbarReq)) == 2
 
 
 async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconnect() -> None:
@@ -1105,6 +1126,44 @@ async def test_a_page_the_venue_cuts_short_is_continued_from_what_it_served() ->
 
         assert [b.ts_event for b in bars] == [
             close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(30))
+        ]
+
+
+async def test_a_page_cut_short_without_saying_so_skips_no_bar() -> None:
+    client_config = config(history_page_size=20)
+    server = trendbar_venue(chunk=5, announce_more=False)
+    async with harness(client_config=client_config, server=server) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(FIRST_H1_MINUTE),
+            end=at_minute(LAST_H1_MINUTE + 60),
+        )
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(FIRST_H1_MINUTE + 60 * offset, 3600) for offset in range(RECORDED_H1_BARS)
+        ]
+
+
+async def test_the_bar_at_the_requested_start_survives_a_page_cut_short() -> None:
+    client_config = config(history_page_size=20)
+    server = trendbar_venue(inclusive_to=True, chunk=1)
+    async with harness(client_config=client_config, server=server) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(LAST_H1_MINUTE - 120),
+            end=at_minute(LAST_H1_MINUTE + 60),
+        )
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 120, 3600),
+            close_ns(LAST_H1_MINUTE - 60, 3600),
+            close_ns(LAST_H1_MINUTE, 3600),
         ]
 
 
