@@ -426,7 +426,9 @@ def _is_cant_route(error: BaseException) -> bool:
     return False
 
 
-_ACCOUNT_CLIENTS: dict[tuple[int, str], CTraderAccountClient] = {}
+# The credentials are kept beside the client so a later call is compared with what the
+# client was built from, not with a token it has since refreshed for itself.
+_ACCOUNT_CLIENTS: dict[tuple[int, str], tuple[CTraderAccountClient, AccountCredentials]] = {}
 
 
 def get_cached_ctrader_account_client(
@@ -441,11 +443,13 @@ def get_cached_ctrader_account_client(
 
     Later calls with the same key return the first instance; their other arguments are ignored.
     A differing `environment` or credential is reported in one WARNING: the first client's
-    host and tokens win, and the second config would otherwise be ignored in silence.
+    host and tokens win, and the second config would otherwise be ignored in silence. The
+    comparison is against the credentials the client was built from, so a token the client
+    refreshed on its own is not reported as the caller's disagreement.
     """
     key = (account_id, credentials.client_id)
-    client = _ACCOUNT_CLIENTS.get(key)
-    if client is None:
+    entry = _ACCOUNT_CLIENTS.get(key)
+    if entry is None:
         client = CTraderAccountClient(
             account_id=account_id,
             credentials=credentials,
@@ -453,10 +457,10 @@ def get_cached_ctrader_account_client(
             logger=logger,
             **kwargs,
         )
-        _ACCOUNT_CLIENTS[key] = client
+        _ACCOUNT_CLIENTS[key] = (client, credentials)
         return client
 
-    cached = client._credentials
+    client, cached = entry
     differences: list[str] = []
     if environment != client._environment:
         differences.append(

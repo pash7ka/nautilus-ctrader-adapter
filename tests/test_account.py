@@ -421,6 +421,32 @@ def test_a_cached_client_warns_once_when_the_credentials_differ() -> None:
         assert secret not in warnings[0]
 
 
+def test_a_cached_client_stays_silent_about_a_token_it_refreshed_itself() -> None:
+    """A refresh is the client's own doing, not a disagreement with the caller.
+
+    Comparing against the live credentials would report every post-refresh call as an ignored
+    setting, sending a reader after a token the caller never got wrong.
+    """
+    config_credentials = credentials(token_expires_at=_EXPIRES_AT)
+    client = get_cached_ctrader_account_client(
+        account_id=ACCOUNT_ID,
+        credentials=config_credentials,
+        environment="demo",
+        logger=RecordingLogger(),
+    )
+    client._on_tokens_refreshed("refreshed-access-token", "refreshed-refresh-token", _EXPIRES_AT)
+    logger = RecordingLogger()
+
+    get_cached_ctrader_account_client(
+        account_id=ACCOUNT_ID,
+        credentials=config_credentials,
+        environment="demo",
+        logger=logger,
+    )
+
+    assert [message for level, message in logger.lines if level == "warning"] == []
+
+
 def test_a_cached_client_for_the_same_environment_and_credentials_logs_nothing() -> None:
     get_cached_ctrader_account_client(
         account_id=ACCOUNT_ID,
