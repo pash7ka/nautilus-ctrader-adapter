@@ -13,6 +13,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from nautilus_ctrader.common.errors import CTraderConnectionError
+
 
 @dataclass(frozen=True)
 class RawBar:
@@ -74,6 +76,9 @@ class BarCloser:
     - Otherwise a timer at `boundary + period + grace` queues it for history, which is asked up
       to `1 + history_retries` times, `grace` apart; if it never has the bar, the last streamed
       state is emitted instead.
+    - While there is no connection there is no history to ask, so that is not a spent attempt:
+      the entry stays queued until `backfill` or a later closed bar resumes it. A bar that
+      closed during an outage is therefore never emitted from its partial streamed state.
     - The first update after construction, `on_disconnect` or `backfill` is a baseline: if its
       bar has already closed, it is queued for history with that state as the fallback.
     - No boundary before the bar forming at construction is ever emitted.
@@ -206,6 +211,9 @@ class BarCloser:
         self._held = None
         self._cancel_timer()
         self._current = None
+        # There is a connection again, so an entry the resolver left queued when it went down
+        # can be asked for now. Done here because the rounds below may enqueue nothing.
+        self._pump()
         try:
             end, capped = await self._backfill_rounds(fetch_range)
             if self._closed:
@@ -361,7 +369,15 @@ class BarCloser:
     async def _resolve(self) -> None:
         try:
             while (pending := self._emit_ready()) is not None:
-                result = await self._from_history(pending)
+                try:
+                    result = await self._from_history(pending)
+                except CTraderConnectionError as e:
+                    # With no connection there is nothing to ask, so the entry is left exactly
+                    # as it is and this task stops. Whatever queues the next boundary restarts
+                    # it - the reconnect's `backfill` at the latest - and by then history can
+                    # serve the bar that closed during the outage.
+                    self._log.debug(f"{self._label}: no connection for history ({e!r})")
+                    return
                 if self._closed:
                     return
                 # Resolved: the entry now carries its final bar, or none if no bar exists.
@@ -376,7 +392,8 @@ class BarCloser:
     async def _from_history(self, pending: _Pending) -> RawBar | None:
         """Ask history for `pending`'s bar; fall back to its streamed state.
 
-        Return `None` if nothing should be emitted.
+        Return `None` if nothing should be emitted. Raises `CTraderConnectionError` for the
+        caller to leave the entry queued: see the class docstring.
         """
         boundary = pending.boundary
         error: Exception | None = None
@@ -387,6 +404,8 @@ class BarCloser:
                 return None
             try:
                 result = await self._fetch(boundary)
+            except CTraderConnectionError:
+                raise
             except Exception as e:
                 # Any history failure is retried, then falls back to the streamed state.
                 error = e

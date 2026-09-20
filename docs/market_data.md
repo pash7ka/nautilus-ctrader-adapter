@@ -56,7 +56,8 @@ once, in ascending order, whichever of them got there first:
   bar replaces the streamed state. History can lag a just-closed bar, so it is asked up to
   `1 + bar_close_history_retries` times, a grace period apart. If it still has nothing, the last
   streamed state is emitted with a WARNING, and a repeat of the same condition drops to DEBUG
-  rather than flooding the log.
+  rather than flooding the log. A request that finds no connection is not one of those
+  attempts: the bar keeps waiting, and the backfill below closes it.
 - **A backfill after a reconnect.** Bars that closed while the connection was down are fetched
   from history and emitted before the stream resumes.
 

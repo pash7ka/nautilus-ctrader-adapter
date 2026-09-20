@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 
 from nautilus_ctrader.common.bars import BarCloser, RawBar
+from nautilus_ctrader.common.errors import CTraderConnectionError
 from tests.recording_logger import RecordingLogger
 
 PERIOD = 60
@@ -1044,6 +1045,68 @@ async def test_probe_h_hitting_the_round_cap_skips_no_bar() -> None:
     assert debugs_of(logger) == [
         "L: queued 2 bars that closed during the final backfill fetch for history"
     ]
+
+
+def outage_history(hist: History, down: list[bool], attempts: list[int]):
+    """`hist.fetch`, failing the way the client's does while the connection is down."""
+
+    async def fetch(boundary_secs: int) -> RawBar | None:
+        attempts.append(boundary_secs)
+        if down[0]:
+            raise CTraderConnectionError("session not ready (state=CONNECTING)")
+        return await hist.fetch(boundary_secs)
+
+    return fetch
+
+
+async def test_probe_i_a_bar_closing_during_an_outage_is_not_emitted_from_its_partial_state():
+    clock = FakeClock(T0 + 10)
+    hist = History(clock, lag=0)
+    down = [True]
+    attempts: list[int] = []
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+    closer = make_closer(clock, outage_history(hist, down, attempts), emitted, logger)
+
+    closer.on_update(s(0))  # the partial state of the bar forming at T0, seen at T0+10
+    await clock.advance(51)  # T0+61: the timer queues T0; the connection went down at T0+30
+    for _ in range(4):
+        await clock.advance(GRACE)
+
+    assert attempts == [T0]  # not a spent attempt, so no retry ran either
+    assert emitted == []
+    assert warnings_of(logger) == []
+
+    down[0] = False  # T0+195: reconnected, and the restore drives the closer
+    closer.on_disconnect()
+    clock.t = T0 + 195
+    await closer.backfill(hist.fetch_range)
+
+    assert emitted == [h(0), h(60), h(120)]  # T0 corrected from history, not the streamed s0
+
+
+async def test_a_history_entry_left_queued_by_an_outage_resumes_on_the_next_closed_bar():
+    # Nothing waits for a backfill that may never come: whatever queues the next boundary
+    # resumes the entry, and the queue keeps them in order.
+    clock = FakeClock(T0 + 10)
+    hist = History(clock, lag=0)
+    down = [True]
+    attempts: list[int] = []
+    emitted: list[RawBar] = []
+    closer = make_closer(clock, outage_history(hist, down, attempts), emitted, RecordingLogger())
+
+    closer.on_update(s(0))
+    await clock.advance(51)  # T0+61: the timer queues T0
+    await clock.advance(GRACE)
+    await clock.advance(GRACE)  # far enough for the retries to have been spent
+    assert emitted == []
+
+    down[0] = False
+    closer.on_update(s(60))  # the stream is back; no backfill ran for this subscription
+    await clock.advance(58)  # T0+121: the timer queues T0+60 behind the waiting T0
+    await settle()
+
+    assert emitted == [h(0), h(60)]
 
 
 async def test_backfill_gives_up_waiting_on_a_fetch_that_never_returns() -> None:
