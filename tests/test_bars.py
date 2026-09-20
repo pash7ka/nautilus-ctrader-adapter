@@ -261,20 +261,25 @@ async def test_a_fetch_that_raises_once_is_retried_and_history_still_wins() -> N
     assert warnings_of(logger) == []
 
 
-def test_baseline_discards_a_first_update_already_past_its_end() -> None:
-    clock = FakeClock(T0 + 120)
-    fetch = FetchStub([])
+async def test_a_baseline_update_already_past_its_end_goes_to_history_not_the_stream() -> None:
+    clock = FakeClock(T0)  # floor = T0, so the baseline branch is what decides
+    history_bar = bar(T0, tag="history")
+    fetch = FetchStub([history_bar])
     emitted: list[RawBar] = []
     closer = make_closer(clock, fetch, emitted, RecordingLogger())
 
-    closer.on_update(bar(T0, tag="stale"))
-    assert emitted == []
-    assert clock.timers == []  # no timer armed for a bar that was never treated as forming
+    clock.t = T0 + 120
+    closer.on_update(bar(T0, tag="stale"))  # the venue's last bar, already closed
+    assert emitted == []  # never treated as the forming bar
+
+    await clock.advance(0)
+    assert fetch.calls == [T0]
+    assert emitted == [history_bar]
 
     # A later, still-forming bar behaves normally.
     closer.on_update(bar(T0 + 120, tag="live"))
     closer.on_update(bar(T0 + 180, tag="live2"))
-    assert emitted == [bar(T0 + 120, tag="live")]
+    assert emitted == [history_bar, bar(T0 + 120, tag="live")]
 
 
 async def test_a_history_fetch_in_flight_does_not_double_emit_the_closed_bar() -> None:
@@ -1039,3 +1044,93 @@ async def test_probe_h_hitting_the_round_cap_skips_no_bar() -> None:
     assert debugs_of(logger) == [
         "L: queued 2 bars that closed during the final backfill fetch for history"
     ]
+
+
+async def test_backfill_gives_up_waiting_on_a_fetch_that_never_returns() -> None:
+    clock = FakeClock(T0)
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+    never = asyncio.Event()
+    calls: list[int] = []
+
+    async def fetch(boundary_secs: int) -> RawBar | None:
+        calls.append(boundary_secs)
+        await never.wait()
+        return None
+
+    closer = make_closer(clock, fetch, emitted, logger)
+    closer.on_update(s(0))
+    await clock.advance(61)  # the timer queues T0; its history request never returns
+    assert calls == [T0]
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        return [h(60)]
+
+    clock.t = T0 + 180
+    task = asyncio.create_task(closer.backfill(fetch_range))
+    await settle()
+    assert emitted == []  # h60 is queued behind the stuck T0 entry
+
+    # Bound = (1 + retries) * grace * queue length + grace = 3 * 2 + 1 = 7 s.
+    await clock.advance(7)
+    await asyncio.wait_for(task, timeout=1)
+
+    assert any("still resolving" in line for line in warnings_of(logger))
+    assert emitted == []  # the entries stay queued, in order, for the resolver
+    closer.close()
+
+
+async def test_a_second_backfill_while_one_is_running_is_a_no_op() -> None:
+    clock = FakeClock(T0 + 5)
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+    closer = make_closer(clock, FetchStub([]), emitted, logger)
+    closer.mark_emitted(T0)
+    clock.t = T0 + 180
+
+    gate = asyncio.Event()
+    calls: list[tuple[int, int]] = []
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        calls.append((start, end))
+        await gate.wait()
+        return [h(60), h(120)]
+
+    task = asyncio.create_task(closer.backfill(fetch_range))
+    await asyncio.sleep(0)
+
+    await closer.backfill(fetch_range)  # returns at once, without a second fetch
+    assert calls == [(T0 + 60, T0 + 120)]
+    assert debugs_of(logger) == ["L: backfill already running; ignoring the second call"]
+
+    gate.set()
+    await task
+    assert emitted == [h(60), h(120)]
+
+
+async def test_on_disconnect_drops_a_held_update() -> None:
+    clock = FakeClock(T0 + 5)
+    emitted: list[RawBar] = []
+    closer = make_closer(clock, FetchStub([]), emitted, RecordingLogger())
+    closer.mark_emitted(T0)
+    clock.t = T0 + 180
+
+    gate = asyncio.Event()
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        await gate.wait()
+        return [h(60), h(120)]
+
+    task = asyncio.create_task(closer.backfill(fetch_range))
+    await asyncio.sleep(0)
+
+    closer.on_update(s(180))  # held while backfill is in flight
+    closer.on_disconnect()  # the connection this update came from is gone
+
+    gate.set()
+    await task
+
+    assert emitted == [h(60), h(120)]  # the held update was dropped, not replayed
+    closer.on_update(s(240))  # the baseline on the new connection
+    closer.on_update(s(300))
+    assert emitted == [h(60), h(120), s(240)]

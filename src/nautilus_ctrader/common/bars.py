@@ -79,6 +79,9 @@ class BarCloser:
     - No boundary before the bar forming at construction is ever emitted.
     - `close()` stops all of it permanently.
 
+    `on_update`, `mark_emitted`, `close` and the clock's timer callbacks must run on the event
+    loop thread: queueing a boundary may start the resolver task.
+
     The warn-once fallback flags - one for a failed history request, one for history simply
     having no bar - are per closer instance, i.e. per subscription.
     """
@@ -162,6 +165,7 @@ class BarCloser:
             return
         self._cancel_timer()
         self._current = None
+        self._held = None
         self._baseline = True
 
     def close(self) -> None:
@@ -194,6 +198,9 @@ class BarCloser:
         - Stream updates are held meanwhile; the latest is replayed afterwards.
         """
         if self._closed:
+            return
+        if self._holding:
+            self._log.debug(f"{self._label}: backfill already running; ignoring the second call")
             return
         self._holding = True
         self._held = None
@@ -257,8 +264,31 @@ class BarCloser:
         for bar in sorted(bars, key=lambda b: b.boundary_secs):
             if start <= bar.boundary_secs <= end:
                 self._enqueue(bar.boundary_secs, bar, needs_history=False)
-        await self._drained.wait()
+        await self._wait_drained()
         return True
+
+    async def _wait_drained(self) -> None:
+        """Wait for the queue to drain, but never longer than its own retries can take.
+
+        A history request that never returns must not block `backfill`, and with it the
+        caller's restore path, forever. The queued entries and the resolver are left alone.
+        """
+        if self._drained.is_set():
+            return
+        queued = len(self._queue)
+        bound_secs = (1 + self._retries) * self._grace * queued + self._grace
+        drained = asyncio.ensure_future(self._drained.wait())
+        expiry = asyncio.ensure_future(self._sleep(bound_secs))
+        try:
+            await asyncio.wait({drained, expiry}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            drained.cancel()
+            expiry.cancel()
+        if not self._drained.is_set():
+            self._log.warning(
+                f"{self._label}: still resolving {len(self._queue)} closed bars after "
+                f"{bound_secs} s; continuing the backfill"
+            )
 
     def _floor_boundary(self, t: float) -> int:
         return (int(t) // self._period) * self._period
