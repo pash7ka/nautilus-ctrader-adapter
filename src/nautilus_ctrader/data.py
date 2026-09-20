@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,26 +17,38 @@ from decimal import Decimal
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.data.messages import (
+    RequestBars,
     RequestInstrument,
     RequestInstruments,
+    SubscribeBars,
     SubscribeQuoteTicks,
+    UnsubscribeBars,
     UnsubscribeQuoteTicks,
 )
 from nautilus_trader.live.data_client import LiveMarketDataClient
+from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId
 from nautilus_trader.model.instruments import Instrument
 
 from nautilus_ctrader.common.account import CTraderAccountClient
+from nautilus_ctrader.common.bars import BarCloser, Clock, RawBar
 from nautilus_ctrader.common.errors import (
+    CTraderConnectionError,
     CTraderError,
     CTraderProtocolError,
     CTraderRequestError,
 )
-from nautilus_ctrader.common.parsing import quote_from_prices
+from nautilus_ctrader.common.parsing import (
+    bar_boundary_secs,
+    bar_from_trendbar,
+    quote_from_prices,
+)
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
+from nautilus_ctrader.enums import PERIOD_SECS, trendbar_period_for
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
 
 CONVERSION_CONSUMER = "conversion"
@@ -49,9 +62,41 @@ def _quote_consumer(instrument_id: InstrumentId) -> str:
     return f"quotes:{instrument_id}"
 
 
+def _bar_consumer(bar_type: BarType) -> str:
+    return f"bars:{bar_type}"
+
+
+def _bar_restore_key(bar_type: BarType) -> tuple[str, str]:
+    return ("bar_backfill", str(bar_type))
+
+
 def _conversion_message(quote: str, deposit: str, symbols: list[str]) -> str:
     """The INFO line reporting a subscribed currency-conversion chain."""
     return f"Conversion {quote}->{deposit}: subscribed {', '.join(symbols)}"
+
+
+def _raw_bar(trendbar: om.ProtoOATrendbar, period_secs: int) -> RawBar:
+    """A trendbar in the closer's own units. The period is the caller's, never the message's."""
+    return RawBar(
+        boundary_secs=bar_boundary_secs(trendbar.utcTimestampInMinutes, period_secs),
+        low=trendbar.low,
+        delta_open=trendbar.deltaOpen,
+        delta_high=trendbar.deltaHigh,
+        delta_close=trendbar.deltaClose,
+        volume=trendbar.volume,
+    )
+
+
+def _trendbar(raw: RawBar) -> om.ProtoOATrendbar:
+    """`raw` back as a trendbar, with no period: `bar_from_trendbar` takes it from the bar type."""
+    return om.ProtoOATrendbar(
+        volume=raw.volume,
+        low=raw.low,
+        deltaOpen=raw.delta_open,
+        deltaHigh=raw.delta_high,
+        deltaClose=raw.delta_close,
+        utcTimestampInMinutes=raw.boundary_secs // 60,
+    )
 
 
 @dataclass
@@ -65,13 +110,39 @@ class _Book:
     ask: int | None = None
 
 
+@dataclass(frozen=True)
+class _LoopClock:
+    """The production `Clock` for the bar closers: wall time, and the event loop for timers."""
+
+    loop: asyncio.AbstractEventLoop
+
+    def now(self) -> float:
+        return time.time()
+
+    def call_later(self, delay_secs: float, callback: Callable[[], None]) -> asyncio.TimerHandle:
+        return self.loop.call_later(delay_secs, callback)
+
+
+@dataclass(frozen=True)
+class _BarSub:
+    """One live bar subscription: where its trendbars come from, and what closes them."""
+
+    symbol_id: int
+    period: int
+    closer: BarCloser
+
+
 class CTraderDataClient(LiveMarketDataClient):
     """
-    Market data for one cTrader account: instruments, currency conversion and quote ticks.
+    Market data for one cTrader account: instruments, currency conversion, quote ticks and bars.
 
     Quote ticks are published for subscribed instruments and for every leg of a
     currency-conversion chain, because Nautilus builds its exchange rates from the quotes in
     the cache, not from the subscriptions.
+
+    Bars arrive as trendbars inside the same spot events, so a bar subscription holds the spot
+    subscription the venue requires for it; which of them is closed, and when, is decided by a
+    `BarCloser` per bar type.
 
     Parameters
     ----------
@@ -132,9 +203,9 @@ class CTraderDataClient(LiveMarketDataClient):
 
         self._session: CTraderSession | None = None
         self._books: dict[int, _Book] = {}
-        # The consumers holding each symbol's spot subscription. A hold is recorded before its
-        # request goes out, because the registry counts a subscribe whose outcome is unknown,
-        # and dropped once its unsubscribe starts or the venue refuses the subscribe outright.
+        # The quote consumers holding each symbol's spot subscription. A hold is recorded
+        # before its request goes out, because the registry counts a subscribe whose outcome is
+        # unknown, and dropped once its unsubscribe starts or the venue refuses the subscribe.
         self._spot_holds: dict[int, set[str]] = {}
         # Holds whose unsubscribe is in flight. They no longer publish, but a cancelled release
         # must still be repeated, so they stay here until the request returns.
@@ -144,9 +215,15 @@ class CTraderDataClient(LiveMarketDataClient):
         self._spot_listeners: dict[int, SpotListener] = {}
         self._converted: set[InstrumentId] = set()
         self._conversion_legs: dict[InstrumentId, frozenset[int]] = {}
+        self._bars: dict[BarType, _BarSub] = {}
+        # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
+        # with, which is how a spot event's trendbars are routed.
+        self._bar_routes: dict[tuple[int, int], _BarSub] = {}
+        self._bar_clock: Clock = _LoopClock(loop)
         # Keys already reported as undeliverable; a repeat is logged at DEBUG, since a broken
         # scale would otherwise flood the log on every tick.
         self._quote_errors: set[InstrumentId] = set()
+        self._bar_errors: set[BarType] = set()
         self._unknown_symbols: set[int] = set()
 
     @property
@@ -160,6 +237,7 @@ class CTraderDataClient(LiveMarketDataClient):
         self._conversion_legs.clear()
         # A problem that survives a reconnect is worth reporting at full volume again.
         self._quote_errors.clear()
+        self._bar_errors.clear()
         self._unknown_symbols.clear()
 
         await self._account.connect()
@@ -181,14 +259,16 @@ class CTraderDataClient(LiveMarketDataClient):
             self._handle_data(instrument)
 
     async def _disconnect(self) -> None:
+        session, self._session = self._session, None
         try:
-            if self._session is not None:
-                self._session.remove_event_handler(
+            if session is not None:
+                session.remove_event_handler(
                     oa.ProtoOASymbolChangedEvent,
                     self._on_symbol_changed,
                 )
-                self._session.remove_restore(_BOOK_RESET_RESTORE)
-                self._session = None
+                session.remove_restore(_BOOK_RESET_RESTORE)
+            for bar_type in list(self._bars):
+                await self._drop_bars(bar_type, session)
             # A snapshot: releasing a hold drops it from the mapping.
             for symbol_id, consumer in sorted(self._all_holds()):
                 await self._release_spots(symbol_id, consumer)
@@ -457,6 +537,273 @@ class CTraderDataClient(LiveMarketDataClient):
         """
         self._books.clear()
 
+    # -- Bars -------------------------------------------------------------------------------
+
+    async def _subscribe_bars(self, command: SubscribeBars) -> None:
+        bar_type = command.bar_type
+        if bar_type in self._bars:
+            return
+        try:
+            period = trendbar_period_for(bar_type)
+        except ValueError as e:
+            self._log.error(f"Cannot subscribe bars: {e}")
+            return
+        instrument = self._instrument_provider.find(bar_type.instrument_id)
+        if instrument is None:
+            self._log.error(f"Cannot subscribe bars: {bar_type.instrument_id} is not loaded")
+            return
+
+        symbol_id = instrument.info["symbol_id"]
+        # Created before the venue request: the closer ignores every boundary below the bar
+        # forming at its construction, so building it afterwards would drop a bar that closed
+        # while the request was in flight.
+        sub = _BarSub(symbol_id, period, self._make_closer(bar_type, symbol_id, period))
+        self._bars[bar_type] = sub
+        self._bar_routes[(symbol_id, period)] = sub
+        self._sync_listener(symbol_id)
+        try:
+            await self._account.subscriptions.subscribe_trendbars(
+                symbol_id,
+                period,
+                _bar_consumer(bar_type),
+            )
+        except CTraderRequestError:
+            self._forget_bars(bar_type, sub)
+            raise
+        if self._session is not None:
+            # Registered after the registry's own restore for this key, and so run after it:
+            # the backfill's history requests need the reconnected subscription in place.
+            self._session.add_restore(
+                _bar_restore_key(bar_type),
+                functools.partial(self._restore_bars, sub),
+            )
+
+    async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
+        await self._drop_bars(command.bar_type, self._session)
+
+    async def _drop_bars(self, bar_type: BarType, session: CTraderSession | None) -> None:
+        sub = self._bars.get(bar_type)
+        if sub is None:
+            return
+        self._forget_bars(bar_type, sub)
+        if session is not None:
+            session.remove_restore(_bar_restore_key(bar_type))
+        await self._account.subscriptions.unsubscribe_trendbars(
+            sub.symbol_id,
+            sub.period,
+            _bar_consumer(bar_type),
+        )
+
+    def _forget_bars(self, bar_type: BarType, sub: _BarSub) -> None:
+        """Stop routing and closing `bar_type`, before its venue subscription is given up."""
+        del self._bars[bar_type]
+        self._bar_routes.pop((sub.symbol_id, sub.period), None)
+        sub.closer.close()
+        self._sync_listener(sub.symbol_id)
+
+    def _make_closer(self, bar_type: BarType, symbol_id: int, period: int) -> BarCloser:
+        return BarCloser(
+            period_secs=PERIOD_SECS[period],
+            grace_secs=self._config.bar_close_grace_secs,
+            history_retries=self._config.bar_close_history_retries,
+            clock=self._bar_clock,
+            fetch=functools.partial(self._fetch_bar, symbol_id, period),
+            emit=functools.partial(self._emit_bar, bar_type, symbol_id),
+            logger=self._log,
+            label=str(bar_type),
+        )
+
+    async def _restore_bars(self, sub: _BarSub) -> None:
+        sub.closer.on_disconnect()
+        await sub.closer.backfill(functools.partial(self._fetch_bar_range, sub))
+
+    def _on_bar_spot(self, symbol_id: int, event: oa.ProtoOASpotEvent) -> None:
+        for trendbar in event.trendbar:
+            # Routed by the bar's own period: a spot event carries one forming bar per
+            # subscribed period. A historical bar leaves the field unset, where it would read
+            # as M1, so an unset one is never routed.
+            if not trendbar.HasField("period"):
+                continue
+            sub = self._bar_routes.get((symbol_id, trendbar.period))
+            if sub is not None:
+                sub.closer.on_update(_raw_bar(trendbar, PERIOD_SECS[sub.period]))
+
+    def _emit_bar(self, bar_type: BarType, symbol_id: int, raw: RawBar) -> None:
+        # Looked up per bar rather than captured, so a reloaded instrument's precisions apply.
+        instrument = self._instrument_provider.instrument_for_symbol_id(symbol_id)
+        if instrument is None:
+            self._log_once(
+                self._bar_errors,
+                bar_type,
+                f"Dropped bar for {bar_type}: its instrument is no longer loaded",
+                self._log.error,
+            )
+            return
+        try:
+            bar = bar_from_trendbar(
+                _trendbar(raw),
+                bar_type,
+                instrument.price_precision,
+                instrument.size_precision,
+                self._clock.timestamp_ns(),
+            )
+        except CTraderProtocolError as e:
+            self._log_once(
+                self._bar_errors,
+                bar_type,
+                f"Dropped bar for {bar_type}: {e}",
+                self._log.error,
+            )
+            return
+        self._handle_data(bar)
+
+    async def _request_bars(self, request: RequestBars) -> None:
+        bar_type = request.bar_type
+        try:
+            period = trendbar_period_for(bar_type)
+        except ValueError as e:
+            self._log.error(f"Cannot request bars: {e}")
+            return
+        instrument = self._instrument_provider.find(bar_type.instrument_id)
+        if instrument is None:
+            self._log.error(f"Cannot request bars: {bar_type.instrument_id} is not loaded")
+            return
+
+        period_secs = PERIOD_SECS[period]
+        now_secs = int(self._bar_clock.now())
+        served = await self._page_history(
+            instrument.info["symbol_id"],
+            period,
+            start_secs=None if request.start is None else int(request.start.timestamp()),
+            end_secs=now_secs if request.end is None else int(request.end.timestamp()),
+            limit=request.limit or None,
+        )
+        # History serves the forming bar too, which is not a bar yet.
+        closed = [raw for raw in served if raw.boundary_secs + period_secs <= now_secs]
+        if request.limit:
+            closed = closed[-request.limit :]
+
+        sub = self._bars.get(bar_type)
+        if sub is not None and closed:
+            # What this request delivered must not go out a second time from the stream.
+            sub.closer.mark_emitted(closed[-1].boundary_secs)
+
+        ts_init = self._clock.timestamp_ns()
+        bars = [
+            bar_from_trendbar(
+                _trendbar(raw),
+                bar_type,
+                instrument.price_precision,
+                instrument.size_precision,
+                ts_init,
+            )
+            for raw in closed
+        ]
+        self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)
+
+    async def _page_history(
+        self,
+        symbol_id: int,
+        period: int,
+        *,
+        start_secs: int | None,
+        end_secs: int,
+        limit: int | None,
+    ) -> list[RawBar]:
+        """Bars opening at or before `end_secs`, ascending, paging backwards from it.
+
+        With neither a `start_secs` nor a `limit` exactly one page is asked for: the caller
+        wanted the most recent bars, not the whole history.
+        """
+        period_secs = PERIOD_SECS[period]
+        # TODO(verify): the venue's cap on a request's time span, which may be shorter than
+        # `history_page_size` periods and would then silently truncate every page.
+        span = self._config.history_page_size * period_secs
+        bars: dict[int, RawBar] = {}
+        to_secs = end_secs
+        while True:
+            from_secs = to_secs - span
+            if start_secs is not None:
+                from_secs = max(start_secs, from_secs)
+            page = await self._get_trendbars(
+                symbol_id,
+                period,
+                from_secs=from_secs,
+                to_secs=to_secs,
+                count=self._config.history_page_size,
+            )
+            for raw in page:
+                bars.setdefault(raw.boundary_secs, raw)
+            if start_secs is None and limit is None:
+                break
+            if limit is not None and len(bars) >= limit:
+                break
+            if start_secs is not None and from_secs <= start_secs:
+                break
+            if start_secs is None and not page:
+                # Without a lower bound, an empty page is the only sign history has run out.
+                break
+            to_secs = from_secs
+        return [bars[boundary] for boundary in sorted(bars)]
+
+    async def _fetch_bar(self, symbol_id: int, period: int, boundary_secs: int) -> RawBar | None:
+        """The one closed bar opening at `boundary_secs`, or `None` if history has none yet."""
+        period_secs = PERIOD_SECS[period]
+        bars = await self._get_trendbars(
+            symbol_id,
+            period,
+            from_secs=boundary_secs,
+            to_secs=boundary_secs + period_secs,
+            count=1,
+        )
+        return next((raw for raw in bars if raw.boundary_secs == boundary_secs), None)
+
+    async def _fetch_bar_range(self, sub: _BarSub, start_secs: int, end_secs: int) -> list[RawBar]:
+        """Every bar history has for the inclusive range `[start_secs, end_secs]`."""
+        period_secs = PERIOD_SECS[sub.period]
+        span = self._config.history_page_size * period_secs
+        bars: list[RawBar] = []
+        cursor = start_secs
+        while cursor <= end_secs:
+            to_secs = min(end_secs + period_secs, cursor + span)
+            bars += await self._get_trendbars(
+                sub.symbol_id,
+                sub.period,
+                from_secs=cursor,
+                to_secs=to_secs,
+                count=self._config.history_page_size,
+            )
+            cursor = to_secs
+        return bars
+
+    async def _get_trendbars(
+        self,
+        symbol_id: int,
+        period: int,
+        *,
+        from_secs: int,
+        to_secs: int,
+        count: int,
+    ) -> list[RawBar]:
+        session = self._session
+        if session is None:
+            raise CTraderConnectionError("data client is not connected")
+        response = await session.request(
+            oa.ProtoOAGetTrendbarsReq(
+                ctidTraderAccountId=self._account.account_id,
+                symbolId=symbol_id,
+                period=period,
+                fromTimestamp=from_secs * 1_000,
+                toTimestamp=to_secs * 1_000,
+                count=count,
+            ),
+            timeout_secs=self._config.history_request_timeout_secs,
+        )
+        # The period is the response's, not each bar's: a historical trendbar leaves its own
+        # `period` unset.
+        period_secs = PERIOD_SECS[period]
+        return [_raw_bar(trendbar, period_secs) for trendbar in response.trendbar]
+
     # -- Subscription bookkeeping -----------------------------------------------------------
 
     async def _hold_spots(self, symbol_id: int, consumer: str) -> bool:
@@ -502,14 +849,22 @@ class CTraderDataClient(LiveMarketDataClient):
         return held | self._releasing
 
     def _sync_listener(self, symbol_id: int) -> None:
-        """Keep exactly one listener on `symbol_id` while any hold remains."""
-        held = symbol_id in self._spot_holds
+        """Keep exactly one listener on `symbol_id` while a quote hold or a bar needs it."""
+        wanted = symbol_id in self._spot_holds or any(
+            sub.symbol_id == symbol_id for sub in self._bars.values()
+        )
         listener = self._spot_listeners.get(symbol_id)
-        if held and listener is None:
-            listener = functools.partial(self._on_quote_spot, symbol_id)
+        if wanted and listener is None:
+            listener = functools.partial(self._on_spot, symbol_id)
             self._spot_listeners[symbol_id] = listener
             self._account.subscriptions.add_spot_listener(symbol_id, listener)
-        elif not held and listener is not None:
+        elif not wanted and listener is not None:
             del self._spot_listeners[symbol_id]
             self._account.subscriptions.remove_spot_listener(symbol_id, listener)
             self._books.pop(symbol_id, None)
+
+    def _on_spot(self, symbol_id: int, event: oa.ProtoOASpotEvent) -> None:
+        """Route one spot event: its prices to the quote path, its trendbars to the closers."""
+        if symbol_id in self._spot_holds:
+            self._on_quote_spot(symbol_id, event)
+        self._on_bar_spot(symbol_id, event)

@@ -1,6 +1,8 @@
-"""Tests for `CTraderDataClient`: connect, instruments, conversion quotes and quote ticks.
+"""Tests for `CTraderDataClient`: connect, instruments, conversion quotes, quote ticks and bars.
 
-Bars belong to `test_bars.py` and to the bar half of the client, which is not covered here.
+The bar-close state machine itself is covered by `test_bars.py`; what is covered here is the
+client half of it - the venue subscriptions, the routing of live trendbars, the historical
+requests and the reconnect backfill.
 
 Everything runs against the fake server replaying `tests/fixtures/m2_recorded.json`. The
 client's own `Logger` writes from Rust and is invisible to pytest, so log *text* is asserted
@@ -10,9 +12,10 @@ against the formatter that produces it and log *effects* against what the venue 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 from nautilus_trader.cache.cache import Cache
@@ -20,13 +23,16 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.data.messages import (
+    RequestBars,
     RequestInstrument,
     RequestInstruments,
+    SubscribeBars,
     SubscribeQuoteTicks,
+    UnsubscribeBars,
     UnsubscribeQuoteTicks,
 )
 from nautilus_trader.model.currencies import EUR, USD
-from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import Bar, BarType, QuoteTick
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
@@ -56,12 +62,25 @@ GER40_ID = InstrumentId(Symbol("GER40.cash"), CTRADER_VENUE)
 EURUSD_SYMBOL_ID = 1
 GER40_SYMBOL_ID = 279
 
+EURUSD_M1 = BarType.from_str(f"{EURUSD_ID}-1-MINUTE-BID-EXTERNAL")
+EURUSD_H1 = BarType.from_str(f"{EURUSD_ID}-1-HOUR-BID-EXTERNAL")
+EURUSD_LAST = BarType.from_str(f"{EURUSD_ID}-1-MINUTE-LAST-EXTERNAL")
+GER40_M1 = BarType.from_str(f"{GER40_ID}-1-MINUTE-BID-EXTERNAL")
+
+M1 = om.ProtoOATrendbarPeriod.Value("M1")
+H1 = om.ProtoOATrendbarPeriod.Value("H1")
+
 SPOTS = RECORDED["spot_events"]
 # Recorded EURUSD spots carrying one side only, the second consistent with the first.
 BID_ONLY = SPOTS[17]
 ASK_ONLY = SPOTS[19]
 TWO_SIDED = SPOTS[0]
 GER40_SPOT = SPOTS[1]
+
+# The first minute the recorded spot events carry a trendbar for, and the last bar of the
+# recorded H1 response. Both in `utcTimestampInMinutes`, as the venue reports them.
+FIRST_M1_MINUTE = 29_829_284
+LAST_H1_MINUTE = 29_829_180
 
 
 def config(**overrides) -> CTraderDataClientConfig:
@@ -93,6 +112,9 @@ class Harness:
 
     def quotes(self) -> list[QuoteTick]:
         return [d for d in self.published if isinstance(d, QuoteTick)]
+
+    def bars(self) -> list[Bar]:
+        return [d for d in self.published if isinstance(d, Bar)]
 
     def subscribed_symbol_ids(self) -> list[int]:
         return [i for r in received(self.server, oa.ProtoOASubscribeSpotsReq) for i in r.symbolId]
@@ -222,6 +244,161 @@ def empty_conversion_venue() -> FakeCTraderServer:
         lambda r: oa.ProtoOASymbolsForConversionRes(ctidTraderAccountId=r.ctidTraderAccountId),
     )
     return server
+
+
+# -- Bar fixtures ---------------------------------------------------------------------------
+
+
+def _live_m1_bars(symbol_id: int) -> dict[int, om.ProtoOATrendbar]:
+    """The closing state of every M1 trendbar the recorded spot events carry for `symbol_id`.
+
+    A forming bar is re-sent on every tick, so the last state recorded for a minute is the one
+    history would serve for it.
+    """
+    bars: dict[int, om.ProtoOATrendbar] = {}
+    for event in SPOTS:
+        if event.symbolId == symbol_id:
+            for trendbar in event.trendbar:
+                bars[trendbar.utcTimestampInMinutes] = trendbar
+    return bars
+
+
+# What the venue's history serves, by `(symbol id, period)` and then by open minute.
+RECORDED_HISTORY: dict[tuple[int, int], dict[int, om.ProtoOATrendbar]] = {
+    (EURUSD_SYMBOL_ID, M1): _live_m1_bars(EURUSD_SYMBOL_ID),
+    (GER40_SYMBOL_ID, M1): _live_m1_bars(GER40_SYMBOL_ID),
+    (EURUSD_SYMBOL_ID, H1): {
+        trendbar.utcTimestampInMinutes: trendbar
+        for trendbar in RECORDED["trendbars_h1"][0].trendbar
+    },
+}
+
+
+def _serve_trendbars(request: oa.ProtoOAGetTrendbarsReq) -> oa.ProtoOAGetTrendbarsRes:
+    source = RECORDED_HISTORY.get((request.symbolId, request.period), {})
+    bars = [
+        trendbar
+        for minute, trendbar in sorted(source.items())
+        if request.fromTimestamp <= minute * 60_000 < request.toTimestamp
+    ]
+    if request.count:
+        bars = bars[-request.count :]
+    return oa.ProtoOAGetTrendbarsRes(
+        ctidTraderAccountId=request.ctidTraderAccountId,
+        symbolId=request.symbolId,
+        period=request.period,
+        trendbar=bars,
+    )
+
+
+def trendbar_venue() -> FakeCTraderServer:
+    """The data venue, also accepting live trendbar subscriptions and serving recorded history."""
+    server = data_venue()
+    for payload_type, response_class in (
+        (om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ, oa.ProtoOASubscribeLiveTrendbarRes),
+        (om.PROTO_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQ, oa.ProtoOAUnsubscribeLiveTrendbarRes),
+    ):
+        server.on(
+            payload_type,
+            lambda r, cls=response_class: cls(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+    server.on(om.PROTO_OA_GET_TRENDBARS_REQ, _serve_trendbars)
+    return server
+
+
+class PinnedClock:
+    """A `Clock` for the client's bar closers whose `now()` the test sets.
+
+    The fixtures carry the venue's own timestamps, so a recorded bar only counts as live while
+    the closer is told the time it was recorded at. Timers still go to the event loop, so the
+    delays the closer computes are real ones.
+    """
+
+    def __init__(self, now_secs: float) -> None:
+        self.t = now_secs
+
+    def now(self) -> float:
+        return self.t
+
+    def call_later(self, delay_secs: float, callback: Callable[[], None]) -> asyncio.TimerHandle:
+        return asyncio.get_running_loop().call_later(delay_secs, callback)
+
+
+def pin_clock(h: Harness, minute: int, offset_secs: float = 5.0) -> PinnedClock:
+    """Put the client's bar clock `offset_secs` into `minute`, and return it for later moves."""
+    clock = PinnedClock(minute * 60 + offset_secs)
+    h.client._bar_clock = clock
+    return clock
+
+
+def at_minute(minute: int) -> datetime:
+    return datetime.fromtimestamp(minute * 60, tz=UTC)
+
+
+def close_ns(minute: int, period_secs: int) -> int:
+    """`ts_event` of the closed bar opening at `minute`: its close time in nanoseconds."""
+    return (minute * 60 + period_secs) * 1_000_000_000
+
+
+def spots_until(symbol_id: int, minute: int) -> list[oa.ProtoOASpotEvent]:
+    """Recorded spot events for `symbol_id`, up to and including the first one opening `minute`."""
+    events = []
+    for event in SPOTS:
+        if event.symbolId != symbol_id or not event.trendbar:
+            continue
+        events.append(event)
+        if event.trendbar[0].utcTimestampInMinutes == minute:
+            break
+    return events
+
+
+async def subscribe_bars(h: Harness, bar_type: BarType) -> None:
+    await h.client._subscribe_bars(
+        SubscribeBars(
+            bar_type=bar_type,
+            client_id=None,
+            venue=CTRADER_VENUE,
+            command_id=UUID4(),
+            ts_init=0,
+        ),
+    )
+
+
+async def unsubscribe_bars(h: Harness, bar_type: BarType) -> None:
+    await h.client._unsubscribe_bars(
+        UnsubscribeBars(
+            bar_type=bar_type,
+            client_id=None,
+            venue=CTRADER_VENUE,
+            command_id=UUID4(),
+            ts_init=0,
+        ),
+    )
+
+
+async def request_bars(
+    h: Harness,
+    bar_type: BarType,
+    *,
+    limit: int = 0,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> list[Bar]:
+    await h.client._request_bars(
+        RequestBars(
+            bar_type=bar_type,
+            start=start,
+            end=end,
+            limit=limit,
+            client_id=None,
+            venue=CTRADER_VENUE,
+            callback=None,
+            request_id=UUID4(),
+            ts_init=0,
+            params=None,
+        ),
+    )
+    return list(h.responses[-1].data)
 
 
 # -- Config ---------------------------------------------------------------------------------
@@ -614,6 +791,206 @@ async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(
         await push_spot(h, ASK_ONLY)
 
         assert not h.quotes()
+
+
+# -- Live bars ------------------------------------------------------------------------------
+
+
+async def test_a_change_of_open_time_closes_exactly_one_bar() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+
+        assert len(h.bars()) == 1
+        bar = h.bars()[0]
+        assert bar.bar_type == EURUSD_M1
+        assert bar.ts_event == close_ns(FIRST_M1_MINUTE, 60)
+
+
+async def test_subscribing_bars_holds_the_trendbar_subscription() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+
+        await subscribe_bars(h, EURUSD_M1)
+
+        subscribed = received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+        assert [(r.symbolId, r.period) for r in subscribed] == [(EURUSD_SYMBOL_ID, M1)]
+
+
+async def test_bars_reach_a_symbol_that_has_no_quote_subscription() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, GER40_M1)
+
+        for event in spots_until(GER40_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+
+        assert [b.bar_type for b in h.bars()] == [GER40_M1]
+        # Spots are held for the trendbars, not for quoting, so no tick is published.
+        assert not h.quotes()
+
+
+async def test_an_unsupported_price_type_is_refused_without_a_venue_subscription() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        await subscribe_bars(h, EURUSD_LAST)
+
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+        assert EURUSD_LAST not in h.client._bars
+
+
+async def test_unsubscribing_bars_releases_the_subscription_and_stops_the_bars() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+
+        await unsubscribe_bars(h, EURUSD_M1)
+
+        released = received(h.server, oa.ProtoOAUnsubscribeLiveTrendbarReq)
+        assert [(r.symbolId, r.period) for r in released] == [(EURUSD_SYMBOL_ID, M1)]
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+        assert not h.bars()
+
+
+async def test_disconnect_releases_the_trendbar_subscription() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+
+        await h.client._disconnect()
+
+        assert received(h.server, oa.ProtoOAUnsubscribeLiveTrendbarReq)
+        assert not h.client._bars
+
+
+# -- Historical bars ------------------------------------------------------------------------
+
+
+async def test_request_bars_returns_the_last_closed_bars_ascending() -> None:
+    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        bars = await request_bars(h, EURUSD_H1, limit=30, end=at_minute(LAST_H1_MINUTE + 60))
+
+        assert len(bars) == 30
+        assert [b.ts_event for b in bars] == sorted(b.ts_event for b in bars)
+        assert bars[-1].ts_event == close_ns(LAST_H1_MINUTE, 3600)
+        assert all(b.bar_type == EURUSD_H1 for b in bars)
+        # Twenty bars a page, so the thirtieth is only reached on the second one.
+        assert len(received(h.server, oa.ProtoOAGetTrendbarsReq)) == 2
+
+
+async def test_request_bars_without_a_start_or_a_limit_asks_for_one_page() -> None:
+    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        bars = await request_bars(h, EURUSD_H1, end=at_minute(LAST_H1_MINUTE + 60))
+
+        assert len(received(h.server, oa.ProtoOAGetTrendbarsReq)) == 1
+        assert len(bars) == 20
+
+
+async def test_request_bars_stops_at_the_requested_start() -> None:
+    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(LAST_H1_MINUTE - 120),
+            end=at_minute(LAST_H1_MINUTE + 60),
+        )
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 120, 3600),
+            close_ns(LAST_H1_MINUTE - 60, 3600),
+            close_ns(LAST_H1_MINUTE, 3600),
+        ]
+
+
+async def test_a_warm_up_request_is_not_repeated_by_the_stream() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        warm_up = await request_bars(h, EURUSD_M1, end=at_minute(FIRST_M1_MINUTE + 1))
+        assert [b.ts_event for b in warm_up] == [close_ns(FIRST_M1_MINUTE, 60)]
+
+        # Subscribed in the next minute, as a warm-up ending at that bar's close implies.
+        pin_clock(h, FIRST_M1_MINUTE + 1)
+        await subscribe_bars(h, EURUSD_M1)
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 2):
+            await push_spot(h, event)
+
+        assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE + 1, 60)]
+
+
+async def test_a_request_covering_a_live_subscription_suppresses_the_streamed_bar() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+
+        clock.t = (FIRST_M1_MINUTE + 1) * 60 + 5
+        served = await request_bars(h, EURUSD_M1, end=at_minute(FIRST_M1_MINUTE + 1))
+        assert [b.ts_event for b in served] == [close_ns(FIRST_M1_MINUTE, 60)]
+
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+
+        # The request already delivered the bar the stream would now close.
+        assert not h.bars()
+
+
+# -- Reconnect ------------------------------------------------------------------------------
+
+
+async def test_a_reconnect_drops_the_partial_bar_and_backfills_what_was_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE):
+            await push_spot(h, event)
+        assert not h.bars()
+
+        await h.server.drop_connections()
+        # Three bars closed while the connection was down.
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await wait_until(
+            lambda: len(h.bars()) >= 3,
+            timeout_secs=10.0,
+            description="the missed bars were backfilled",
+        )
+
+        assert [b.ts_event for b in h.bars()] == [
+            close_ns(FIRST_M1_MINUTE, 60),
+            close_ns(FIRST_M1_MINUTE + 1, 60),
+            close_ns(FIRST_M1_MINUTE + 2, 60),
+        ]
+        # The backfill's history requests must follow the re-subscription, not precede it.
+        order = [
+            type(m).__name__
+            for m in h.server.received
+            if isinstance(m, oa.ProtoOASubscribeLiveTrendbarReq | oa.ProtoOAGetTrendbarsReq)
+        ]
+        assert order[:3] == [
+            "ProtoOASubscribeLiveTrendbarReq",
+            "ProtoOASubscribeLiveTrendbarReq",
+            "ProtoOAGetTrendbarsReq",
+        ]
 
 
 # -- Carry-over fixes -----------------------------------------------------------------------
