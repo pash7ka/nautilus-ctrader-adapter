@@ -155,6 +155,33 @@ class CTraderInstrumentProvider(InstrumentProvider):
                 instruments.append(self._build_or_fail(specs.get(leg.symbolId), leg))
         return instruments
 
+    def reset_conversion_cache(self, symbol_id: int | None = None) -> bool:
+        """Drop cached conversion chains, keeping the loaded instruments; returns whether any went.
+
+        `symbol_id` limits it to chains that use that symbol. A chain is venue data that the
+        broker can change, so the caller decides how long to trust one.
+        """
+        stale = [
+            key
+            for key, chain in self._chains.items()
+            if symbol_id is None or any(leg.symbolId == symbol_id for leg in chain)
+        ]
+        for key in stale:
+            del self._chains[key]
+        return bool(stale)
+
+    def remove_failed(self, instrument_id: InstrumentId, reason: str) -> None:
+        """Unload an instrument that must not be traded, recording it as a D6 failure.
+
+        For a failure the loader itself cannot see, such as a conversion chain that cannot be
+        resolved for an instrument that otherwise built fine.
+        """
+        instrument = self._instruments.pop(instrument_id, None)
+        if instrument is not None:
+            self._by_symbol_id.pop(instrument.info["symbol_id"], None)
+            self._quote_asset_id.pop(instrument_id, None)
+        self._record_failure(instrument_id.symbol.value, reason)
+
     async def reload(self, symbol_id: int) -> Instrument:
         """Refetch and rebuild the instrument for `symbol_id`, bypassing the spec cache.
 
