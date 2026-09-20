@@ -834,11 +834,10 @@ class Verifier:
 
     def _track_m1(self, event: oa.ProtoOASpotEvent, now: float) -> None:
         """Note when the stream rolls its forming M1 bar - the moment it closes the last one."""
-        period_secs = PERIOD_SECS[om.M1]
         for trendbar in event.trendbar:
             if trendbar.period != om.M1:
                 continue
-            boundary = bar_boundary_secs(trendbar.utcTimestampInMinutes, period_secs)
+            boundary = bar_boundary_secs(trendbar.utcTimestampInMinutes)
             previous = self._m1_boundary.get(event.symbolId)
             if previous is not None and boundary <= previous:
                 continue
@@ -920,8 +919,7 @@ class Verifier:
             except CTraderRequestError as e:
                 return None, polls, e.error_code
             served = any(
-                bar_boundary_secs(t.utcTimestampInMinutes, period_secs) == boundary
-                for t in response.trendbar
+                bar_boundary_secs(t.utcTimestampInMinutes) == boundary for t in response.trendbar
             )
             if served:
                 return time.time() - (boundary + period_secs), polls, None

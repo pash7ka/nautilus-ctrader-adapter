@@ -41,6 +41,7 @@ from nautilus_ctrader.common.errors import (
 from nautilus_ctrader.common.parsing import (
     bar_boundary_secs,
     bar_from_trendbar,
+    is_unaligned_boundary,
     quote_from_prices,
 )
 from nautilus_ctrader.common.session import CTraderSession
@@ -75,10 +76,10 @@ def _conversion_message(quote: str, deposit: str, symbols: list[str]) -> str:
     return f"Conversion {quote}->{deposit}: subscribed {', '.join(symbols)}"
 
 
-def _raw_bar(trendbar: om.ProtoOATrendbar, period_secs: int) -> RawBar:
-    """A trendbar in the closer's own units. The period is the caller's, never the message's."""
+def _raw_bar(trendbar: om.ProtoOATrendbar) -> RawBar:
+    """A trendbar in the closer's own units."""
     return RawBar(
-        boundary_secs=bar_boundary_secs(trendbar.utcTimestampInMinutes, period_secs),
+        boundary_secs=bar_boundary_secs(trendbar.utcTimestampInMinutes),
         low=trendbar.low,
         delta_open=trendbar.deltaOpen,
         delta_high=trendbar.deltaHigh,
@@ -227,6 +228,7 @@ class CTraderDataClient(LiveMarketDataClient):
         # scale would otherwise flood the log on every tick.
         self._quote_errors: set[InstrumentId] = set()
         self._bar_errors: set[BarType] = set()
+        self._bar_phases: set[BarType] = set()
         self._unknown_symbols: set[int] = set()
 
     @property
@@ -244,6 +246,7 @@ class CTraderDataClient(LiveMarketDataClient):
         # A problem that survives a reconnect is worth reporting at full volume again.
         self._quote_errors.clear()
         self._bar_errors.clear()
+        self._bar_phases.clear()
         self._unknown_symbols.clear()
 
         await self._account.connect()
@@ -674,7 +677,7 @@ class CTraderDataClient(LiveMarketDataClient):
             history_retries=self._config.bar_close_history_retries,
             clock=self._bar_clock,
             fetch=functools.partial(self._fetch_bar, symbol_id, period),
-            emit=functools.partial(self._emit_bar, bar_type, symbol_id),
+            emit=functools.partial(self._emit_bar, bar_type, symbol_id, PERIOD_SECS[period]),
             logger=self._log,
             label=str(bar_type),
         )
@@ -692,9 +695,10 @@ class CTraderDataClient(LiveMarketDataClient):
                 continue
             sub = self._bar_routes.get((symbol_id, trendbar.period))
             if sub is not None:
-                sub.closer.on_update(_raw_bar(trendbar, PERIOD_SECS[sub.period]))
+                sub.closer.on_update(_raw_bar(trendbar))
 
-    def _emit_bar(self, bar_type: BarType, symbol_id: int, raw: RawBar) -> None:
+    def _emit_bar(self, bar_type: BarType, symbol_id: int, period_secs: int, raw: RawBar) -> None:
+        self._note_bar_phase(bar_type, period_secs, raw.boundary_secs)
         # Looked up per bar rather than captured, so a reloaded instrument's precisions apply.
         instrument = self._instrument_provider.instrument_for_symbol_id(symbol_id)
         if instrument is None:
@@ -722,6 +726,22 @@ class CTraderDataClient(LiveMarketDataClient):
             )
             return
         self._handle_data(bar)
+
+    def _note_bar_phase(self, bar_type: BarType, period_secs: int, boundary_secs: int) -> None:
+        """Report an open time that breaks the epoch alignment expected of the period.
+
+        Reported, never corrected: the venue's open time is the bar's own, and a period whose
+        boundaries carry the trading day's phase is what flooring used to get wrong.
+        """
+        if not is_unaligned_boundary(boundary_secs, period_secs):
+            return
+        self._log_once(
+            self._bar_phases,
+            bar_type,
+            f"Open time {boundary_secs} of a {bar_type} bar is not a multiple of its period; "
+            "published as the venue sent it",
+            self._log.warning,
+        )
 
     async def _request_bars(self, request: RequestBars) -> None:
         bar_type = request.bar_type
@@ -902,10 +922,7 @@ class CTraderDataClient(LiveMarketDataClient):
             ),
             timeout_secs=self._config.history_request_timeout_secs,
         )
-        # The period is the response's, not each bar's: a historical trendbar leaves its own
-        # `period` unset.
-        period_secs = PERIOD_SECS[period]
-        bars = [_raw_bar(trendbar, period_secs) for trendbar in response.trendbar]
+        bars = [_raw_bar(trendbar) for trendbar in response.trendbar]
         return bars, response.hasMore or len(bars) >= count
 
     # -- Subscription bookkeeping -----------------------------------------------------------

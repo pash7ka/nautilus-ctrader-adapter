@@ -6,6 +6,7 @@ real, read-only broker connection. Never against hand-built symbol specs.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -145,12 +146,37 @@ def test_recorded_h1_trendbar_converts_with_close_timestamp() -> None:
         instrument.size_precision,
         ts_init=0,
     )
-    boundary = parsing.bar_boundary_secs(tb.utcTimestampInMinutes, 3600)
+    boundary = parsing.bar_boundary_secs(tb.utcTimestampInMinutes)
     assert bar.ts_event == (boundary + 3600) * 1_000_000_000
     assert bar.open == parsing.price_from_raw(tb.low + tb.deltaOpen, spec.digits)
     assert bar.high == parsing.price_from_raw(tb.low + tb.deltaHigh, spec.digits)
     assert bar.low == parsing.price_from_raw(tb.low, spec.digits)
     assert bar.close == parsing.price_from_raw(tb.low + tb.deltaClose, spec.digits)
+
+
+def test_a_venue_open_time_off_the_epoch_grid_is_never_moved() -> None:
+    """A trading day opens at 21:00 UTC, so flooring a daily bar's own open time loses a day."""
+    res = REC["trendbars_h1"][0]
+    light = next(s for s in LIGHT.values() if s.symbolId == res.symbolId)
+    spec = SPECS[res.symbolId]
+    open_secs = int(datetime(2025, 3, 10, 21, 0, tzinfo=UTC).timestamp())
+    tb = om.ProtoOATrendbar()
+    tb.CopyFrom(res.trendbar[-1])
+    tb.utcTimestampInMinutes = open_secs // 60
+
+    for step, period_secs in (("1-DAY", 86_400), ("4-HOUR", 14_400)):
+        bar_type = BarType.from_str(f"{light.symbolName}.CTRADER-{step}-BID-EXTERNAL")
+        bar = parsing.bar_from_trendbar(tb, bar_type, spec.digits, 2, ts_init=0)
+        assert bar.ts_event == (open_secs + period_secs) * 1_000_000_000
+
+
+def test_only_the_periods_observed_epoch_aligned_are_checked_for_alignment() -> None:
+    open_secs = int(datetime(2025, 3, 10, 21, 0, tzinfo=UTC).timestamp())
+    assert not parsing.is_unaligned_boundary(open_secs, 3_600)
+    assert parsing.is_unaligned_boundary(open_secs + 60, 3_600)
+    # H4 and longer carry the trading day's own phase, so nothing is expected of them.
+    assert not parsing.is_unaligned_boundary(open_secs, 14_400)
+    assert not parsing.is_unaligned_boundary(open_secs, 86_400)
 
 
 def test_bar_from_trendbar_rejects_a_period_that_disagrees_with_the_bar_type() -> None:

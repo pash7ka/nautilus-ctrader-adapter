@@ -70,11 +70,15 @@ GER40_SYMBOL_ID = 279
 
 EURUSD_M1 = BarType.from_str(f"{EURUSD_ID}-1-MINUTE-BID-EXTERNAL")
 EURUSD_H1 = BarType.from_str(f"{EURUSD_ID}-1-HOUR-BID-EXTERNAL")
+EURUSD_M15 = BarType.from_str(f"{EURUSD_ID}-15-MINUTE-BID-EXTERNAL")
+EURUSD_D1 = BarType.from_str(f"{EURUSD_ID}-1-DAY-BID-EXTERNAL")
 EURUSD_LAST = BarType.from_str(f"{EURUSD_ID}-1-MINUTE-LAST-EXTERNAL")
 GER40_M1 = BarType.from_str(f"{GER40_ID}-1-MINUTE-BID-EXTERNAL")
 
 M1 = om.ProtoOATrendbarPeriod.Value("M1")
 H1 = om.ProtoOATrendbarPeriod.Value("H1")
+M15 = om.ProtoOATrendbarPeriod.Value("M15")
+D1 = om.ProtoOATrendbarPeriod.Value("D1")
 
 SPOTS = RECORDED["spot_events"]
 # Recorded EURUSD spots carrying one side only, the second consistent with the first.
@@ -89,6 +93,8 @@ FIRST_M1_MINUTE = 29_829_284
 FIRST_H1_MINUTE = 29_826_300
 LAST_H1_MINUTE = 29_829_180
 RECORDED_H1_BARS = 49
+# 21:00 UTC of the day before, where a trading day opens: three hours short of a calendar day.
+FIRST_D1_MINUTE = FIRST_M1_MINUTE // 1_440 * 1_440 - 180
 
 
 def config(**overrides) -> CTraderDataClientConfig:
@@ -894,6 +900,57 @@ async def test_a_change_of_open_time_closes_exactly_one_bar() -> None:
             "1.14809",
         ]
         assert float(bar.volume) == 84.0
+
+
+def forming_spot(period: int, minute: int) -> oa.ProtoOASpotEvent:
+    """A spot event carrying one forming trendbar of `period`, opening at `minute`."""
+    return oa.ProtoOASpotEvent(
+        ctidTraderAccountId=ACCOUNT_ID,
+        symbolId=EURUSD_SYMBOL_ID,
+        bid=114_811,
+        trendbar=[
+            om.ProtoOATrendbar(
+                period=period,
+                utcTimestampInMinutes=minute,
+                low=114_800,
+                deltaOpen=10,
+                deltaHigh=20,
+                deltaClose=5,
+                volume=100,
+            ),
+        ],
+    )
+
+
+async def test_a_daily_bar_closes_on_the_venues_own_open_time() -> None:
+    # A daily bar opens at 21:00 UTC, so an epoch-aligned floor puts both the subscription and
+    # the close a calendar day away from the bar the venue is sending.
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        h.client._bar_clock = PinnedClock((FIRST_D1_MINUTE + 300) * 60)
+        await subscribe_bars(h, EURUSD_D1)
+
+        await push_spot(h, forming_spot(D1, FIRST_D1_MINUTE))
+        h.client._bar_clock.t = (FIRST_D1_MINUTE + 1_440) * 60 + 5
+        await push_spot(h, forming_spot(D1, FIRST_D1_MINUTE + 1_440))
+
+        assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_D1_MINUTE, 86_400)]
+
+
+async def test_an_intraday_open_time_off_the_grid_is_published_not_rounded() -> None:
+    # The venue timestamps a bar with its opening tick, and every intraday open observed so far
+    # has been the period boundary itself. One that is not is reported, never moved.
+    opened = FIRST_M1_MINUTE // 15 * 15 + 3
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        h.client._bar_clock = PinnedClock(opened * 60 + 5)
+        await subscribe_bars(h, EURUSD_M15)
+
+        await push_spot(h, forming_spot(M15, opened))
+        h.client._bar_clock.t = (opened + 15) * 60 + 5
+        await push_spot(h, forming_spot(M15, opened + 15))
+
+        assert [b.ts_event for b in h.bars()] == [close_ns(opened, 900)]
 
 
 async def test_a_quote_unsubscribe_forgets_the_book_although_the_bars_go_on() -> None:

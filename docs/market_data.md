@@ -32,13 +32,17 @@ Supported periods are the ones the venue serves: 1, 2, 3, 4, 5, 10, 15 and 30 mi
 
 ## `ts_event` is the bar's close
 
-A bar's `ts_event` is the end of the period it covers: its period-aligned open boundary plus
-the period. A 15-minute bar covering 09:00–09:15 carries `ts_event = 09:15`.
+A bar's `ts_event` is the end of the period it covers: the open time the venue gave the bar,
+plus the period. A 15-minute bar covering 09:00–09:15 carries `ts_event = 09:15`.
 
-The venue timestamps a trendbar with the minute of its *opening tick*, which is not necessarily
-the period boundary — a quiet market can open a bar late. The adapter aligns that timestamp
-down to the period boundary and adds the period, so bars of the same type are evenly spaced
-whatever the venue's opening tick happened to be.
+That open time is used exactly as sent and is never rounded to a multiple of the period, because
+a period's boundaries are not necessarily aligned to midnight: a daily bar opens at 21:00 UTC,
+covering the venue's trading day rather than a calendar day. Rounding it would put every daily
+bar on the wrong day.
+
+The venue timestamps a bar with its *opening tick*. On the intraday periods that has always been
+the period boundary itself; an open time that is not one is logged and published as it came,
+rather than corrected into an assumption about where the boundary should be.
 
 ## When a bar closes
 
@@ -72,6 +76,12 @@ Two rules follow from this, and applications depend on both:
   bar. Bar streams from this adapter have gaps — over weekends, holidays and market breaks —
   and an application that needs a continuous series must fill it itself. Fabricating a flat bar
   would be inventing prices that never traded.
+
+**A daily bar's first close after subscribing can be a day late.** Which bars have already
+closed is worked out from the clock and the period alone, which assumes a period's boundaries
+are multiples of it. That holds for the intraday periods but not for the daily one, so the
+backfill run at a subscribe or a reconnect may miss the daily bar that closed just before it.
+The first daily bar then arrives when the stream closes the following one.
 
 ## Warm-up: subscribe first, then request
 

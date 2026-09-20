@@ -117,7 +117,9 @@ class History:
         if self.range_gate is not None:
             await self.range_gate.wait()
         self._clock.t += self._cost
-        return [h(b - T0) for b in range(start, end + 1, PERIOD) if self._served(b)]
+        # Only real boundaries are served, however the requested window is phased.
+        first = start + (T0 - start) % PERIOD
+        return [h(b - T0) for b in range(first, end + 1, PERIOD) if self._served(b)]
 
 
 def make_closer(
@@ -707,9 +709,9 @@ async def test_backfill_starts_from_the_bar_forming_at_creation_when_never_emitt
 
     await closer.backfill(fetch_range)
 
-    # end = floor(200/60)*60 - 60 = T0+120; start = floor(5/60)*60 = T0 (the bar forming at
-    # creation, so nothing that closed before the subscription existed is emitted).
-    assert calls == [(T0, T0 + 120)]
+    # end = floor(200/60)*60 - 60 = T0+120; start is one period back from creation, so the
+    # window covers the bar forming then and nothing that had already closed.
+    assert calls == [(T0 + 5 - 60 + 1, T0 + 120)]
     assert emitted == [h1]
     assert closer.last_emitted == T0
     closer.close()
@@ -737,7 +739,7 @@ async def test_backfill_skips_the_fetch_and_still_resets_baseline_when_nothing_h
     assert clock.timers == []
 
     clock.t = T0 + 400  # time passes before the post-backfill baseline update arrives
-    closer.on_update(bar(T0 + 200, tag="stale"))  # before the subscription: ignored
+    closer.on_update(bar(T0 + 120, tag="stale"))  # before the subscription: ignored
     assert emitted == []
     closer.on_update(bar(T0 + 400, tag="live"))
     closer.on_update(bar(T0 + 460, tag="live2"))

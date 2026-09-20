@@ -27,6 +27,7 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 PRICE_SCALE: int = 100_000
 # Volumes are specified in cents of a unit.
 VOLUME_SCALE: int = 100
+SECS_PER_HOUR: int = 3_600
 
 _METALS = frozenset({"XAU", "XAG", "XPT", "XPD"})
 
@@ -84,11 +85,25 @@ def price_from_raw(raw: int, digits: int) -> Price:
     return Price(Decimal(raw) / PRICE_SCALE, digits)
 
 
-def bar_boundary_secs(utc_minutes: int, period_secs: int) -> int:
-    """The period-aligned open time, in seconds, for a trendbar's `utcTimestampInMinutes`."""
-    # TODO(verify): open times are period-aligned for every period; D1/H4 boundaries.
-    secs = utc_minutes * 60
-    return secs - secs % period_secs
+def bar_boundary_secs(utc_minutes: int) -> int:
+    """A trendbar's `utcTimestampInMinutes` as its open time in seconds.
+
+    The venue's value is authoritative and is never moved onto a multiple of the period: a
+    period's boundaries are not necessarily aligned to the Unix epoch. A daily bar opens at
+    21:00 UTC, so flooring one put it on the previous calendar day.
+    """
+    return utc_minutes * 60
+
+
+def is_unaligned_boundary(boundary_secs: int, period_secs: int) -> bool:
+    """Whether an open time breaks the epoch alignment expected of `period_secs`.
+
+    Of the periods this adapter supports, only those dividing an hour were observed aligned.
+    H4 and longer carry the trading day's own phase, so nothing is expected of them.
+    """
+    # TODO(verify): observing every supported period on a live connection would settle which
+    # ones are epoch-aligned. M1, M15 and H1 were seen aligned; the daily open is at 21:00 UTC.
+    return SECS_PER_HOUR % period_secs == 0 and boundary_secs % period_secs != 0
 
 
 def _optional_field(message: Message, field: str) -> object | None:
@@ -262,7 +277,7 @@ def bar_from_trendbar(
 ) -> Bar:
     """A closed `Bar` from a `ProtoOATrendbar`.
 
-    `ts_event` is the bar's close time: its period-aligned open boundary plus the period.
+    `ts_event` is the bar's close time: the venue's own open time plus the period.
 
     The period comes from `bar_type`, not `tb.period`: recorded historical responses leave
     `ProtoOATrendbar.period` unset on every individual bar (the real period is only carried on
@@ -286,8 +301,7 @@ def bar_from_trendbar(
     volume = Quantity(tb.volume, size_precision)
 
     period_secs = PERIOD_SECS[period]
-    boundary = bar_boundary_secs(tb.utcTimestampInMinutes, period_secs)
-    ts_event = (boundary + period_secs) * 1_000_000_000
+    ts_event = (bar_boundary_secs(tb.utcTimestampInMinutes) + period_secs) * 1_000_000_000
 
     return Bar(bar_type, open_price, high_price, low_price, close_price, volume, ts_event, ts_init)
 

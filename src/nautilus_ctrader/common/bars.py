@@ -111,7 +111,12 @@ class BarCloser:
         self._emit_cb = emit
         self._log = logger
         self._label = label
-        self._floor = self._floor_boundary(clock.now())
+        # The oldest boundary this closer may emit. A bar is still forming while
+        # `boundary + period > now`, and the bar forming at construction is the first one this
+        # subscription owns. Stated as that bound rather than as a floored boundary because a
+        # period's boundaries need not be aligned to the Unix epoch: a daily bar opens at
+        # 21:00 UTC, and flooring dropped it as too old for most of its own day.
+        self._floor = int(clock.now()) - period_secs + 1
         self._last_emitted: int | None = None
         self._current: RawBar | None = None
         self._timer: asyncio.TimerHandle | Any | None = None
@@ -187,10 +192,10 @@ class BarCloser:
     async def backfill(self, fetch_range: Callable[[int, int], Awaitable[list[RawBar]]]) -> None:
         """Queue every bar closed since the last one, then resume the stream as a baseline.
 
-        `fetch_range(start, end)` returns bars for the **inclusive** range `[start, end]`; both
-        are period-aligned boundaries. Bars outside the range are ignored. `start` continues
-        from `last_emitted`, never earlier than the bar forming at construction; `end` is the
-        last boundary already closed by the clock.
+        `fetch_range(start, end)` returns bars for the **inclusive** range `[start, end]`, and
+        bars outside it are ignored. `start` continues from `last_emitted`, never earlier than
+        the bar forming at construction, so it is a plain lower bound rather than a boundary;
+        `end` is the last boundary the clock says has closed.
 
         - If the closed range advances while a fetch and its emits are in flight, the new part
           is fetched again, for up to `_MAX_BACKFILL_ROUNDS` rounds; past that, a WARNING is
@@ -302,6 +307,12 @@ class BarCloser:
         return (int(t) // self._period) * self._period
 
     def _last_closed_boundary(self) -> int:
+        # TODO(verify): whether any period this adapter supports has boundaries the venue does
+        # not align to the Unix epoch beyond the daily 21:00 open. For such a period this lands
+        # between two real boundaries, so `backfill` asks history for a bar that never existed
+        # and leaves the genuinely closed one to the stream, delaying its first close by a
+        # period. Learning a period's phase from the bars themselves would settle it, and is a
+        # design decision rather than part of this fix.
         return self._floor_boundary(self._clock.now()) - self._period
 
     def _is_covered(self, boundary: int) -> bool:
