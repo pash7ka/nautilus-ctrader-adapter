@@ -129,8 +129,9 @@ For the instruments named in `load_ids`, the chains are prepared during connect,
 client reports connected — so an instrument that cannot be valued is known to be unusable
 before anything can trade it. An instrument that arrived through `load_all` gets its chain on
 its first subscription instead — quotes or bars alike, since the valuation needs it either
-way: resolving a chain for every symbol a broker offers would be pointless work. Chains are resolved once per connection, and again if the venue announces that
-one of their symbols changed.
+way: resolving a chain for every symbol a broker offers would be pointless work. Chains are
+resolved once per connection, and again if the venue announces that one of their symbols
+changed.
 
 Two different failures are reported differently, because they need different responses:
 

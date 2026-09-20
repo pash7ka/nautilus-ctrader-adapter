@@ -37,7 +37,6 @@ from nautilus_ctrader.common.errors import (
     CTraderError,
     CTraderProtocolError,
     CTraderRequestError,
-    CTraderTimeoutError,
 )
 from nautilus_ctrader.common.parsing import (
     bar_boundary_secs,
@@ -400,9 +399,10 @@ class CTraderDataClient(LiveMarketDataClient):
             if self._config.fail_on_instrument_error:
                 raise
             return None
-        except (CTraderConnectionError, CTraderTimeoutError) as e:
-            # A stalled or unsent request says nothing about the instrument, so dropping it
-            # would lose it for the whole process over one reconnect.
+        except CTraderError as e:
+            # Everything else - a lost connection, a timeout, a session that cannot
+            # authenticate - says nothing about the instrument, and dropping it would lose it
+            # for the whole process over one reconnect.
             self._conversion_not_subscribed(instrument.id, e, during_connect=during_connect)
             return None
         try:

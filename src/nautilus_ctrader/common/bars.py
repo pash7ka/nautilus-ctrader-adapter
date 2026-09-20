@@ -405,6 +405,7 @@ class BarCloser:
             try:
                 result = await self._fetch(boundary)
             except CTraderConnectionError:
+                # Kept ahead of the catch-all below, which would count it as an attempt.
                 raise
             except Exception as e:
                 # Any history failure is retried, then falls back to the streamed state.
