@@ -37,9 +37,10 @@ _ALREADY_SUBSCRIBED = "ALREADY_SUBSCRIBED"
 _ACCEPTING = (SessionState.READY, SessionState.RESTORING)
 # Only picks DEBUG over WARNING for an unsubscribe refused during a restore.
 # TODO(verify): the code the venue refuses an unsubscribe of a never-subscribed key with, for
-# live trendbars as well as spots. A live-trendbar subscribe without spots was refused with
-# INVALID_REQUEST rather than NOT_SUBSCRIBED_TO_SPOTS, but with that market closed, so which
-# of the two the venue means for a missing subscription is still open.
+# live trendbars as well as spots. A *subscribe* without spots is refused with INVALID_REQUEST,
+# not with this code (see docs/protocol.md), so the venue does not use it for every missing
+# subscription. INVALID_REQUEST is deliberately not added here: it is the venue's generic
+# refusal, and treating it as expected would hide a genuinely malformed request.
 _NOT_SUBSCRIBED = frozenset({"NOT_SUBSCRIBED_TO_SPOTS"})
 
 

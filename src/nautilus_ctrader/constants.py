@@ -54,7 +54,9 @@ HISTORICAL_PAYLOAD_TYPES: frozenset[type] = frozenset(
     {_oa.ProtoOAGetTrendbarsReq, _oa.ProtoOAGetTickDataReq},
 )
 
-# TODO(verify): per-request id limit.
+# Confirmed live: 100 ids in one request are accepted and all 100 symbols come back.
+# TODO(verify): where the venue's own limit actually sits, which is still unknown -
+# only that it is at least this batch.
 SYMBOL_BY_ID_BATCH: int = 100
 
 # Refresh this far ahead of the access token's expiry. Several times the minimum refresh

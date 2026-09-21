@@ -195,14 +195,13 @@ as the first enum value, which here is the one-minute period. Reading a historic
 `period` therefore produces a plausible wrong answer rather than an error, on every period
 except the one-minute one.
 
-**Unconfirmed**: whether subscribing to live trendbars requires an **active spot subscription**
-for the same symbol. A live-trendbar subscribe sent with no spot subscription for that symbol
-was refused — but with `INVALID_REQUEST`, not with the `NOT_SUBSCRIBED_TO_SPOTS` the schema
-carries for exactly this case. The probe ran while that symbol's market was closed, so it is not
-established whether `INVALID_REQUEST` answers the missing subscription or the shut market;
-repeating it on an open market would settle it. Either way this adapter holds a spot
-subscription for as long as it holds a live trendbar, so a consumer that asks only for bars
-still gets one.
+**Subscribing to live trendbars requires an active spot subscription** for the same symbol
+(confirmed). On an open market, a live-trendbar subscribe sent with no spot subscription for
+that symbol was refused, while the same subscribe sent after a spot subscription succeeded and
+delivered live bars. The refusal came back as `INVALID_REQUEST`, **not** as the
+`NOT_SUBSCRIBED_TO_SPOTS` the schema carries for exactly this case, so do not match on that
+code to recognise the condition. This adapter holds a spot subscription for as long as it holds
+a live trendbar, so a consumer that asks only for bars still gets one.
 
 ### Historical trendbars
 
@@ -222,9 +221,15 @@ milliseconds and a `count`, and pages backwards: `count` is counted back from `t
   response says the window's start was never reached, so "the page stopped short of
   `fromTimestamp`" carries no information about whether older bars exist. The same rule as
   above covers it: continue from the oldest boundary the page actually served.
-- **`count` is honoured well past a page** (confirmed): `count = 5000` was served in full, and
-  `hasMore` was still true. The cap near 500 that this adapter's default page size was chosen
-  around does not exist.
+- **`count` is honoured well past a page** (confirmed): `count = 5000` was answered with 4999
+  bars, and `hasMore` was still true. The cap near 500 that this adapter's default page size
+  was chosen around does not exist. Across runs a request for `count = N` has come back with
+  both `N` and `N - 1` bars — never more than `N` — so the count is an upper bound, not a
+  promise.
+- **History serves a bar almost as soon as it closes** (confirmed): polling for a just-closed
+  one-minute bar returned it between 0.06 s and 1.0 s after its boundary, over five
+  consecutive bars. In the same run every one of those bars was closed by the live stream
+  rather than by a timeout, so the history fallback is the exception, not the normal path.
 - **A trendbar day is not a calendar day** (confirmed): daily bars open at 21:00 UTC, not at
   00:00. The intraday periods behave as expected — observed M1, M15 and H1 open times are all
   multiples of their own length — but a daily bar covers the venue's trading day, so its open

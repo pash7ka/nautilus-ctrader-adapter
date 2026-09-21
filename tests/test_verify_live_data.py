@@ -334,7 +334,10 @@ def test_item_5a_is_unknown_when_no_count_was_served() -> None:
 def test_item_5b_wants_the_wide_window_rejected() -> None:
     assert v.decide_wide_boundaries("INCORRECT_BOUNDARIES", None)[0] == OK
     assert v.decide_wide_boundaries("NO_QUOTES", None)[0] == DIFFERS
-    assert v.decide_wide_boundaries(None, 500)[0] == DIFFERS
+    # Accepting a wide window and truncating it is this venue's confirmed behaviour.
+    status, lines = v.decide_wide_boundaries(None, 500)
+    assert status == OK
+    assert "500 bars served" in lines[0]
 
 
 def test_item_6_wants_every_requested_id_answered() -> None:

@@ -435,7 +435,12 @@ def decide_wide_boundaries(error_code: str | None, returned: int | None) -> Deci
         return OK, (f"a {days}-day window is rejected with INCORRECT_BOUNDARIES",)
     if error_code is not None:
         return DIFFERS, (f"a {days}-day window is rejected with {error_code}",)
-    return DIFFERS, (f"a {days}-day window is accepted, {returned} bars served",)
+    # Serving a short page for a wide window is this venue's confirmed behaviour, not a
+    # surprise. Either answer is legitimate; the item exists to record which one is given.
+    return OK, (
+        f"a {days}-day window is accepted, {returned} bars served",
+        "a short page therefore says nothing about whether older bars exist",
+    )
 
 
 def decide_symbol_batch(
