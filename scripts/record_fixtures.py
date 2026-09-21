@@ -15,6 +15,12 @@ Run once per fixture refresh, from the repository root:
 
 The account id is passed on the command line and never written anywhere. Overwrites
 `tests/fixtures/m2_recorded.json`.
+
+When `_CLEARED_FIELDS` grows, the committed fixture predates the new entry and still carries
+what it names. Replaying the current scrubbing over the recorded file, without a connection and
+without an account id, rewrites it in place:
+
+    uv run python scripts/record_fixtures.py --rescrub
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from collections.abc import Iterable
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message
 
+from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderRequestError
 from nautilus_ctrader.common.rate_limit import RateLimiter
@@ -572,6 +579,45 @@ def _encode(message: Message) -> dict:
     }
 
 
+def _decode(item: dict) -> Message:
+    message = codec.payload_class(item["type"])()
+    message.ParseFromString(base64.b64decode(item["payload"]))
+    return message
+
+
+def rescrub_bytes(data: bytes) -> bytes:
+    """Replay the current `scrub()` over an already recorded fixture file's contents.
+
+    A pure function from the recorded JSON to the rewritten JSON: no credentials, no account
+    id, no connection, so this mode cannot reach the venue. Keys and message order come
+    straight from `data`, and each message is re-encoded exactly as a fresh recording encodes
+    it, so the only difference is what `scrub()` now removes.
+
+    The recorded file no longer holds a real account id or trader login, so the fake values
+    stand in for them: what has to be replayed is the clearing by field name, and the sweep
+    for a stray identifier then has nothing left to find.
+    """
+    recorded = json.loads(data)
+    output = {
+        key: [_encode(scrub(_decode(item), FAKE_ACCOUNT_ID, FAKE_TRADER_LOGIN)) for item in items]
+        for key, items in recorded.items()
+    }
+    return json.dumps(output, indent=2).encode("utf-8")
+
+
+def _rescrub() -> None:
+    before = _OUTPUT_PATH.read_bytes()
+    after = rescrub_bytes(before)
+    _OUTPUT_PATH.write_bytes(after)
+
+    changed = sum(
+        old["payload"] != new["payload"]
+        for key, items in json.loads(before).items()
+        for old, new in zip(items, json.loads(after)[key], strict=True)
+    )
+    print(f"messages rewritten: {changed}, bytes: {len(before)} -> {len(after)}")
+
+
 async def _run(account_id: int, env: dict[str, str]) -> None:
     result = await record(account_id, env)
     real_login = result.secrets.real_login
@@ -611,12 +657,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Record a scrubbed snapshot of broker responses into tests/fixtures/m2_recorded.json."
         ),
     )
-    parser.add_argument("--account-id", type=int, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--account-id", type=int, help="record a fresh snapshot from the venue")
+    mode.add_argument(
+        "--rescrub",
+        action="store_true",
+        help="rewrite the recorded file in place, offline, replaying the current scrubbing",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
+
+    if args.rescrub:
+        # Returns before the `.env` read and the event loop below: `rescrub_bytes` takes the
+        # recorded file's bytes and nothing else, so this mode has nothing to connect with.
+        try:
+            _rescrub()
+        except Exception as e:
+            print(f"error: {type(e).__name__}: re-scrub failed", file=sys.stderr)
+            return 1
+        return 0
+
     env = get_tokens.load_env(_REPO_ROOT / ".env")
     try:
         asyncio.run(_run(args.account_id, env))

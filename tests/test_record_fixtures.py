@@ -7,8 +7,12 @@ recording flow itself needs a live broker connection and is not run in CI - only
 recorded, already-scrubbed output (`tests/fixtures/m2_recorded.json`) is checked here.
 """
 
+import base64
 import importlib.util
+import json
 import pathlib
+
+import pytest
 
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -178,6 +182,71 @@ def test_scrub_miss_in_raw_bytes_is_caught_by_the_byte_level_check() -> None:
     raise AssertionError("scrub miss inside the raw serialized bytes was not detected")
 
 
+def _recorded_under_the_old_rules() -> bytes:
+    """A recorded file from before `_CLEARED_FIELDS` grew: ids and tokens already faked, the
+    fields added to the set later still in place."""
+    account_list = record_fixtures.scrub(_account_list(), REAL_ACCOUNT, REAL_LOGIN)
+    account = account_list.ctidTraderAccount[0]
+    account.lastClosingDealTimestamp = 1_700_000_000_000
+    account.lastBalanceUpdateTimestamp = 1_700_000_000_000
+    symbol_specs = record_fixtures.scrub(_symbol(), REAL_ACCOUNT, REAL_LOGIN)
+    symbol_specs.symbol[0].holiday.extend(_symbol().symbol[0].holiday)
+    return json.dumps(
+        {
+            "account_list": [record_fixtures._encode(account_list)],
+            "symbol_specs": [record_fixtures._encode(symbol_specs)],
+        },
+        indent=2,
+    ).encode("utf-8")
+
+
+def _parse(cls, item: dict):
+    message = cls()
+    message.ParseFromString(base64.b64decode(item["payload"]))
+    return message
+
+
+def test_rescrub_removes_what_the_current_rules_clear() -> None:
+    rescrubbed = json.loads(record_fixtures.rescrub_bytes(_recorded_under_the_old_rules()))
+
+    account_list = _parse(
+        oa.ProtoOAGetAccountListByAccessTokenRes,
+        rescrubbed["account_list"][0],
+    )
+    account = account_list.ctidTraderAccount[0]
+    for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp"):
+        assert not account.HasField(field), field
+    assert not _parse(oa.ProtoOASymbolByIdRes, rescrubbed["symbol_specs"][0]).symbol[0].holiday
+
+    # The values the original scrub installed survive the replay untouched.
+    assert account_list.accessToken == record_fixtures.FAKE_TOKEN
+    assert account.ctidTraderAccountId == record_fixtures.FAKE_ACCOUNT_ID
+    assert account.traderLogin == record_fixtures.FAKE_TRADER_LOGIN
+    assert account.isLive is True
+
+
+def test_rescrub_preserves_the_recorded_files_shape() -> None:
+    """A re-scrub is meant to show up as nothing but the removed data, so keys, order, payload
+    types and the JSON formatting all have to come out as a fresh recording writes them."""
+    before = _recorded_under_the_old_rules()
+    after = record_fixtures.rescrub_bytes(before)
+
+    assert list(json.loads(after)) == list(json.loads(before))
+    assert [i["type"] for i in json.loads(after)["account_list"]] == [
+        i["type"] for i in json.loads(before)["account_list"]
+    ]
+    assert after == json.dumps(json.loads(after), indent=2).encode("utf-8")
+    assert record_fixtures.rescrub_bytes(after) == after
+
+
+def test_rescrub_mode_takes_no_account_id() -> None:
+    """Nothing to connect with: the offline mode excludes the account id the recording needs."""
+    args = record_fixtures._build_arg_parser().parse_args(["--rescrub"])
+    assert args.rescrub and args.account_id is None
+    with pytest.raises(SystemExit):
+        record_fixtures._build_arg_parser().parse_args(["--rescrub", "--account-id", "1"])
+
+
 def test_recorded_fixtures_are_scrubbed_and_complete() -> None:
     rec = load_recorded()
     for key in (
@@ -194,6 +263,10 @@ def test_recorded_fixtures_are_scrubbed_and_complete() -> None:
         assert rec[key], key
     assert rec["trader"][0].trader.ctidTraderAccountId == FAKE_ACCOUNT_ID
     assert not rec["trader"][0].trader.HasField("brokerName")
+    assert not any(s.holiday for m in rec["symbol_specs"] for s in m.symbol)
+    for account in rec["account_list"][0].ctidTraderAccount:
+        for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp"):
+            assert not account.HasField(field), field
     m1 = [
         tb.utcTimestampInMinutes
         for ev in rec["spot_events"]
