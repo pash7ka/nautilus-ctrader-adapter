@@ -16,6 +16,9 @@ from tests.fixtures import FAKE_ACCOUNT_ID, load_recorded
 from tests.recording_logger import RecordingLogger
 
 ACCOUNT_ID = 7654321
+# The recorder clears `traderLogin`, so the fake venue supplies its own. A real venue always
+# sends one, and a distinctive value keeps the log-leak check honest.
+TRADER_LOGIN = 8901234
 RECORDED = load_recorded()
 
 
@@ -39,6 +42,7 @@ def account_list(*, is_live: bool, listed: bool = True) -> oa.ProtoOAGetAccountL
             entry.CopyFrom(recorded)
             assert entry.ctidTraderAccountId == FAKE_ACCOUNT_ID
             entry.ctidTraderAccountId = ACCOUNT_ID
+            entry.traderLogin = TRADER_LOGIN
             entry.isLive = is_live
     return res
 
