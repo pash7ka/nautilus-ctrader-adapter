@@ -98,11 +98,15 @@ def bar_boundary_secs(utc_minutes: int) -> int:
 def is_unaligned_boundary(boundary_secs: int, period_secs: int) -> bool:
     """Whether an open time breaks the epoch alignment expected of `period_secs`.
 
-    Of the periods this adapter supports, only those dividing an hour were observed aligned.
-    H4 and longer carry the trading day's own phase, so nothing is expected of them.
+    Only the periods dividing an hour are expected to be epoch-aligned, and that is arithmetic
+    rather than a guess: the trading day starts on the hour, so a period that divides an hour
+    divides the day's offset too and keeps its alignment whatever that offset is. A longer
+    period carries the offset instead, so nothing is expected of it.
+
+    Confirmed live for every period this adapter supports: M1, M15 and H1 open on multiples of
+    their own length, while H4, H12 and D1 open on the trading day's phase - D1 at 21:00 UTC,
+    and H4 and H12 one hour into their own grid, on every bar observed across two symbols.
     """
-    # TODO(verify): observing every supported period on a live connection would settle which
-    # ones are epoch-aligned. M1, M15 and H1 were seen aligned; the daily open is at 21:00 UTC.
     return SECS_PER_HOUR % period_secs == 0 and boundary_secs % period_secs != 0
 
 

@@ -111,7 +111,10 @@ _STALE_BAR_AGE_SECS = 3600.0
 
 # Item 3: bars per period, and how wide a window to ask for them over. Three periods' worth
 # covers a weekend without the window itself becoming the thing under test.
-_ALIGNMENT_PERIODS = ("M1", "M15", "H1", "D1")
+# H4 and H12 are here because they are the periods in doubt: a 21:00 trading day is a whole
+# number of hours, so everything up to H1 keeps its epoch alignment either way, while
+# 75600 s is not a multiple of 4 or 12 hours.
+_ALIGNMENT_PERIODS = ("M1", "M15", "H1", "H4", "H12", "D1")
 _ALIGNMENT_COUNT = 10
 _ALIGNMENT_WINDOW_FACTOR = 3
 
@@ -132,6 +135,7 @@ _MAX_LISTED_DETAILS = 8
 _RUN_OVERHEAD_SECS = 300.0
 _RESOLVE_HOST_TIMEOUT_SECS = 60.0
 
+_SECS_PER_HOUR = 3600
 _SECS_PER_DAY = 86_400
 
 
@@ -335,11 +339,14 @@ def decide_spot_timestamp(timestamp: int | None, local_secs: float) -> Decision:
 
 
 def decide_alignment(observations: Sequence[AlignmentObservation]) -> Decision:
-    """Period alignment for the intraday periods, and the UTC boundary time for D1.
+    """Whether each period's open times keep one consistent phase, and what that phase is.
 
-    A day is not a multiple of the venue's trading day, so D1 is judged on whether every bar
-    opens at the same time of day rather than on being a multiple of 86400 s; that time is the
-    observation the item asks for.
+    Alignment to the Unix epoch is not the thing worth testing: the venue's trading day starts
+    at an offset into the calendar day, so a period that does not divide that offset carries the
+    offset instead. What matters to a consumer is that a period has *one* phase, whatever it is,
+    because a single phase is what makes a boundary predictable. A period whose bars all open on
+    a multiple of their own length is reported as aligned; one with a single other phase is
+    reported with the times of day its bars open at; more than one phase is a real surprise.
     """
     if not any(o.open_secs for o in observations):
         codes = sorted({o.error_code or "no bars" for o in observations}) or ["no probe ran"]
@@ -352,24 +359,25 @@ def decide_alignment(observations: Sequence[AlignmentObservation]) -> Decision:
         if not observation.open_secs:
             detail.append(f"{prefix}: {observation.error_code or 'no bars'}")
             continue
-        if observation.period_secs >= _SECS_PER_DAY:
-            offsets = sorted({s % _SECS_PER_DAY for s in observation.open_secs})
-            if len(offsets) == 1:
-                detail.append(f"{prefix}: every bar opens at {_hhmm_of_day(offsets[0])} UTC")
-            else:
-                differs = True
-                times = ", ".join(_hhmm_of_day(o) for o in offsets)
-                detail.append(f"{prefix}: bars open at more than one time of day: {times}")
-            continue
-        misaligned = [s for s in observation.open_secs if s % observation.period_secs]
-        if misaligned:
+        phases = {s % observation.period_secs for s in observation.open_secs}
+        times = ", ".join(
+            _hhmm_of_day(o) for o in sorted({s % _SECS_PER_DAY for s in observation.open_secs})
+        )
+        if phases == {0}:
+            detail.append(f"{prefix}: {len(observation.open_secs)} open times aligned")
+        elif len(phases) == 1 and next(iter(phases)) % _SECS_PER_HOUR == 0:
+            # A trading day starts on the hour, so the only phase it can impose is a whole
+            # number of hours. That is the venue's day showing through, not a surprise.
+            detail.append(f"{prefix}: one whole-hour phase, bars open at {times} UTC")
+        elif len(phases) == 1:
             differs = True
             detail.append(
-                f"{prefix}: {len(misaligned)} of {len(observation.open_secs)} open times are "
-                f"not multiples of {observation.period_secs} s",
+                f"{prefix}: one phase, but {next(iter(phases))} s is not a whole hour, so the "
+                f"trading day does not explain it; bars open at {times} UTC",
             )
-            continue
-        detail.append(f"{prefix}: {len(observation.open_secs)} open times aligned")
+        else:
+            differs = True
+            detail.append(f"{prefix}: more than one phase, bars open at {times} UTC")
     return (DIFFERS if differs else OK), tuple(detail)
 
 

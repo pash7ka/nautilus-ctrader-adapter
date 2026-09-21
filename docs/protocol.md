@@ -231,9 +231,15 @@ milliseconds and a `count`, and pages backwards: `count` is counted back from `t
   consecutive bars. In the same run every one of those bars was closed by the live stream
   rather than by a timeout, so the history fallback is the exception, not the normal path.
 - **A trendbar day is not a calendar day** (confirmed): daily bars open at 21:00 UTC, not at
-  00:00. The intraday periods behave as expected — observed M1, M15 and H1 open times are all
-  multiples of their own length — but a daily bar covers the venue's trading day, so its open
-  time is an offset into the calendar day rather than the start of one.
+  00:00. A bar covers the venue's trading day, so its open time is an offset into the calendar
+  day rather than the start of one.
+- **Which periods keep epoch alignment follows from that offset** (confirmed). The trading day
+  starts on the hour, so every period dividing an hour divides the offset too and stays aligned:
+  M1, M15 and H1 were observed opening on multiples of their own length. H4, H12 and D1 do not
+  divide 21 hours, so they carry the offset instead — every observed H4 and H12 bar, across two
+  symbols, opened one hour into its own grid, and every D1 bar at 21:00 UTC. A consumer that
+  floors a timestamp by the period to find a boundary is therefore correct up to H1 and wrong
+  from H4 up; take the open time the venue sends instead.
 
 **Unconfirmed**: whether `fromTimestamp` and `toTimestamp` are inclusive. The paging absorbs
 an inclusive `toTimestamp` harmlessly, since a repeated boundary is de-duplicated. An

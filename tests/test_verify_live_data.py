@@ -255,9 +255,27 @@ def test_item_3_accepts_aligned_intraday_periods() -> None:
 
 
 def test_item_3_flags_an_open_time_off_the_period() -> None:
+    """A 7 s phase is consistent, but no trading day can impose it, so it stays a surprise."""
     status, detail = v.decide_alignment([_aligned(EURUSD, "M15", 900, offset=7)])
     assert status == DIFFERS
-    assert "not multiples of 900" in detail[0]
+    assert "not a whole hour" in detail[0]
+
+
+def test_item_3_accepts_a_whole_hour_phase_from_the_trading_day() -> None:
+    """H4 carries the trading day's phase: 21:00 is not a multiple of four hours."""
+    status, detail = v.decide_alignment([_aligned(EURUSD, "H4", 14_400, offset=3600)])
+    assert status == OK
+    assert "whole-hour phase" in detail[0]
+
+
+def test_item_3_flags_bars_that_keep_more_than_one_phase() -> None:
+    mixed = v.AlignmentObservation(
+        EURUSD,
+        "H4",
+        14_400,
+        open_secs=(1_700_006_400, 1_700_020_800 + 1800),
+    )
+    assert v.decide_alignment([mixed])[0] == DIFFERS
 
 
 def test_item_3_reports_the_d1_boundary_time_instead_of_midnight_alignment() -> None:
