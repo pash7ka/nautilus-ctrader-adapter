@@ -10,10 +10,15 @@ Message definitions come from Spotware's MIT-licensed
 fact below is not yet confirmed against a live connection, it is marked **unconfirmed** and
 carries a `TODO(verify):` comment at the corresponding place in the source.
 
+A fact marked **confirmed** was observed on a real connection to the API, against a real
+broker account, and is fixed in a recorded fixture where it is a value rather than a
+behaviour. Everything else is read from the schema or its documentation and is an assumption
+until a connection settles it.
+
 ## 1. Transport
 
-The API is reached over TLS at `demo.ctraderapi.com:5035` (demo accounts) or
-`live.ctraderapi.com:5035` (live accounts) — the same port for both environments.
+The API is reached over TLS at `demo.ctraderapi.com:5035` or `live.ctraderapi.com:5035` — the
+same port for both.
 
 Each frame on the wire is a 4-byte big-endian length prefix followed by a serialised
 `ProtoMessage` envelope, capped at 15,000,000 bytes. This is exactly the framing Twisted's
@@ -21,6 +26,18 @@ Each frame on the wire is a 4-byte big-endian length prefix followed by a serial
 15_000_000`), which is what Spotware's own reference SDK is built on. A length prefix
 declaring more than the cap is treated as a protocol violation and the connection is dropped
 rather than read further.
+
+### Which host an account belongs to
+
+**The account's own `isLive` flag decides the host** (confirmed), and nothing else does:
+account authentication on the wrong host is refused with `CANT_ROUTE_REQUEST`. How the access
+token was issued makes no difference — a token obtained through a sandbox authorization flow
+still routes by the account's flag.
+
+The account list (`ProtoOAGetAccountListByAccessTokenReq`) is served on **either** host
+(confirmed), which is what makes host selection automatic: this adapter opens a short
+connection to one host, reads the flag for the configured account, and connects to the host
+that flag names. Naming the environment explicitly skips that step.
 
 ## 2. Envelope and correlation
 
@@ -118,7 +135,8 @@ re-authentication as an expired token) breaks that cycle.
 ## 6. Rate limiting
 
 A rate-limit breach is reported as `ProtoOAErrorRes` with `errorCode = BLOCKED_PAYLOAD_TYPE`
-and a `retryAfter` value in seconds, scoped to the specific payload type that was throttled.
+(confirmed) and a `retryAfter` value in seconds, scoped to the specific payload type that was
+throttled.
 
 This adapter treats `retryAfter` as authoritative: on a breach, the affected bucket is paused
 for exactly the duration the venue reports, rather than guessing a backoff. Requests are
@@ -130,21 +148,112 @@ own `BLOCKED_PAYLOAD_TYPE` responses settle the real numbers.
 
 ## 7. Scaling — read this before trusting any number
 
-Three conversions in this protocol are the highest-consequence unknowns in the whole API,
-because getting any of them wrong by a factor produces a working request for the wrong size:
+Every scale in this protocol is implicit. Getting one wrong by a factor produces a perfectly
+valid request for the wrong size, which is why each of the values below is fixed in a recorded
+response and asserted in the test suite rather than reasoned about.
 
-- **Volumes are not lots.** The wire value needs a broker-supplied conversion to arrive at a
-  human-meaningful size.
-- **Monetary values carry a `moneyDigits` scale.** The same integer means different amounts of
-  money depending on the instrument's configured digit count.
-- **Trendbar prices are integers encoded as deltas from `low`**, not absolute prices.
+- **Volumes are in cents of a unit** (confirmed): `units = volume / 100`. They are not lots.
+  What a "unit" is depends on the symbol — a unit of the base currency for an FX pair, a
+  contract for an index or a metal — and the symbol's own `measurementUnits` field names it.
+  A lot is `lotSize` in those same units.
+- **Spot prices and trendbar prices are integers in 1/100000 of a price unit** (confirmed),
+  regardless of the symbol's `digits`. A symbol quoted to 2 decimals still sends
+  `2528164000` for a price of `25281.64`. `digits` says how many decimals are meaningful, not
+  how the integer is scaled.
+- **Trendbar prices are deltas from `low`** (confirmed): a trendbar carries `low` as an
+  absolute price and `deltaOpen`, `deltaHigh`, `deltaClose` as non-negative offsets from it, so
+  `open = low + deltaOpen` and so on.
+- **Monetary values carry a `moneyDigits` scale.** The account reports its own digit count, and
+  the same integer means different amounts of money at different counts.
 
-None of this conversion exists in the adapter yet. When it is built, each converter must be
-checked against a recorded real response before it ships, and scaling in particular will be
-verified against a live account with a minimum-size order before it is trusted for anything
-larger.
+Trendbar timestamps are minutes since epoch, of the bar's **opening tick** rather than of the
+period boundary; see [§8](#8-market-data-messages).
 
-## 8. A known inconsistency: `maintenanceEndTimestamp`
+## 8. Market data messages
+
+### Spot events
+
+`ProtoOASpotEvent` is the only live price message; there is no separate trade or bar-close
+event.
+
+- Spot events are **one-sided** (confirmed): an event carries `bid`, or `ask`, or both, and
+  bid-only and ask-only events are both entirely normal. A consumer that needs a two-sided
+  quote has to remember the last value of each side.
+- A spot event's `timestamp` is in **milliseconds** (confirmed).
+- Spot events carry no size at all. There is no depth in this protocol.
+
+### Live trendbars travel inside spot events
+
+There is no bar message and no bar-close event. `ProtoOASpotEvent.trendbar` is a repeated
+field carrying the currently forming bar of **each** period the connection is subscribed to,
+and a live trendbar identifies its own period through `ProtoOATrendbar.period` (confirmed).
+
+A **historical** trendbar does not (confirmed): in a `ProtoOAGetTrendbarsRes`, the individual
+bars leave `period` unset and the period is carried once, on the response. This asymmetry is a
+trap in the protobuf encoding rather than in the documentation — an unset enum field reads back
+as the first enum value, which here is the one-minute period. Reading a historical bar's own
+`period` therefore produces a plausible wrong answer rather than an error, on every period
+except the one-minute one.
+
+**Subscribing to live trendbars requires an active spot subscription** for the same symbol
+(confirmed). On an open market, a live-trendbar subscribe sent with no spot subscription for
+that symbol was refused, while the same subscribe sent after a spot subscription succeeded and
+delivered live bars. The refusal came back as `INVALID_REQUEST`, **not** as the
+`NOT_SUBSCRIBED_TO_SPOTS` the schema carries for exactly this case, so do not match on that
+code to recognise the condition. This adapter holds a spot subscription for as long as it holds
+a live trendbar, so a consumer that asks only for bars still gets one.
+
+### Historical trendbars
+
+`ProtoOAGetTrendbarsReq` takes a symbol, a period, a `fromTimestamp`/`toTimestamp` window in
+milliseconds and a `count`, and pages backwards: `count` is counted back from `toTimestamp`.
+
+- **History reaches back before the account's own registration timestamp** (confirmed). A
+  freshly created account can still warm a strategy up.
+- **A page can come back short without any error.** A request for `count = 500` returned 499
+  bars with `hasMore = true` (confirmed). A caller must therefore never treat "fewer bars than
+  asked for" as "the history is exhausted"; this adapter continues the next window from the
+  oldest bar a page actually served, rather than from where the window was asked to start, so a
+  short page skips nothing.
+- **A window far wider than the page is truncated in silence** (confirmed). A request spanning
+  400 days, with `count = 500`, was accepted and answered with 500 one-minute bars — a few
+  hours of the 400 days — with no `INCORRECT_BOUNDARIES` and no other error. Nothing in the
+  response says the window's start was never reached, so "the page stopped short of
+  `fromTimestamp`" carries no information about whether older bars exist. The same rule as
+  above covers it: continue from the oldest boundary the page actually served.
+- **`count` is honoured well past a page** (confirmed): `count = 5000` was answered with 4999
+  bars, and `hasMore` was still true. The cap near 500 that this adapter's default page size
+  was chosen around does not exist. Across runs a request for `count = N` has come back with
+  both `N` and `N - 1` bars — never more than `N` — so the count is an upper bound, not a
+  promise.
+- **History serves a bar almost as soon as it closes** (confirmed): polling for a just-closed
+  one-minute bar returned it between 0.06 s and 1.0 s after its boundary, over five
+  consecutive bars. In the same run every one of those bars was closed by the live stream
+  rather than by a timeout, so the history fallback is the exception, not the normal path.
+- **A trendbar day is not a calendar day** (confirmed): daily bars open at 21:00 UTC, not at
+  00:00. A bar covers the venue's trading day, so its open time is an offset into the calendar
+  day rather than the start of one.
+- **Which periods keep epoch alignment follows from that offset** (confirmed). The trading day
+  starts on the hour, so every period dividing an hour divides the offset too and stays aligned:
+  M1, M15 and H1 were observed opening on multiples of their own length. H4, H12 and D1 do not
+  divide 21 hours, so they carry the offset instead — every observed H4 and H12 bar, across two
+  symbols, opened one hour into its own grid, and every D1 bar at 21:00 UTC. A consumer that
+  floors a timestamp by the period to find a boundary is therefore correct up to H1 and wrong
+  from H4 up; take the open time the venue sends instead.
+
+**Unconfirmed**: whether `fromTimestamp` and `toTimestamp` are inclusive. The paging absorbs
+an inclusive `toTimestamp` harmlessly, since a repeated boundary is de-duplicated. An
+*exclusive* `fromTimestamp` would not be absorbed — the bar at each window's start would be
+lost on every page — which is why this is the first thing to check on a live connection.
+
+**Unconfirmed**: the venue's maximum `count` per request, and whether a maximum span exists at
+all. Neither limit has been reached: 5000 was served in full, and the 400-day window was
+answered without complaint by a page that simply stopped at its `count`. `INCORRECT_BOUNDARIES`
+exists in the schema but has never been seen, so a span cap may sit above the spans asked for,
+or may be enforced only by truncation. Both show up as a page that did not reach its window's
+start, which the paging already handles.
+
+## 9. A known inconsistency: `maintenanceEndTimestamp`
 
 The API has two error message types, and they document the same field name in two different
 units: `maintenanceEndTimestamp` is in milliseconds on `ProtoErrorRes`, and in seconds on

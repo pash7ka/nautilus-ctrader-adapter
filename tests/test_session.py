@@ -265,7 +265,7 @@ async def test_unsolicited_events_reach_the_event_handler() -> None:
     session = _session(server)
     seen: list[object] = []
     try:
-        session.set_event_handler(seen.append)
+        session.add_event_handler(oa.ProtoOASpotEvent, seen.append)
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
 

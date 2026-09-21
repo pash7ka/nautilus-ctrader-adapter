@@ -4,10 +4,11 @@ A [cTrader Open API](https://help.ctrader.com/open-api/) adapter for
 [NautilusTrader](https://github.com/nautechsystems/nautilus_trader): market data and order
 execution against any broker that exposes cTrader Open API.
 
-> **Status: early development (pre-alpha).** The transport layer is in place and tested
-> offline; the instrument provider, data client and execution client come next. The public API
-> is not stable, there is no PyPI release yet, and nothing here should be pointed at a live
-> account yet. See [Roadmap](#roadmap).
+> **Status: early development (pre-alpha).** The transport layer, the instrument provider and
+> the market data client are in place and tested offline; the execution client comes next. The
+> public API is not stable and there is no PyPI release yet. Nothing here trades: the adapter
+> sends no orders at all, and the scripts that do connect to a real account only read from it.
+> See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -89,25 +90,36 @@ never written to logs: the transport logs no payload bytes at all.
 
 ## Usage
 
-> Planned API, subject to change while the package is pre-alpha.
+> Subject to change while the package is pre-alpha. There is no execution client yet.
 
 ```python
-from nautilus_trader.live.node import TradingNode
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.live.config import TradingNodeConfig
+from nautilus_trader.live.node import TradingNode
 
-from nautilus_ctrader import CTRADER, CTraderDataClientConfig, CTraderExecClientConfig
-from nautilus_ctrader.factories import CTraderLiveDataClientFactory, CTraderLiveExecClientFactory
+from nautilus_ctrader import CTRADER, CTraderDataClientConfig, CTraderLiveDataClientFactory
 
 config = TradingNodeConfig(
-    data_clients={CTRADER: CTraderDataClientConfig(demo=True)},
-    exec_clients={CTRADER: CTraderExecClientConfig(demo=True)},
+    data_clients={
+        CTRADER: CTraderDataClientConfig(
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            access_token=ACCESS_TOKEN,
+            refresh_token=REFRESH_TOKEN,
+            account_id=ACCOUNT_ID,
+            instrument_provider=InstrumentProviderConfig(load_ids=frozenset(["EURUSD.CTRADER"])),
+        ),
+    },
 )
 
 node = TradingNode(config=config)
 node.add_data_client_factory(CTRADER, CTraderLiveDataClientFactory)
-node.add_exec_client_factory(CTRADER, CTraderLiveExecClientFactory)
 node.build()
 ```
+
+`account_id` is the account's `ctidTraderAccountId`; the host is chosen from the account's own
+live flag unless `environment` says otherwise. To persist the tokens the adapter refreshes
+while it runs, see [docs/market_data.md](docs/market_data.md).
 
 ## Protocol notes
 
@@ -123,11 +135,11 @@ node.build()
   re-established.
 - Outbound requests are rate-limited, with a separate and much tighter budget for historical
   data requests.
-- Volumes are not expressed in lots, and monetary values carry an explicit digit scale
-  (`moneyDigits`). Getting a scale factor wrong is the most expensive mistake available in
-  this API. None of that conversion exists yet: when it is built, each converter will be
-  checked against a recorded real response, and scaling verified against a live account with
-  a minimum-size order, before anything else is trusted.
+- Volumes are not expressed in lots but in cents of a unit, prices are integers in 1/100000 of
+  a price unit whatever the symbol's decimals, and monetary values carry an explicit digit
+  scale (`moneyDigits`). Getting a scale factor wrong is the most expensive mistake available
+  in this API, so every converter is checked against a recorded real response rather than a
+  hand-built message.
 
 Protobuf message definitions come from Spotware's MIT-licensed
 [openapi-proto-messages](https://github.com/spotware/openapi-proto-messages); the Python
@@ -136,8 +148,11 @@ needs no protoc toolchain. This package does **not** depend on the official
 `ctrader-open-api` SDK at runtime: it is built on Twisted, while NautilusTrader is asyncio,
 and it hard-pins `protobuf==3.20.1`, which conflicts with the rest of a modern stack.
 
-[docs/protocol.md](docs/protocol.md) documents the wire protocol in full, including what is
-still unknown about scaling, the easiest thing to get expensively wrong.
+[docs/protocol.md](docs/protocol.md) documents the wire protocol in full, marking each fact as
+confirmed against a live connection or still unconfirmed.
+[docs/instruments.md](docs/instruments.md) is the symbol-to-instrument mapping, and
+[docs/market_data.md](docs/market_data.md) says what the data client delivers and what it does
+not guarantee.
 
 ## Development
 

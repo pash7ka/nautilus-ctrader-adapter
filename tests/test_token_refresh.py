@@ -308,7 +308,8 @@ async def test_a_late_refresh_reply_never_reaches_the_event_handler() -> None:
     session = _session(server)
     seen: list[object] = []
     try:
-        session.set_event_handler(seen.append)
+        session.add_event_handler(oa.ProtoOARefreshTokenRes, seen.append)
+        session.add_event_handler(oa.ProtoOASpotEvent, seen.append)
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
 
@@ -630,7 +631,10 @@ async def test_an_auth_loss_event_stops_the_session_accepting_requests() -> None
     session = _session(server, backoff_base_secs=0.05)
     states: list[SessionState] = []
     # The handler runs right after the session reacts to the event, before any teardown.
-    session.set_event_handler(lambda _payload: states.append(session.state))
+    session.add_event_handler(
+        oa.ProtoOAAccountDisconnectEvent,
+        lambda _payload: states.append(session.state),
+    )
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
@@ -660,7 +664,7 @@ async def test_an_auth_loss_during_bring_up_is_reported_without_a_stale_error() 
         backoff_base_secs=0.05,
     )
     seen: list[object] = []
-    session.set_event_handler(seen.append)
+    session.add_event_handler(oa.ProtoOAAccountDisconnectEvent, seen.append)
     attempts: list[int] = []
 
     async def restore() -> None:

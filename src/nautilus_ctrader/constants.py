@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from nautilus_trader.model.identifiers import Venue
 
+from nautilus_ctrader.messages import OpenApiMessages_pb2 as _oa
+
 CTRADER: str = "CTRADER"
 CTRADER_VENUE: Venue = Venue(CTRADER)
 
@@ -40,12 +42,22 @@ CONNECT_TIMEOUT_SECS: float = 10.0
 BUCKET_DEFAULT: str = "default"
 BUCKET_HISTORICAL: str = "historical"
 
-# TODO(verify): their SDK defaults to 5 messages/second overall, while prose documentation
-# quotes ~50 requests/second general with a much lower historical budget. A live connection
-# returning BLOCKED_PAYLOAD_TYPE with retryAfter under load settles the real figures. Until
-# then these stay at the SDK's conservative default.
-DEFAULT_RATE_LIMIT_PER_SEC: float = 5.0
-HISTORICAL_RATE_LIMIT_PER_SEC: float = 1.0
+# Documented figures (50/s general, 5/s historical per connection); M1 used 5/1 as
+# placeholders. TODO(verify): a live BLOCKED_PAYLOAD_TYPE with retryAfter under load settles
+# the real figures.
+DEFAULT_RATE_LIMIT_PER_SEC: float = 50.0
+HISTORICAL_RATE_LIMIT_PER_SEC: float = 5.0
+
+# Payload types that `CTraderSession.request()` defaults to the historical bucket for; an
+# explicit `bucket` argument still overrides this.
+HISTORICAL_PAYLOAD_TYPES: frozenset[type] = frozenset(
+    {_oa.ProtoOAGetTrendbarsReq, _oa.ProtoOAGetTickDataReq},
+)
+
+# Confirmed live: 100 ids in one request are accepted and all 100 symbols come back.
+# TODO(verify): where the venue's own limit actually sits, which is still unknown -
+# only that it is at least this batch.
+SYMBOL_BY_ID_BATCH: int = 100
 
 # Refresh this far ahead of the access token's expiry. Several times the minimum refresh
 # interval, so a failed attempt can be retried before the token lapses.
