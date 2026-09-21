@@ -69,10 +69,17 @@ get_tokens = importlib.util.module_from_spec(_GET_TOKENS_SPEC)
 sys.modules[_GET_TOKENS_SPEC.name] = get_tokens
 _GET_TOKENS_SPEC.loader.exec_module(get_tokens)
 
+# Two substitutions the fixture cannot do without: `ctidTraderAccountId` is `required` and the
+# fake server routes on it, so it needs a distinct non-zero value, and `accessToken` is
+# `required` in five messages, where a self-describing string reads better than an empty one.
 FAKE_ACCOUNT_ID = 1_000_001
-FAKE_TRADER_LOGIN = 2_000_002
 FAKE_TOKEN = "scrubbed-token"
-FAKE_BALANCE = 1_000_000
+
+# Reached only by the by-type sweep at the end of `_scrub_in_place`, for a real trader login
+# found in an int64/uint64 field this script does not know by name. `traderLogin` itself is
+# cleared, so nothing is expected to use this; it exists because such an unknown field may be
+# `required`, and the sweep therefore cannot clear what it finds.
+FAKE_TRADER_LOGIN = 2_000_002
 
 SYMBOLS = ("EURUSD", "XAUUSD", "GER40.cash", "US100.cash")
 SPOT_RECORD_SECS = 150.0  # covers at least one M1 bar-to-bar transition
@@ -92,13 +99,16 @@ _CLEARED_FIELDS = frozenset(
         "ibBonus",
         "nonWithdrawableBonus",
         "registrationTimestamp",
+        "traderLogin",
         # When the account last traded and was last credited: no name, but the pair dates one
         # real account.
         "lastClosingDealTimestamp",
         "lastBalanceUpdateTimestamp",
-        # Broker-authored holiday names, descriptions and a schedule time zone. Nothing the
-        # protocol tests need, and between them they identify one broker's calendar.
+        # Broker-authored calendar data: holiday names and descriptions, and the time zone a
+        # symbol's trading schedule is expressed in. Nothing the protocol tests need, and
+        # between them they identify one broker's calendar.
         "holiday",
+        "scheduleTimeZone",
     }
 )
 
@@ -126,9 +136,9 @@ def _varint(n: int) -> bytes:
 
 
 # proto2 `required` fields cannot just be cleared: an unset required field makes the whole
-# message fail SerializeToString(). Cleared fields that turn out to be required get one of
-# these fixed fake values instead (0 for any not listed here) so the message stays valid.
-_FAKE_REQUIRED_VALUES: dict[str, object] = {"balance": FAKE_BALANCE}
+# message fail SerializeToString(). A cleared field that turns out to be required is therefore
+# set to 0 instead, or to a value named here for the rare one where 0 will not do.
+_FAKE_REQUIRED_VALUES: dict[str, object] = {}
 
 
 class ScrubError(RuntimeError):
@@ -139,16 +149,15 @@ def scrub(message: Message, real_account_id: int, real_login: int | None) -> Mes
     """Return a scrubbed copy of `message`.
 
     Recursively walks every field of a `CopyFrom` copy: any int64/uint64 field named
-    `ctidTraderAccountId` becomes `FAKE_ACCOUNT_ID`, `traderLogin` becomes `FAKE_TRADER_LOGIN`,
-    `accessToken`/`refreshToken` become `FAKE_TOKEN`, and `_CLEARED_FIELDS` are cleared -
-    wherever any of these occur, at any nesting depth, and whether the cleared field is a
-    scalar or a whole submessage. A `_CLEARED_FIELDS` entry that is `required` in the schema
-    is set to a fake value instead of cleared, since an unset required field would make the
-    message fail to serialize. As a second pass, independent of
-    field name, any other int64/uint64 scalar still carrying exactly `real_account_id` or
-    `real_login` is replaced too - including each element of a repeated int64/uint64 field -
-    so a field this function does not yet know the name of can never carry a real identifier
-    through unnoticed.
+    `ctidTraderAccountId` becomes `FAKE_ACCOUNT_ID`, `accessToken`/`refreshToken` become
+    `FAKE_TOKEN`, and `_CLEARED_FIELDS` are cleared - wherever any of these occur, at any
+    nesting depth, and whether the cleared field is a scalar or a whole submessage. A
+    `_CLEARED_FIELDS` entry that is `required` in the schema is zeroed instead of cleared,
+    since an unset required field would make the message fail to serialize. As a
+    second pass, independent of field name, any other int64/uint64 scalar still carrying
+    exactly `real_account_id` or `real_login` is replaced too - including each element of a
+    repeated int64/uint64 field - so a field this function does not yet know the name of can
+    never carry a real identifier through unnoticed.
     """
     result = type(message)()
     result.CopyFrom(message)
@@ -162,8 +171,8 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
         # Before the message branch below, so a cleared field can be a nested message too.
         if name in _CLEARED_FIELDS:
             if field.label == FieldDescriptor.LABEL_REQUIRED:
-                # Clearing would leave it unset and break serialization; give it a fake value
-                # that still satisfies the required-field constraint instead.
+                # Clearing would leave it unset and break serialization; zero it instead, so
+                # it stays present without carrying an invented value.
                 setattr(message, name, _FAKE_REQUIRED_VALUES.get(name, 0))
             else:
                 message.ClearField(name)
@@ -177,10 +186,10 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
 
         if name == "ctidTraderAccountId":
             setattr(message, name, FAKE_ACCOUNT_ID)
-        elif name == "traderLogin":
-            setattr(message, name, FAKE_TRADER_LOGIN)
         elif name in ("accessToken", "refreshToken"):
             setattr(message, name, FAKE_TOKEN)
+        # The safety net for fields not named above: substituted rather than cleared, because
+        # an unknown field may be `required`.
         elif field.type in _IDENTIFYING_INT_TYPES:
             if field.label == FieldDescriptor.LABEL_REPEATED:
                 for i, item in enumerate(value):

@@ -253,7 +253,10 @@ async def test_account_details_never_reach_the_log() -> None:
     text = "\n".join(message for _level, message in logger.lines)
     assert str(ACCOUNT_ID) not in text
     for entry in RECORDED["account_list"][0].ctidTraderAccount:
-        assert str(entry.traderLogin) not in text
+        # Both are scrubbed out of the fixture, so these only fire on a recording that still
+        # carries them; an unset `traderLogin` reads back as 0, which any log line may contain.
+        if entry.HasField("traderLogin"):
+            assert str(entry.traderLogin) not in text
         if entry.brokerTitleShort:
             assert entry.brokerTitleShort not in text
 

@@ -116,6 +116,23 @@ def test_info_has_every_key_and_round_trips_through_to_dict(name: str) -> None:
     assert type(i).from_dict(type(i).to_dict(i)).info == i.info
 
 
+def test_schedule_time_zone_reaches_info() -> None:
+    """The one `info` key the recorded symbols cannot exercise with a value.
+
+    `scheduleTimeZone` is scrubbed out of the fixture as broker calendar data, and the fixture
+    holds recorded data only - so the populated example of this optional field lives here, as a
+    synthetic value set by hand on a copy of a recorded spec.
+    """
+    light = LIGHT["EURUSD"]
+    spec = om.ProtoOASymbol()
+    spec.CopyFrom(SPECS[light.symbolId])
+    spec.scheduleTimeZone = "Etc/UTC"
+
+    instrument = parsing.instrument_from_symbol(spec, light, ASSETS, {}, ts_init=0)
+
+    assert instrument.info["schedule_time_zone"] == "Etc/UTC"
+
+
 def test_price_from_raw_is_exact_or_refuses() -> None:
     assert parsing.price_from_raw(114_830, 5) == Price.from_str("1.14830")
     assert parsing.price_from_raw(2_528_164_000, 2) == Price.from_str("25281.64")

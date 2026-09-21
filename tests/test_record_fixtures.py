@@ -74,6 +74,7 @@ def _symbol() -> oa.ProtoOASymbolByIdRes:
                 symbolId=1,
                 digits=5,
                 pipPosition=4,
+                scheduleTimeZone="Europe/Somewhere",
                 holiday=[
                     om.ProtoOAHoliday(
                         holidayId=7,
@@ -94,7 +95,6 @@ def test_scrub_replaces_ids_and_removes_personal_fields() -> None:
     t = scrubbed.trader
     assert scrubbed.ctidTraderAccountId == record_fixtures.FAKE_ACCOUNT_ID
     assert t.ctidTraderAccountId == record_fixtures.FAKE_ACCOUNT_ID
-    assert t.traderLogin == record_fixtures.FAKE_TRADER_LOGIN
     for field in (
         "balanceVersion",
         "managerBonus",
@@ -102,17 +102,18 @@ def test_scrub_replaces_ids_and_removes_personal_fields() -> None:
         "nonWithdrawableBonus",
         "brokerName",
         "registrationTimestamp",
+        "traderLogin",
     ):
         assert not t.HasField(field), field
     assert t.moneyDigits == 2 and t.accountType == om.HEDGED
 
 
-def test_scrub_fakes_the_required_balance_field_instead_of_clearing_it() -> None:
+def test_scrub_zeroes_the_required_balance_field_instead_of_clearing_it() -> None:
     """`balance` is `required` in the schema; clearing it (like the other personal fields)
-    would make the message fail to serialize, so it must be set to a fixed fake value."""
+    would make the message fail to serialize, so it stays present and is set to zero."""
     scrubbed = record_fixtures.scrub(_trader(), REAL_ACCOUNT, REAL_LOGIN)
     assert scrubbed.trader.HasField("balance")
-    assert scrubbed.trader.balance == record_fixtures.FAKE_BALANCE
+    assert scrubbed.trader.balance == 0
 
 
 def test_scrub_account_list_drops_token_and_broker_title() -> None:
@@ -120,18 +121,18 @@ def test_scrub_account_list_drops_token_and_broker_title() -> None:
     assert s.accessToken == record_fixtures.FAKE_TOKEN
     a = s.ctidTraderAccount[0]
     assert a.ctidTraderAccountId == record_fixtures.FAKE_ACCOUNT_ID
-    assert a.traderLogin == record_fixtures.FAKE_TRADER_LOGIN
     assert not a.HasField("brokerTitleShort")
-    for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp"):
+    for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp", "traderLogin"):
         assert not a.HasField(field), field
     assert a.isLive is True
 
 
-def test_scrub_clears_the_brokers_holiday_schedule() -> None:
+def test_scrub_clears_the_brokers_calendar() -> None:
     """A cleared field can be a whole repeated submessage, not only a scalar."""
     scrubbed = record_fixtures.scrub(_symbol(), REAL_ACCOUNT, REAL_LOGIN)
     symbol = scrubbed.symbol[0]
     assert not symbol.holiday
+    assert not symbol.HasField("scheduleTimeZone")
     assert (symbol.digits, symbol.pipPosition) == (5, 4)
 
 
@@ -189,8 +190,10 @@ def _recorded_under_the_old_rules() -> bytes:
     account = account_list.ctidTraderAccount[0]
     account.lastClosingDealTimestamp = 1_700_000_000_000
     account.lastBalanceUpdateTimestamp = 1_700_000_000_000
+    account.traderLogin = record_fixtures.FAKE_TRADER_LOGIN
     symbol_specs = record_fixtures.scrub(_symbol(), REAL_ACCOUNT, REAL_LOGIN)
     symbol_specs.symbol[0].holiday.extend(_symbol().symbol[0].holiday)
+    symbol_specs.symbol[0].scheduleTimeZone = _symbol().symbol[0].scheduleTimeZone
     return json.dumps(
         {
             "account_list": [record_fixtures._encode(account_list)],
@@ -214,14 +217,15 @@ def test_rescrub_removes_what_the_current_rules_clear() -> None:
         rescrubbed["account_list"][0],
     )
     account = account_list.ctidTraderAccount[0]
-    for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp"):
+    for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp", "traderLogin"):
         assert not account.HasField(field), field
-    assert not _parse(oa.ProtoOASymbolByIdRes, rescrubbed["symbol_specs"][0]).symbol[0].holiday
+    symbol = _parse(oa.ProtoOASymbolByIdRes, rescrubbed["symbol_specs"][0]).symbol[0]
+    assert not symbol.holiday
+    assert not symbol.HasField("scheduleTimeZone")
 
     # The values the original scrub installed survive the replay untouched.
     assert account_list.accessToken == record_fixtures.FAKE_TOKEN
     assert account.ctidTraderAccountId == record_fixtures.FAKE_ACCOUNT_ID
-    assert account.traderLogin == record_fixtures.FAKE_TRADER_LOGIN
     assert account.isLive is True
 
 
@@ -261,11 +265,17 @@ def test_recorded_fixtures_are_scrubbed_and_complete() -> None:
         "account_list",
     ):
         assert rec[key], key
-    assert rec["trader"][0].trader.ctidTraderAccountId == FAKE_ACCOUNT_ID
-    assert not rec["trader"][0].trader.HasField("brokerName")
-    assert not any(s.holiday for m in rec["symbol_specs"] for s in m.symbol)
+    trader = rec["trader"][0].trader
+    assert trader.ctidTraderAccountId == FAKE_ACCOUNT_ID
+    assert not trader.HasField("brokerName")
+    assert not trader.HasField("traderLogin")
+    # `required`, so present rather than cleared - but carrying no invented number.
+    assert trader.HasField("balance") and trader.balance == 0
+    for symbol in (s for m in rec["symbol_specs"] for s in m.symbol):
+        assert not symbol.holiday
+        assert not symbol.HasField("scheduleTimeZone")
     for account in rec["account_list"][0].ctidTraderAccount:
-        for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp"):
+        for field in ("lastClosingDealTimestamp", "lastBalanceUpdateTimestamp", "traderLogin"):
             assert not account.HasField(field), field
     m1 = [
         tb.utcTimestampInMinutes
