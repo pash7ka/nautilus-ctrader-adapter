@@ -36,9 +36,9 @@ A bar's `ts_event` is the end of the period it covers: the open time the venue g
 plus the period. A 15-minute bar covering 09:00–09:15 carries `ts_event = 09:15`.
 
 That open time is used exactly as sent and is never rounded to a multiple of the period, because
-a period's boundaries are not necessarily aligned to midnight: a daily bar opens at 21:00 UTC,
-covering the venue's trading day rather than a calendar day. Rounding it would put every daily
-bar on the wrong day.
+a period's boundaries are not necessarily aligned to midnight: a daily bar covers the venue's
+trading day rather than a calendar day, opening at 21:00 or 22:00 UTC depending on the time of
+year. Rounding it would put every daily bar on the wrong day.
 
 The venue timestamps a bar with its *opening tick*. On the intraday periods that has always been
 the period boundary itself; an open time that is not one is logged and published as it came,
