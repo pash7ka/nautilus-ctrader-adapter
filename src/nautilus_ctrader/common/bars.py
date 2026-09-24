@@ -84,6 +84,9 @@ class BarCloser:
     - No boundary before the bar forming at construction is ever emitted.
     - `close()` stops all of it permanently.
 
+    Where this period's boundaries fall is learnt from the bars seen, never assumed: see
+    `_observe()`.
+
     `on_update`, `mark_emitted`, `close` and the clock's timer callbacks must run on the event
     loop thread: queueing a boundary may start the resolver task.
 
@@ -115,8 +118,9 @@ class BarCloser:
         # `boundary + period > now`, and the bar forming at construction is the first one this
         # subscription owns. Stated as that bound rather than as a floored boundary because a
         # period's boundaries need not be aligned to the Unix epoch: a daily bar opens at
-        # 21:00 UTC, and flooring dropped it as too old for most of its own day.
+        # 21:00 or 22:00 UTC, and flooring dropped it as too old for most of its own day.
         self._floor = int(clock.now()) - period_secs + 1
+        self._phase: int | None = None
         self._last_emitted: int | None = None
         self._current: RawBar | None = None
         self._timer: asyncio.TimerHandle | Any | None = None
@@ -136,6 +140,7 @@ class BarCloser:
         return self._last_emitted
 
     def mark_emitted(self, boundary_secs: int) -> None:
+        self._observe(boundary_secs)
         if self._last_emitted is None or boundary_secs > self._last_emitted:
             self._last_emitted = boundary_secs
         while self._queue and self._is_covered(self._queue[0].boundary):
@@ -144,8 +149,11 @@ class BarCloser:
             self._drained.set()
 
     def on_update(self, bar: RawBar) -> None:
+        if self._closed:
+            return
         boundary = bar.boundary_secs
-        if self._closed or boundary < self._floor or self._is_covered(boundary):
+        self._observe(boundary)
+        if boundary < self._floor or self._is_covered(boundary):
             return
         if self._holding:
             self._held = bar
@@ -205,6 +213,8 @@ class BarCloser:
           are genuinely empty periods and are not retried.
         - After a capped final fetch, every boundary that closed while it ran is also queued
           for history alone, since no fetch covered it.
+        - Until a bar has settled where this period's boundaries fall, that last step is skipped
+          rather than run on a guessed boundary.
         - Stream updates are held meanwhile; the latest is replayed afterwards.
         """
         if self._closed:
@@ -220,17 +230,10 @@ class BarCloser:
         # can be asked for now. Done here because the rounds below may enqueue nothing.
         self._pump()
         try:
-            end, capped = await self._backfill_rounds(fetch_range)
+            end = await self._backfill_rounds(fetch_range)
             if self._closed:
                 return
-            newest = self._last_closed_boundary() if capped else end
-            for boundary in range(end, newest + 1, self._period):
-                self._enqueue(boundary, None, needs_history=True)
-            if newest > end:
-                self._log.debug(
-                    f"{self._label}: queued {(newest - end) // self._period} bars that closed "
-                    "during the final backfill fetch for history"
-                )
+            self._queue_tail(end)
         finally:
             self._holding = False
             self._baseline = True
@@ -240,16 +243,16 @@ class BarCloser:
 
     async def _backfill_rounds(
         self, fetch_range: Callable[[int, int], Awaitable[list[RawBar]]]
-    ) -> tuple[int, bool]:
-        """Run the fetch rounds; return the last `end` fetched up to and whether the cap hit."""
+    ) -> int:
+        """Run the fetch rounds; return the last `end` fetched up to."""
         rounds = 0
         while True:
             end = self._last_closed_boundary()
             if not await self._fetch_and_drain(fetch_range, end) or self._closed:
-                return end, False
+                return end
             rounds += 1
             if self._last_closed_boundary() <= end:
-                return end, False
+                return end
             if rounds >= _MAX_BACKFILL_ROUNDS:
                 self._log.warning(
                     f"{self._label}: history fetch is slower than the bar period; "
@@ -257,7 +260,28 @@ class BarCloser:
                 )
                 end = self._last_closed_boundary()
                 await self._fetch_and_drain(fetch_range, end)
-                return end, True
+                return end
+
+    def _queue_tail(self, end: int) -> None:
+        """Queue for history alone every closed boundary the fetches may not have covered.
+
+        That is the newest closed boundary, which history can lag by seconds, and anything that
+        closed during a capped final fetch. While no bar has settled where this period's
+        boundaries fall, nothing is queued: an entry for a boundary that never existed can only
+        resolve to nothing, and the first bar seen settles the phase within a period.
+        """
+        if self._phase is None:
+            return
+        newest = self._last_closed_boundary()
+        # `end` may have been computed before a bar settled the phase, so snap it back onto it.
+        first = min(self._floor_boundary(end), newest)
+        for boundary in range(first, newest + 1, self._period):
+            self._enqueue(boundary, None, needs_history=True)
+        if newest > first:
+            self._log.debug(
+                f"{self._label}: queued {(newest - first) // self._period} bars that closed "
+                "during the final backfill fetch for history"
+            )
 
     async def _fetch_and_drain(
         self, fetch_range: Callable[[int, int], Awaitable[list[RawBar]]], end: int
@@ -275,6 +299,7 @@ class BarCloser:
         if self._closed:
             return True
         for bar in sorted(bars, key=lambda b: b.boundary_secs):
+            self._observe(bar.boundary_secs)
             if start <= bar.boundary_secs <= end:
                 self._enqueue(bar.boundary_secs, bar, needs_history=False)
         await self._wait_drained()
@@ -303,16 +328,31 @@ class BarCloser:
                 f"{bound_secs} s; continuing the backfill"
             )
 
+    def _observe(self, boundary_secs: int) -> None:
+        """Take a real boundary as evidence of where this period's boundaries fall.
+
+        The venue's trading day rolls at a fixed hour of a US time zone, so a period that does
+        not divide that offset opens at an offset into its own grid rather than on a multiple of
+        itself - and that offset moves by an hour with US daylight saving. It is therefore read
+        from every bar seen and replaced whenever one disagrees, never configured. A
+        disagreement is that shift, which needs no reaction.
+        """
+        phase = boundary_secs % self._period
+        if phase == self._phase:
+            return
+        if self._phase is not None:
+            self._log.info(
+                f"{self._label}: bar boundaries moved from {self._phase} s to {phase} s "
+                "into the period (the trading day's offset changed)"
+            )
+        self._phase = phase
+
     def _floor_boundary(self, t: float) -> int:
-        return (int(t) // self._period) * self._period
+        """The newest boundary at or before `t`; epoch-aligned while no bar has settled it."""
+        phase = 0 if self._phase is None else self._phase
+        return ((int(t) - phase) // self._period) * self._period + phase
 
     def _last_closed_boundary(self) -> int:
-        # TODO(verify): whether any period this adapter supports has boundaries the venue does
-        # not align to the Unix epoch beyond the daily 21:00 open. For such a period this lands
-        # between two real boundaries, so `backfill` asks history for a bar that never existed
-        # and leaves the genuinely closed one to the stream, delaying its first close by a
-        # period. Learning a period's phase from the bars themselves would settle it, and is a
-        # design decision rather than part of this fix.
         return self._floor_boundary(self._clock.now()) - self._period
 
     def _is_covered(self, boundary: int) -> bool:
@@ -424,12 +464,14 @@ class BarCloser:
                 self._log.debug(f"{self._label}: history request failed ({e!r})")
                 continue
             error = None
-            if result is not None and result.boundary_secs != boundary:
-                self._log.debug(
-                    f"{self._label}: history returned a bar for {result.boundary_secs}, "
-                    f"expected {boundary}; treating it as no bar"
-                )
-                result = None
+            if result is not None:
+                self._observe(result.boundary_secs)
+                if result.boundary_secs != boundary:
+                    self._log.debug(
+                        f"{self._label}: history returned a bar for {result.boundary_secs}, "
+                        f"expected {boundary}; treating it as no bar"
+                    )
+                    result = None
             if result is not None:
                 return result
         if not self._wanted(pending):

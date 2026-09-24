@@ -1199,3 +1199,152 @@ async def test_on_disconnect_drops_a_held_update() -> None:
     closer.on_update(s(240))  # the baseline on the new connection
     closer.on_update(s(300))
     assert emitted == [h(60), h(120), s(240)]
+
+
+# --- Periods that carry the trading day's offset -------------------------------------------------
+
+# The venue's trading day rolls at a fixed hour of a US time zone, so a period that does not
+# divide that offset opens at an offset into its own grid instead of on a multiple of itself, and
+# that offset moves by an hour with US daylight saving. H4 is the shortest such period.
+H4 = 4 * 3600
+OFFSET = 3600  # while the trading day starts 21 hours into the UTC day
+OFFSET_MOVED = 2 * 3600  # ... and 22 hours after the transition
+B0 = T0 + OFFSET  # a real H4 boundary: T0 itself is a multiple of H4
+
+
+class ShiftedHistory:
+    """History for a period whose boundaries carry the trading day's offset.
+
+    The real boundaries are listed by the test rather than derived, so the offset can move
+    partway through as daylight saving moves it. A bar is served once it has been closed for
+    `lag` seconds.
+    """
+
+    def __init__(self, clock: FakeClock, boundaries: list[int], lag: float = 0.0) -> None:
+        self._clock = clock
+        self._boundaries = sorted(boundaries)
+        self._lag = lag
+        self.calls: list[int] = []
+        self.range_calls: list[tuple[int, int]] = []
+
+    def _served(self, boundary: int) -> bool:
+        return boundary in self._boundaries and boundary + H4 + self._lag <= self._clock.now()
+
+    async def fetch(self, boundary_secs: int) -> RawBar | None:
+        self.calls.append(boundary_secs)
+        return bar(boundary_secs, tag="h") if self._served(boundary_secs) else None
+
+    async def fetch_range(self, start: int, end: int) -> list[RawBar]:
+        self.range_calls.append((start, end))
+        return [bar(b, tag="h") for b in self._boundaries if start <= b <= end and self._served(b)]
+
+
+def make_shifted_closer(clock, fetch, emitted: list[RawBar], logger: RecordingLogger) -> BarCloser:
+    return BarCloser(
+        period_secs=H4,
+        grace_secs=GRACE,
+        history_retries=RETRIES,
+        clock=clock,
+        fetch=fetch,
+        emit=emitted.append,
+        logger=logger,
+        label="H4",
+    )
+
+
+def boundaries_of(emitted: list[RawBar]) -> list[int]:
+    return [b.boundary_secs for b in emitted]
+
+
+def infos_of(logger: RecordingLogger) -> list[str]:
+    return [line for level, line in logger.lines if level == "info"]
+
+
+async def test_a_shifted_period_learns_its_phase_and_asks_history_for_a_real_boundary() -> None:
+    clock = FakeClock(B0 + 10)
+    hist = ShiftedHistory(clock, [B0 - H4, B0, B0 + H4], lag=30)
+    emitted: list[RawBar] = []
+    closer = make_shifted_closer(clock, hist.fetch, emitted, RecordingLogger())
+
+    clock.t = B0 + 2 * H4 + 10  # B0+H4 closed 10 s ago, so history does not have it yet
+    await closer.backfill(hist.fetch_range)
+
+    # The first range is asked for on the epoch-aligned fallback, whose `end` falls between two
+    # real boundaries. The bar it serves settles the phase, and the rest follows that.
+    assert hist.range_calls[0][1] == T0 + H4  # not a boundary of this period
+    assert hist.range_calls[-1] == (B0 + H4, B0 + H4)
+    assert emitted == [bar(B0, tag="h")]
+
+    await clock.advance(0)
+    await clock.advance(GRACE)
+    await clock.advance(GRACE)
+
+    assert hist.calls == [B0 + H4] * 3  # the tail retry, for a boundary that exists
+    assert emitted == [bar(B0, tag="h")]
+    closer.close()
+
+
+async def test_a_daylight_saving_transition_moves_the_phase_and_loses_no_bar() -> None:
+    moved = B0 + 2 * H4 + OFFSET_MOVED - OFFSET  # the first boundary after the offset moves
+    clock = FakeClock(B0 + 10)
+    hist = ShiftedHistory(clock, [B0, B0 + H4, moved, moved + H4])
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+    closer = make_shifted_closer(clock, hist.fetch, emitted, logger)
+
+    closer.on_update(bar(B0, tag="s"))
+    await clock.advance(H4 - 5)  # B0 has closed; its timer resolves it from history
+    closer.on_update(bar(B0 + H4, tag="s"))
+    await clock.advance(H4)  # B0+H4 closes the same way
+
+    assert boundaries_of(emitted) == [B0, B0 + H4]
+
+    # The offset moves an hour, so the next bar opens an hour later than the old phase says.
+    # Nothing opens meanwhile and nothing is invented for the boundary that never existed.
+    await clock.advance(OFFSET_MOVED - OFFSET)
+    assert boundaries_of(emitted) == [B0, B0 + H4]
+
+    closer.on_update(bar(moved, tag="s"))
+    await clock.advance(H4)
+
+    assert boundaries_of(emitted) == [B0, B0 + H4, moved]
+    assert infos_of(logger) == [
+        "H4: bar boundaries moved from 3600 s to 7200 s into the period "
+        "(the trading day's offset changed)"
+    ]
+
+    # A reconnect now works out what has closed on the new phase, not the old one.
+    clock.t = moved + 2 * H4 + 10
+    closer.on_disconnect()
+    await closer.backfill(hist.fetch_range)
+
+    assert hist.range_calls == [(moved + H4, moved + H4)]
+    assert boundaries_of(emitted) == [B0, B0 + H4, moved, moved + H4]
+    assert hist.calls == [B0, B0 + H4, moved]  # never a boundary that did not exist
+
+
+async def test_with_no_phase_observed_the_backfill_tail_asks_for_nothing() -> None:
+    clock = FakeClock(B0 + 10)
+    emitted: list[RawBar] = []
+    calls: list[int] = []
+    range_calls: list[tuple[int, int]] = []
+
+    async def fetch(boundary_secs: int) -> RawBar | None:
+        calls.append(boundary_secs)
+        return None
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        range_calls.append((start, end))
+        return []
+
+    closer = make_shifted_closer(clock, fetch, emitted, RecordingLogger())
+    clock.t = B0 + 2 * H4 + 10
+
+    await closer.backfill(fetch_range)
+    await clock.advance(0)
+    await clock.advance(GRACE)
+    await clock.advance(GRACE)
+
+    assert range_calls == [(B0 + 10 - H4 + 1, T0 + H4)]  # the epoch-aligned fallback, as before
+    assert calls == []  # no bar seen yet, so there is no boundary to ask history about
+    assert emitted == []
