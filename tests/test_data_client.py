@@ -54,6 +54,7 @@ from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoad
 from tests.account_venue import (
     ACCOUNT_ID,
     RECORDED,
+    TRADER_LOGIN,
     HeldReplies,
     account_client,
     received,
@@ -104,7 +105,7 @@ def config(**overrides) -> CTraderDataClientConfig:
         "access_token": "access-token",
         "refresh_token": "refresh-token",
         "token_expires_at": 4_102_444_800.0,
-        "account_id": ACCOUNT_ID,
+        "trader_login": TRADER_LOGIN,
         "instrument_provider": InstrumentProviderConfig(load_ids=frozenset({GER40_ID})),
     }
     values.update(overrides)

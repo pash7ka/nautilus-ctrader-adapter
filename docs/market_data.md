@@ -212,7 +212,7 @@ data_config = CTraderDataClientConfig(
     client_secret=client_secret,
     access_token=access_token,
     refresh_token=refresh_token,
-    account_id=account_id,
+    trader_login=trader_login,
 )
 
 account = account_client_from_config(data_config, Logger("CTRADER"))

@@ -243,12 +243,12 @@ def test_rescrub_preserves_the_recorded_files_shape() -> None:
     assert record_fixtures.rescrub_bytes(after) == after
 
 
-def test_rescrub_mode_takes_no_account_id() -> None:
-    """Nothing to connect with: the offline mode excludes the account id the recording needs."""
+def test_rescrub_mode_takes_no_trader_login() -> None:
+    """Nothing to connect with: the offline mode excludes the login the recording needs."""
     args = record_fixtures._build_arg_parser().parse_args(["--rescrub"])
-    assert args.rescrub and args.account_id is None
+    assert args.rescrub and args.trader_login is None
     with pytest.raises(SystemExit):
-        record_fixtures._build_arg_parser().parse_args(["--rescrub", "--account-id", "1"])
+        record_fixtures._build_arg_parser().parse_args(["--rescrub", "--trader-login", "1"])
 
 
 def test_recorded_fixtures_are_scrubbed_and_complete() -> None:

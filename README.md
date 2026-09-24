@@ -84,10 +84,10 @@ writes the resulting tokens back into it, and lists the accounts the token grant
 application's redirect URI must be `http://localhost:8080/callback`, or whatever
 `--redirect-uri` says.
 
-The account a client is configured with is the `ctidTraderAccountId` from that listing, **not**
-the account number the cTrader interface shows — that one is the `traderLogin`, a different
-identifier of similar length. Authenticating with the login is refused as if the token did not
-grant the account at all, which is a confusing way to find out.
+A client is configured with the `traderLogin` from that listing — the account number your
+broker gave you, the one the cTrader interface shows. The protocol itself addresses an
+account by its `ctidTraderAccountId`, a different identifier of similar length; the adapter
+looks that one up from the accounts the token grants and uses it for every request.
 
 The adapter receives these values from the host application (environment variables or a
 token store you control). `clientSecret` and both tokens are treated as secrets and are
@@ -111,7 +111,7 @@ config = TradingNodeConfig(
             client_secret=CLIENT_SECRET,
             access_token=ACCESS_TOKEN,
             refresh_token=REFRESH_TOKEN,
-            account_id=ACCOUNT_ID,
+            trader_login=TRADER_LOGIN,
             instrument_provider=InstrumentProviderConfig(load_ids=frozenset(["EURUSD.CTRADER"])),
         ),
     },
@@ -122,7 +122,7 @@ node.add_data_client_factory(CTRADER, CTraderLiveDataClientFactory)
 node.build()
 ```
 
-`account_id` is the account's `ctidTraderAccountId`; the host is chosen from the account's own
+`trader_login` is the broker's own account number; the host is chosen from the account's own
 live flag unless `environment` says otherwise. To persist the tokens the adapter refreshes
 while it runs, see [docs/market_data.md](docs/market_data.md).
 

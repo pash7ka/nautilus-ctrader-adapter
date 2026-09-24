@@ -11,10 +11,11 @@ anywhere in this module. Subscriptions taken here are released before the connec
 
 Run from the repository root, while the symbols' market is open:
 
-    uv run python scripts/verify_live_data.py --account-id <id> --minutes 5
+    uv run python scripts/verify_live_data.py --trader-login <login> --minutes 5
 
-The account id is passed on the command line and is never printed, in the report or in any
-error message; a venue rejection is reported by error code only, never by its description.
+The trader login is the account number the broker gave you; the `ctidTraderAccountId` every
+request carries is looked up from it. Neither is ever printed, in the report or in any error
+message; a venue rejection is reported by error code only, never by its description.
 
 Exit code is 1 if any item is `DIFFERS` or the run could not start at all, 0 otherwise - an
 `UNKNOWN` item is a probe that could not run, not a failure. One failing probe never stops the
@@ -133,7 +134,7 @@ _MAX_LISTED_DETAILS = 8
 # The spot window plus room for authentication, the history probes and the release of every
 # subscription. A run that overruns this is stuck, not slow, and reports what it already has.
 _RUN_OVERHEAD_SECS = 300.0
-_RESOLVE_HOST_TIMEOUT_SECS = 60.0
+_RESOLVE_ACCOUNT_TIMEOUT_SECS = 60.0
 
 _SECS_PER_HOUR = 3600
 _SECS_PER_DAY = 86_400
@@ -159,7 +160,7 @@ class Finding:
 
 @dataclass(frozen=True)
 class Settings:
-    account_id: int
+    trader_login: int
     symbols: tuple[str, ...]
     minutes: float
     grace_secs: float
@@ -498,9 +499,15 @@ class Verifier:
     everything already decided. A probe that raises records `UNKNOWN` and the next item runs.
     """
 
-    def __init__(self, requester: ReadOnlyRequester, settings: Settings) -> None:
+    def __init__(
+        self,
+        requester: ReadOnlyRequester,
+        settings: Settings,
+        account_id: int,
+    ) -> None:
         self._requester = requester
         self._settings = settings
+        self._account_id = account_id
         self.findings: list[Finding] = []
         self.unresolved_symbols: tuple[str, ...] = ()
         self._symbol_ids: dict[str, int] = {}
@@ -560,7 +567,7 @@ class Verifier:
     async def _load_symbols(self) -> Decision:
         """Item 0. Resolves the requested names and their digits; every later item needs it."""
         listed = await self._request(
-            oa.ProtoOASymbolsListReq(ctidTraderAccountId=self._settings.account_id),
+            oa.ProtoOASymbolsListReq(ctidTraderAccountId=self._account_id),
         )
         by_name = {s.symbolName: s.symbolId for s in listed.symbol}
         self._all_symbol_ids = tuple(s.symbolId for s in listed.symbol if s.enabled)
@@ -576,7 +583,7 @@ class Verifier:
             return UNKNOWN, (offered, "none of the requested symbols is among them")
         specs = await self._request(
             oa.ProtoOASymbolByIdReq(
-                ctidTraderAccountId=self._settings.account_id,
+                ctidTraderAccountId=self._account_id,
                 symbolId=list(self._symbol_ids.values()),
             ),
         )
@@ -606,7 +613,7 @@ class Verifier:
         try:
             await self._request(
                 oa.ProtoOASubscribeLiveTrendbarReq(
-                    ctidTraderAccountId=self._settings.account_id,
+                    ctidTraderAccountId=self._account_id,
                     symbolId=symbol_id,
                     period=om.M1,
                 ),
@@ -617,7 +624,7 @@ class Verifier:
         with contextlib.suppress(Exception):
             await self._request(
                 oa.ProtoOAUnsubscribeLiveTrendbarReq(
-                    ctidTraderAccountId=self._settings.account_id,
+                    ctidTraderAccountId=self._account_id,
                     symbolId=symbol_id,
                     period=om.M1,
                 ),
@@ -711,7 +718,7 @@ class Verifier:
         try:
             response = await self._request(
                 oa.ProtoOASymbolByIdReq(
-                    ctidTraderAccountId=self._settings.account_id,
+                    ctidTraderAccountId=self._account_id,
                     symbolId=batch,
                 ),
             )
@@ -767,7 +774,7 @@ class Verifier:
         try:
             await self._request(
                 oa.ProtoOASubscribeSpotsReq(
-                    ctidTraderAccountId=self._settings.account_id,
+                    ctidTraderAccountId=self._account_id,
                     symbolId=symbol_ids,
                     subscribeToSpotTimestamp=True,
                 ),
@@ -779,7 +786,7 @@ class Verifier:
             for symbol_id in symbol_ids:
                 await self._request(
                     oa.ProtoOASubscribeLiveTrendbarReq(
-                        ctidTraderAccountId=self._settings.account_id,
+                        ctidTraderAccountId=self._account_id,
                         symbolId=symbol_id,
                         period=om.M1,
                     ),
@@ -805,7 +812,7 @@ class Verifier:
             with contextlib.suppress(Exception):
                 await self._request(
                     oa.ProtoOAUnsubscribeLiveTrendbarReq(
-                        ctidTraderAccountId=self._settings.account_id,
+                        ctidTraderAccountId=self._account_id,
                         symbolId=symbol_id,
                         period=om.M1,
                     ),
@@ -813,7 +820,7 @@ class Verifier:
         with contextlib.suppress(Exception):
             await self._request(
                 oa.ProtoOAUnsubscribeSpotsReq(
-                    ctidTraderAccountId=self._settings.account_id,
+                    ctidTraderAccountId=self._account_id,
                     symbolId=list(symbol_ids),
                 ),
             )
@@ -950,7 +957,7 @@ class Verifier:
     ) -> oa.ProtoOAGetTrendbarsRes:
         return await self._request(
             oa.ProtoOAGetTrendbarsReq(
-                ctidTraderAccountId=self._settings.account_id,
+                ctidTraderAccountId=self._account_id,
                 symbolId=symbol_id,
                 period=period,
                 fromTimestamp=from_secs * 1_000,
@@ -1006,9 +1013,13 @@ async def verify(
     tls: bool,
     credentials: Credentials,
     settings: Settings,
+    account_id: int,
     rate_limiter: RateLimiter | None = None,
 ) -> tuple[list[Finding], str]:
     """Authenticate, run every item, and return the findings with the formatted report.
+
+    `account_id` is the `ctidTraderAccountId` `_resolve_account()` read off the account
+    list; `settings.trader_login` is what the caller asked for and is never sent.
 
     The connection is closed whatever happens, and the report is built from whatever was
     decided before an error or the hard time bound cut the run short. `rate_limiter` defaults
@@ -1022,7 +1033,7 @@ async def verify(
         rate_limiter=RateLimiter(_RATE_LIMITS) if rate_limiter is None else rate_limiter,
     )
     requester = ReadOnlyRequester(connection, history_budget=settings.history_budget)
-    verifier = Verifier(requester, settings)
+    verifier = Verifier(requester, settings, account_id)
     await connection.connect()
     try:
         await requester.request(
@@ -1033,7 +1044,7 @@ async def verify(
         )
         await requester.request(
             oa.ProtoOAAccountAuthReq(
-                ctidTraderAccountId=settings.account_id,
+                ctidTraderAccountId=account_id,
                 accessToken=credentials.access_token,
             ),
         )
@@ -1059,31 +1070,32 @@ async def verify(
     return verifier.findings, report
 
 
-def _no_such_account_message(granted, account_id: int) -> str:
+def _no_such_account_message(granted, trader_login: int) -> str:
     """Why the account was not found, naming no identifier.
 
-    The two identifiers are of similar length, and the one the interface shows is the login, so
-    mistaking them is easy and the bare refusal reads as a token problem.
+    The two identifiers are of similar length, and only the login is the account number the
+    interface shows, so giving the other one is easy and the bare refusal reads as a token
+    problem.
     """
-    if any(a.HasField("traderLogin") and a.traderLogin == account_id for a in granted):
+    if any(a.ctidTraderAccountId == trader_login for a in granted):
         return (
-            "the account id given is a traderLogin, not a ctidTraderAccountId; the two are "
-            "different identifiers of similar length, and only the latter authenticates"
+            "the value given is a ctidTraderAccountId, not a traderLogin; expected is the "
+            "account number the cTrader interface shows, which this script resolves itself"
         )
-    return f"the access token does not grant that account id (it grants {len(granted)})"
+    return f"the access token grants no account with that trader login (it grants {len(granted)})"
 
 
-async def _resolve_host(account_id: int, credentials: Credentials) -> str:
-    """The host the account lives on, from its own `isLive` flag.
+async def _resolve_account(trader_login: int, credentials: Credentials) -> tuple[str, int]:
+    """The host the account lives on, and the `ctidTraderAccountId` every request carries.
 
-    The account list is served on either host; only the flag decides where the account itself
-    can be authenticated.
+    The account list is served on either host; it maps the login to the id, and its `isLive`
+    flag decides where the account itself can be authenticated.
     """
     connection = CTraderConnection(DEMO_HOST, PROTOBUF_PORT, logger=QuietLogger())
     requester = ReadOnlyRequester(connection, history_budget=0)
     await connection.connect()
     try:
-        async with asyncio.timeout(_RESOLVE_HOST_TIMEOUT_SECS):
+        async with asyncio.timeout(_RESOLVE_ACCOUNT_TIMEOUT_SECS):
             await requester.request(
                 oa.ProtoOAApplicationAuthReq(
                     clientId=credentials.client_id,
@@ -1095,13 +1107,17 @@ async def _resolve_host(account_id: int, credentials: Credentials) -> str:
             )
     finally:
         await connection.close()
-    account = next(
-        (a for a in listed.ctidTraderAccount if a.ctidTraderAccountId == account_id),
-        None,
-    )
-    if account is None:
-        raise RuntimeError(_no_such_account_message(listed.ctidTraderAccount, account_id))
-    return LIVE_HOST if account.isLive else DEMO_HOST
+    matched = [
+        a
+        for a in listed.ctidTraderAccount
+        if a.HasField("traderLogin") and a.traderLogin == trader_login
+    ]
+    if not matched:
+        raise RuntimeError(_no_such_account_message(listed.ctidTraderAccount, trader_login))
+    if len(matched) > 1:
+        raise RuntimeError("more than one granted account has that trader login")
+    account = matched[0]
+    return (LIVE_HOST if account.isLive else DEMO_HOST), account.ctidTraderAccountId
 
 
 def parse_symbols(text: str) -> tuple[str, ...]:
@@ -1118,7 +1134,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Verify this adapter's market-data assumptions against a live account, read-only."
         ),
     )
-    parser.add_argument("--account-id", type=int, required=True)
+    parser.add_argument(
+        "--trader-login",
+        type=int,
+        required=True,
+        help="the account number the broker gave you, as the cTrader interface shows it",
+    )
     parser.add_argument(
         "--minutes",
         type=float,
@@ -1161,7 +1182,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def settings_from_args(args: argparse.Namespace) -> Settings:
     return Settings(
-        account_id=args.account_id,
+        trader_login=args.trader_login,
         symbols=tuple(args.symbols),
         minutes=args.minutes,
         grace_secs=args.bar_close_grace_secs,
@@ -1176,8 +1197,15 @@ async def _run(settings: Settings, env: dict[str, str]) -> tuple[list[Finding], 
         client_secret=env["CTRADER_CLIENT_SECRET"],
         access_token=env["CTRADER_ACCESS_TOKEN"],
     )
-    host = await _resolve_host(settings.account_id, credentials)
-    return await verify(host, PROTOBUF_PORT, tls=True, credentials=credentials, settings=settings)
+    host, account_id = await _resolve_account(settings.trader_login, credentials)
+    return await verify(
+        host,
+        PROTOBUF_PORT,
+        tls=True,
+        credentials=credentials,
+        settings=settings,
+        account_id=account_id,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -45,7 +45,7 @@ XAUUSD = "XAUUSD"
 
 def settings(**overrides) -> v.Settings:
     values = {
-        "account_id": account_venue.ACCOUNT_ID,
+        "trader_login": account_venue.TRADER_LOGIN,
         "symbols": (EURUSD, XAUUSD),
         "minutes": 0.02,
         "grace_secs": 1.0,
@@ -147,9 +147,9 @@ def test_parse_symbols_rejects_an_empty_list() -> None:
 
 
 def test_the_defaults_watch_two_major_symbols_for_five_minutes() -> None:
-    args = v.build_arg_parser().parse_args(["--account-id", "42"])
+    args = v.build_arg_parser().parse_args(["--trader-login", "42"])
     parsed = v.settings_from_args(args)
-    assert parsed.account_id == 42
+    assert parsed.trader_login == 42
     assert parsed.minutes == 5.0
     assert parsed.symbols == ("EURUSD", "XAUUSD")
     # The batch the adapter itself uses, so a default run verifies the number it depends on.
@@ -157,7 +157,7 @@ def test_the_defaults_watch_two_major_symbols_for_five_minutes() -> None:
     assert parsed.history_budget > 0
 
 
-def test_the_account_id_is_required() -> None:
+def test_the_trader_login_is_required() -> None:
     with pytest.raises(SystemExit):
         v.build_arg_parser().parse_args([])
 
@@ -165,7 +165,7 @@ def test_the_account_id_is_required() -> None:
 def test_every_setting_can_be_overridden() -> None:
     args = v.build_arg_parser().parse_args(
         [
-            "--account-id",
+            "--trader-login",
             "42",
             "--minutes",
             "1.5",
@@ -247,18 +247,18 @@ def _aligned(symbol: str, period_name: str, period_secs: int, *, offset: int = 0
     )
 
 
-def test_a_login_mistaken_for_an_account_id_is_named_as_such() -> None:
+def test_an_account_id_mistaken_for_a_login_is_named_as_such() -> None:
     """The two identifiers look alike, so the bare refusal reads as a token problem."""
     granted = [oa_model.ProtoOACtidTraderAccount(ctidTraderAccountId=111, traderLogin=222)]
-    message = v._no_such_account_message(granted, 222)
+    message = v._no_such_account_message(granted, 111)
     assert "traderLogin" in message and "ctidTraderAccountId" in message
     assert "111" not in message and "222" not in message
 
 
-def test_an_account_the_token_does_not_grant_is_reported_without_its_id() -> None:
+def test_a_login_the_token_does_not_grant_is_reported_without_it() -> None:
     granted = [oa_model.ProtoOACtidTraderAccount(ctidTraderAccountId=111, traderLogin=222)]
     message = v._no_such_account_message(granted, 999)
-    assert "999" not in message and "111" not in message
+    assert "999" not in message and "111" not in message and "222" not in message
 
 
 def test_item_3_accepts_aligned_intraday_periods() -> None:
@@ -526,7 +526,7 @@ async def _push_spots_once_subscribed(server: FakeCTraderServer, symbol_id: int)
     )
 
 
-async def test_a_whole_run_reports_every_item_and_never_prints_the_account_id() -> None:
+async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -> None:
     server = verify_venue()
     await server.start()
     eurusd_id = next(
@@ -540,6 +540,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_the_account_id() 
             tls=False,
             credentials=v.Credentials("client-id", "client-secret", "access-token"),
             settings=settings(),
+            account_id=account_venue.ACCOUNT_ID,
             # The fake venue is local; the live budget would only slow the test down.
             rate_limiter=RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0}),
         )
@@ -562,6 +563,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_the_account_id() 
     assert by_item["4"].status == UNKNOWN
 
     assert str(account_venue.ACCOUNT_ID) not in report
+    assert str(account_venue.TRADER_LOGIN) not in report
     assert "access-token" not in report
     assert "client-id" not in report
 
@@ -584,6 +586,7 @@ async def test_a_venue_that_refuses_history_leaves_the_other_items_decided() -> 
             tls=False,
             credentials=v.Credentials("client-id", "client-secret", "access-token"),
             settings=settings(minutes=0.005),
+            account_id=account_venue.ACCOUNT_ID,
             rate_limiter=RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0}),
         )
     finally:
@@ -608,6 +611,7 @@ async def test_every_subscription_is_released_before_the_connection_closes() -> 
             tls=False,
             credentials=v.Credentials("client-id", "client-secret", "access-token"),
             settings=settings(symbols=(EURUSD,), minutes=0.005),
+            account_id=account_venue.ACCOUNT_ID,
             rate_limiter=RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0}),
         )
     finally:
