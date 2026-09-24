@@ -84,6 +84,11 @@ writes the resulting tokens back into it, and lists the accounts the token grant
 application's redirect URI must be `http://localhost:8080/callback`, or whatever
 `--redirect-uri` says.
 
+The account a client is configured with is the `ctidTraderAccountId` from that listing, **not**
+the account number the cTrader interface shows — that one is the `traderLogin`, a different
+identifier of similar length. Authenticating with the login is refused as if the token did not
+grant the account at all, which is a confusing way to find out.
+
 The adapter receives these values from the host application (environment variables or a
 token store you control). `clientSecret` and both tokens are treated as secrets and are
 never written to logs: the transport logs no payload bytes at all.

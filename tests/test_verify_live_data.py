@@ -24,6 +24,7 @@ from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL, SYMBOL_BY_ID_BATCH
 from nautilus_ctrader.enums import PERIOD_SECS
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests import account_venue
 from tests.fake_server import FakeCTraderServer
@@ -244,6 +245,20 @@ def _aligned(symbol: str, period_name: str, period_secs: int, *, offset: int = 0
         period_secs,
         open_secs=tuple(base - i * period_secs + offset for i in range(3)),
     )
+
+
+def test_a_login_mistaken_for_an_account_id_is_named_as_such() -> None:
+    """The two identifiers look alike, so the bare refusal reads as a token problem."""
+    granted = [oa_model.ProtoOACtidTraderAccount(ctidTraderAccountId=111, traderLogin=222)]
+    message = v._no_such_account_message(granted, 222)
+    assert "traderLogin" in message and "ctidTraderAccountId" in message
+    assert "111" not in message and "222" not in message
+
+
+def test_an_account_the_token_does_not_grant_is_reported_without_its_id() -> None:
+    granted = [oa_model.ProtoOACtidTraderAccount(ctidTraderAccountId=111, traderLogin=222)]
+    message = v._no_such_account_message(granted, 999)
+    assert "999" not in message and "111" not in message
 
 
 def test_item_3_accepts_aligned_intraday_periods() -> None:

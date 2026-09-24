@@ -1059,6 +1059,20 @@ async def verify(
     return verifier.findings, report
 
 
+def _no_such_account_message(granted, account_id: int) -> str:
+    """Why the account was not found, naming no identifier.
+
+    The two identifiers are of similar length, and the one the interface shows is the login, so
+    mistaking them is easy and the bare refusal reads as a token problem.
+    """
+    if any(a.HasField("traderLogin") and a.traderLogin == account_id for a in granted):
+        return (
+            "the account id given is a traderLogin, not a ctidTraderAccountId; the two are "
+            "different identifiers of similar length, and only the latter authenticates"
+        )
+    return f"the access token does not grant that account id (it grants {len(granted)})"
+
+
 async def _resolve_host(account_id: int, credentials: Credentials) -> str:
     """The host the account lives on, from its own `isLive` flag.
 
@@ -1086,7 +1100,7 @@ async def _resolve_host(account_id: int, credentials: Credentials) -> str:
         None,
     )
     if account is None:
-        raise RuntimeError("the access token does not grant the requested account id")
+        raise RuntimeError(_no_such_account_message(listed.ctidTraderAccount, account_id))
     return LIVE_HOST if account.isLive else DEMO_HOST
 
 
