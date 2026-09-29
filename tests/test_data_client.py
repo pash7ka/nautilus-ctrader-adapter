@@ -1106,14 +1106,16 @@ async def test_a_cancelled_bar_unsubscribe_is_repeated_at_disconnect() -> None:
         await held.stop_holding()
 
         assert EURUSD_M1 not in h.client._bars  # no longer routed or closed
-        assert EURUSD_M1 in h.client._releasing_bars  # still on record for the repeat
+        # Still on record for the repeat.
+        bar_hold = (EURUSD_SYMBOL_ID, M1, f"bars:{EURUSD_M1}")
+        assert bar_hold in h.account.subscriptions.trendbar_holds(h.client._owner)
         for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
             await push_spot(h, event)
         assert not h.bars()
 
         await h.client._disconnect()
 
-        assert not h.client._releasing_bars
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
         # The repeat reaches the venue: the cancelled one settled nothing.
         assert len(received(h.server, oa.ProtoOAUnsubscribeLiveTrendbarReq)) == 2
 
@@ -1132,8 +1134,8 @@ async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconne
         # only what this connect subscribed itself is on record.
         assert not h.client._bars
         assert not h.client._bar_routes
-        assert GER40_SYMBOL_ID not in h.client._spot_holds
-        assert h.client._spot_holds == {EURUSD_SYMBOL_ID: {CONVERSION_CONSUMER}}
+        held = h.account.subscriptions.spot_holds(h.client._owner)
+        assert held == {(EURUSD_SYMBOL_ID, CONVERSION_CONSUMER)}
 
 
 async def test_disconnect_releases_the_trendbar_subscription() -> None:
@@ -1180,7 +1182,8 @@ async def test_bars_are_not_subscribed_for_an_instrument_the_chain_could_not_be_
         assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
         assert GER40_M1 not in h.client._bars
         assert not h.client._bar_routes
-        assert GER40_SYMBOL_ID not in h.client._spot_holds
+        held = h.account.subscriptions.spot_holds(h.client._owner)
+        assert GER40_SYMBOL_ID not in {symbol_id for symbol_id, _ in held}
 
 
 # -- Historical bars ------------------------------------------------------------------------
@@ -1489,7 +1492,8 @@ async def test_a_cancelled_release_does_not_let_a_later_one_re_attach_the_listen
 
         assert not h.quotes()
         # The cancelled release is still on record, so a disconnect repeats its unsubscribe.
-        assert (EURUSD_SYMBOL_ID, CONVERSION_CONSUMER) in h.client._all_holds()
+        held = h.account.subscriptions.spot_holds(h.client._owner)
+        assert (EURUSD_SYMBOL_ID, CONVERSION_CONSUMER) in held
 
 
 async def test_disconnect_forgets_which_instruments_were_converted() -> None:
@@ -1499,3 +1503,57 @@ async def test_disconnect_forgets_which_instruments_were_converted() -> None:
         await h.client._disconnect()
 
         assert not h.client._converted
+
+
+# -- Sharing the account's registry ---------------------------------------------------------
+
+# Another client of the same account, using the very names this client uses.
+OTHER_OWNER = "another client"
+
+
+async def test_another_clients_quote_hold_publishes_nothing_here() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        # The bars keep this client's listener on the symbol.
+        await subscribe_bars(h, GER40_M1)
+        await h.account.subscriptions.subscribe_spots(
+            GER40_SYMBOL_ID,
+            f"quotes:{GER40_ID}",
+            OTHER_OWNER,
+        )
+
+        await push_spot(h, GER40_SPOT)
+
+        assert not h.quotes()
+
+
+async def test_disconnect_releases_only_this_clients_holds() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await h.account.subscriptions.subscribe_spots(
+            EURUSD_SYMBOL_ID,
+            CONVERSION_CONSUMER,
+            OTHER_OWNER,
+        )
+
+        await h.client._disconnect()
+
+        assert CONVERSION_CONSUMER in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert EURUSD_SYMBOL_ID not in h.unsubscribed_symbol_ids()
+
+
+async def test_connect_releases_what_an_interrupted_disconnect_left_in_the_registry() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        await subscribe_quotes(h, GER40_ID)
+        await h.account.disconnect()  # a disconnect that never reached the client
+
+        await h.client._connect()
+
+        # Neither counted any more nor restored by the new session.
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
+        assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)[1:]

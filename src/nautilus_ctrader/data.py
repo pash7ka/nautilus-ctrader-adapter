@@ -202,15 +202,13 @@ class CTraderDataClient(LiveMarketDataClient):
             else Decimal(str(config.synthetic_quote_size))
         )
 
+        # Scopes this client's consumer names in the account's registry, which every client of
+        # the account shares. The prefix because a data and an execution client may share a
+        # `ClientId`; a string rather than the object so a client rebuilt under the same id
+        # releases what an earlier instance left behind.
+        self._owner = f"data:{self.id}"
         self._session: CTraderSession | None = None
         self._books: dict[int, _Book] = {}
-        # The quote consumers holding each symbol's spot subscription. A hold is recorded
-        # before its request goes out, because the registry counts a subscribe whose outcome is
-        # unknown, and dropped once its unsubscribe starts or the venue refuses the subscribe.
-        self._spot_holds: dict[int, set[str]] = {}
-        # Holds whose unsubscribe is in flight. They no longer publish, but a cancelled release
-        # must still be repeated, so they stay here until the request returns.
-        self._releasing: set[tuple[int, str]] = set()
         # One listener per symbol however many holds it has: a symbol that is both subscribed
         # and a conversion leg would otherwise emit every quote once per listener.
         self._spot_listeners: dict[int, SpotListener] = {}
@@ -220,9 +218,6 @@ class CTraderDataClient(LiveMarketDataClient):
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
         self._bar_routes: dict[tuple[int, int], _BarSub] = {}
-        # Bar subscriptions whose unsubscribe is in flight, kept for the same reason as
-        # `_releasing`: a cancelled one must still be repeated.
-        self._releasing_bars: dict[BarType, _BarSub] = {}
         self._bar_clock: Clock = _LoopClock(loop)
         # Keys already reported as undeliverable; a repeat is logged at DEBUG, since a broken
         # scale would otherwise flood the log on every tick.
@@ -236,9 +231,11 @@ class CTraderDataClient(LiveMarketDataClient):
         return self._instrument_provider
 
     async def _connect(self) -> None:
-        # Nothing from an earlier connection may survive here: a `_disconnect` cut short would
-        # otherwise make a later subscribe a silent no-op against a session that is gone.
+        # Nothing from an earlier connection may survive here, in this client or in the
+        # registry: a `_disconnect` cut short would otherwise make a later subscribe a silent
+        # no-op against a session that is gone.
         self._forget_subscriptions()
+        await self._release_subscriptions(None)
         # A chain is venue data that can change, so it is re-queried once per connection.
         self._instrument_provider.reset_conversion_cache()
         self._converted.clear()
@@ -276,27 +273,32 @@ class CTraderDataClient(LiveMarketDataClient):
                     self._on_symbol_changed,
                 )
                 session.remove_restore(_BOOK_RESET_RESTORE)
-            for bar_type in sorted(self._all_bars(), key=str):
-                await self._drop_bars(bar_type, session)
-            # A snapshot: releasing a hold drops it from the mapping.
-            for symbol_id, consumer in sorted(self._all_holds()):
-                await self._release_spots(symbol_id, consumer)
+            await self._release_subscriptions(session)
             self._conversion_legs.clear()
             self._converted.clear()
         finally:
             await self._account.disconnect()
 
+    async def _release_subscriptions(self, session: CTraderSession | None) -> None:
+        """Release everything the registry still counts for this client.
+
+        Cancelled releases included: the registry keeps counting those until one runs its
+        course.
+        """
+        subscriptions = self._account.subscriptions
+        for bar_type in sorted(self._bars, key=str):
+            await self._drop_bars(bar_type, session)
+        for symbol_id, period, consumer in sorted(subscriptions.trendbar_holds(self._owner)):
+            await subscriptions.unsubscribe_trendbars(symbol_id, period, consumer, self._owner)
+        for symbol_id, consumer in sorted(subscriptions.spot_holds(self._owner)):
+            await self._release_spots(symbol_id, consumer)
+
     def _forget_subscriptions(self) -> None:
-        """Drop every record of what was subscribed, without touching the venue."""
+        """Drop this client's own routing of what was subscribed, without touching the venue."""
         for sub in self._bars.values():
-            sub.closer.close()
-        for sub in self._releasing_bars.values():
             sub.closer.close()
         self._bars.clear()
         self._bar_routes.clear()
-        self._releasing_bars.clear()
-        self._spot_holds.clear()
-        self._releasing.clear()
         for symbol_id, listener in self._spot_listeners.items():
             self._account.subscriptions.remove_spot_listener(symbol_id, listener)
         self._spot_listeners.clear()
@@ -517,7 +519,8 @@ class CTraderDataClient(LiveMarketDataClient):
         # Found by consumer name rather than through the instrument's symbol id, because the
         # instrument may have been dropped since and the hold must be released even then.
         consumer = _quote_consumer(command.instrument_id)
-        symbol_id = next((s for s, c in self._all_holds() if c == consumer), None)
+        held = self._account.subscriptions.spot_holds(self._owner)
+        symbol_id = next((s for s, c in held if c == consumer), None)
         if symbol_id is not None:
             await self._release_spots(symbol_id, consumer)
 
@@ -620,14 +623,15 @@ class CTraderDataClient(LiveMarketDataClient):
         self._bars[bar_type] = sub
         self._bar_routes[(symbol_id, period)] = sub
         self._sync_listener(symbol_id)
+        subscriptions = self._account.subscriptions
         try:
-            await self._account.subscriptions.subscribe_trendbars(symbol_id, period, consumer)
+            await subscriptions.subscribe_trendbars(symbol_id, period, consumer, self._owner)
         finally:
             # Whatever the outcome - success, refusal, cancellation, a lost connection - what
             # is kept here must match what the registry counts. It counts a subscribe whose
             # outcome is unknown, and those still need the restore; a refused or unrecorded one
             # leaves nothing behind, and the bar type must stay free for another try.
-            if consumer in self._account.subscriptions.trendbar_consumers(symbol_id, period):
+            if (symbol_id, period, consumer) in subscriptions.trendbar_holds(self._owner):
                 if self._session is not None:
                     # Added after the registry's own restore for this key, and so run after it:
                     # the backfill's history needs the reconnected subscription in place.
@@ -642,22 +646,22 @@ class CTraderDataClient(LiveMarketDataClient):
         await self._drop_bars(command.bar_type, self._session)
 
     async def _drop_bars(self, bar_type: BarType, session: CTraderSession | None) -> None:
-        sub = self._bars.get(bar_type) or self._releasing_bars.get(bar_type)
-        if sub is None:
-            return
-        if bar_type in self._bars:
+        subscriptions = self._account.subscriptions
+        consumer = _bar_consumer(bar_type)
+        sub = self._bars.get(bar_type)
+        if sub is not None:
             self._forget_bars(bar_type, sub)
-        # Recorded until the request returns, so a cancelled unsubscribe is repeated at
-        # disconnect rather than leaving the venue sending trendbars nobody listens to.
-        self._releasing_bars[bar_type] = sub
+            symbol_id, period = sub.symbol_id, sub.period
+        else:
+            # Only a cancelled release can be left, and the registry still counts it.
+            held = subscriptions.trendbar_holds(self._owner)
+            found = next(((s, p) for s, p, c in held if c == consumer), None)
+            if found is None:
+                return
+            symbol_id, period = found
         if session is not None:
             session.remove_restore(_bar_restore_key(bar_type))
-        await self._account.subscriptions.unsubscribe_trendbars(
-            sub.symbol_id,
-            sub.period,
-            _bar_consumer(bar_type),
-        )
-        self._releasing_bars.pop(bar_type, None)
+        await subscriptions.unsubscribe_trendbars(symbol_id, period, consumer, self._owner)
 
     def _forget_bars(self, bar_type: BarType, sub: _BarSub) -> None:
         """Stop routing and closing `bar_type`, before its venue subscription is given up."""
@@ -665,10 +669,6 @@ class CTraderDataClient(LiveMarketDataClient):
         self._bar_routes.pop((sub.symbol_id, sub.period), None)
         sub.closer.close()
         self._sync_listener(sub.symbol_id)
-
-    def _all_bars(self) -> set[BarType]:
-        """Every bar type the registry may still count a trendbar reference for."""
-        return set(self._bars) | set(self._releasing_bars)
 
     def _make_closer(self, bar_type: BarType, symbol_id: int, period: int) -> BarCloser:
         return BarCloser(
@@ -929,65 +929,58 @@ class CTraderDataClient(LiveMarketDataClient):
 
     async def _hold_spots(self, symbol_id: int, consumer: str) -> bool:
         """Subscribe `symbol_id`'s spots for `consumer`; returns whether this call added it."""
-        consumers = self._spot_holds.setdefault(symbol_id, set())
-        if consumer in consumers:
+        subscriptions = self._account.subscriptions
+        if consumer in subscriptions.active_consumers(symbol_id, self._owner):
             return False
-        consumers.add(consumer)
-        self._sync_listener(symbol_id)
+        # Attached first: the registry makes the consumer active as the call starts, so a spot
+        # arriving before the answer is published.
+        self._attach_listener(symbol_id)
         try:
-            await self._account.subscriptions.subscribe_spots(symbol_id, consumer)
-        except CTraderRequestError:
-            # A venue refusal is the one outcome the registry does not count.
-            self._discard_hold(symbol_id, consumer)
+            await subscriptions.subscribe_spots(symbol_id, consumer, self._owner)
+        finally:
+            # Detaches it again if the registry did not count the subscribe.
             self._sync_listener(symbol_id)
-            raise
         return True
 
     async def _release_spots(self, symbol_id: int, consumer: str) -> None:
-        key = (symbol_id, consumer)
-        if consumer not in self._spot_holds.get(symbol_id, ()) and key not in self._releasing:
-            return
-        # Dropped before the request, so nothing is published while it is in flight and a
-        # release of another consumer cannot re-attach a listener for it meanwhile. The key
-        # stays in `_releasing` until the request returns, so a cancelled release is repeated.
-        self._discard_hold(symbol_id, consumer)
-        self._releasing.add(key)
-        self._sync_listener(symbol_id)
-        await self._account.subscriptions.unsubscribe_spots(symbol_id, consumer)
-        self._releasing.discard(key)
+        subscriptions = self._account.subscriptions
+        if subscriptions.active_consumers(symbol_id, self._owner) <= {consumer}:
+            # The last quote hold goes as the release starts, and nothing updates the book
+            # after that, so it is dropped now rather than when the release returns.
+            self._books.pop(symbol_id, None)
+        try:
+            # The registry makes `consumer` inactive as the call starts, so nothing is published
+            # for it while the request is in flight; a cancelled release stays held for the next
+            # one to repeat.
+            await subscriptions.unsubscribe_spots(symbol_id, consumer, self._owner)
+        finally:
+            self._sync_listener(symbol_id)
 
-    def _discard_hold(self, symbol_id: int, consumer: str) -> None:
-        consumers = self._spot_holds.get(symbol_id)
-        if consumers is None:
-            return
-        consumers.discard(consumer)
-        if not consumers:
-            del self._spot_holds[symbol_id]
-
-    def _all_holds(self) -> set[tuple[int, str]]:
-        """Every `(symbol id, consumer)` the registry may still count for this client."""
-        held = {(s, c) for s, consumers in self._spot_holds.items() for c in consumers}
-        return held | self._releasing
+    def _quoting(self, symbol_id: int) -> bool:
+        return bool(self._account.subscriptions.active_consumers(symbol_id, self._owner))
 
     def _sync_listener(self, symbol_id: int) -> None:
         """Keep exactly one listener on `symbol_id` while a quote hold or a bar needs it."""
-        quoting = symbol_id in self._spot_holds
+        quoting = self._quoting(symbol_id)
         if not quoting:
             # Tied to the quote holds, not to the listener a bar subscription also keeps alive:
             # a side from before a gap in the subscription must never be paired with one after.
             self._books.pop(symbol_id, None)
-        wanted = quoting or any(sub.symbol_id == symbol_id for sub in self._bars.values())
-        listener = self._spot_listeners.get(symbol_id)
-        if wanted and listener is None:
+        if quoting or any(sub.symbol_id == symbol_id for sub in self._bars.values()):
+            self._attach_listener(symbol_id)
+            return
+        listener = self._spot_listeners.pop(symbol_id, None)
+        if listener is not None:
+            self._account.subscriptions.remove_spot_listener(symbol_id, listener)
+
+    def _attach_listener(self, symbol_id: int) -> None:
+        if symbol_id not in self._spot_listeners:
             listener = functools.partial(self._on_spot, symbol_id)
             self._spot_listeners[symbol_id] = listener
             self._account.subscriptions.add_spot_listener(symbol_id, listener)
-        elif not wanted and listener is not None:
-            del self._spot_listeners[symbol_id]
-            self._account.subscriptions.remove_spot_listener(symbol_id, listener)
 
     def _on_spot(self, symbol_id: int, event: oa.ProtoOASpotEvent) -> None:
         """Route one spot event: its prices to the quote path, its trendbars to the closers."""
-        if symbol_id in self._spot_holds:
+        if self._quoting(symbol_id):
             self._on_quote_spot(symbol_id, event)
         self._on_bar_spot(symbol_id, event)

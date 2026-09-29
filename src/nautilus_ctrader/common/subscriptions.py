@@ -84,9 +84,10 @@ class SubscriptionRegistry:
       never raises for want of a connection.
     - The same consumer subscribing twice counts once.
     - Counted and active are different facts. A consumer is active - should receive data -
-      from the moment its subscribe is called until its unsubscribe is, and is counted until
-      that unsubscribe has run its course. `active_consumers()` answers the first, and
-      `spot_holds()` / `trendbar_holds()` what an owner still has to release.
+      from the moment its subscribe is called until its unsubscribe is, or until the
+      subscribe ends uncounted; it stays counted until that unsubscribe has run its course.
+      `active_consumers()` answers the first, and `spot_holds()` / `trendbar_holds()` what an
+      owner still has to release.
     - A consumer joining a key whose restore is in the session's `failed_restores` gets no
       data until the restore retry succeeds.
     - It outlives sessions: the account client `attach`es each new session before starting it
