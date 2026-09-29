@@ -154,6 +154,11 @@ class CTraderSession:
         return self._state is SessionState.READY
 
     @property
+    def bring_up_generation(self) -> int:
+        """Bumped at the start of every bring-up, before any restore runs."""
+        return self._bring_up_generation
+
+    @property
     def failed_restores(self) -> frozenset[Hashable]:
         """Keys whose restore failed in the most recent bring-up."""
         return frozenset(self._failed_restores)

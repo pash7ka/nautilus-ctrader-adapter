@@ -748,6 +748,20 @@ async def test_a_consumer_is_active_and_held_while_its_subscribe_is_in_flight(
     assert registry.active_consumers(EURUSD, "data") == frozenset({"a"})
 
 
+async def test_has_active_consumer_answers_for_its_owner_only(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+
+    assert registry.has_active_consumer(EURUSD, "data")
+    assert not registry.has_active_consumer(EURUSD, "execution")
+
+    await registry.unsubscribe_spots(EURUSD, "a", "data")
+    assert not registry.has_active_consumer(EURUSD, "data")
+
+
 async def test_a_refused_subscribe_leaves_nothing_active_or_held(
     server: FakeCTraderServer,
     client: CTraderAccountClient,

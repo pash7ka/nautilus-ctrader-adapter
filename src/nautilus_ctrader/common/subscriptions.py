@@ -238,6 +238,11 @@ class SubscriptionRegistry:
         intents = self._intents.get(_spots_key(symbol_id), {})
         return frozenset(name for (o, name), i in intents.items() if o == owner and i.wanted)
 
+    def has_active_consumer(self, symbol_id: int, owner: str) -> bool:
+        """Whether `active_consumers()` is non-empty, without building it: asked on every spot."""
+        intents = self._intents.get(_spots_key(symbol_id), {})
+        return any(o == owner and i.wanted for (o, _), i in intents.items())
+
     def spot_holds(self, owner: str) -> frozenset[tuple[int, str]]:
         """Every `(symbol id, consumer)` spot hold `owner` still has to release.
 

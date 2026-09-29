@@ -480,6 +480,30 @@ async def test_an_unknown_asset_class_override_fails_construction() -> None:
             )
 
 
+async def test_a_provider_that_is_not_the_accounts_own_fails_construction() -> None:
+    async with harness() as h:
+        client_config = h.client._config
+        # Built from the same settings, so only its identity differs from the account's.
+        separate = CTraderInstrumentProvider(
+            h.account,
+            client_config.instrument_provider,
+            parse_asset_class_overrides(client_config.asset_class_overrides),
+            client_config.fail_on_instrument_error,
+            RecordingLogger(),
+        )
+        with pytest.raises(ValueError, match="get_instrument_provider"):
+            CTraderDataClient(
+                loop=asyncio.get_running_loop(),
+                account=h.account,
+                msgbus=TestComponentStubs.msgbus(),
+                cache=TestComponentStubs.cache(),
+                clock=TestComponentStubs.clock(),
+                instrument_provider=separate,
+                config=client_config,
+                name="CTRADER-002",
+            )
+
+
 # -- Connect --------------------------------------------------------------------------------
 
 
@@ -932,6 +956,45 @@ async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(
         assert not h.quotes()
 
 
+@pytest.mark.parametrize("other_owner_first", [False, True], ids=["alone", "another owner first"])
+async def test_a_bid_from_before_a_reconnect_is_not_paired_while_the_restores_run(
+    monkeypatch: pytest.MonkeyPatch,
+    other_owner_first: bool,
+) -> None:
+    # A key another owner held before this client connected is restored before anything this
+    # client registers, so the books must not depend on the order the restores run in.
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+    async with harness() as h:
+        await h.account.connect()  # another client of the account brought it up first
+        if other_owner_first:
+            await h.account.subscriptions.subscribe_spots(EURUSD_SYMBOL_ID, "quotes", "other")
+        await h.client._connect()
+        await subscribe_quotes(h, EURUSD_ID)
+        await push_spot(h, BID_ONLY)
+        assert not h.quotes()
+
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+            lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), 10.0)
+        # The venue has the re-subscribe, and a spot lands before the restores are done.
+        await push_spot(h, ASK_ONLY)
+
+        assert not h.quotes()
+        await held.stop_holding()
+        await held.release()
+        await wait_until(
+            lambda: h.account.session.is_ready,
+            timeout_secs=10.0,
+            description="session ready again",
+        )
+        await h.client._disconnect()
+
+
 # -- Live bars ------------------------------------------------------------------------------
 
 
@@ -1300,6 +1363,37 @@ async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconne
         assert held == {(EURUSD_SYMBOL_ID, CONVERSION_CONSUMER)}
         active = h.account.subscriptions.active_consumers(EURUSD_SYMBOL_ID, h.client._owner)
         assert active == {CONVERSION_CONSUMER}
+
+
+async def test_connect_removes_backfill_restores_an_interrupted_disconnect_left_behind() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.account.connect()  # another client keeps the account's session running
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        await subscribe_bars(h, GER40_M1)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQ,
+            lambda r: oa.ProtoOAUnsubscribeLiveTrendbarRes(
+                ctidTraderAccountId=r.ctidTraderAccountId,
+            ),
+        )
+
+        # Cut short in the first bar type's release, so the second keeps its restore.
+        disconnecting = asyncio.create_task(h.client._disconnect())
+        await held.arrived.wait()
+        disconnecting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await disconnecting
+        await held.stop_holding()
+        await held.release()
+        assert ("bar_backfill", str(GER40_M1)) in h.account.session._restores
+
+        await h.client._connect()
+
+        restores = h.account.session._restores
+        assert not [key for key in restores if isinstance(key, tuple) and key[0] == "bar_backfill"]
 
 
 async def test_disconnect_releases_the_trendbar_subscription() -> None:

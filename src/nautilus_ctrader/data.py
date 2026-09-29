@@ -53,8 +53,6 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
 
 CONVERSION_CONSUMER = "conversion"
-# Restore key for the reset that a reconnect needs; also the reason it must run first.
-_BOOK_RESET_RESTORE = "quote_books"
 
 SpotListener = Callable[[oa.ProtoOASpotEvent], None]
 
@@ -167,7 +165,8 @@ class CTraderDataClient(LiveMarketDataClient):
     Raises
     ------
     ValueError
-        If `config.asset_class_overrides` holds a value that is not an `AssetClass` name.
+        If `instrument_provider` is not the account's own, or `config.asset_class_overrides`
+        holds a value that is not an `AssetClass` name.
 
     """
 
@@ -182,6 +181,13 @@ class CTraderDataClient(LiveMarketDataClient):
         config: CTraderDataClientConfig,
         name: str | None = None,
     ) -> None:
+        # Identity, not equality: a second provider would miss the account's chain reset, and
+        # an instrument it unloads would stay loaded for every other client of the account.
+        if instrument_provider is not account.instrument_provider:
+            raise ValueError(
+                "instrument_provider must be the account's own, from "
+                "account.get_instrument_provider()",
+            )
         super().__init__(
             loop=loop,
             client_id=ClientId(name or CTRADER_VENUE.value),
@@ -209,6 +215,9 @@ class CTraderDataClient(LiveMarketDataClient):
         self._owner = f"data:{self.id}"
         self._session: CTraderSession | None = None
         self._books: dict[int, _Book] = {}
+        # The session and its `bring_up_generation` that `_books` were filled under. A session
+        # is part of it because each one counts its bring-ups from zero.
+        self._books_generation: tuple[CTraderSession, int] | None = None
         # One listener per symbol however many holds it has: a symbol that is both subscribed
         # and a conversion leg would otherwise emit every quote once per listener.
         self._spot_listeners: dict[int, SpotListener] = {}
@@ -254,9 +263,6 @@ class CTraderDataClient(LiveMarketDataClient):
         assert session is not None  # `connect()` returned, so the session is up
         self._session = session
         session.add_event_handler(oa.ProtoOASymbolChangedEvent, self._on_symbol_changed)
-        # Registered before any subscription: restores run in registration order, so this one
-        # empties the books before the first re-subscribed spot of a new connection arrives.
-        session.add_restore(_BOOK_RESET_RESTORE, self._reset_books)
 
         # Conversion first: an instrument whose value in the account currency cannot be priced
         # is dropped here, and must never reach the data engine or the cache.
@@ -273,7 +279,6 @@ class CTraderDataClient(LiveMarketDataClient):
                     oa.ProtoOASymbolChangedEvent,
                     self._on_symbol_changed,
                 )
-                session.remove_restore(_BOOK_RESET_RESTORE)
             await self._release_subscriptions(session)
             self._conversion_legs.clear()
             self._converted.clear()
@@ -295,9 +300,16 @@ class CTraderDataClient(LiveMarketDataClient):
             await self._release_spots(symbol_id, consumer)
 
     def _forget_subscriptions(self) -> None:
-        """Drop this client's own routing of what was subscribed, without touching the venue."""
-        for sub in self._bars.values():
+        """Drop this client's own routing of what was subscribed, without touching the venue.
+
+        The backfill restores go too, from the account's session: another client may have
+        kept it running.
+        """
+        session = self._account.session
+        for bar_type, sub in self._bars.items():
             sub.closer.close()
+            if session is not None:
+                session.remove_restore(_bar_restore_key(bar_type))
         self._bars.clear()
         self._bar_routes.clear()
         for symbol_id, listener in self._spot_listeners.items():
@@ -545,7 +557,7 @@ class CTraderDataClient(LiveMarketDataClient):
             )
             return
         instrument_id = instrument.id
-        book = self._books.setdefault(event.symbolId, _Book())
+        book = self._book(event.symbolId)
         if event.HasField("bid"):
             book.bid = event.bid
         if event.HasField("ask"):
@@ -593,13 +605,19 @@ class CTraderDataClient(LiveMarketDataClient):
         seen.add(key)
         first(message)
 
-    async def _reset_books(self) -> None:
-        """Forget every remembered bid and ask.
+    def _book(self, symbol_id: int) -> _Book:
+        """`symbol_id`'s book, every book emptied first if the session has been brought up since.
 
-        Run by the session's restores: after a reconnect a side from before the outage must
-        never be paired with one from after it.
+        After a reconnect a side from before the outage must never be paired with one from
+        after it. Decided by generation rather than by a restore, because restores run in the
+        order their keys were first registered, and another client's may run first.
         """
-        self._books.clear()
+        session = self._account.session
+        generation = None if session is None else (session, session.bring_up_generation)
+        if generation != self._books_generation:
+            self._books.clear()
+            self._books_generation = generation
+        return self._books.setdefault(symbol_id, _Book())
 
     # -- Bars -------------------------------------------------------------------------------
 
@@ -968,7 +986,7 @@ class CTraderDataClient(LiveMarketDataClient):
             self._sync_listener(symbol_id)
 
     def _quoting(self, symbol_id: int) -> bool:
-        return bool(self._account.subscriptions.active_consumers(symbol_id, self._owner))
+        return self._account.subscriptions.has_active_consumer(symbol_id, self._owner)
 
     def _sync_listener(self, symbol_id: int) -> None:
         """Keep exactly one listener on `symbol_id` while a quote hold or a bar needs it."""
