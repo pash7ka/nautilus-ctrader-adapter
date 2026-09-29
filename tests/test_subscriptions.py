@@ -9,6 +9,7 @@ from google.protobuf.message import Message
 from nautilus_ctrader.common import account as account_module
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
+from nautilus_ctrader.common.subscriptions import SubscriptionRegistry
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.account_venue import (
@@ -878,6 +879,115 @@ async def test_a_subscribe_after_a_cancelled_release_makes_it_active_again(
     await registry.subscribe_spots(EURUSD, "a", "data")
 
     assert registry.active_consumers(EURUSD, "data") == frozenset({"a"})
+
+
+async def _cancel_spot_release_the_venue_processes(
+    server: FakeCTraderServer,
+    registry: SubscriptionRegistry,
+) -> None:
+    """Cancel the release of `a`'s spots once its unsubscribe is sent; the venue then honours it."""
+    held = HeldReplies(server, oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+    await held.stop_holding()
+
+
+@pytest.mark.parametrize("owner", ["data", "execution"], ids=["same owner", "another owner"])
+async def test_a_subscribe_after_a_cancelled_release_is_sent_to_the_venue(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+    owner: str,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await _cancel_spot_release_the_venue_processes(server, registry)
+
+    await registry.subscribe_spots(EURUSD, "a", owner)
+
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 2
+    assert registry.active_consumers(EURUSD, owner) == frozenset({"a"})
+
+    # That subscribe settled the key, so the next consumer joins without a request.
+    await registry.subscribe_spots(EURUSD, "b", "data")
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 2
+
+
+async def test_a_subscribe_re_sent_after_a_cancelled_release_accepts_already_subscribed(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await _cancel_spot_release_the_venue_processes(server, registry)
+    server.refuse[oa.ProtoOASubscribeSpotsReq] = "ALREADY_SUBSCRIBED"
+
+    await registry.subscribe_spots(EURUSD, "b", "data")
+
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 2
+    assert registry.consumers(EURUSD) == frozenset({"a", "b"})
+    await registry.subscribe_spots(EURUSD, "c", "data")
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 2
+
+
+async def test_a_trendbar_subscribe_after_a_cancelled_trendbar_release_is_sent_to_the_venue(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQ,
+        lambda r: oa.ProtoOAUnsubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+    )
+    releasing = asyncio.create_task(registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+    await held.stop_holding()
+    server.received.clear()
+
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
+
+    assert ("ProtoOASubscribeLiveTrendbarReq", (EURUSD,), M15) in _subscriptions(server)
+    assert registry.trendbar_consumers(EURUSD, M15, "data") == frozenset({"bars"})
+    assert registry.consumers(EURUSD) == frozenset({f"trendbar:{M15}:bars"})
+
+
+async def test_a_completed_release_settles_a_cancelled_one(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await _cancel_spot_release_the_venue_processes(server, registry)
+    await registry.unsubscribe_spots(EURUSD, "a", "data")
+
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await registry.subscribe_spots(EURUSD, "b", "data")
+
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 2
+
+
+async def test_a_reconnect_settles_a_cancelled_release(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await _cancel_spot_release_the_venue_processes(server, registry)
+
+    await client.disconnect()
+    await client.connect()
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 2
+
+    # The restore re-subscribed it on the new connection, so this joins without a request.
+    await registry.subscribe_spots(EURUSD, "b", "data")
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 2
 
 
 async def test_a_release_started_during_the_subscribe_ends_with_nothing_held(
