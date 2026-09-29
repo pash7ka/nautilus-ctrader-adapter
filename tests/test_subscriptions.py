@@ -699,3 +699,230 @@ async def test_a_raising_listener_is_logged_once_and_does_not_stop_the_others(
 
     listener_lines = [level for level, m in logger.lines if "Spot listener" in m]
     assert listener_lines == ["error", "debug"]
+
+
+# -- Owners, and consumers being subscribed or released ---------------------------------------
+
+
+def _spot_reply(request: Message) -> Message:
+    return oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=request.ctidTraderAccountId)
+
+
+def _spot_unsubscribe_reply(request: Message) -> Message:
+    return oa.ProtoOAUnsubscribeSpotsRes(ctidTraderAccountId=request.ctidTraderAccountId)
+
+
+async def test_the_same_name_under_two_owners_is_two_consumers(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "quotes", "data")
+    await registry.subscribe_spots(EURUSD, "quotes", "execution")
+
+    await registry.unsubscribe_spots(EURUSD, "quotes", "data")
+
+    assert received(server, oa.ProtoOAUnsubscribeSpotsReq) == []
+    assert registry.spot_holds("data") == frozenset()
+    assert registry.spot_holds("execution") == frozenset({(EURUSD, "quotes")})
+    assert registry.active_consumers(EURUSD, "execution") == frozenset({"quotes"})
+
+
+async def test_a_consumer_is_active_and_held_while_its_subscribe_is_in_flight(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    held = HeldReplies(server, oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ, _spot_reply)
+
+    subscribing = asyncio.create_task(registry.subscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+
+    # Not counted yet, but already on record: a spot may arrive before the answer does.
+    assert registry.consumers(EURUSD) == frozenset()
+    assert registry.active_consumers(EURUSD, "data") == frozenset({"a"})
+    assert registry.spot_holds("data") == frozenset({(EURUSD, "a")})
+
+    await held.stop_holding()
+    await subscribing
+    assert registry.active_consumers(EURUSD, "data") == frozenset({"a"})
+
+
+async def test_a_refused_subscribe_leaves_nothing_active_or_held(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    server.refuse[oa.ProtoOASubscribeSpotsReq] = "SYMBOL_NOT_FOUND"
+
+    with pytest.raises(CTraderRequestError):
+        await client.subscriptions.subscribe_spots(EURUSD, "a", "data")
+
+    assert client.subscriptions.active_consumers(EURUSD, "data") == frozenset()
+    assert client.subscriptions.spot_holds("data") == frozenset()
+
+
+async def test_a_subscribe_the_registry_did_not_record_leaves_nothing_active_or_held(
+    monkeypatch: pytest.MonkeyPatch,
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    async def unreadable(*_args: object, **_kwargs: object) -> Message:
+        raise CTraderProtocolError("unreadable response")
+
+    # The session stays up, so this is not taken for a loss.
+    monkeypatch.setattr(client.session, "request", unreadable)
+
+    with pytest.raises(CTraderProtocolError):
+        await client.subscriptions.subscribe_spots(EURUSD, "a", "data")
+
+    assert client.subscriptions.consumers(EURUSD) == frozenset()
+    assert client.subscriptions.active_consumers(EURUSD, "data") == frozenset()
+    assert client.subscriptions.spot_holds("data") == frozenset()
+
+
+async def test_a_consumer_stops_being_active_as_its_release_starts(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    held = HeldReplies(server, oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+
+    assert registry.active_consumers(EURUSD, "data") == frozenset()
+    assert registry.spot_holds("data") == frozenset({(EURUSD, "a")})
+
+    await held.stop_holding()
+    await releasing
+    assert registry.spot_holds("data") == frozenset()
+
+
+async def test_a_cancelled_release_stays_held_but_inactive_until_repeated(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    held = HeldReplies(server, oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+    await held.stop_holding()
+
+    assert registry.active_consumers(EURUSD, "data") == frozenset()
+    assert registry.spot_holds("data") == frozenset({(EURUSD, "a")})
+
+    await registry.unsubscribe_spots(EURUSD, "a", "data")
+
+    assert registry.spot_holds("data") == frozenset()
+    assert len(received(server, oa.ProtoOAUnsubscribeSpotsReq)) == 2
+
+
+async def test_a_release_cancelled_before_it_runs_stays_inactive(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    held = HeldReplies(server, oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ, _spot_reply)
+    subscribing = asyncio.create_task(registry.subscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+
+    # Queued behind the subscribe on the key lock, and cancelled there.
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
+    await asyncio.sleep(0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+    await held.stop_holding()
+    await subscribing
+
+    # Subscribed after all, and still to be released.
+    assert registry.consumers(EURUSD) == frozenset({"a"})
+    assert registry.active_consumers(EURUSD, "data") == frozenset()
+    assert registry.spot_holds("data") == frozenset({(EURUSD, "a")})
+
+
+async def test_a_subscribe_after_a_cancelled_release_makes_it_active_again(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    held = HeldReplies(server, oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+    await held.stop_holding()
+
+    await registry.subscribe_spots(EURUSD, "a", "data")
+
+    assert registry.active_consumers(EURUSD, "data") == frozenset({"a"})
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 1
+
+
+async def test_a_release_started_during_the_subscribe_ends_with_nothing_held(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    held = HeldReplies(server, oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ, _spot_reply)
+    subscribing = asyncio.create_task(registry.subscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
+    await asyncio.sleep(0)
+    assert registry.active_consumers(EURUSD, "data") == frozenset()
+
+    await held.stop_holding()
+    await asyncio.gather(subscribing, releasing)
+
+    assert registry.consumers(EURUSD) == frozenset()
+    assert registry.spot_holds("data") == frozenset()
+
+
+async def test_trendbar_holds_list_the_trendbar_consumer_but_not_its_spot_leg(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
+
+    assert registry.trendbar_holds("data") == frozenset({(EURUSD, M15, "bars")})
+    assert registry.trendbar_holds("execution") == frozenset()
+    assert registry.spot_holds("data") == frozenset()
+    assert registry.active_consumers(EURUSD, "data") == frozenset()
+
+
+async def test_a_cancelled_trendbar_release_stays_held_until_repeated(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQ,
+        lambda r: oa.ProtoOAUnsubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+    )
+
+    releasing = asyncio.create_task(registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+    await held.stop_holding()
+
+    assert registry.trendbar_holds("data") == frozenset({(EURUSD, M15, "bars")})
+
+    await registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data")
+
+    assert registry.trendbar_holds("data") == frozenset()
+    assert len(received(server, oa.ProtoOAUnsubscribeLiveTrendbarReq)) == 2
