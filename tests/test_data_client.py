@@ -560,6 +560,25 @@ async def test_a_broken_conversion_fails_connect_when_configured_to() -> None:
             await h.client._connect()
 
 
+async def test_a_failed_connect_republishes_no_reloaded_instrument() -> None:
+    async with harness(
+        client_config=config(fail_on_instrument_error=True),
+        server=empty_conversion_venue(),
+    ) as h:
+        with pytest.raises(InstrumentLoadError):
+            await h.client._connect()
+        await h.provider.load_ids_async([EURUSD_ID])
+        # Registered after the client's, so it is called after it.
+        reloaded: list = []
+        h.account.add_reload_listener(reloaded.append)
+        before = len(h.published)
+
+        await h.server.push(symbol_changed(EURUSD_SYMBOL_ID))
+        await wait_until(lambda: reloaded, description="EURUSD reloaded")
+
+        assert not republished(h.published[before:], EURUSD_ID)
+
+
 async def test_connect_re_queries_the_conversion_chain_every_time() -> None:
     async with harness() as h:
         await h.client._connect()
@@ -1299,6 +1318,58 @@ async def test_a_subscribe_unsubscribe_subscribe_during_one_conversion_ends_subs
         assert h.subscribed_symbol_ids().count(GER40_SYMBOL_ID) == 1
         await push_spot(h, GER40_SPOT)
         assert [q.instrument_id for q in h.quotes()] == [GER40_ID]
+
+
+async def disconnect_during_conversion(h: Harness, subscribe: Callable, key: object) -> int:
+    """Disconnect the client while `subscribe` of `key` waits on its EURUSD leg.
+
+    Another user keeps the account's session up, as an execution client would, so whatever the
+    subscribe takes afterwards would be a real venue subscription. Returns how much had been
+    published when the disconnect started.
+    """
+    await h.account.connect()
+    held = hold_conversion_leg(h)
+    subscribing = asyncio.create_task(subscribe(h, key))
+    await held.arrived.wait()
+
+    published = len(h.published)
+    disconnecting = asyncio.create_task(h.client._disconnect())
+    await asyncio.sleep(0)
+    await held.stop_holding()
+    await asyncio.gather(subscribing, disconnecting)
+    return published
+
+
+async def test_a_quote_subscribe_converting_across_a_disconnect_takes_no_hold() -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+
+        published = await disconnect_during_conversion(h, subscribe_quotes, GER40_ID)
+
+        assert not h.account.subscriptions.spot_holds(h.client._owner)
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        assert not h.published[published:]
+        await push_spot(h, GER40_SPOT)
+        await push_spot(h, TWO_SIDED)
+        assert not h.quotes()
+
+
+async def test_a_bar_subscribe_converting_across_a_disconnect_takes_no_hold() -> None:
+    async with harness(client_config=load_all_config(), server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+
+        published = await disconnect_during_conversion(h, subscribe_bars, GER40_M1)
+
+        assert not h.account.subscriptions.spot_holds(h.client._owner)
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
+        assert not h.client._bars
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+        assert not h.published[published:]
+        for event in spots_until(GER40_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+        assert not h.bars()
 
 
 async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(

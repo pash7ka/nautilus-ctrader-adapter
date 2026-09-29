@@ -234,6 +234,9 @@ class CTraderDataClient(LiveMarketDataClient):
         # Subscribes still preparing their conversion, by consumer name. An unsubscribe drops
         # the entry, and a subscribe whose marker is gone then takes no hold.
         self._preparing: dict[str, set[object]] = {}
+        # Advanced by every `_connect` and `_disconnect`, so a subscribe that awaited across one
+        # knows its preparation belongs to a connection that is gone.
+        self._connection_generation = 0
         self._bars: dict[BarType, _BarSub] = {}
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
@@ -251,6 +254,7 @@ class CTraderDataClient(LiveMarketDataClient):
         return self._instrument_provider
 
     async def _connect(self) -> None:
+        self._connection_generation += 1
         # Nothing from an earlier connection may survive here, in this client or in the
         # registry: a `_disconnect` cut short would otherwise make a later subscribe a silent
         # no-op against a session that is gone.
@@ -269,16 +273,19 @@ class CTraderDataClient(LiveMarketDataClient):
         session = self._account.session
         assert session is not None  # `connect()` returned, so the session is up
         self._session = session
-        self._account.add_reload_listener(self._on_instrument_reloaded)
 
         # Conversion first: an instrument whose value in the account currency cannot be priced
         # is dropped here, and must never reach the data engine or the cache.
         await self._connect_conversions()
 
+        # Only once nothing above can fail, so a failed connect leaves no listener behind.
+        self._account.add_reload_listener(self._on_instrument_reloaded)
         for instrument in self._instrument_provider.list_all():
             self._handle_data(instrument)
 
     async def _disconnect(self) -> None:
+        self._connection_generation += 1
+        self._preparing.clear()
         session, self._session = self._session, None
         self._account.remove_reload_listener(self._on_instrument_reloaded)
         try:
@@ -318,6 +325,7 @@ class CTraderDataClient(LiveMarketDataClient):
             self._account.subscriptions.remove_spot_listener(symbol_id, listener)
         self._spot_listeners.clear()
         self._books.clear()
+        self._preparing.clear()
 
     # -- Instruments ------------------------------------------------------------------------
 
@@ -514,9 +522,13 @@ class CTraderDataClient(LiveMarketDataClient):
 
         Also refuses, silently, if `consumer` was unsubscribed meanwhile: that unsubscribe found
         no hold to release. The chain stays held, as after a completed subscribe and unsubscribe.
+
+        Refuses silently too if the client connected or disconnected meanwhile, releasing the
+        instrument's chain: the release that came with it did not see what was still being held.
         """
         if not self._config.subscribe_conversion_quotes:
             return True
+        connection = self._connection_generation
         marker = object()
         self._preparing.setdefault(consumer, set()).add(marker)
         try:
@@ -527,6 +539,12 @@ class CTraderDataClient(LiveMarketDataClient):
             markers.discard(marker)
             if not markers:
                 self._preparing.pop(consumer, None)
+        if connection != self._connection_generation:
+            # Before the release's first await, so a preparation queued behind this one for the
+            # same instrument does not take the chain as converted.
+            self._converted.discard(instrument.id)
+            await self._retire_old_legs(_conversion_consumer(instrument.id), set())
+            return False
         if chain is None:
             self._report_missing_conversion(instrument.id, what)
             return False
@@ -637,6 +655,7 @@ class CTraderDataClient(LiveMarketDataClient):
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         bar_type = command.bar_type
+        # Enough: Nautilus records it before this task, and its engine gates on `subscribed_bars()`.
         if bar_type in self._bars:
             return
         try:
