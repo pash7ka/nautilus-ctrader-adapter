@@ -6,6 +6,8 @@ against a hand-built symbol spec.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.enums import AssetClass
@@ -18,7 +20,14 @@ from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
-from tests.account_venue import RECORDED, account_client, received, venue
+from tests.account_venue import (
+    RECORDED,
+    HeldReplies,
+    account_client,
+    for_account,
+    received,
+    venue,
+)
 from tests.recording_logger import RecordingLogger
 
 LIGHT = {s.symbolName: s for s in RECORDED["symbols"][0].symbol}
@@ -225,6 +234,66 @@ async def test_conversion_instruments_for_is_cached() -> None:
 
         assert len(first) == 1 and first[0] is second[0]
         assert len(received(server, oa.ProtoOASymbolsForConversionReq)) == 1
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_per_symbol_reset_advances_the_generation_only_when_it_drops_a_chain() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        provider = _provider(client)
+        await provider.load_ids_async([GER40_ID])
+        await provider.conversion_instruments_for(provider.find(GER40_ID))
+        generation = provider.conversion_generation
+
+        assert not provider.reset_conversion_cache(LIGHT["GER40.cash"].symbolId)
+        assert provider.conversion_generation == generation
+
+        assert provider.reset_conversion_cache(LIGHT["EURUSD"].symbolId)
+        assert provider.conversion_generation == generation + 1
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+def test_a_full_reset_advances_the_generation_even_with_nothing_cached() -> None:
+    provider = _provider(account_client(venue()))
+    generation = provider.conversion_generation
+
+    assert not provider.reset_conversion_cache()
+    assert provider.conversion_generation == generation + 1
+
+
+async def test_a_per_symbol_reset_during_a_chain_query_keeps_its_answer_out_of_the_cache() -> None:
+    server = venue()
+    held = HeldReplies(
+        server,
+        om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ,
+        lambda r: for_account(RECORDED["conversion_eur_usd"][0], r.ctidTraderAccountId),
+    )
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        provider = _provider(client)
+        await provider.load_ids_async([GER40_ID])
+        ger40 = provider.find(GER40_ID)
+        generation = provider.conversion_generation
+        query = asyncio.create_task(provider.conversion_instruments_for(ger40))
+        await held.arrived.wait()
+
+        # Nothing is cached yet, but the answer in flight may already be stale.
+        provider.reset_conversion_cache(LIGHT["EURUSD"].symbolId)
+        await held.stop_holding()
+        await query
+
+        assert provider.conversion_generation != generation
+        await provider.conversion_instruments_for(ger40)
+        assert len(received(server, oa.ProtoOASymbolsForConversionReq)) == 2
     finally:
         await client.disconnect()
         await server.stop()

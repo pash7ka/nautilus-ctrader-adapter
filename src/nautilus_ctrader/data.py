@@ -226,7 +226,7 @@ class CTraderDataClient(LiveMarketDataClient):
         self._spot_listeners: dict[int, SpotListener] = {}
         self._converted: set[InstrumentId] = set()
         # The provider's `conversion_generation` that `_converted` is valid for. The provider is
-        # the account's, so another client or the account's own bring-up may reset it.
+        # the account's, which resets it on a bring-up and on a symbol change.
         self._converted_generation = instrument_provider.conversion_generation
         # One preparation per instrument at a time: its legs are held under one consumer name,
         # so an older preparation finishing last would retire the legs of a newer chain.
@@ -269,7 +269,7 @@ class CTraderDataClient(LiveMarketDataClient):
         session = self._account.session
         assert session is not None  # `connect()` returned, so the session is up
         self._session = session
-        session.add_event_handler(oa.ProtoOASymbolChangedEvent, self._on_symbol_changed)
+        self._account.add_reload_listener(self._on_instrument_reloaded)
 
         # Conversion first: an instrument whose value in the account currency cannot be priced
         # is dropped here, and must never reach the data engine or the cache.
@@ -280,12 +280,8 @@ class CTraderDataClient(LiveMarketDataClient):
 
     async def _disconnect(self) -> None:
         session, self._session = self._session, None
+        self._account.remove_reload_listener(self._on_instrument_reloaded)
         try:
-            if session is not None:
-                session.remove_event_handler(
-                    oa.ProtoOASymbolChangedEvent,
-                    self._on_symbol_changed,
-                )
             await self._release_subscriptions(session)
             self._converted.clear()
         finally:
@@ -348,29 +344,10 @@ class CTraderDataClient(LiveMarketDataClient):
             request.params,
         )
 
-    def _on_symbol_changed(self, event: oa.ProtoOASymbolChangedEvent) -> None:
-        for symbol_id in event.symbolId:
-            self.create_task(
-                self._reload_symbol(symbol_id),
-                log_msg=f"reload symbol {symbol_id}",
-            )
-
-    async def _reload_symbol(self, symbol_id: int) -> None:
-        provider = self._instrument_provider
-        changed = provider.instrument_for_symbol_id(symbol_id)
-        name = f"symbol id {symbol_id}" if changed is None else changed.id.symbol.value
-        self._log.warning(f"Symbol changed at the venue: {name}; reloading")
-        was_current = self._converted_generation == provider.conversion_generation
-        if not provider.reset_conversion_cache(symbol_id) and was_current:
-            # No cached chain used the symbol, so what `_converted` records is still current.
-            # Otherwise every conversion is prepared again on its next use.
-            self._converted_generation = provider.conversion_generation
-        try:
-            reloaded = await provider.reload(symbol_id)
-        except (InstrumentLoadError, CTraderError) as e:
-            self._log.error(f"Reload of {name} failed: {e}")
-            return
-        self._handle_data(reloaded)
+    def _on_instrument_reloaded(self, instrument: Instrument) -> None:
+        # The account has already dropped the chains through the changed symbol; whether a
+        # conversion is prepared again is left to the generation check in `_prepare_conversion`.
+        self._handle_data(instrument)
 
     # -- Conversion -------------------------------------------------------------------------
 

@@ -189,7 +189,12 @@ transport layer can know.
 ## Symbol changes
 
 When the venue announces that a symbol changed, the adapter logs a WARNING naming it, re-fetches
-its specification and republishes the rebuilt instrument through the data engine. Cached
-currency-conversion chains that use the symbol are dropped and resolved again. The new values
-are published as they are; judging whether a changed contract size or minimum distance is
-acceptable is the application's decision.
+its specification and republishes the rebuilt instrument through the data engine. This happens
+once per account, however many clients share it: the account reloads the instrument and every
+connected data client republishes it. A failed reload is one ERROR, and the previous instrument
+stays loaded.
+
+Cached currency-conversion chains that use the symbol are dropped and resolved again on their
+next use; a symbol outside every chain leaves the prepared conversions as they are. The new
+values are published as they are; judging whether a changed contract size or minimum distance
+is acceptable is the application's decision.

@@ -127,6 +127,7 @@ class Harness:
     cache: Cache
     published: list
     responses: list
+    logger: RecordingLogger
 
     def instruments(self) -> list[Instrument]:
         return [d for d in self.published if isinstance(d, Instrument)]
@@ -190,7 +191,7 @@ async def harness(
         config=client_config,
     )
     try:
-        yield Harness(server, account, provider, client, cache, published, responses)
+        yield Harness(server, account, provider, client, cache, published, responses, logger)
     finally:
         await account.disconnect()
         await server.stop()
@@ -774,6 +775,96 @@ async def test_a_symbol_change_outside_every_chain_leaves_the_conversions_prepar
 
         # A conversion prepared again would publish its chain again.
         assert [i.id for i in h.instruments()].count(EURUSD_ID) == legs_published
+
+
+def second_client(h: Harness) -> tuple[CTraderDataClient, list]:
+    """Another data client of `h`'s account, and the list of what it publishes."""
+    msgbus = TestComponentStubs.msgbus()
+    published: list = []
+    msgbus.register(endpoint="DataEngine.process", handler=published.append)
+    client = CTraderDataClient(
+        loop=asyncio.get_running_loop(),
+        account=h.account,
+        msgbus=msgbus,
+        cache=TestComponentStubs.cache(),
+        clock=TestComponentStubs.clock(),
+        instrument_provider=h.provider,
+        config=h.client._config,
+        name="CTRADER-002",
+    )
+    return client, published
+
+
+def symbol_changed(symbol_id: int) -> oa.ProtoOASymbolChangedEvent:
+    return oa.ProtoOASymbolChangedEvent(ctidTraderAccountId=ACCOUNT_ID, symbolId=[symbol_id])
+
+
+def republished(published: list, instrument_id: InstrumentId) -> bool:
+    return any(isinstance(d, Instrument) and d.id == instrument_id for d in published)
+
+
+async def test_two_clients_of_one_account_reload_a_changed_symbol_once() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        second, second_published = second_client(h)
+        await second._connect()
+        try:
+            before = len(h.published)
+            second_before = len(second_published)
+            requests = len(received(h.server, oa.ProtoOASymbolByIdReq))
+
+            await h.server.push(symbol_changed(GER40_SYMBOL_ID))
+            await wait_until(
+                lambda: (
+                    republished(h.published[before:], GER40_ID)
+                    and republished(second_published[second_before:], GER40_ID)
+                ),
+                description="GER40.cash republished by both clients",
+            )
+            await push_spot(h, TWO_SIDED)
+
+            assert len(received(h.server, oa.ProtoOASymbolByIdReq)) == requests + 1
+            warnings = [m for level, m in h.logger.lines if level == "warning"]
+            assert warnings.count("Symbol changed at the venue: GER40.cash; reloading") == 1
+        finally:
+            await second._disconnect()
+
+
+async def test_a_failed_reload_is_reported_once_for_two_clients() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        second, _ = second_client(h)
+        await second._connect()
+        try:
+            await h.server.push(symbol_changed(999_999))
+            await wait_until(
+                lambda: any("Reload of" in e for e in h.logger.errors()),
+                description="the failed reload reported",
+            )
+            await push_spot(h, TWO_SIDED)
+
+            assert len([e for e in h.logger.errors() if "Reload of" in e]) == 1
+        finally:
+            await second._disconnect()
+
+
+async def test_a_disconnected_client_no_longer_republishes_a_changed_symbol() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        second, second_published = second_client(h)
+        await second._connect()
+        await second._disconnect()
+        second_before = len(second_published)
+        before = len(h.published)
+
+        await h.server.push(symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(
+            lambda: republished(h.published[before:], GER40_ID),
+            description="GER40.cash republished by the connected client",
+        )
+        await push_spot(h, TWO_SIDED)
+
+        assert not republished(second_published[second_before:], GER40_ID)
 
 
 async def test_request_instrument_answers_from_the_provider() -> None:

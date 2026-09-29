@@ -21,11 +21,13 @@ from google.protobuf.message import Message
 from nautilus_trader.common.component import Logger
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.instruments import Instrument
 
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
+    CTraderError,
     CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
@@ -41,9 +43,10 @@ from nautilus_ctrader.constants import (
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from nautilus_ctrader.providers import CTraderInstrumentProvider
+from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
 
 TokenListener = Callable[[str, str, float], None]
+ReloadListener = Callable[[Instrument], None]
 
 Environment = Literal["auto", "demo", "live"]
 ENVIRONMENTS: tuple[Environment, ...] = get_args(Environment)
@@ -73,6 +76,8 @@ class CTraderAccountClient:
       force it.
     - `connect()` returns once the session is ready and the reference data is loaded; bad
       credentials fail it at once rather than after `connect_timeout_secs`.
+    - A symbol the venue reports as changed is reloaded here, once for all clients; they
+      learn of it through `add_reload_listener()`.
     """
 
     def __init__(
@@ -105,6 +110,8 @@ class CTraderAccountClient:
 
         self.session: CTraderSession | None = None
         self._token_listeners: list[TokenListener] = []
+        self._reload_listeners: list[ReloadListener] = []
+        self._reload_tasks: set[asyncio.Task] = set()
         self._users = 0
         # Serialises `connect()` and `disconnect()`, so at most one session is ever brought up.
         self._lifecycle_lock = asyncio.Lock()
@@ -203,6 +210,20 @@ class CTraderAccountClient:
         refresh token may no longer work.
         """
         self._token_listeners.append(callback)
+
+    def add_reload_listener(self, callback: ReloadListener) -> None:
+        """Register `callback(instrument)` for every instrument reloaded after a symbol change.
+
+        The account reloads each changed symbol once, however many clients it serves, and calls
+        every listener with the rebuilt instrument, which the provider already holds. A reload
+        that fails calls none. Adding a registered listener again changes nothing.
+        """
+        if callback not in self._reload_listeners:
+            self._reload_listeners.append(callback)
+
+    def remove_reload_listener(self, callback: ReloadListener) -> None:
+        if callback in self._reload_listeners:
+            self._reload_listeners.remove(callback)
 
     async def connect(self) -> None:
         """Become a user of the account's session, bringing it up if this is the first user.
@@ -313,6 +334,9 @@ class CTraderAccountClient:
             # A chain is venue data that can change, so it is re-queried once per bring-up;
             # a reconnect of the running session keeps it.
             self._instrument_provider.reset_conversion_cache()
+        # Only now, when the reference data a reload needs is loaded. The session keeps it
+        # across its own reconnects.
+        session.add_event_handler(oa.ProtoOASymbolChangedEvent, self._on_symbol_changed)
         self._retry_task = asyncio.create_task(self._retry_restores_loop(session))
         self._log.info("Account session ready")
 
@@ -334,14 +358,19 @@ class CTraderAccountClient:
 
     async def _stop(self, session: CTraderSession | None) -> None:
         self.subscriptions.detach()
+        if session is not None:
+            session.remove_event_handler(oa.ProtoOASymbolChangedEvent, self._on_symbol_changed)
+        tasks, self._reload_tasks = self._reload_tasks, set()
         retry_task, self._retry_task = self._retry_task, None
         if retry_task is not None:
-            retry_task.cancel()
-        # The session is stopped even if this is cancelled while the retry task winds down;
+            tasks.add(retry_task)
+        for task in tasks:
+            task.cancel()
+        # The session is stopped even if this is cancelled while the tasks wind down;
         # otherwise it would run on with nothing left to reach it.
         try:
-            if retry_task is not None:
-                await asyncio.wait({retry_task})
+            if tasks:
+                await asyncio.wait(tasks)
         finally:
             if session is not None:
                 await session.stop()
@@ -514,6 +543,44 @@ class CTraderAccountClient:
         self.light_symbols = {s.symbolName: s for s in symbol_list.symbol}
         self._money_digits = trader.moneyDigits
         self._deposit_asset = deposit_asset
+
+    def _on_symbol_changed(self, event: oa.ProtoOASymbolChangedEvent) -> None:
+        provider = self._instrument_provider
+        if provider is None:
+            # No client has asked for instruments, so nothing is loaded or cached.
+            return
+        for symbol_id in event.symbolId:
+            changed = provider.instrument_for_symbol_id(symbol_id)
+            name = f"symbol id {symbol_id}" if changed is None else changed.id.symbol.value
+            self._log.warning(f"Symbol changed at the venue: {name}; reloading")
+            # Before the reload's first await, so no conversion prepared meanwhile trusts a
+            # chain through the changed symbol.
+            provider.reset_conversion_cache(symbol_id)
+            task = asyncio.create_task(self._reload_symbol(provider, symbol_id, name))
+            self._reload_tasks.add(task)
+            task.add_done_callback(self._on_reload_done)
+
+    async def _reload_symbol(
+        self,
+        provider: CTraderInstrumentProvider,
+        symbol_id: int,
+        name: str,
+    ) -> None:
+        try:
+            reloaded = await provider.reload(symbol_id)
+        except (InstrumentLoadError, CTraderError) as e:
+            self._log.error(f"Reload of {name} failed: {e}")
+            return
+        for listener in tuple(self._reload_listeners):
+            try:
+                listener(reloaded)
+            except Exception as e:
+                self._log.exception(f"Reload listener raised for {reloaded.id}", e)
+
+    def _on_reload_done(self, task: asyncio.Task) -> None:
+        self._reload_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self._log.exception("Symbol reload raised", task.exception())
 
     async def _retry_restores_loop(self, session: CTraderSession) -> None:
         failures: dict[Hashable, int] = {}
