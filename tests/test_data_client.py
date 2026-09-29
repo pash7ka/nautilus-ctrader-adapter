@@ -1244,6 +1244,8 @@ async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconne
         assert not h.client._bar_routes
         held = h.account.subscriptions.spot_holds(h.client._owner)
         assert held == {(EURUSD_SYMBOL_ID, CONVERSION_CONSUMER)}
+        active = h.account.subscriptions.active_consumers(EURUSD_SYMBOL_ID, h.client._owner)
+        assert active == {CONVERSION_CONSUMER}
 
 
 async def test_disconnect_releases_the_trendbar_subscription() -> None:
@@ -1661,6 +1663,10 @@ async def test_connect_releases_what_an_interrupted_disconnect_left_in_the_regis
 
         await h.client._connect()
 
+        # A conversion hold left counted would make this connect's own hold a no-op, with no
+        # listener to publish the chain's quotes.
+        await push_spot(h, TWO_SIDED)
+        assert [q.instrument_id for q in h.quotes()] == [EURUSD_ID]
         # Neither counted any more nor restored by the new session.
         assert not h.account.subscriptions.trendbar_holds(h.client._owner)
         assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)

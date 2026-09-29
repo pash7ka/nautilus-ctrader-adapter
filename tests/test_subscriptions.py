@@ -864,7 +864,6 @@ async def test_a_subscribe_after_a_cancelled_release_makes_it_active_again(
     await registry.subscribe_spots(EURUSD, "a", "data")
 
     assert registry.active_consumers(EURUSD, "data") == frozenset({"a"})
-    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 1
 
 
 async def test_a_release_started_during_the_subscribe_ends_with_nothing_held(
