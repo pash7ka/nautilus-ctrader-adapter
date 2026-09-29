@@ -122,7 +122,7 @@ class SubscriptionRegistry:
         if session is not None:
             session.remove_event_handler(oa.ProtoOASpotEvent, self._on_spot)
 
-    async def subscribe_spots(self, symbol_id: int, consumer: str, owner: str = "") -> None:
+    async def subscribe_spots(self, symbol_id: int, consumer: str, owner: str) -> None:
         """Hold `symbol_id`'s spot subscription for `consumer`.
 
         Raises `CTraderRequestError` only if the venue refuses it. A cancelled or timed-out
@@ -134,7 +134,7 @@ class SubscriptionRegistry:
             async with self._lock(key):
                 await self._acquire(key, held)
 
-    async def unsubscribe_spots(self, symbol_id: int, consumer: str, owner: str = "") -> None:
+    async def unsubscribe_spots(self, symbol_id: int, consumer: str, owner: str) -> None:
         """Release `consumer`'s spot reference.
 
         Idempotent, and a cancelled call keeps the reference, so repeating it re-sends the
@@ -151,7 +151,7 @@ class SubscriptionRegistry:
         symbol_id: int,
         period: int,
         consumer: str,
-        owner: str = "",
+        owner: str,
     ) -> None:
         """Subscribe live trendbars, holding the spot subscription the venue requires for them.
 
@@ -181,7 +181,7 @@ class SubscriptionRegistry:
         symbol_id: int,
         period: int,
         consumer: str,
-        owner: str = "",
+        owner: str,
     ) -> None:
         """Release both of `consumer`'s references.
 
@@ -220,7 +220,7 @@ class SubscriptionRegistry:
         """Names counted on `symbol_id`'s spots, of every owner, trendbar holders included."""
         return frozenset(name for _, name in self._consumers.get(_spots_key(symbol_id), ()))
 
-    def trendbar_consumers(self, symbol_id: int, period: int, owner: str = "") -> frozenset[str]:
+    def trendbar_consumers(self, symbol_id: int, period: int, owner: str) -> frozenset[str]:
         """`owner`'s names counted on `symbol_id`'s live trendbars for `period`.
 
         Unlike `trendbar_holds()`, a consumer whose spot leg alone is counted is not included:
@@ -229,7 +229,7 @@ class SubscriptionRegistry:
         key = _trendbar_key(symbol_id, period)
         return frozenset(name for o, name in self._consumers.get(key, ()) if o == owner)
 
-    def active_consumers(self, symbol_id: int, owner: str = "") -> frozenset[str]:
+    def active_consumers(self, symbol_id: int, owner: str) -> frozenset[str]:
         """`owner`'s consumers of `symbol_id`'s spots that should receive data now.
 
         Subscribed, or with a subscribe in flight, and with no unsubscribe started since.
@@ -238,7 +238,7 @@ class SubscriptionRegistry:
         intents = self._intents.get(_spots_key(symbol_id), {})
         return frozenset(name for (o, name), i in intents.items() if o == owner and i.wanted)
 
-    def spot_holds(self, owner: str = "") -> frozenset[tuple[int, str]]:
+    def spot_holds(self, owner: str) -> frozenset[tuple[int, str]]:
         """Every `(symbol id, consumer)` spot hold `owner` still has to release.
 
         Counted, or with a subscribe in flight - active or not, so a release that was
@@ -246,7 +246,7 @@ class SubscriptionRegistry:
         """
         return frozenset((key[1], name) for key, name in self._held(owner, "spots"))
 
-    def trendbar_holds(self, owner: str = "") -> frozenset[tuple[int, int, str]]:
+    def trendbar_holds(self, owner: str) -> frozenset[tuple[int, int, str]]:
         """Every `(symbol id, period, consumer)` trendbar hold `owner` still has to release.
 
         Either leg counted is enough, so this includes a consumer whose spot leg alone is left

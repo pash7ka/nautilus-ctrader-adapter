@@ -120,17 +120,17 @@ async def test_two_consumers_share_one_venue_subscription(
 ) -> None:
     registry = client.subscriptions
 
-    await registry.subscribe_spots(EURUSD, "a")
-    await registry.subscribe_spots(EURUSD, "b")
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await registry.subscribe_spots(EURUSD, "b", "data")
     assert registry.consumers(EURUSD) == frozenset({"a", "b"})
     [request] = received(server, oa.ProtoOASubscribeSpotsReq)
     assert request.ctidTraderAccountId == client.account_id
     assert request.subscribeToSpotTimestamp is True
 
-    await registry.unsubscribe_spots(EURUSD, "a")
+    await registry.unsubscribe_spots(EURUSD, "a", "data")
     assert received(server, oa.ProtoOAUnsubscribeSpotsReq) == []
 
-    await registry.unsubscribe_spots(EURUSD, "b")
+    await registry.unsubscribe_spots(EURUSD, "b", "data")
     assert registry.consumers(EURUSD) == frozenset()
     assert _subscriptions(server) == [
         ("ProtoOASubscribeSpotsReq", (EURUSD,)),
@@ -144,9 +144,9 @@ async def test_the_same_consumer_counts_once(
 ) -> None:
     registry = client.subscriptions
 
-    await registry.subscribe_spots(EURUSD, "a")
-    await registry.subscribe_spots(EURUSD, "a")
-    await registry.unsubscribe_spots(EURUSD, "a")
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await registry.unsubscribe_spots(EURUSD, "a", "data")
 
     assert _subscriptions(server) == [
         ("ProtoOASubscribeSpotsReq", (EURUSD,)),
@@ -161,8 +161,8 @@ async def test_concurrent_first_subscriptions_send_one_request(
     server.reply_delay_secs = 0.05
 
     await asyncio.gather(
-        client.subscriptions.subscribe_spots(EURUSD, "a"),
-        client.subscriptions.subscribe_spots(EURUSD, "b"),
+        client.subscriptions.subscribe_spots(EURUSD, "a", "data"),
+        client.subscriptions.subscribe_spots(EURUSD, "b", "data"),
     )
 
     assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 1
@@ -177,9 +177,9 @@ async def test_trendbars_take_a_spot_reference_and_release_it_last(
 ) -> None:
     registry = client.subscriptions
 
-    await registry.subscribe_trendbars(EURUSD, M15, "bars")
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
     assert registry.consumers(EURUSD) == frozenset({f"trendbar:{M15}:bars"})
-    await registry.unsubscribe_trendbars(EURUSD, M15, "bars")
+    await registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data")
 
     assert registry.consumers(EURUSD) == frozenset()
     assert _subscriptions(server) == [
@@ -195,10 +195,10 @@ async def test_trendbar_release_keeps_spots_another_consumer_holds(
     client: CTraderAccountClient,
 ) -> None:
     registry = client.subscriptions
-    await registry.subscribe_spots(EURUSD, "quotes")
-    await registry.subscribe_trendbars(EURUSD, M15, "bars")
+    await registry.subscribe_spots(EURUSD, "quotes", "data")
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
 
-    await registry.unsubscribe_trendbars(EURUSD, M15, "bars")
+    await registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data")
 
     assert registry.consumers(EURUSD) == frozenset({"quotes"})
     assert received(server, oa.ProtoOAUnsubscribeSpotsReq) == []
@@ -211,7 +211,7 @@ async def test_already_subscribed_counts_as_success(
     server.refuse[oa.ProtoOASubscribeSpotsReq] = "ALREADY_SUBSCRIBED"
     server.refuse[oa.ProtoOASubscribeLiveTrendbarReq] = "ALREADY_SUBSCRIBED"
 
-    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars")
+    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars", "data")
 
     assert client.subscriptions.consumers(EURUSD) == frozenset({f"trendbar:{M15}:bars"})
 
@@ -223,7 +223,7 @@ async def test_a_refused_subscription_is_not_counted(
     server.refuse[oa.ProtoOASubscribeSpotsReq] = "SYMBOL_NOT_FOUND"
 
     with pytest.raises(CTraderRequestError):
-        await client.subscriptions.subscribe_spots(EURUSD, "a")
+        await client.subscriptions.subscribe_spots(EURUSD, "a", "data")
 
     assert client.subscriptions.consumers(EURUSD) == frozenset()
     assert client.session.failed_restores == frozenset()
@@ -236,7 +236,7 @@ async def test_a_refused_trendbar_releases_its_spot_reference(
     server.refuse[oa.ProtoOASubscribeLiveTrendbarReq] = "NOT_SUBSCRIBED_TO_SPOTS"
 
     with pytest.raises(CTraderRequestError):
-        await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars")
+        await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars", "data")
 
     assert client.subscriptions.consumers(EURUSD) == frozenset()
     assert _subscriptions(server)[-1] == ("ProtoOAUnsubscribeSpotsReq", (EURUSD,))
@@ -247,10 +247,10 @@ async def test_a_failed_unsubscribe_still_drops_the_reference(
     client: CTraderAccountClient,
     logger: RecordingLogger,
 ) -> None:
-    await client.subscriptions.subscribe_spots(EURUSD, "a")
+    await client.subscriptions.subscribe_spots(EURUSD, "a", "data")
     server.refuse[oa.ProtoOAUnsubscribeSpotsReq] = "NOT_SUBSCRIBED_TO_SPOTS"
 
-    await client.subscriptions.unsubscribe_spots(EURUSD, "a")
+    await client.subscriptions.unsubscribe_spots(EURUSD, "a", "data")
 
     assert client.subscriptions.consumers(EURUSD) == frozenset()
     warnings = [m for level, m in logger.lines if level == "warning"]
@@ -264,8 +264,8 @@ async def test_subscriptions_while_detached_are_recorded_and_restored_on_connect
     client = account_client(server, logger=logger)
     registry = client.subscriptions
 
-    await registry.subscribe_spots(EURUSD, "a")
-    await registry.subscribe_spots(GBPUSD, "b")
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await registry.subscribe_spots(GBPUSD, "b", "data")
     assert registry.consumers(EURUSD) == frozenset({"a"})
     assert _subscriptions(server) == []
 
@@ -277,7 +277,7 @@ async def test_subscriptions_while_detached_are_recorded_and_restored_on_connect
         ]
         await client.disconnect()
 
-        await registry.unsubscribe_spots(EURUSD, "a")
+        await registry.unsubscribe_spots(EURUSD, "a", "data")
         assert registry.consumers(EURUSD) == frozenset()
         server.received.clear()
 
@@ -303,7 +303,7 @@ async def test_a_subscribe_while_reconnecting_is_sent_by_the_next_bring_up(
     monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
     held = await _reconnect_held(server)
 
-    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars")
+    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars", "data")
     assert client.subscriptions.consumers(EURUSD) == frozenset({f"trendbar:{M15}:bars"})
     assert _subscriptions(server) == []
 
@@ -319,11 +319,11 @@ async def test_an_unsubscribe_while_reconnecting_is_not_restored(
     client: CTraderAccountClient,
 ) -> None:
     monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
-    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars")
+    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars", "data")
     held = await _reconnect_held(server)
     server.received.clear()
 
-    await client.subscriptions.unsubscribe_trendbars(EURUSD, M15, "bars")
+    await client.subscriptions.unsubscribe_trendbars(EURUSD, M15, "bars", "data")
     assert client.subscriptions.consumers(EURUSD) == frozenset()
 
     await held.stop_holding()
@@ -339,7 +339,7 @@ async def test_a_restore_racing_the_last_unsubscribe_leaves_no_subscription(
 ) -> None:
     monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
     registry = client.subscriptions
-    await registry.subscribe_trendbars(EURUSD, M15, "bars")
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
     # The spots restore passes; the trendbar restore's own spots request is held.
     held = HeldReplies(
         server,
@@ -354,7 +354,7 @@ async def test_a_restore_racing_the_last_unsubscribe_leaves_no_subscription(
     await server.drop_connections()
     await asyncio.wait_for(held.arrived.wait(), 2.0)
 
-    unsubscribing = asyncio.create_task(registry.unsubscribe_trendbars(EURUSD, M15, "bars"))
+    unsubscribing = asyncio.create_task(registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data"))
     # One tick suffices: the task blocks on the key lock at its first statement.
     await asyncio.sleep(0)
     assert not unsubscribing.done()
@@ -374,12 +374,12 @@ async def test_interleaved_trendbar_unsubscribe_and_subscribe_end_subscribed(
     client: CTraderAccountClient,
 ) -> None:
     registry = client.subscriptions
-    await registry.subscribe_trendbars(EURUSD, M15, "bars")
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
     server.reply_delay_secs = 0.02
 
     await asyncio.gather(
-        registry.unsubscribe_trendbars(EURUSD, M15, "bars"),
-        registry.subscribe_trendbars(EURUSD, M15, "bars"),
+        registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data"),
+        registry.subscribe_trendbars(EURUSD, M15, "bars", "data"),
     )
 
     assert registry.consumers(EURUSD) == frozenset({f"trendbar:{M15}:bars"})
@@ -409,7 +409,7 @@ async def test_an_unknown_trendbar_outcome_is_recorded_and_cleaned_up_by_unsubsc
     await client.connect()
     try:
         registry = client.subscriptions
-        subscribing = asyncio.create_task(registry.subscribe_trendbars(EURUSD, M15, "bars"))
+        subscribing = asyncio.create_task(registry.subscribe_trendbars(EURUSD, M15, "bars", "data"))
         await wait_until(
             lambda: bool(received(server, oa.ProtoOASubscribeLiveTrendbarReq)),
             description="trendbar request sent",
@@ -422,7 +422,7 @@ async def test_an_unknown_trendbar_outcome_is_recorded_and_cleaned_up_by_unsubsc
             await subscribing
         assert ("trendbar", EURUSD, M15) in client.session.failed_restores
 
-        await registry.unsubscribe_trendbars(EURUSD, M15, "bars")
+        await registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data")
 
         assert registry.consumers(EURUSD) == frozenset()
         sent = [entry[0] for entry in _subscriptions(server)]
@@ -451,7 +451,7 @@ async def test_a_timed_out_subscribe_is_retried_by_the_restore_retry(
     client = account_client(server, logger=logger)
     await client.connect()
     try:
-        await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars")
+        await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars", "data")
         assert client.session.failed_restores == frozenset({("trendbar", EURUSD, M15)})
 
         await held.stop_holding()
@@ -468,14 +468,14 @@ async def test_a_cancelled_unsubscribe_keeps_the_reference_and_a_repeat_re_sends
     client: CTraderAccountClient,
 ) -> None:
     registry = client.subscriptions
-    await registry.subscribe_spots(EURUSD, "a")
+    await registry.subscribe_spots(EURUSD, "a", "data")
     held = HeldReplies(
         server,
         oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ,
         lambda r: oa.ProtoOAUnsubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
     )
 
-    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a"))
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
     await asyncio.wait_for(held.arrived.wait(), 2.0)
     releasing.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -485,7 +485,7 @@ async def test_a_cancelled_unsubscribe_keeps_the_reference_and_a_repeat_re_sends
     assert registry.consumers(EURUSD) == frozenset({"a"})
 
     await held.stop_holding()
-    await registry.unsubscribe_spots(EURUSD, "a")
+    await registry.unsubscribe_spots(EURUSD, "a", "data")
 
     assert registry.consumers(EURUSD) == frozenset()
     assert len(received(server, oa.ProtoOAUnsubscribeSpotsReq)) == 2
@@ -501,13 +501,13 @@ async def test_a_cancelled_spots_leg_is_released_by_unsubscribe_trendbars(
         lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
     )
     registry = client.subscriptions
-    subscribing = asyncio.create_task(registry.subscribe_trendbars(EURUSD, M15, "bars"))
+    subscribing = asyncio.create_task(registry.subscribe_trendbars(EURUSD, M15, "bars", "data"))
     await asyncio.wait_for(held.arrived.wait(), 2.0)
     subscribing.cancel()
     with pytest.raises(asyncio.CancelledError):
         await subscribing
 
-    await registry.unsubscribe_trendbars(EURUSD, M15, "bars")
+    await registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data")
 
     assert registry.consumers(EURUSD) == frozenset()
     assert client.session.failed_restores == frozenset()
@@ -533,7 +533,7 @@ async def test_a_loss_surfacing_as_another_error_records_the_intent(
         return await real_request(payload, **kwargs)
 
     monkeypatch.setattr(session, "request", lost_on_first_subscribe)
-    await client.subscriptions.subscribe_spots(EURUSD, "a")
+    await client.subscriptions.subscribe_spots(EURUSD, "a", "data")
 
     assert client.subscriptions.consumers(EURUSD) == frozenset({"a"})
     await lost[0].stop_holding()
@@ -550,8 +550,8 @@ async def test_live_keys_are_restored_after_a_reconnect(
 ) -> None:
     monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
     registry = client.subscriptions
-    await registry.subscribe_spots(GBPUSD, "quotes")
-    await registry.subscribe_trendbars(EURUSD, M15, "bars")
+    await registry.subscribe_spots(GBPUSD, "quotes", "data")
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
     server.received.clear()
     connections = server.connection_count
 
@@ -577,8 +577,8 @@ async def test_a_refused_restore_is_reported_and_the_others_still_work(
 ) -> None:
     monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
     registry = client.subscriptions
-    await registry.subscribe_spots(GBPUSD, "quotes")
-    await registry.subscribe_trendbars(EURUSD, M15, "bars")
+    await registry.subscribe_spots(GBPUSD, "quotes", "data")
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
     spots = []
     registry.add_spot_listener(GBPUSD, spots.append)
     server.refuse[oa.ProtoOASubscribeLiveTrendbarReq] = "TRADING_DISABLED"
@@ -603,7 +603,7 @@ async def test_restores_accept_already_subscribed(
     client: CTraderAccountClient,
 ) -> None:
     monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
-    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars")
+    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars", "data")
     server.refuse[oa.ProtoOASubscribeSpotsReq] = "ALREADY_SUBSCRIBED"
     server.refuse[oa.ProtoOASubscribeLiveTrendbarReq] = "ALREADY_SUBSCRIBED"
     connections = server.connection_count
@@ -621,7 +621,7 @@ async def test_live_keys_survive_a_disconnect_and_connect(
     server: FakeCTraderServer,
     client: CTraderAccountClient,
 ) -> None:
-    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars")
+    await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars", "data")
     await client.disconnect()
     server.received.clear()
 
@@ -647,7 +647,7 @@ async def test_spots_reach_only_their_symbol_listener(
     logger: RecordingLogger,
 ) -> None:
     registry = client.subscriptions
-    await registry.subscribe_spots(EURUSD, "a")
+    await registry.subscribe_spots(EURUSD, "a", "data")
     eurusd, gbpusd = [], []
     registry.add_spot_listener(EURUSD, eurusd.append)
     registry.add_spot_listener(GBPUSD, gbpusd.append)
