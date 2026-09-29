@@ -52,13 +52,16 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
 
-CONVERSION_CONSUMER = "conversion"
-
 SpotListener = Callable[[oa.ProtoOASpotEvent], None]
 
 
 def _quote_consumer(instrument_id: InstrumentId) -> str:
     return f"quotes:{instrument_id}"
+
+
+def _conversion_consumer(instrument_id: InstrumentId) -> str:
+    """One name per instrument, so the registry counts every instrument a shared leg serves."""
+    return f"conversion:{instrument_id}"
 
 
 def _bar_consumer(bar_type: BarType) -> str:
@@ -225,7 +228,6 @@ class CTraderDataClient(LiveMarketDataClient):
         # The provider's `conversion_generation` that `_converted` is valid for. The provider is
         # the account's, so another client or the account's own bring-up may reset it.
         self._converted_generation = instrument_provider.conversion_generation
-        self._conversion_legs: dict[InstrumentId, frozenset[int]] = {}
         self._bars: dict[BarType, _BarSub] = {}
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
@@ -249,7 +251,6 @@ class CTraderDataClient(LiveMarketDataClient):
         self._forget_subscriptions()
         await self._release_subscriptions(None)
         self._converted.clear()
-        self._conversion_legs.clear()
         # A problem that survives a reconnect is worth reporting at full volume again.
         self._quote_errors.clear()
         self._bar_errors.clear()
@@ -280,7 +281,6 @@ class CTraderDataClient(LiveMarketDataClient):
                     self._on_symbol_changed,
                 )
             await self._release_subscriptions(session)
-            self._conversion_legs.clear()
             self._converted.clear()
         finally:
             await self._account.disconnect()
@@ -429,14 +429,14 @@ class CTraderDataClient(LiveMarketDataClient):
             # for the whole process over one reconnect.
             self._conversion_not_subscribed(instrument.id, e, during_connect=during_connect)
             return None
+        consumer = _conversion_consumer(instrument.id)
         try:
-            await self._hold_chain(chain)
+            await self._hold_chain(chain, consumer)
         except CTraderError as e:
             self._conversion_not_subscribed(instrument.id, e, during_connect=during_connect)
             return None
 
-        legs = frozenset(leg.info["symbol_id"] for leg in chain)
-        await self._retire_old_legs(instrument.id, legs)
+        await self._retire_old_legs(consumer, {leg.info["symbol_id"] for leg in chain})
         # Only now, and only if the chain is still the current one: neither a half-subscribed
         # nor a stale chain may count as converted.
         if generation == self._instrument_provider.conversion_generation:
@@ -470,26 +470,28 @@ class CTraderDataClient(LiveMarketDataClient):
             f"retrying on the next subscribe",
         )
 
-    async def _hold_chain(self, chain: list[Instrument]) -> None:
+    async def _hold_chain(self, chain: list[Instrument], consumer: str) -> None:
         """Subscribe every leg's spots, releasing the ones this call added if one is refused."""
         added: list[int] = []
         try:
             for leg in chain:
                 symbol_id = leg.info["symbol_id"]
-                if await self._hold_spots(symbol_id, CONVERSION_CONSUMER):
+                if await self._hold_spots(symbol_id, consumer):
                     added.append(symbol_id)
         except CTraderError:
             for symbol_id in added:
-                await self._release_spots(symbol_id, CONVERSION_CONSUMER)
+                await self._release_spots(symbol_id, consumer)
             raise
 
-    async def _retire_old_legs(self, instrument_id: InstrumentId, legs: frozenset[int]) -> None:
-        """Release the legs this instrument no longer converts through and nothing else holds."""
-        previous = self._conversion_legs.get(instrument_id, frozenset())
-        self._conversion_legs[instrument_id] = legs
-        for symbol_id in previous - legs:
-            if not any(symbol_id in held for held in self._conversion_legs.values()):
-                await self._release_spots(symbol_id, CONVERSION_CONSUMER)
+    async def _retire_old_legs(self, consumer: str, legs: set[int]) -> None:
+        """Release `consumer`'s holds on the symbols that are no longer among its `legs`.
+
+        Another instrument's hold on the same symbol is its own, so the venue subscription stays
+        while any instrument still converts through it.
+        """
+        held = self._account.subscriptions.spot_holds(self._owner)
+        for symbol_id in sorted(s for s, c in held if c == consumer and s not in legs):
+            await self._release_spots(symbol_id, consumer)
 
     # -- Quotes -----------------------------------------------------------------------------
 
