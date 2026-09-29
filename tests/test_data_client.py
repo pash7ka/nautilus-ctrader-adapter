@@ -150,12 +150,12 @@ async def harness(
     await server.start()
     logger = RecordingLogger()
     account = account_client(server, logger=logger, credentials=client_config.credentials())
-    provider = CTraderInstrumentProvider(
-        account,
-        client_config.instrument_provider,
-        parse_asset_class_overrides(client_config.asset_class_overrides),
-        client_config.fail_on_instrument_error,
-        logger,
+    # The account's own provider, which its bring-up resets, as the factory hands it over.
+    provider = account.get_instrument_provider(
+        config=client_config.instrument_provider,
+        asset_class_overrides=parse_asset_class_overrides(client_config.asset_class_overrides),
+        fail_on_instrument_error=client_config.fail_on_instrument_error,
+        logger=logger,
     )
     published: list = []
     responses: list = []
@@ -539,6 +539,38 @@ async def test_connect_re_queries_the_conversion_chain_every_time() -> None:
         assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 2
 
 
+async def test_a_client_joining_a_running_account_keeps_the_chains_already_resolved() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        second = CTraderDataClient(
+            loop=asyncio.get_running_loop(),
+            account=h.account,
+            msgbus=TestComponentStubs.msgbus(),
+            cache=TestComponentStubs.cache(),
+            clock=TestComponentStubs.clock(),
+            instrument_provider=h.provider,
+            config=h.client._config,
+            name="CTRADER-002",
+        )
+
+        await second._connect()
+        try:
+            assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 1
+        finally:
+            await second._disconnect()
+
+
+async def test_a_conversion_is_prepared_again_once_the_provider_resets_its_chains() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 1
+
+        h.provider.reset_conversion_cache()
+        await subscribe_quotes(h, GER40_ID)
+
+        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 2
+
+
 async def test_the_nautilus_lifecycle_connects_and_disconnects_the_client() -> None:
     async with harness() as h:
         h.client.connect()
@@ -691,6 +723,28 @@ async def test_a_symbol_change_on_a_chain_leg_re_queries_the_chain() -> None:
         await subscribe_quotes(h, GER40_ID)
 
         assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 2
+
+
+async def test_a_symbol_change_outside_every_chain_leaves_the_conversions_prepared() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        before = len(h.instruments())
+        await h.server.push(
+            oa.ProtoOASymbolChangedEvent(
+                ctidTraderAccountId=ACCOUNT_ID,
+                symbolId=[GER40_SYMBOL_ID],
+            ),
+        )
+        await wait_until(
+            lambda: any(i.id == GER40_ID for i in h.instruments()[before:]),
+            description="GER40.cash republished",
+        )
+        legs_published = [i.id for i in h.instruments()].count(EURUSD_ID)
+
+        await subscribe_quotes(h, GER40_ID)
+
+        # A conversion prepared again would publish its chain again.
+        assert [i.id for i in h.instruments()].count(EURUSD_ID) == legs_published
 
 
 async def test_request_instrument_answers_from_the_provider() -> None:

@@ -158,7 +158,7 @@ class CTraderDataClient(LiveMarketDataClient):
     clock : LiveClock
         The clock for the client.
     instrument_provider : CTraderInstrumentProvider
-        The instrument provider, built over the same `account`.
+        The account's own provider, from `account.get_instrument_provider()`.
     config : CTraderDataClientConfig
         The configuration for the client.
     name : str, optional
@@ -213,6 +213,9 @@ class CTraderDataClient(LiveMarketDataClient):
         # and a conversion leg would otherwise emit every quote once per listener.
         self._spot_listeners: dict[int, SpotListener] = {}
         self._converted: set[InstrumentId] = set()
+        # The provider's `conversion_generation` that `_converted` is valid for. The provider is
+        # the account's, so another client or the account's own bring-up may reset it.
+        self._converted_generation = instrument_provider.conversion_generation
         self._conversion_legs: dict[InstrumentId, frozenset[int]] = {}
         self._bars: dict[BarType, _BarSub] = {}
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
@@ -236,8 +239,6 @@ class CTraderDataClient(LiveMarketDataClient):
         # no-op against a session that is gone.
         self._forget_subscriptions()
         await self._release_subscriptions(None)
-        # A chain is venue data that can change, so it is re-queried once per connection.
-        self._instrument_provider.reset_conversion_cache()
         self._converted.clear()
         self._conversion_legs.clear()
         # A problem that survives a reconnect is worth reporting at full volume again.
@@ -341,10 +342,11 @@ class CTraderDataClient(LiveMarketDataClient):
         changed = provider.instrument_for_symbol_id(symbol_id)
         name = f"symbol id {symbol_id}" if changed is None else changed.id.symbol.value
         self._log.warning(f"Symbol changed at the venue: {name}; reloading")
-        if provider.reset_conversion_cache(symbol_id):
-            # A leg of a cached chain changed, so every chain is resolved again on demand.
-            # The holds stay until then, and re-resolution releases the ones that drop out.
-            self._converted.clear()
+        was_current = self._converted_generation == provider.conversion_generation
+        if not provider.reset_conversion_cache(symbol_id) and was_current:
+            # No cached chain used the symbol, so what `_converted` records is still current.
+            # Otherwise every conversion is prepared again on its next use.
+            self._converted_generation = provider.conversion_generation
         try:
             reloaded = await provider.reload(symbol_id)
         except (InstrumentLoadError, CTraderError) as e:
@@ -390,11 +392,16 @@ class CTraderDataClient(LiveMarketDataClient):
           unless this is the bring-up and `fail_on_instrument_error` is set, which asks for an
           instrument that cannot be priced to fail the connect rather than start unpriced.
         """
-        if instrument.id in self._converted:
-            return []
         # Read before the first await: a symbol change during it resets the chain cache, and
         # what this call resolved must then not be recorded as current.
         generation = self._instrument_provider.conversion_generation
+        if generation != self._converted_generation:
+            # A reset since these were prepared: each chain is resolved again on demand. The
+            # holds stay until then, and re-resolution releases the ones that drop out.
+            self._converted.clear()
+            self._converted_generation = generation
+        if instrument.id in self._converted:
+            return []
         try:
             chain = await self._instrument_provider.conversion_instruments_for(instrument)
         except (InstrumentLoadError, CTraderRequestError, CTraderProtocolError) as e:
