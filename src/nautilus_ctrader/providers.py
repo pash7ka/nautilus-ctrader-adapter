@@ -76,8 +76,12 @@ class CTraderInstrumentProvider(InstrumentProvider):
         # so a name is not a safe key.
         self._quote_asset_id: dict[InstrumentId, int] = {}
         self._chains: dict[tuple[int, int], list[om.ProtoOALightSymbol]] = {}
-        # Bumped by every reset, so a chain fetched before one is not written back after it.
+        # Bumped by a reset that may make a resolved chain stale, so a chain fetched before one
+        # is not written back after it.
         self._chain_generation = 0
+        # Chain queries awaiting the venue: a per-symbol reset cannot tell whether their answers
+        # use the symbol, so it treats them as stale.
+        self._chain_queries = 0
         # Symbol names dropped by `remove_failed`: refused until explicitly requested again,
         # so a chain or a reload cannot quietly resurrect an instrument that must not trade.
         self._blocked: set[str] = set()
@@ -146,7 +150,11 @@ class CTraderInstrumentProvider(InstrumentProvider):
         chain = self._chains.get(cache_key)
         if chain is None:
             generation = self._chain_generation
-            chain = await self._account.conversion_chain(quote_asset_id, deposit_asset_id)
+            self._chain_queries += 1
+            try:
+                chain = await self._account.conversion_chain(quote_asset_id, deposit_asset_id)
+            finally:
+                self._chain_queries -= 1
             if not chain:
                 raise InstrumentLoadError(
                     f"no conversion chain from {instrument.quote_currency.code} to "
@@ -171,10 +179,11 @@ class CTraderInstrumentProvider(InstrumentProvider):
 
     @property
     def conversion_generation(self) -> int:
-        """Bumped by every `reset_conversion_cache()`.
+        """Bumped by every `reset_conversion_cache()` that may have made a resolved chain stale.
 
-        A caller that resolves a chain across an await reads this first and compares after, to
-        tell whether what it resolved is still current.
+        That is every full reset, and a per-symbol one that dropped a chain or overlapped a
+        chain query. A caller that resolves a chain across an await reads this first and
+        compares after, to tell whether what it resolved is still current.
         """
         return self._chain_generation
 
@@ -183,6 +192,9 @@ class CTraderInstrumentProvider(InstrumentProvider):
 
         `symbol_id` limits it to chains that use that symbol. A chain is venue data that the
         broker can change, so the caller decides how long to trust one.
+
+        Advances `conversion_generation` unless the per-symbol form provably changed nothing:
+        it dropped no chain and no chain query was awaiting the venue.
 
         The full form also clears the instruments blocked by `remove_failed`, since it marks a
         fresh start; the per-symbol form deliberately keeps them, because one symbol changing
@@ -195,7 +207,8 @@ class CTraderInstrumentProvider(InstrumentProvider):
         ]
         for key in stale:
             del self._chains[key]
-        self._chain_generation += 1
+        if symbol_id is None or stale or self._chain_queries:
+            self._chain_generation += 1
         if symbol_id is None:
             # A full reset is a fresh start for the connection, so a dropped instrument gets
             # another chance to load.

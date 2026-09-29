@@ -48,7 +48,7 @@ from nautilus_ctrader.common.errors import (
 )
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
-from nautilus_ctrader.data import CONVERSION_CONSUMER, CTraderDataClient, _conversion_message
+from nautilus_ctrader.data import CTraderDataClient, _conversion_message
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
@@ -67,8 +67,13 @@ from tests.recording_logger import RecordingLogger
 
 EURUSD_ID = InstrumentId(Symbol("EURUSD"), CTRADER_VENUE)
 GER40_ID = InstrumentId(Symbol("GER40.cash"), CTRADER_VENUE)
+US100_ID = InstrumentId(Symbol("US100.cash"), CTRADER_VENUE)
+XAUUSD_ID = InstrumentId(Symbol("XAUUSD"), CTRADER_VENUE)
 EURUSD_SYMBOL_ID = 1
 GER40_SYMBOL_ID = 279
+# GER40.cash is EUR-quoted in a USD account; its hold on the EURUSD leg goes by this name.
+GER40_CONVERSION = f"conversion:{GER40_ID}"
+US100_CONVERSION = f"conversion:{US100_ID}"
 
 EURUSD_M1 = BarType.from_str(f"{EURUSD_ID}-1-MINUTE-BID-EXTERNAL")
 EURUSD_H1 = BarType.from_str(f"{EURUSD_ID}-1-HOUR-BID-EXTERNAL")
@@ -122,6 +127,7 @@ class Harness:
     cache: Cache
     published: list
     responses: list
+    logger: RecordingLogger
 
     def instruments(self) -> list[Instrument]:
         return [d for d in self.published if isinstance(d, Instrument)]
@@ -185,7 +191,7 @@ async def harness(
         config=client_config,
     )
     try:
-        yield Harness(server, account, provider, client, cache, published, responses)
+        yield Harness(server, account, provider, client, cache, published, responses, logger)
     finally:
         await account.disconnect()
         await server.stop()
@@ -521,7 +527,7 @@ async def test_connect_subscribes_the_conversion_chain() -> None:
         await h.client._connect()
 
         assert EURUSD_SYMBOL_ID in h.subscribed_symbol_ids()
-        assert "conversion" in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
 
 
 def test_the_conversion_message_names_the_currencies_and_the_symbols() -> None:
@@ -552,6 +558,25 @@ async def test_a_broken_conversion_fails_connect_when_configured_to() -> None:
     ) as h:
         with pytest.raises(InstrumentLoadError):
             await h.client._connect()
+
+
+async def test_a_failed_connect_republishes_no_reloaded_instrument() -> None:
+    async with harness(
+        client_config=config(fail_on_instrument_error=True),
+        server=empty_conversion_venue(),
+    ) as h:
+        with pytest.raises(InstrumentLoadError):
+            await h.client._connect()
+        await h.provider.load_ids_async([EURUSD_ID])
+        # Registered after the client's, so it is called after it.
+        reloaded: list = []
+        h.account.add_reload_listener(reloaded.append)
+        before = len(h.published)
+
+        await h.server.push(symbol_changed(EURUSD_SYMBOL_ID))
+        await wait_until(lambda: reloaded, description="EURUSD reloaded")
+
+        assert not republished(h.published[before:], EURUSD_ID)
 
 
 async def test_connect_re_queries_the_conversion_chain_every_time() -> None:
@@ -771,6 +796,104 @@ async def test_a_symbol_change_outside_every_chain_leaves_the_conversions_prepar
         assert [i.id for i in h.instruments()].count(EURUSD_ID) == legs_published
 
 
+def second_client(h: Harness) -> tuple[CTraderDataClient, list]:
+    """Another data client of `h`'s account, and the list of what it publishes."""
+    msgbus = TestComponentStubs.msgbus()
+    published: list = []
+    msgbus.register(endpoint="DataEngine.process", handler=published.append)
+    client = CTraderDataClient(
+        loop=asyncio.get_running_loop(),
+        account=h.account,
+        msgbus=msgbus,
+        cache=TestComponentStubs.cache(),
+        clock=TestComponentStubs.clock(),
+        instrument_provider=h.provider,
+        config=h.client._config,
+        name="CTRADER-002",
+    )
+    return client, published
+
+
+def symbol_changed(symbol_id: int) -> oa.ProtoOASymbolChangedEvent:
+    return oa.ProtoOASymbolChangedEvent(ctidTraderAccountId=ACCOUNT_ID, symbolId=[symbol_id])
+
+
+def republished(published: list, instrument_id: InstrumentId) -> bool:
+    return any(isinstance(d, Instrument) and d.id == instrument_id for d in published)
+
+
+async def test_two_clients_of_one_account_reload_a_changed_symbol_once() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        second, second_published = second_client(h)
+        await second._connect()
+        try:
+            before = len(h.published)
+            second_before = len(second_published)
+            requests = len(received(h.server, oa.ProtoOASymbolByIdReq))
+
+            await h.server.push(symbol_changed(GER40_SYMBOL_ID))
+            await wait_until(
+                lambda: (
+                    republished(h.published[before:], GER40_ID)
+                    and republished(second_published[second_before:], GER40_ID)
+                ),
+                description="GER40.cash republished by both clients",
+            )
+            await push_spot(h, TWO_SIDED)
+
+            assert len(received(h.server, oa.ProtoOASymbolByIdReq)) == requests + 1
+            warnings = [m for level, m in h.logger.lines if level == "warning"]
+            assert warnings.count("Symbol changed at the venue: GER40.cash; reloading") == 1
+        finally:
+            await second._disconnect()
+
+
+async def test_a_failed_reload_is_reported_once_for_two_clients() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        second, second_published = second_client(h)
+        await second._connect()
+        try:
+            before = len(h.published)
+            second_before = len(second_published)
+            h.server.on(om.PROTO_OA_SYMBOL_BY_ID_REQ, _refusal)
+
+            await h.server.push(symbol_changed(GER40_SYMBOL_ID))
+            await wait_until(
+                lambda: any("Reload of" in e for e in h.logger.errors()),
+                description="the failed reload reported",
+            )
+            await push_spot(h, TWO_SIDED)
+
+            reload_errors = [e for e in h.logger.errors() if "Reload of" in e]
+            assert len(reload_errors) == 1
+            assert reload_errors[0].startswith("Reload of GER40.cash failed: ")
+            assert not republished(h.published[before:], GER40_ID)
+            assert not republished(second_published[second_before:], GER40_ID)
+        finally:
+            await second._disconnect()
+
+
+async def test_a_disconnected_client_no_longer_republishes_a_changed_symbol() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        second, second_published = second_client(h)
+        await second._connect()
+        await second._disconnect()
+        second_before = len(second_published)
+        before = len(h.published)
+
+        await h.server.push(symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(
+            lambda: republished(h.published[before:], GER40_ID),
+            description="GER40.cash republished by the connected client",
+        )
+        await push_spot(h, TWO_SIDED)
+
+        assert not republished(second_published[second_before:], GER40_ID)
+
+
 async def test_request_instrument_answers_from_the_provider() -> None:
     async with harness() as h:
         await h.client._connect()
@@ -859,7 +982,7 @@ async def test_a_refused_conversion_leg_keeps_the_instrument_and_retries() -> No
         )
         await subscribe_quotes(h, GER40_ID)
 
-        assert "conversion" in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
         assert GER40_ID in h.client._converted
 
 
@@ -891,7 +1014,7 @@ async def test_an_unanswered_chain_request_keeps_the_instrument_and_retries(
         monkeypatch.undo()
         await subscribe_quotes(h, GER40_ID)
 
-        assert "conversion" in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
         assert GER40_ID in h.client._converted
 
 
@@ -929,8 +1052,324 @@ async def test_dropping_one_hold_on_a_symbol_leaves_the_other_emitting() -> None
         await push_spot(h, TWO_SIDED)
 
         # Still held for the conversion chain, so still exactly one tick.
-        assert "conversion" in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
         assert len(h.quotes()) == 1
+
+
+# -- Conversion legs shared between instruments ---------------------------------------------
+
+
+def serve_chains(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    chains: dict[InstrumentId, list[InstrumentId]],
+) -> None:
+    """Resolve each instrument's chain from `chains`, which the test may change as it goes.
+
+    An instrument not listed has no chain. The recording has a single EUR-quoted instrument,
+    so two instruments sharing a leg, or a chain that changes, can only be arranged by hand.
+    """
+
+    async def conversion_instruments_for(instrument: Instrument) -> list[Instrument]:
+        return [h.provider.find(leg) for leg in chains.get(instrument.id, [])]
+
+    monkeypatch.setattr(h.provider, "conversion_instruments_for", conversion_instruments_for)
+
+
+async def drop_chain(
+    h: Harness,
+    chains: dict[InstrumentId, list[InstrumentId]],
+    instrument_id: InstrumentId,
+) -> None:
+    """Resolve `instrument_id`'s chain again, to one without legs, as its next subscribe does."""
+    chains[instrument_id] = []
+    h.provider.reset_conversion_cache()
+    await subscribe_quotes(h, instrument_id)
+
+
+def load_all_config() -> CTraderDataClientConfig:
+    return config(instrument_provider=InstrumentProviderConfig(load_all=True))
+
+
+def spots_reply(request: oa.ProtoOASubscribeSpotsReq) -> Message:
+    return oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=request.ctidTraderAccountId)
+
+
+async def test_a_leg_one_instrument_drops_stays_held_for_another_still_preparing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        chains = {GER40_ID: [EURUSD_ID], US100_ID: [EURUSD_ID, XAUUSD_ID]}
+        serve_chains(h, monkeypatch, chains)
+        await subscribe_quotes(h, GER40_ID)
+        held = HeldReplies(h.server, om.PROTO_OA_SUBSCRIBE_SPOTS_REQ, spots_reply)
+        # US100.cash takes EURUSD, which is already subscribed, and waits on XAUUSD.
+        preparing = asyncio.create_task(subscribe_quotes(h, US100_ID))
+        await held.arrived.wait()
+
+        await drop_chain(h, chains, GER40_ID)
+        await held.stop_holding()
+        await preparing
+
+        assert EURUSD_SYMBOL_ID not in h.unsubscribed_symbol_ids()
+        assert US100_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        await push_spot(h, TWO_SIDED)
+        assert [q.instrument_id for q in h.quotes()] == [EURUSD_ID]
+
+
+async def test_a_shared_leg_is_released_once_the_last_instrument_drops_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        chains = {GER40_ID: [EURUSD_ID], US100_ID: [EURUSD_ID]}
+        serve_chains(h, monkeypatch, chains)
+        await subscribe_quotes(h, GER40_ID)
+        await subscribe_quotes(h, US100_ID)
+
+        await drop_chain(h, chains, GER40_ID)
+
+        assert EURUSD_SYMBOL_ID not in h.unsubscribed_symbol_ids()
+        consumers = h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert consumers == {US100_CONVERSION}
+
+        await drop_chain(h, chains, US100_ID)
+
+        assert h.unsubscribed_symbol_ids().count(EURUSD_SYMBOL_ID) == 1
+        assert not h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        await push_spot(h, TWO_SIDED)
+        assert not h.quotes()
+
+
+async def test_disconnect_releases_the_conversion_hold_of_every_instrument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        serve_chains(h, monkeypatch, {GER40_ID: [EURUSD_ID], US100_ID: [EURUSD_ID]})
+        await subscribe_quotes(h, GER40_ID)
+        await subscribe_quotes(h, US100_ID)
+        assert h.account.subscriptions.consumers(EURUSD_SYMBOL_ID) == {
+            GER40_CONVERSION,
+            US100_CONVERSION,
+        }
+
+        await h.client._disconnect()
+
+        assert not h.account.subscriptions.spot_holds(h.client._owner)
+        assert h.unsubscribed_symbol_ids().count(EURUSD_SYMBOL_ID) == 1
+
+
+async def test_a_symbol_held_as_a_leg_twice_and_for_quotes_emits_one_quote_per_spot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        serve_chains(h, monkeypatch, {GER40_ID: [EURUSD_ID], US100_ID: [EURUSD_ID]})
+        await subscribe_quotes(h, EURUSD_ID)
+        await subscribe_quotes(h, GER40_ID)
+        await subscribe_quotes(h, US100_ID)
+        assert h.account.subscriptions.consumers(EURUSD_SYMBOL_ID) == {
+            f"quotes:{EURUSD_ID}",
+            GER40_CONVERSION,
+            US100_CONVERSION,
+        }
+
+        await push_spot(h, TWO_SIDED)
+
+        assert len(h.quotes()) == 1
+        assert len(h.cache.quote_ticks(EURUSD_ID)) == 1
+
+
+async def test_an_older_preparation_does_not_release_the_legs_of_a_newer_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        chains = {GER40_ID: [EURUSD_ID]}
+        resolving = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def conversion_instruments_for(instrument: Instrument) -> list[Instrument]:
+            legs = [h.provider.find(leg) for leg in chains[instrument.id]]
+            if not resolving.is_set():
+                resolving.set()
+                await resume.wait()
+            return legs
+
+        monkeypatch.setattr(h.provider, "conversion_instruments_for", conversion_instruments_for)
+        stale = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await resolving.wait()
+        # The chain changes at the venue while the first preparation still holds the old one.
+        chains[GER40_ID] = [XAUUSD_ID]
+        h.provider.reset_conversion_cache()
+        current = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await asyncio.sleep(0)
+
+        resume.set()
+        await asyncio.gather(stale, current)
+
+        xauusd_symbol_id = h.provider.find(XAUUSD_ID).info["symbol_id"]
+        holds = h.account.subscriptions.spot_holds(h.client._owner)
+        assert {s for s, c in holds if c == GER40_CONVERSION} == {xauusd_symbol_id}
+        assert GER40_ID in h.client._converted
+
+
+# -- An unsubscribe arriving while its subscribe prepares the conversion --------------------
+
+
+def subscription_state(h: Harness) -> tuple:
+    """What this client and the account's registry keep of its subscriptions."""
+    subscriptions = h.account.subscriptions
+    return (
+        subscriptions.spot_holds(h.client._owner),
+        subscriptions.trendbar_holds(h.client._owner),
+        frozenset(h.client._converted),
+        frozenset(h.client._bars),
+        frozenset(h.client._spot_listeners),
+        frozenset(h.account.session._restores),
+    )
+
+
+async def state_after_subscribe_then_unsubscribe(
+    subscribe: Callable,
+    unsubscribe: Callable,
+    key: object,
+    server: FakeCTraderServer,
+) -> tuple:
+    """`subscription_state()` once `subscribe` of `key` has completed, and then `unsubscribe`."""
+    async with harness(client_config=load_all_config(), server=server) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe(h, key)
+        await unsubscribe(h, key)
+        return subscription_state(h)
+
+
+def hold_conversion_leg(h: Harness) -> HeldReplies:
+    """Hold spot subscribes: the first one is GER40.cash's EURUSD leg, inside its preparation."""
+    return HeldReplies(h.server, om.PROTO_OA_SUBSCRIBE_SPOTS_REQ, spots_reply)
+
+
+async def test_a_quote_unsubscribe_during_the_conversion_of_its_subscribe_wins() -> None:
+    expected = await state_after_subscribe_then_unsubscribe(
+        subscribe_quotes,
+        unsubscribe_quotes,
+        GER40_ID,
+        data_venue(),
+    )
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        held = hold_conversion_leg(h)
+        subscribing = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await held.arrived.wait()
+        assert list(held.pending[0][1].symbolId) == [EURUSD_SYMBOL_ID]
+
+        await unsubscribe_quotes(h, GER40_ID)
+        await held.stop_holding()
+        await subscribing
+
+        assert subscription_state(h) == expected
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        await push_spot(h, GER40_SPOT)
+        assert GER40_ID not in {q.instrument_id for q in h.quotes()}
+
+
+async def test_a_bar_unsubscribe_during_the_conversion_of_its_subscribe_wins() -> None:
+    expected = await state_after_subscribe_then_unsubscribe(
+        subscribe_bars,
+        unsubscribe_bars,
+        GER40_M1,
+        trendbar_venue(),
+    )
+    async with harness(client_config=load_all_config(), server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        held = hold_conversion_leg(h)
+        subscribing = asyncio.create_task(subscribe_bars(h, GER40_M1))
+        await held.arrived.wait()
+        assert list(held.pending[0][1].symbolId) == [EURUSD_SYMBOL_ID]
+
+        await unsubscribe_bars(h, GER40_M1)
+        await held.stop_holding()
+        await subscribing
+
+        assert subscription_state(h) == expected
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+
+
+async def test_a_subscribe_unsubscribe_subscribe_during_one_conversion_ends_subscribed() -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        held = hold_conversion_leg(h)
+        subscribing = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await held.arrived.wait()
+
+        await unsubscribe_quotes(h, GER40_ID)
+        resubscribing = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await asyncio.sleep(0)
+        await held.stop_holding()
+        await asyncio.gather(subscribing, resubscribing)
+
+        holds = h.account.subscriptions.spot_holds(h.client._owner)
+        assert (GER40_SYMBOL_ID, f"quotes:{GER40_ID}") in holds
+        assert h.subscribed_symbol_ids().count(GER40_SYMBOL_ID) == 1
+        await push_spot(h, GER40_SPOT)
+        assert [q.instrument_id for q in h.quotes()] == [GER40_ID]
+
+
+async def disconnect_during_conversion(h: Harness, subscribe: Callable, key: object) -> int:
+    """Disconnect the client while `subscribe` of `key` waits on its EURUSD leg.
+
+    Another user keeps the account's session up, as an execution client would, so whatever the
+    subscribe takes afterwards would be a real venue subscription. Returns how much had been
+    published when the disconnect started.
+    """
+    await h.account.connect()
+    held = hold_conversion_leg(h)
+    subscribing = asyncio.create_task(subscribe(h, key))
+    await held.arrived.wait()
+
+    published = len(h.published)
+    disconnecting = asyncio.create_task(h.client._disconnect())
+    await asyncio.sleep(0)
+    await held.stop_holding()
+    await asyncio.gather(subscribing, disconnecting)
+    return published
+
+
+async def test_a_quote_subscribe_converting_across_a_disconnect_takes_no_hold() -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+
+        published = await disconnect_during_conversion(h, subscribe_quotes, GER40_ID)
+
+        assert not h.account.subscriptions.spot_holds(h.client._owner)
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        assert not h.published[published:]
+        await push_spot(h, GER40_SPOT)
+        await push_spot(h, TWO_SIDED)
+        assert not h.quotes()
+
+
+async def test_a_bar_subscribe_converting_across_a_disconnect_takes_no_hold() -> None:
+    async with harness(client_config=load_all_config(), server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+
+        published = await disconnect_during_conversion(h, subscribe_bars, GER40_M1)
+
+        assert not h.account.subscriptions.spot_holds(h.client._owner)
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
+        assert not h.client._bars
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+        assert not h.published[published:]
+        for event in spots_until(GER40_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+        assert not h.bars()
 
 
 async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(
@@ -1360,9 +1799,9 @@ async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconne
         assert not h.client._bars
         assert not h.client._bar_routes
         held = h.account.subscriptions.spot_holds(h.client._owner)
-        assert held == {(EURUSD_SYMBOL_ID, CONVERSION_CONSUMER)}
+        assert held == {(EURUSD_SYMBOL_ID, GER40_CONVERSION)}
         active = h.account.subscriptions.active_consumers(EURUSD_SYMBOL_ID, h.client._owner)
-        assert active == {CONVERSION_CONSUMER}
+        assert active == {GER40_CONVERSION}
 
 
 async def test_connect_removes_backfill_restores_an_interrupted_disconnect_left_behind() -> None:
@@ -1419,7 +1858,7 @@ async def test_subscribing_bars_alone_still_prepares_the_conversion_chain() -> N
         await subscribe_bars(h, GER40_M1)
 
         assert GER40_ID in h.client._converted
-        assert CONVERSION_CONSUMER in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
         assert EURUSD_ID in {i.id for i in h.instruments()}  # the leg reaches the cache
 
 
@@ -1735,7 +2174,7 @@ async def test_a_cancelled_release_does_not_let_a_later_one_re_attach_the_listen
         )
 
         cancelled = asyncio.create_task(
-            h.client._release_spots(EURUSD_SYMBOL_ID, CONVERSION_CONSUMER),
+            h.client._release_spots(EURUSD_SYMBOL_ID, GER40_CONVERSION),
         )
         await held.arrived.wait()
         cancelled.cancel()
@@ -1751,7 +2190,7 @@ async def test_a_cancelled_release_does_not_let_a_later_one_re_attach_the_listen
         assert not h.quotes()
         # The cancelled release is still on record, so a disconnect repeats its unsubscribe.
         held = h.account.subscriptions.spot_holds(h.client._owner)
-        assert (EURUSD_SYMBOL_ID, CONVERSION_CONSUMER) in held
+        assert (EURUSD_SYMBOL_ID, GER40_CONVERSION) in held
 
 
 async def test_disconnect_forgets_which_instruments_were_converted() -> None:
@@ -1791,13 +2230,13 @@ async def test_disconnect_releases_only_this_clients_holds() -> None:
         await h.client._connect()
         await h.account.subscriptions.subscribe_spots(
             EURUSD_SYMBOL_ID,
-            CONVERSION_CONSUMER,
+            GER40_CONVERSION,
             OTHER_OWNER,
         )
 
         await h.client._disconnect()
 
-        assert CONVERSION_CONSUMER in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
         assert EURUSD_SYMBOL_ID not in h.unsubscribed_symbol_ids()
 
 

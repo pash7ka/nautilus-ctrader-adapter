@@ -52,13 +52,16 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
 
-CONVERSION_CONSUMER = "conversion"
-
 SpotListener = Callable[[oa.ProtoOASpotEvent], None]
 
 
 def _quote_consumer(instrument_id: InstrumentId) -> str:
     return f"quotes:{instrument_id}"
+
+
+def _conversion_consumer(instrument_id: InstrumentId) -> str:
+    """One name per instrument, so the registry counts every instrument a shared leg serves."""
+    return f"conversion:{instrument_id}"
 
 
 def _bar_consumer(bar_type: BarType) -> str:
@@ -223,9 +226,17 @@ class CTraderDataClient(LiveMarketDataClient):
         self._spot_listeners: dict[int, SpotListener] = {}
         self._converted: set[InstrumentId] = set()
         # The provider's `conversion_generation` that `_converted` is valid for. The provider is
-        # the account's, so another client or the account's own bring-up may reset it.
+        # the account's, which resets it on a bring-up and on a symbol change.
         self._converted_generation = instrument_provider.conversion_generation
-        self._conversion_legs: dict[InstrumentId, frozenset[int]] = {}
+        # One preparation per instrument at a time: its legs are held under one consumer name,
+        # so an older preparation finishing last would retire the legs of a newer chain.
+        self._conversion_locks: dict[InstrumentId, asyncio.Lock] = {}
+        # Subscribes still preparing their conversion, by consumer name. An unsubscribe drops
+        # the entry, and a subscribe whose marker is gone then takes no hold.
+        self._preparing: dict[str, set[object]] = {}
+        # Advanced by every `_connect` and `_disconnect`, so a subscribe that awaited across one
+        # knows its preparation belongs to a connection that is gone.
+        self._connection_generation = 0
         self._bars: dict[BarType, _BarSub] = {}
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
@@ -243,13 +254,13 @@ class CTraderDataClient(LiveMarketDataClient):
         return self._instrument_provider
 
     async def _connect(self) -> None:
+        self._connection_generation += 1
         # Nothing from an earlier connection may survive here, in this client or in the
         # registry: a `_disconnect` cut short would otherwise make a later subscribe a silent
         # no-op against a session that is gone.
         self._forget_subscriptions()
         await self._release_subscriptions(None)
         self._converted.clear()
-        self._conversion_legs.clear()
         # A problem that survives a reconnect is worth reporting at full volume again.
         self._quote_errors.clear()
         self._bar_errors.clear()
@@ -262,25 +273,23 @@ class CTraderDataClient(LiveMarketDataClient):
         session = self._account.session
         assert session is not None  # `connect()` returned, so the session is up
         self._session = session
-        session.add_event_handler(oa.ProtoOASymbolChangedEvent, self._on_symbol_changed)
 
         # Conversion first: an instrument whose value in the account currency cannot be priced
         # is dropped here, and must never reach the data engine or the cache.
         await self._connect_conversions()
 
+        # Only once nothing above can fail, so a failed connect leaves no listener behind.
+        self._account.add_reload_listener(self._on_instrument_reloaded)
         for instrument in self._instrument_provider.list_all():
             self._handle_data(instrument)
 
     async def _disconnect(self) -> None:
+        self._connection_generation += 1
+        self._preparing.clear()
         session, self._session = self._session, None
+        self._account.remove_reload_listener(self._on_instrument_reloaded)
         try:
-            if session is not None:
-                session.remove_event_handler(
-                    oa.ProtoOASymbolChangedEvent,
-                    self._on_symbol_changed,
-                )
             await self._release_subscriptions(session)
-            self._conversion_legs.clear()
             self._converted.clear()
         finally:
             await self._account.disconnect()
@@ -316,6 +325,7 @@ class CTraderDataClient(LiveMarketDataClient):
             self._account.subscriptions.remove_spot_listener(symbol_id, listener)
         self._spot_listeners.clear()
         self._books.clear()
+        self._preparing.clear()
 
     # -- Instruments ------------------------------------------------------------------------
 
@@ -342,29 +352,10 @@ class CTraderDataClient(LiveMarketDataClient):
             request.params,
         )
 
-    def _on_symbol_changed(self, event: oa.ProtoOASymbolChangedEvent) -> None:
-        for symbol_id in event.symbolId:
-            self.create_task(
-                self._reload_symbol(symbol_id),
-                log_msg=f"reload symbol {symbol_id}",
-            )
-
-    async def _reload_symbol(self, symbol_id: int) -> None:
-        provider = self._instrument_provider
-        changed = provider.instrument_for_symbol_id(symbol_id)
-        name = f"symbol id {symbol_id}" if changed is None else changed.id.symbol.value
-        self._log.warning(f"Symbol changed at the venue: {name}; reloading")
-        was_current = self._converted_generation == provider.conversion_generation
-        if not provider.reset_conversion_cache(symbol_id) and was_current:
-            # No cached chain used the symbol, so what `_converted` records is still current.
-            # Otherwise every conversion is prepared again on its next use.
-            self._converted_generation = provider.conversion_generation
-        try:
-            reloaded = await provider.reload(symbol_id)
-        except (InstrumentLoadError, CTraderError) as e:
-            self._log.error(f"Reload of {name} failed: {e}")
-            return
-        self._handle_data(reloaded)
+    def _on_instrument_reloaded(self, instrument: Instrument) -> None:
+        # The account has already dropped the chains through the changed symbol; whether a
+        # conversion is prepared again is left to the generation check in `_prepare_conversion`.
+        self._handle_data(instrument)
 
     # -- Conversion -------------------------------------------------------------------------
 
@@ -404,6 +395,16 @@ class CTraderDataClient(LiveMarketDataClient):
           unless this is the bring-up and `fail_on_instrument_error` is set, which asks for an
           instrument that cannot be priced to fail the connect rather than start unpriced.
         """
+        lock = self._conversion_locks.setdefault(instrument.id, asyncio.Lock())
+        async with lock:
+            return await self._prepare_conversion_locked(instrument, during_connect=during_connect)
+
+    async def _prepare_conversion_locked(
+        self,
+        instrument: Instrument,
+        *,
+        during_connect: bool,
+    ) -> list[Instrument] | None:
         # Read before the first await: a symbol change during it resets the chain cache, and
         # what this call resolved must then not be recorded as current.
         generation = self._instrument_provider.conversion_generation
@@ -429,14 +430,14 @@ class CTraderDataClient(LiveMarketDataClient):
             # for the whole process over one reconnect.
             self._conversion_not_subscribed(instrument.id, e, during_connect=during_connect)
             return None
+        consumer = _conversion_consumer(instrument.id)
         try:
-            await self._hold_chain(chain)
+            await self._hold_chain(chain, consumer)
         except CTraderError as e:
             self._conversion_not_subscribed(instrument.id, e, during_connect=during_connect)
             return None
 
-        legs = frozenset(leg.info["symbol_id"] for leg in chain)
-        await self._retire_old_legs(instrument.id, legs)
+        await self._retire_old_legs(consumer, {leg.info["symbol_id"] for leg in chain})
         # Only now, and only if the chain is still the current one: neither a half-subscribed
         # nor a stale chain may count as converted.
         if generation == self._instrument_provider.conversion_generation:
@@ -470,26 +471,28 @@ class CTraderDataClient(LiveMarketDataClient):
             f"retrying on the next subscribe",
         )
 
-    async def _hold_chain(self, chain: list[Instrument]) -> None:
+    async def _hold_chain(self, chain: list[Instrument], consumer: str) -> None:
         """Subscribe every leg's spots, releasing the ones this call added if one is refused."""
         added: list[int] = []
         try:
             for leg in chain:
                 symbol_id = leg.info["symbol_id"]
-                if await self._hold_spots(symbol_id, CONVERSION_CONSUMER):
+                if await self._hold_spots(symbol_id, consumer):
                     added.append(symbol_id)
         except CTraderError:
             for symbol_id in added:
-                await self._release_spots(symbol_id, CONVERSION_CONSUMER)
+                await self._release_spots(symbol_id, consumer)
             raise
 
-    async def _retire_old_legs(self, instrument_id: InstrumentId, legs: frozenset[int]) -> None:
-        """Release the legs this instrument no longer converts through and nothing else holds."""
-        previous = self._conversion_legs.get(instrument_id, frozenset())
-        self._conversion_legs[instrument_id] = legs
-        for symbol_id in previous - legs:
-            if not any(symbol_id in held for held in self._conversion_legs.values()):
-                await self._release_spots(symbol_id, CONVERSION_CONSUMER)
+    async def _retire_old_legs(self, consumer: str, legs: set[int]) -> None:
+        """Release `consumer`'s holds on the symbols that are no longer among its `legs`.
+
+        Another instrument's hold on the same symbol is its own, so the venue subscription stays
+        while any instrument still converts through it.
+        """
+        held = self._account.subscriptions.spot_holds(self._owner)
+        for symbol_id in sorted(s for s, c in held if c == consumer and s not in legs):
+            await self._release_spots(symbol_id, consumer)
 
     # -- Quotes -----------------------------------------------------------------------------
 
@@ -500,26 +503,54 @@ class CTraderDataClient(LiveMarketDataClient):
             self._log.error(f"Cannot subscribe quotes: {instrument_id} is not loaded")
             return
 
-        if not await self._convert_before_subscribing(instrument, "quotes"):
+        consumer = _quote_consumer(instrument_id)
+        if not await self._convert_before_subscribing(instrument, "quotes", consumer):
             return
 
-        await self._hold_spots(instrument.info["symbol_id"], _quote_consumer(instrument_id))
+        await self._hold_spots(instrument.info["symbol_id"], consumer)
 
-    async def _convert_before_subscribing(self, instrument: Instrument, what: str) -> bool:
+    async def _convert_before_subscribing(
+        self,
+        instrument: Instrument,
+        what: str,
+        consumer: str,
+    ) -> bool:
         """Resolve and publish `instrument`'s conversion chain; report and refuse if it fails.
 
         Run before the venue subscription, so nothing is ever published for an instrument that
         cannot be priced in the account currency. `what` names the subscription being refused.
+
+        Also refuses, silently, if `consumer` was unsubscribed meanwhile: that unsubscribe found
+        no hold to release. The chain stays held, as after a completed subscribe and unsubscribe.
+
+        Refuses silently too if the client connected or disconnected meanwhile, releasing the
+        instrument's chain: the release that came with it did not see what was still being held.
         """
         if not self._config.subscribe_conversion_quotes:
             return True
-        chain = await self._prepare_conversion(instrument)
+        connection = self._connection_generation
+        marker = object()
+        self._preparing.setdefault(consumer, set()).add(marker)
+        try:
+            chain = await self._prepare_conversion(instrument)
+        finally:
+            markers = self._preparing.get(consumer, set())
+            wanted = marker in markers
+            markers.discard(marker)
+            if not markers:
+                self._preparing.pop(consumer, None)
+        if connection != self._connection_generation:
+            # Before the release's first await, so a preparation queued behind this one for the
+            # same instrument does not take the chain as converted.
+            self._converted.discard(instrument.id)
+            await self._retire_old_legs(_conversion_consumer(instrument.id), set())
+            return False
         if chain is None:
             self._report_missing_conversion(instrument.id, what)
             return False
         for leg in chain:
             self._handle_data(leg)
-        return True
+        return wanted
 
     def _report_missing_conversion(self, instrument_id: InstrumentId, what: str) -> None:
         """Say which of the two ways the conversion failed, because they need different acts."""
@@ -538,6 +569,7 @@ class CTraderDataClient(LiveMarketDataClient):
         # Found by consumer name rather than through the instrument's symbol id, because the
         # instrument may have been dropped since and the hold must be released even then.
         consumer = _quote_consumer(command.instrument_id)
+        self._preparing.pop(consumer, None)
         held = self._account.subscriptions.spot_holds(self._owner)
         symbol_id = next((s for s, c in held if c == consumer), None)
         if symbol_id is not None:
@@ -623,6 +655,7 @@ class CTraderDataClient(LiveMarketDataClient):
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         bar_type = command.bar_type
+        # Enough: Nautilus records it before this task, and its engine gates on `subscribed_bars()`.
         if bar_type in self._bars:
             return
         try:
@@ -636,7 +669,8 @@ class CTraderDataClient(LiveMarketDataClient):
             return
         # A bars-only subscriber needs the account valued just as much as a quote subscriber
         # does. Before anything below is recorded, so a refused chain leaves nothing behind.
-        if not await self._convert_before_subscribing(instrument, "bars"):
+        consumer = _bar_consumer(bar_type)
+        if not await self._convert_before_subscribing(instrument, "bars", consumer):
             return
 
         symbol_id = instrument.info["symbol_id"]
@@ -644,7 +678,6 @@ class CTraderDataClient(LiveMarketDataClient):
         # forming at its construction, so building it afterwards would drop a bar that closed
         # while the request was in flight.
         sub = _BarSub(symbol_id, period, self._make_closer(bar_type, symbol_id, period))
-        consumer = _bar_consumer(bar_type)
         self._bars[bar_type] = sub
         self._bar_routes[(symbol_id, period)] = sub
         self._sync_listener(symbol_id)
@@ -671,6 +704,7 @@ class CTraderDataClient(LiveMarketDataClient):
                     self._forget_bars(bar_type, sub)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
+        self._preparing.pop(_bar_consumer(command.bar_type), None)
         await self._drop_bars(command.bar_type, self._session)
 
     async def _drop_bars(self, bar_type: BarType, session: CTraderSession | None) -> None:

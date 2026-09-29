@@ -83,6 +83,8 @@ class SubscriptionRegistry:
       the intent is recorded, and the next bring-up's restores act on it; (un)subscribing
       never raises for want of a connection.
     - The same consumer subscribing twice counts once.
+    - After a cancelled last unsubscribe the venue may have dropped the key while it is still
+      counted, so the next subscribe of it, by any consumer, is sent rather than joined.
     - Counted and active are different facts. A consumer is active - should receive data -
       from the moment its subscribe is called until its unsubscribe is, or until the
       subscribe ends uncounted; it stays counted until that unsubscribe has run its course.
@@ -102,6 +104,9 @@ class SubscriptionRegistry:
         # Every consumer an (un)subscribe call has named and that is counted or may yet be,
         # trendbar spot legs excepted: they belong to their trendbar consumer.
         self._intents: dict[_Key, dict[_Consumer, _Intent]] = {}
+        # Counted keys whose last unsubscribe was cancelled, until a subscribe or a completed
+        # release settles them.
+        self._maybe_unsubscribed: set[_Key] = set()
         # Per key; a trendbar operation takes its trendbar lock before its spots lock, never
         # the other way round.
         self._locks: dict[_Key, asyncio.Lock] = {}
@@ -165,7 +170,7 @@ class SubscriptionRegistry:
         spot_consumer = _trendbar_spot_consumer(period, held)
         with self._subscribing(key, held):
             async with self._lock(key):
-                if held in self._consumers.get(key, ()):
+                if held in self._consumers.get(key, ()) and key not in self._maybe_unsubscribed:
                     return
                 async with self._lock(spots):
                     await self._acquire(spots, spot_consumer)
@@ -314,9 +319,12 @@ class SubscriptionRegistry:
         return None
 
     async def _acquire(self, key: _Key, consumer: _Consumer) -> None:
-        """Count `consumer` on `key`, subscribing first if it is new. Caller holds the key lock."""
+        """Count `consumer` on `key`, subscribing first if it is new or its venue state uncertain.
+
+        Caller holds the key lock.
+        """
         consumers = self._consumers.get(key)
-        if consumers is not None:
+        if consumers is not None and key not in self._maybe_unsubscribed:
             consumers.add(consumer)
             return
         session = self._accepting_session()
@@ -344,6 +352,7 @@ class SubscriptionRegistry:
             # Recorded against whichever session is attached now: if that is no longer the one
             # the request went through, its next bring-up restores the key.
             self._record(key, consumer)
+            self._maybe_unsubscribed.discard(key)
 
     def _record_unknown(self, session: CTraderSession, key: _Key, consumer: _Consumer) -> None:
         self._record(key, consumer)
@@ -365,7 +374,8 @@ class SubscriptionRegistry:
         The reference is dropped once the request has run its course, failure included: its
         consumer is gone either way, and spots the venue keeps sending are dropped for want of
         a listener. A cancellation is the one outcome that keeps it, mirroring `_acquire`: the
-        venue may still be streaming the key, and only a repeated unsubscribe settles that.
+        venue may still be streaming the key, and only a repeated unsubscribe settles that. It
+        may equally have stopped, so the key is marked for the next `_acquire` to re-subscribe.
         """
         consumers = self._consumers.get(key)
         if consumers is None or consumer not in consumers:
@@ -387,7 +397,11 @@ class SubscriptionRegistry:
                 self._log.debug(f"Unsubscribe {key!r} during restore: {detail}")
             else:
                 self._log.warning(f"Unsubscribe {key!r} failed: {detail}")
+        except asyncio.CancelledError:
+            self._maybe_unsubscribed.add(key)
+            raise
         del self._consumers[key]
+        self._maybe_unsubscribed.discard(key)
         if self._session is not None:
             self._session.remove_restore(key)
 
@@ -406,6 +420,7 @@ class SubscriptionRegistry:
                     if key not in self._consumers:
                         return
                     await _subscribe(session, [request])
+            self._maybe_unsubscribed.discard(key)
 
         return restore
 

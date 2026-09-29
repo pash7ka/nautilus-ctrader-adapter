@@ -1136,3 +1136,278 @@ async def test_the_account_bring_up_re_queries_conversion_chains_and_a_reconnect
     finally:
         await client.disconnect()
         await server.stop()
+
+
+# -- Symbol changes -------------------------------------------------------------------------
+
+GER40_SYMBOL_ID = 279
+# Offered by the venue, but not among the provider's `load_ids`.
+EURUSD_ID = InstrumentId(Symbol("EURUSD"), CTRADER_VENUE)
+EURUSD_SYMBOL_ID = 1
+
+
+def _symbol_changed(symbol_id: int) -> oa.ProtoOASymbolChangedEvent:
+    return oa.ProtoOASymbolChangedEvent(ctidTraderAccountId=ACCOUNT_ID, symbolId=[symbol_id])
+
+
+def _symbol_warnings(logger: RecordingLogger) -> list[str]:
+    return [m for level, m in logger.lines if level == "warning" and "Symbol changed" in m]
+
+
+async def _round_trip(client: CTraderAccountClient) -> None:
+    """Return once every event pushed before it has been dispatched.
+
+    A request the event's handler starts goes out after this one; a second round trip covers it.
+    """
+    await client.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+
+
+def _refusal(request: Message) -> Message:
+    return oa.ProtoOAErrorRes(
+        ctidTraderAccountId=request.ctidTraderAccountId,
+        errorCode="INVALID_REQUEST",
+    )
+
+
+async def test_the_account_reloads_a_changed_symbol_once_and_notifies_every_listener() -> None:
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    provider = _instrument_provider(client)
+    first: list = []
+    second: list = []
+    client.add_reload_listener(first.append)
+    client.add_reload_listener(second.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+        requests = len(received(server, oa.ProtoOASymbolByIdReq))
+
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(lambda: first and second, description="both listeners notified")
+        await _round_trip(client)
+
+        assert [i.id for i in first] == [GER40_ID]
+        assert second == first
+        assert provider.find(GER40_ID) is first[0]
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests + 1
+        assert _symbol_warnings(logger) == ["Symbol changed at the venue: GER40.cash; reloading"]
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_raising_reload_listener_neither_stops_the_others_nor_loses_the_reload() -> None:
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    provider = _instrument_provider(client)
+    notified: list = []
+
+    def raising(_instrument) -> None:
+        raise RuntimeError("listener bug")
+
+    client.add_reload_listener(raising)
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(lambda: notified, description="the second listener notified")
+
+        assert provider.find(GER40_ID) is notified[0]
+        assert [e for e in logger.errors() if "Reload listener" in e] == [
+            f"Reload listener raised for {GER40_ID}",
+        ]
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_removed_reload_listener_is_not_notified() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    provider = _instrument_provider(client)
+    removed: list = []
+    kept: list = []
+    client.add_reload_listener(removed.append)
+    client.add_reload_listener(kept.append)
+    client.remove_reload_listener(removed.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(lambda: kept, description="the kept listener notified")
+        await _round_trip(client)
+
+        assert not removed
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_failed_reload_is_reported_once_and_notifies_nobody() -> None:
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+
+        loaded = provider.find(GER40_ID)
+        server.on(oa_model.PROTO_OA_SYMBOL_BY_ID_REQ, _refusal)
+
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(lambda: logger.errors(), description="the failure reported")
+        await _round_trip(client)
+
+        errors = logger.errors()
+        assert len(errors) == 1
+        assert errors[0].startswith("Reload of GER40.cash failed: ")
+        assert not notified
+        assert provider.find(GER40_ID) is loaded
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_change_of_a_symbol_dropped_by_remove_failed_is_ignored() -> None:
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+        provider.remove_failed(GER40_ID, "dropped by the application")
+        errors = len(logger.errors())
+        requests = len(received(server, oa.ProtoOASymbolByIdReq))
+
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await _round_trip(client)
+        await _round_trip(client)
+
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests
+        assert not notified
+        assert provider.find(GER40_ID) is None
+        assert not _symbol_warnings(logger)
+        assert len(logger.errors()) == errors
+
+        # Requested again, it is built from the changed spec rather than a cached one.
+        await provider.load_ids_async([GER40_ID])
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests + 1
+        assert provider.find(GER40_ID) is not None
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_change_of_a_symbol_the_application_never_loaded_is_ignored() -> None:
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+        requests = len(received(server, oa.ProtoOASymbolByIdReq))
+
+        await server.push(_symbol_changed(EURUSD_SYMBOL_ID))
+        await _round_trip(client)
+        await _round_trip(client)
+
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests
+        assert not notified
+        assert provider.find(EURUSD_ID) is None
+        assert not _symbol_warnings(logger)
+        assert not logger.errors()
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_symbol_changes_are_handled_after_a_reconnect_and_after_a_new_bring_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+
+        await server.drop_connections()
+        await wait_until(
+            lambda: server.connection_count >= 3 and client.session.is_ready,
+            timeout_secs=10.0,
+            description="session reconnected on its own",
+        )
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(lambda: len(notified) == 1, description="handled after a reconnect")
+
+        await client.disconnect()
+        await client.connect()
+        requests = len(received(server, oa.ProtoOASymbolByIdReq))
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(lambda: len(notified) == 2, description="handled after a bring-up")
+        await _round_trip(client)
+
+        assert len(notified) == 2
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests + 1
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_symbol_change_before_a_later_bring_up_is_ready_is_not_lost() -> None:
+    server = venue()
+    # The first subscribe is answered; the second, the later bring-up's restore, is held.
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        answer_first=1,
+    )
+    await server.start()
+    client = account_client(server)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+        await client.subscriptions.subscribe_spots(GER40_SYMBOL_ID, "quotes", "owner")
+        await client.disconnect()
+
+        connecting = asyncio.create_task(client.connect())
+        # Authenticated and restoring, so not ready yet.
+        await held.arrived.wait()
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await held.stop_holding()
+        await connecting
+
+        await wait_until(lambda: notified, description="the change handled")
+        assert [i.id for i in notified] == [GER40_ID]
+    finally:
+        await client.disconnect()
+        await server.stop()
