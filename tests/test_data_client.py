@@ -1064,6 +1064,144 @@ async def test_a_symbol_held_as_a_leg_twice_and_for_quotes_emits_one_quote_per_s
         assert len(h.cache.quote_ticks(EURUSD_ID)) == 1
 
 
+async def test_an_older_preparation_does_not_release_the_legs_of_a_newer_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        chains = {GER40_ID: [EURUSD_ID]}
+        resolving = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def conversion_instruments_for(instrument: Instrument) -> list[Instrument]:
+            legs = [h.provider.find(leg) for leg in chains[instrument.id]]
+            if not resolving.is_set():
+                resolving.set()
+                await resume.wait()
+            return legs
+
+        monkeypatch.setattr(h.provider, "conversion_instruments_for", conversion_instruments_for)
+        stale = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await resolving.wait()
+        # The chain changes at the venue while the first preparation still holds the old one.
+        chains[GER40_ID] = [XAUUSD_ID]
+        h.provider.reset_conversion_cache()
+        current = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await asyncio.sleep(0)
+
+        resume.set()
+        await asyncio.gather(stale, current)
+
+        xauusd_symbol_id = h.provider.find(XAUUSD_ID).info["symbol_id"]
+        holds = h.account.subscriptions.spot_holds(h.client._owner)
+        assert {s for s, c in holds if c == GER40_CONVERSION} == {xauusd_symbol_id}
+        assert GER40_ID in h.client._converted
+
+
+# -- An unsubscribe arriving while its subscribe prepares the conversion --------------------
+
+
+def subscription_state(h: Harness) -> tuple:
+    """What this client and the account's registry keep of its subscriptions."""
+    subscriptions = h.account.subscriptions
+    return (
+        subscriptions.spot_holds(h.client._owner),
+        subscriptions.trendbar_holds(h.client._owner),
+        frozenset(h.client._converted),
+        frozenset(h.client._bars),
+        frozenset(h.client._spot_listeners),
+        frozenset(h.account.session._restores),
+    )
+
+
+async def state_after_subscribe_then_unsubscribe(
+    subscribe: Callable,
+    unsubscribe: Callable,
+    key: object,
+    server: FakeCTraderServer,
+) -> tuple:
+    """`subscription_state()` once `subscribe` of `key` has completed, and then `unsubscribe`."""
+    async with harness(client_config=load_all_config(), server=server) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe(h, key)
+        await unsubscribe(h, key)
+        return subscription_state(h)
+
+
+def hold_conversion_leg(h: Harness) -> HeldReplies:
+    """Hold spot subscribes: the first one is GER40.cash's EURUSD leg, inside its preparation."""
+    return HeldReplies(h.server, om.PROTO_OA_SUBSCRIBE_SPOTS_REQ, spots_reply)
+
+
+async def test_a_quote_unsubscribe_during_the_conversion_of_its_subscribe_wins() -> None:
+    expected = await state_after_subscribe_then_unsubscribe(
+        subscribe_quotes,
+        unsubscribe_quotes,
+        GER40_ID,
+        data_venue(),
+    )
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        held = hold_conversion_leg(h)
+        subscribing = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await held.arrived.wait()
+        assert list(held.pending[0][1].symbolId) == [EURUSD_SYMBOL_ID]
+
+        await unsubscribe_quotes(h, GER40_ID)
+        await held.stop_holding()
+        await subscribing
+
+        assert subscription_state(h) == expected
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        await push_spot(h, GER40_SPOT)
+        assert GER40_ID not in {q.instrument_id for q in h.quotes()}
+
+
+async def test_a_bar_unsubscribe_during_the_conversion_of_its_subscribe_wins() -> None:
+    expected = await state_after_subscribe_then_unsubscribe(
+        subscribe_bars,
+        unsubscribe_bars,
+        GER40_M1,
+        trendbar_venue(),
+    )
+    async with harness(client_config=load_all_config(), server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        held = hold_conversion_leg(h)
+        subscribing = asyncio.create_task(subscribe_bars(h, GER40_M1))
+        await held.arrived.wait()
+        assert list(held.pending[0][1].symbolId) == [EURUSD_SYMBOL_ID]
+
+        await unsubscribe_bars(h, GER40_M1)
+        await held.stop_holding()
+        await subscribing
+
+        assert subscription_state(h) == expected
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+
+
+async def test_a_subscribe_unsubscribe_subscribe_during_one_conversion_ends_subscribed() -> None:
+    async with harness(client_config=load_all_config()) as h:
+        await h.client._connect()
+        held = hold_conversion_leg(h)
+        subscribing = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await held.arrived.wait()
+
+        await unsubscribe_quotes(h, GER40_ID)
+        resubscribing = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await asyncio.sleep(0)
+        await held.stop_holding()
+        await asyncio.gather(subscribing, resubscribing)
+
+        holds = h.account.subscriptions.spot_holds(h.client._owner)
+        assert (GER40_SYMBOL_ID, f"quotes:{GER40_ID}") in holds
+        assert h.subscribed_symbol_ids().count(GER40_SYMBOL_ID) == 1
+        await push_spot(h, GER40_SPOT)
+        assert [q.instrument_id for q in h.quotes()] == [GER40_ID]
+
+
 async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

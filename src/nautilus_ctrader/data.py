@@ -228,6 +228,12 @@ class CTraderDataClient(LiveMarketDataClient):
         # The provider's `conversion_generation` that `_converted` is valid for. The provider is
         # the account's, so another client or the account's own bring-up may reset it.
         self._converted_generation = instrument_provider.conversion_generation
+        # One preparation per instrument at a time: its legs are held under one consumer name,
+        # so an older preparation finishing last would retire the legs of a newer chain.
+        self._conversion_locks: dict[InstrumentId, asyncio.Lock] = {}
+        # Subscribes still preparing their conversion, by consumer name. An unsubscribe drops
+        # the entry, and a subscribe whose marker is gone then takes no hold.
+        self._preparing: dict[str, set[object]] = {}
         self._bars: dict[BarType, _BarSub] = {}
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
@@ -404,6 +410,16 @@ class CTraderDataClient(LiveMarketDataClient):
           unless this is the bring-up and `fail_on_instrument_error` is set, which asks for an
           instrument that cannot be priced to fail the connect rather than start unpriced.
         """
+        lock = self._conversion_locks.setdefault(instrument.id, asyncio.Lock())
+        async with lock:
+            return await self._prepare_conversion_locked(instrument, during_connect=during_connect)
+
+    async def _prepare_conversion_locked(
+        self,
+        instrument: Instrument,
+        *,
+        during_connect: bool,
+    ) -> list[Instrument] | None:
         # Read before the first await: a symbol change during it resets the chain cache, and
         # what this call resolved must then not be recorded as current.
         generation = self._instrument_provider.conversion_generation
@@ -502,26 +518,44 @@ class CTraderDataClient(LiveMarketDataClient):
             self._log.error(f"Cannot subscribe quotes: {instrument_id} is not loaded")
             return
 
-        if not await self._convert_before_subscribing(instrument, "quotes"):
+        consumer = _quote_consumer(instrument_id)
+        if not await self._convert_before_subscribing(instrument, "quotes", consumer):
             return
 
-        await self._hold_spots(instrument.info["symbol_id"], _quote_consumer(instrument_id))
+        await self._hold_spots(instrument.info["symbol_id"], consumer)
 
-    async def _convert_before_subscribing(self, instrument: Instrument, what: str) -> bool:
+    async def _convert_before_subscribing(
+        self,
+        instrument: Instrument,
+        what: str,
+        consumer: str,
+    ) -> bool:
         """Resolve and publish `instrument`'s conversion chain; report and refuse if it fails.
 
         Run before the venue subscription, so nothing is ever published for an instrument that
         cannot be priced in the account currency. `what` names the subscription being refused.
+
+        Also refuses, silently, if `consumer` was unsubscribed meanwhile: that unsubscribe found
+        no hold to release. The chain stays held, as after a completed subscribe and unsubscribe.
         """
         if not self._config.subscribe_conversion_quotes:
             return True
-        chain = await self._prepare_conversion(instrument)
+        marker = object()
+        self._preparing.setdefault(consumer, set()).add(marker)
+        try:
+            chain = await self._prepare_conversion(instrument)
+        finally:
+            markers = self._preparing.get(consumer, set())
+            wanted = marker in markers
+            markers.discard(marker)
+            if not markers:
+                self._preparing.pop(consumer, None)
         if chain is None:
             self._report_missing_conversion(instrument.id, what)
             return False
         for leg in chain:
             self._handle_data(leg)
-        return True
+        return wanted
 
     def _report_missing_conversion(self, instrument_id: InstrumentId, what: str) -> None:
         """Say which of the two ways the conversion failed, because they need different acts."""
@@ -540,6 +574,7 @@ class CTraderDataClient(LiveMarketDataClient):
         # Found by consumer name rather than through the instrument's symbol id, because the
         # instrument may have been dropped since and the hold must be released even then.
         consumer = _quote_consumer(command.instrument_id)
+        self._preparing.pop(consumer, None)
         held = self._account.subscriptions.spot_holds(self._owner)
         symbol_id = next((s for s, c in held if c == consumer), None)
         if symbol_id is not None:
@@ -638,7 +673,8 @@ class CTraderDataClient(LiveMarketDataClient):
             return
         # A bars-only subscriber needs the account valued just as much as a quote subscriber
         # does. Before anything below is recorded, so a refused chain leaves nothing behind.
-        if not await self._convert_before_subscribing(instrument, "bars"):
+        consumer = _bar_consumer(bar_type)
+        if not await self._convert_before_subscribing(instrument, "bars", consumer):
             return
 
         symbol_id = instrument.info["symbol_id"]
@@ -646,7 +682,6 @@ class CTraderDataClient(LiveMarketDataClient):
         # forming at its construction, so building it afterwards would drop a bar that closed
         # while the request was in flight.
         sub = _BarSub(symbol_id, period, self._make_closer(bar_type, symbol_id, period))
-        consumer = _bar_consumer(bar_type)
         self._bars[bar_type] = sub
         self._bar_routes[(symbol_id, period)] = sub
         self._sync_listener(symbol_id)
@@ -673,6 +708,7 @@ class CTraderDataClient(LiveMarketDataClient):
                     self._forget_bars(bar_type, sub)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
+        self._preparing.pop(_bar_consumer(command.bar_type), None)
         await self._drop_bars(command.bar_type, self._session)
 
     async def _drop_bars(self, bar_type: BarType, session: CTraderSession | None) -> None:
