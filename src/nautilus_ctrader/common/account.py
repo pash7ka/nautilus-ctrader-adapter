@@ -76,8 +76,8 @@ class CTraderAccountClient:
       force it.
     - `connect()` returns once the session is ready and the reference data is loaded; bad
       credentials fail it at once rather than after `connect_timeout_secs`.
-    - A symbol the venue reports as changed is reloaded here, once for all clients; they
-      learn of it through `add_reload_listener()`.
+    - A loaded symbol the venue reports as changed is reloaded here, once for all clients;
+      they learn of it through `add_reload_listener()`. One not loaded is left unloaded.
     """
 
     def __init__(
@@ -314,8 +314,11 @@ class CTraderAccountClient:
             async with deadline:
                 host = await self._resolve_account()
                 session = self._build_session(host)
-                # Before `start()`, so the first bring-up already restores live subscriptions.
+                # Before `start()`, so the first bring-up already restores live subscriptions,
+                # and a symbol change arriving before the session is ready is not lost. No
+                # instrument is loaded before the reference data, so no reload starts that early.
                 self.subscriptions.attach(session)
+                session.add_event_handler(oa.ProtoOASymbolChangedEvent, self._on_symbol_changed)
                 self.session = session
                 await session.start()
                 await self._wait_ready(session)
@@ -324,8 +327,8 @@ class CTraderAccountClient:
         except BaseException as e:
             self.session = None
             if session is not None:
-                self.subscriptions.detach()
-                await session.stop()
+                # Also cancels a reload an early symbol change started.
+                await self._stop(session)
             if isinstance(e, TimeoutError) and deadline.expired():
                 cause = session.last_error if session is not None else None
                 raise self._connect_timeout_error() from (cause or e)
@@ -334,9 +337,6 @@ class CTraderAccountClient:
             # A chain is venue data that can change, so it is re-queried once per bring-up;
             # a reconnect of the running session keeps it.
             self._instrument_provider.reset_conversion_cache()
-        # Only now, when the reference data a reload needs is loaded. The session keeps it
-        # across its own reconnects.
-        session.add_event_handler(oa.ProtoOASymbolChangedEvent, self._on_symbol_changed)
         self._retry_task = asyncio.create_task(self._retry_restores_loop(session))
         self._log.info("Account session ready")
 
@@ -551,7 +551,14 @@ class CTraderAccountClient:
             return
         for symbol_id in event.symbolId:
             changed = provider.instrument_for_symbol_id(symbol_id)
-            name = f"symbol id {symbol_id}" if changed is None else changed.id.symbol.value
+            if changed is None:
+                # Never requested, or dropped by `remove_failed`: which instruments exist is the
+                # application's decision. Only the cached spec goes, so a later load fetches the
+                # changed one.
+                self._symbol_specs.pop(symbol_id, None)
+                self._log.debug(f"Symbol changed at the venue: symbol id {symbol_id}; not loaded")
+                continue
+            name = changed.id.symbol.value
             self._log.warning(f"Symbol changed at the venue: {name}; reloading")
             # Before the reload's first await, so no conversion prepared meanwhile trusts a
             # chain through the changed symbol.

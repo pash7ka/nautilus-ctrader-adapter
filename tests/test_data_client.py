@@ -833,17 +833,25 @@ async def test_two_clients_of_one_account_reload_a_changed_symbol_once() -> None
 async def test_a_failed_reload_is_reported_once_for_two_clients() -> None:
     async with harness() as h:
         await h.client._connect()
-        second, _ = second_client(h)
+        second, second_published = second_client(h)
         await second._connect()
         try:
-            await h.server.push(symbol_changed(999_999))
+            before = len(h.published)
+            second_before = len(second_published)
+            h.server.on(om.PROTO_OA_SYMBOL_BY_ID_REQ, _refusal)
+
+            await h.server.push(symbol_changed(GER40_SYMBOL_ID))
             await wait_until(
                 lambda: any("Reload of" in e for e in h.logger.errors()),
                 description="the failed reload reported",
             )
             await push_spot(h, TWO_SIDED)
 
-            assert len([e for e in h.logger.errors() if "Reload of" in e]) == 1
+            reload_errors = [e for e in h.logger.errors() if "Reload of" in e]
+            assert len(reload_errors) == 1
+            assert reload_errors[0].startswith("Reload of GER40.cash failed: ")
+            assert not republished(h.published[before:], GER40_ID)
+            assert not republished(second_published[second_before:], GER40_ID)
         finally:
             await second._disconnect()
 

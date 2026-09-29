@@ -192,7 +192,8 @@ When the venue announces that a symbol changed, the adapter logs a WARNING namin
 its specification and republishes the rebuilt instrument through the data engine. This happens
 once per account, however many clients share it: the account reloads the instrument and every
 connected data client republishes it. A failed reload is one ERROR, and the previous instrument
-stays loaded.
+stays loaded. Only an instrument that is loaded is reloaded: a change to a symbol the application
+never loaded, or one that was dropped, is ignored.
 
 Cached currency-conversion chains that use the symbol are dropped and resolved again on their
 next use; a symbol outside every chain leaves the prepared conversions as they are. The new

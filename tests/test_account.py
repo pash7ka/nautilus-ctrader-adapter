@@ -1141,8 +1141,9 @@ async def test_the_account_bring_up_re_queries_conversion_chains_and_a_reconnect
 # -- Symbol changes -------------------------------------------------------------------------
 
 GER40_SYMBOL_ID = 279
-# Not in the recorded symbol list, so its reload fails without a request.
-UNOFFERED_SYMBOL_ID = 999_999
+# Offered by the venue, but not among the provider's `load_ids`.
+EURUSD_ID = InstrumentId(Symbol("EURUSD"), CTRADER_VENUE)
+EURUSD_SYMBOL_ID = 1
 
 
 def _symbol_changed(symbol_id: int) -> oa.ProtoOASymbolChangedEvent:
@@ -1154,8 +1155,18 @@ def _symbol_warnings(logger: RecordingLogger) -> list[str]:
 
 
 async def _round_trip(client: CTraderAccountClient) -> None:
-    """Return once every event pushed before it has been dispatched, and its requests sent."""
+    """Return once every event pushed before it has been dispatched.
+
+    A request the event's handler starts goes out after this one; a second round trip covers it.
+    """
     await client.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+
+
+def _refusal(request: Message) -> Message:
+    return oa.ProtoOAErrorRes(
+        ctidTraderAccountId=request.ctidTraderAccountId,
+        errorCode="INVALID_REQUEST",
+    )
 
 
 async def test_the_account_reloads_a_changed_symbol_once_and_notifies_every_listener() -> None:
@@ -1252,14 +1263,79 @@ async def test_a_failed_reload_is_reported_once_and_notifies_nobody() -> None:
         await client.connect()
         await provider.initialize()
 
-        await server.push(_symbol_changed(UNOFFERED_SYMBOL_ID))
+        loaded = provider.find(GER40_ID)
+        server.on(oa_model.PROTO_OA_SYMBOL_BY_ID_REQ, _refusal)
+
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
         await wait_until(lambda: logger.errors(), description="the failure reported")
         await _round_trip(client)
 
         errors = logger.errors()
         assert len(errors) == 1
-        assert errors[0].startswith(f"Reload of symbol id {UNOFFERED_SYMBOL_ID} failed: ")
+        assert errors[0].startswith("Reload of GER40.cash failed: ")
         assert not notified
+        assert provider.find(GER40_ID) is loaded
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_change_of_a_symbol_dropped_by_remove_failed_is_ignored() -> None:
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+        provider.remove_failed(GER40_ID, "dropped by the application")
+        errors = len(logger.errors())
+        requests = len(received(server, oa.ProtoOASymbolByIdReq))
+
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await _round_trip(client)
+        await _round_trip(client)
+
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests
+        assert not notified
+        assert provider.find(GER40_ID) is None
+        assert not _symbol_warnings(logger)
+        assert len(logger.errors()) == errors
+
+        # Requested again, it is built from the changed spec rather than a cached one.
+        await provider.load_ids_async([GER40_ID])
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests + 1
+        assert provider.find(GER40_ID) is not None
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_change_of_a_symbol_the_application_never_loaded_is_ignored() -> None:
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+        requests = len(received(server, oa.ProtoOASymbolByIdReq))
+
+        await server.push(_symbol_changed(EURUSD_SYMBOL_ID))
+        await _round_trip(client)
+        await _round_trip(client)
+
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests
+        assert not notified
+        assert provider.find(EURUSD_ID) is None
+        assert not _symbol_warnings(logger)
+        assert not logger.errors()
     finally:
         await client.disconnect()
         await server.stop()
@@ -1298,6 +1374,40 @@ async def test_symbol_changes_are_handled_after_a_reconnect_and_after_a_new_brin
 
         assert len(notified) == 2
         assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests + 1
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_symbol_change_before_a_later_bring_up_is_ready_is_not_lost() -> None:
+    server = venue()
+    # The first subscribe is answered; the second, the later bring-up's restore, is held.
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        answer_first=1,
+    )
+    await server.start()
+    client = account_client(server)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+        await client.subscriptions.subscribe_spots(GER40_SYMBOL_ID, "quotes", "owner")
+        await client.disconnect()
+
+        connecting = asyncio.create_task(client.connect())
+        # Authenticated and restoring, so not ready yet.
+        await held.arrived.wait()
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await held.stop_holding()
+        await connecting
+
+        await wait_until(lambda: notified, description="the change handled")
+        assert [i.id for i in notified] == [GER40_ID]
     finally:
         await client.disconnect()
         await server.stop()
