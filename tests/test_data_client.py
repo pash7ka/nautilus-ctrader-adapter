@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
+from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
@@ -1118,6 +1119,113 @@ async def test_a_cancelled_bar_unsubscribe_is_repeated_at_disconnect() -> None:
         assert not h.account.subscriptions.trendbar_holds(h.client._owner)
         # The repeat reaches the venue: the cancelled one settled nothing.
         assert len(received(h.server, oa.ProtoOAUnsubscribeLiveTrendbarReq)) == 2
+
+
+def _spot_unsubscribe_reply(request: oa.ProtoOAUnsubscribeSpotsReq) -> Message:
+    return oa.ProtoOAUnsubscribeSpotsRes(ctidTraderAccountId=request.ctidTraderAccountId)
+
+
+def _refusal(request: Message) -> Message:
+    return oa.ProtoOAErrorRes(
+        ctidTraderAccountId=request.ctidTraderAccountId,
+        errorCode="TRADING_DISABLED",
+    )
+
+
+async def test_a_bar_unsubscribe_cancelled_in_its_spots_leg_is_repeated_at_disconnect() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        # GER40's spots are held by its bars alone, so their release reaches the venue.
+        await subscribe_bars(h, GER40_M1)
+        held = HeldReplies(h.server, om.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+
+        cancelled = asyncio.create_task(unsubscribe_bars(h, GER40_M1))
+        await held.arrived.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await held.stop_holding()
+
+        assert GER40_M1 not in h.client._bars
+        await h.client._disconnect()
+
+        assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+        assert h.unsubscribed_symbol_ids().count(GER40_SYMBOL_ID) == 2
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["cancelled", "refused, rollback cancelled"])
+async def test_a_bar_subscribe_cut_short_holding_only_spots_frees_the_bar_type(
+    refused: bool,
+) -> None:
+    server = trendbar_venue()
+    if refused:
+        server.on(om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ, _refusal)
+        # Cut short in the rollback of the spots leg.
+        held_type, reply = om.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply
+    else:
+        held_type = om.PROTO_OA_SUBSCRIBE_SPOTS_REQ
+
+        def reply(r: Message) -> Message:
+            return oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId)
+
+    async with harness(server=server) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        held = HeldReplies(h.server, held_type, reply)
+
+        cancelled = asyncio.create_task(subscribe_bars(h, GER40_M1))
+        await held.arrived.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await held.stop_holding()
+
+        # No live trendbars, so nothing to route, and a retry must not be a silent no-op.
+        assert GER40_M1 not in h.client._bars
+        assert not h.client._bar_routes
+        # The spot leg the registry still counts is released all the same.
+        await h.client._disconnect()
+        assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+
+
+async def test_a_bar_unsubscribe_during_its_subscribe_leaves_no_backfill_restore() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ,
+            lambda r: oa.ProtoOASubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+
+        subscribing = asyncio.create_task(subscribe_bars(h, EURUSD_M1))
+        await held.arrived.wait()
+        unsubscribing = asyncio.create_task(unsubscribe_bars(h, EURUSD_M1))
+        await wait_until(lambda: EURUSD_M1 not in h.client._bars, description="bars forgotten")
+        await held.stop_holding()
+        await asyncio.gather(subscribing, unsubscribing)
+
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
+        assert ("bar_backfill", str(EURUSD_M1)) not in h.account.session._restores
+
+
+async def test_a_refused_bar_subscribe_racing_its_unsubscribe_reports_the_refusal() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        held = HeldReplies(h.server, om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ, _refusal)
+
+        subscribing = asyncio.create_task(subscribe_bars(h, EURUSD_M1))
+        await held.arrived.wait()
+        unsubscribing = asyncio.create_task(unsubscribe_bars(h, EURUSD_M1))
+        await wait_until(lambda: EURUSD_M1 not in h.client._bars, description="bars forgotten")
+        await held.stop_holding()
+
+        with pytest.raises(CTraderRequestError):
+            await subscribing
+        await unsubscribing
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
 
 
 async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconnect() -> None:

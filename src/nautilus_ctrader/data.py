@@ -627,20 +627,23 @@ class CTraderDataClient(LiveMarketDataClient):
         try:
             await subscriptions.subscribe_trendbars(symbol_id, period, consumer, self._owner)
         finally:
-            # Whatever the outcome - success, refusal, cancellation, a lost connection - what
-            # is kept here must match what the registry counts. It counts a subscribe whose
-            # outcome is unknown, and those still need the restore; a refused or unrecorded one
-            # leaves nothing behind, and the bar type must stay free for another try.
-            if (symbol_id, period, consumer) in subscriptions.trendbar_holds(self._owner):
-                if self._session is not None:
-                    # Added after the registry's own restore for this key, and so run after it:
-                    # the backfill's history needs the reconnected subscription in place.
-                    self._session.add_restore(
-                        _bar_restore_key(bar_type),
-                        functools.partial(self._restore_bars, sub),
-                    )
-            else:
-                self._forget_bars(bar_type, sub)
+            # What is kept here must match what the registry counts, whatever the outcome:
+            # - a counted trendbar leg, unknown outcomes included, keeps the bars and needs the
+            #   backfill restore;
+            # - without one there are no live bars, so the bar type is freed for another try;
+            #   a spot leg left counted is released with this client's other holds;
+            # - an unsubscribe that ran meanwhile has already forgotten `sub`.
+            if self._bars.get(bar_type) is sub:
+                if consumer in subscriptions.trendbar_consumers(symbol_id, period, self._owner):
+                    if self._session is not None:
+                        # Added after the registry's own restore for this key, and so run after
+                        # it: the backfill's history needs the reconnected subscription in place.
+                        self._session.add_restore(
+                            _bar_restore_key(bar_type),
+                            functools.partial(self._restore_bars, sub),
+                        )
+                else:
+                    self._forget_bars(bar_type, sub)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
         await self._drop_bars(command.bar_type, self._session)
@@ -653,7 +656,8 @@ class CTraderDataClient(LiveMarketDataClient):
             self._forget_bars(bar_type, sub)
             symbol_id, period = sub.symbol_id, sub.period
         else:
-            # Only a cancelled release can be left, and the registry still counts it.
+            # Only what a cancellation cut short can be left - a release, or a subscribe that
+            # got no further than its spot leg - and the registry still counts it.
             held = subscriptions.trendbar_holds(self._owner)
             found = next(((s, p) for s, p, c in held if c == consumer), None)
             if found is None:

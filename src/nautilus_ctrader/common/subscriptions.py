@@ -220,10 +220,14 @@ class SubscriptionRegistry:
         """Names counted on `symbol_id`'s spots, of every owner, trendbar holders included."""
         return frozenset(name for _, name in self._consumers.get(_spots_key(symbol_id), ()))
 
-    def trendbar_consumers(self, symbol_id: int, period: int) -> frozenset[str]:
-        """Names counted on `symbol_id`'s live trendbars for `period`, of every owner."""
+    def trendbar_consumers(self, symbol_id: int, period: int, owner: str = "") -> frozenset[str]:
+        """`owner`'s names counted on `symbol_id`'s live trendbars for `period`.
+
+        Unlike `trendbar_holds()`, a consumer whose spot leg alone is counted is not included:
+        it has no live trendbars.
+        """
         key = _trendbar_key(symbol_id, period)
-        return frozenset(name for _, name in self._consumers.get(key, ()))
+        return frozenset(name for o, name in self._consumers.get(key, ()) if o == owner)
 
     def active_consumers(self, symbol_id: int, owner: str = "") -> frozenset[str]:
         """`owner`'s consumers of `symbol_id`'s spots that should receive data now.
@@ -243,7 +247,11 @@ class SubscriptionRegistry:
         return frozenset((key[1], name) for key, name in self._held(owner, "spots"))
 
     def trendbar_holds(self, owner: str = "") -> frozenset[tuple[int, int, str]]:
-        """Every `(symbol id, period, consumer)` trendbar hold `owner` still has to release."""
+        """Every `(symbol id, period, consumer)` trendbar hold `owner` still has to release.
+
+        Either leg counted is enough, so this includes a consumer whose spot leg alone is left
+        by a cancelled call.
+        """
         return frozenset((key[1], key[2], name) for key, name in self._held(owner, "trendbar"))
 
     def _held(self, owner: str, kind: str) -> Iterator[tuple[_Key, str]]:
@@ -276,11 +284,20 @@ class SubscriptionRegistry:
         """Forget `consumer`'s intent once nothing is counted or pending for it."""
         intents = self._intents.get(key, {})
         intent = intents.get(consumer)
-        if intent is None or intent.pending or consumer in self._consumers.get(key, ()):
+        if intent is None or intent.pending or self._counted(key, consumer):
             return
         del intents[consumer]
         if not intents:
             del self._intents[key]
+
+    def _counted(self, key: _Key, consumer: _Consumer) -> bool:
+        """Whether any of `consumer`'s references on `key` is counted, a trendbar's spot leg too."""
+        if consumer in self._consumers.get(key, ()):
+            return True
+        if key[0] != "trendbar":
+            return False
+        spot_consumer = _trendbar_spot_consumer(key[2], consumer)
+        return spot_consumer in self._consumers.get(_spots_key(key[1]), ())
 
     def _lock(self, key: _Key) -> asyncio.Lock:
         return self._locks.setdefault(key, asyncio.Lock())

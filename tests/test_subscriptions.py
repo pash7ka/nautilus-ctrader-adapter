@@ -926,3 +926,74 @@ async def test_a_cancelled_trendbar_release_stays_held_until_repeated(
 
     assert registry.trendbar_holds("data") == frozenset()
     assert len(received(server, oa.ProtoOAUnsubscribeLiveTrendbarReq)) == 2
+
+
+async def test_a_trendbar_release_cancelled_in_its_spots_leg_stays_held_until_repeated(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_trendbars(EURUSD, M15, "bars", "data")
+    held = HeldReplies(server, oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+
+    releasing = asyncio.create_task(registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+    await held.stop_holding()
+
+    # The trendbar leg is gone, the spot leg is not: the owner still has it to release.
+    assert registry.trendbar_holds("data") == frozenset({(EURUSD, M15, "bars")})
+    assert registry.trendbar_consumers(EURUSD, M15, "data") == frozenset()
+    assert registry.consumers(EURUSD) == frozenset({f"trendbar:{M15}:bars"})
+
+    await registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data")
+
+    assert registry.trendbar_holds("data") == frozenset()
+    assert registry.consumers(EURUSD) == frozenset()
+    assert len(received(server, oa.ProtoOAUnsubscribeLiveTrendbarReq)) == 1
+    assert len(received(server, oa.ProtoOAUnsubscribeSpotsReq)) == 2
+
+
+async def test_a_trendbar_subscribe_cancelled_in_its_spots_leg_stays_held(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    held = HeldReplies(server, oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ, _spot_reply)
+
+    subscribing = asyncio.create_task(registry.subscribe_trendbars(EURUSD, M15, "bars", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    subscribing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await subscribing
+    await held.stop_holding()
+
+    assert registry.trendbar_holds("data") == frozenset({(EURUSD, M15, "bars")})
+    assert registry.trendbar_consumers(EURUSD, M15, "data") == frozenset()
+
+
+async def test_a_refused_trendbar_whose_spot_rollback_is_cancelled_stays_held(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    server.refuse[oa.ProtoOASubscribeLiveTrendbarReq] = "TRADING_DISABLED"
+    held = HeldReplies(server, oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+
+    subscribing = asyncio.create_task(registry.subscribe_trendbars(EURUSD, M15, "bars", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    subscribing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await subscribing
+    await held.stop_holding()
+
+    assert registry.trendbar_holds("data") == frozenset({(EURUSD, M15, "bars")})
+    assert registry.trendbar_consumers(EURUSD, M15, "data") == frozenset()
+    assert registry.consumers(EURUSD) == frozenset({f"trendbar:{M15}:bars"})
+
+    await registry.unsubscribe_trendbars(EURUSD, M15, "bars", "data")
+
+    assert registry.trendbar_holds("data") == frozenset()
+    assert registry.consumers(EURUSD) == frozenset()
