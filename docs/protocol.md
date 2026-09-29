@@ -230,16 +230,30 @@ milliseconds and a `count`, and pages backwards: `count` is counted back from `t
   one-minute bar returned it between 0.06 s and 1.0 s after its boundary, over five
   consecutive bars. In the same run every one of those bars was closed by the live stream
   rather than by a timeout, so the history fallback is the exception, not the normal path.
-- **A trendbar day is not a calendar day** (confirmed): daily bars open at 21:00 UTC, not at
-  00:00. A bar covers the venue's trading day, so its open time is an offset into the calendar
-  day rather than the start of one.
+- **A trendbar day is not a calendar day, and its offset is not even constant** (confirmed).
+  A daily bar covers the venue's trading day, which rolls at 17:00 in New York, so its open
+  time is an offset into the calendar day — and that offset follows US daylight saving. Two
+  years of daily bars show it alternating, changing on exactly the US transition dates:
+
+  | Daily bars from | to | open at |
+  |---|---|---|
+  | 2024-11-03 | 2025-03-06 | 22:00 UTC |
+  | 2025-03-09 | 2025-10-30 | 21:00 UTC |
+  | 2025-11-02 | 2026-03-05 | 22:00 UTC |
+  | 2026-03-08 | 2026-09-22 | 21:00 UTC |
+
+  A consumer must therefore not pin the offset once. Note also that the US and EU transition
+  dates differ by a week or two each spring and autumn, so the offset from any European wall
+  clock moves at different moments than the offset from UTC does.
 - **Which periods keep epoch alignment follows from that offset** (confirmed). The trading day
-  starts on the hour, so every period dividing an hour divides the offset too and stays aligned:
-  M1, M15 and H1 were observed opening on multiples of their own length. H4, H12 and D1 do not
-  divide 21 hours, so they carry the offset instead — every observed H4 and H12 bar, across two
-  symbols, opened one hour into its own grid, and every D1 bar at 21:00 UTC. A consumer that
-  floors a timestamp by the period to find a boundary is therefore correct up to H1 and wrong
-  from H4 up; take the open time the venue sends instead.
+  starts on the hour, so every period dividing an hour divides the offset too and stays aligned
+  whatever the offset currently is: M1, M15 and H1 were observed opening on multiples of their
+  own length. H4, H12 and D1 do not divide 21 or 22 hours, so they carry the offset instead —
+  every observed H4 and H12 bar, across two symbols, opened one hour into its own grid while
+  the offset was 21 hours, and it moves with the offset. A consumer that floors a timestamp by
+  the period to find a boundary is therefore correct up to H1 and wrong from H4 up; take the
+  open time the venue sends instead, and derive a boundary from an observed bar rather than
+  from the epoch.
 
 **Unconfirmed**: whether `fromTimestamp` and `toTimestamp` are inclusive. The paging absorbs
 an inclusive `toTimestamp` harmlessly, since a repeated boundary is de-duplicated. An

@@ -36,9 +36,9 @@ A bar's `ts_event` is the end of the period it covers: the open time the venue g
 plus the period. A 15-minute bar covering 09:00–09:15 carries `ts_event = 09:15`.
 
 That open time is used exactly as sent and is never rounded to a multiple of the period, because
-a period's boundaries are not necessarily aligned to midnight: a daily bar opens at 21:00 UTC,
-covering the venue's trading day rather than a calendar day. Rounding it would put every daily
-bar on the wrong day.
+a period's boundaries are not necessarily aligned to midnight: a daily bar covers the venue's
+trading day rather than a calendar day, opening at 21:00 or 22:00 UTC depending on the time of
+year. Rounding it would put every daily bar on the wrong day.
 
 The venue timestamps a bar with its *opening tick*. On the intraday periods that has always been
 the period boundary itself; an open time that is not one is logged and published as it came,
@@ -77,11 +77,13 @@ Two rules follow from this, and applications depend on both:
   and an application that needs a continuous series must fill it itself. Fabricating a flat bar
   would be inventing prices that never traded.
 
-**A daily bar's first close after subscribing can be a day late.** Which bars have already
-closed is worked out from the clock and the period alone, which assumes a period's boundaries
-are multiples of it. That holds for the intraday periods but not for the daily one, so the
-backfill run at a subscribe or a reconnect may miss the daily bar that closed just before it.
-The first daily bar then arrives when the stream closes the following one.
+**A period's boundaries are learnt, not assumed.** The 4-hour, 12-hour and daily periods do not
+divide the trading day's offset, so their boundaries are not multiples of the period, and the
+offset itself moves by an hour with US daylight saving. Which bars have already closed is
+therefore worked out from an offset read from the bars the venue sends — the stream, and the
+history a backfill fetches — and replaced whenever a bar disagrees with it. A move is logged at
+INFO. Until the first bar has settled the offset, a backfill leaves the bar that closed most
+recently to the stream, because it does not yet know which boundary that is.
 
 ## Warm-up: subscribe first, then request
 
@@ -212,7 +214,7 @@ data_config = CTraderDataClientConfig(
     client_secret=client_secret,
     access_token=access_token,
     refresh_token=refresh_token,
-    account_id=account_id,
+    trader_login=trader_login,
 )
 
 account = account_client_from_config(data_config, Logger("CTRADER"))

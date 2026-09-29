@@ -57,9 +57,19 @@ async def test_auto_connects_to_the_listed_account_and_closes_the_pre_connection
         await server.stop()
 
 
-@pytest.mark.parametrize(("is_live", "expected"), [(True, "live.invalid"), (False, "127.0.0.1")])
-async def test_auto_picks_the_host_from_the_is_live_flag(
+@pytest.mark.parametrize(
+    ("environment", "is_live", "expected"),
+    [
+        ("auto", True, "live.invalid"),
+        ("auto", False, "127.0.0.1"),
+        # An explicit environment still resolves the login, but keeps the host it names.
+        ("demo", True, "127.0.0.1"),
+        ("live", False, "live.invalid"),
+    ],
+)
+async def test_the_host_follows_the_is_live_flag_unless_the_environment_names_one(
     monkeypatch: pytest.MonkeyPatch,
+    environment: str,
     is_live: bool,
     expected: str,
 ) -> None:
@@ -76,9 +86,9 @@ async def test_auto_picks_the_host_from_the_is_live_flag(
     monkeypatch.setattr(account_module, "CTraderSession", recording_session)
     await server.start()
     client = CTraderAccountClient(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(),
-        environment="auto",
+        environment=environment,
         logger=RecordingLogger(),
         demo_host=server.host,
         live_host="live.invalid",
@@ -89,24 +99,59 @@ async def test_auto_picks_the_host_from_the_is_live_flag(
         await client.connect()
 
         assert hosts == [expected]
+        assert client.account_id == ACCOUNT_ID
     finally:
         await client.disconnect()
         await server.stop()
 
 
-async def test_auto_rejects_an_account_the_token_does_not_grant() -> None:
-    server = venue(listed=False)
+async def test_a_login_the_token_does_not_grant_is_refused() -> None:
+    server = venue(logins=())
     await server.start()
     client = account_client(server)
     try:
-        with pytest.raises(CTraderAuthError, match="account not granted to this token") as info:
+        with pytest.raises(CTraderAuthError, match="no account with that trader login") as info:
             await client.connect()
 
         assert str(ACCOUNT_ID) not in str(info.value)
-        assert "login" not in str(info.value).lower()
+        assert str(TRADER_LOGIN) not in str(info.value)
         assert client.session is None
         await wait_until(lambda: server.open_connection_count == 0, description="all closed")
     finally:
+        await server.stop()
+
+
+async def test_two_granted_accounts_sharing_a_login_are_refused_rather_than_guessed() -> None:
+    """Logins are unique per broker server, but one token can grant accounts on several."""
+    server = venue(logins=(TRADER_LOGIN, TRADER_LOGIN))
+    await server.start()
+    client = account_client(server)
+    try:
+        with pytest.raises(CTraderAuthError, match="more than one granted account") as info:
+            await client.connect()
+
+        assert str(ACCOUNT_ID) not in str(info.value)
+        assert str(TRADER_LOGIN) not in str(info.value)
+        assert client.session is None
+        assert not received(server, oa.ProtoOAAccountAuthReq)
+    finally:
+        await server.stop()
+
+
+async def test_the_account_id_is_unreadable_before_it_is_resolved() -> None:
+    """A request built before the login is looked up must fail, not go out unaddressed."""
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    try:
+        with pytest.raises(CTraderConnectionError, match="not resolved"):
+            _ = client.account_id
+
+        await client.connect()
+
+        assert client.account_id == ACCOUNT_ID
+    finally:
+        await client.disconnect()
         await server.stop()
 
 
@@ -203,7 +248,8 @@ async def test_explicit_environment_that_cannot_route_names_the_problem() -> Non
             await client.connect()
         assert time.monotonic() - started < 2.0
         assert str(ACCOUNT_ID) not in str(info.value)
-        assert not received(server, oa.ProtoOAGetAccountListByAccessTokenReq)
+        # The list is fetched even for an explicit environment: it resolves the login.
+        assert len(received(server, oa.ProtoOAGetAccountListByAccessTokenReq)) == 1
         await wait_until(lambda: server.open_connection_count == 0, description="all closed")
     finally:
         await server.stop()
@@ -253,8 +299,9 @@ async def test_account_details_never_reach_the_log() -> None:
 
     text = "\n".join(message for _level, message in logger.lines)
     assert str(ACCOUNT_ID) not in text
-    # The login the venue served, not the fixture's: the recorder clears `traderLogin`, and an
-    # unset one reads back as 0, which any log line may contain.
+    # The login the venue served and the client was configured with, not the fixture's: the
+    # recorder clears `traderLogin`, and an unset one reads back as 0, which any log line may
+    # contain.
     assert str(TRADER_LOGIN) not in text
     for entry in RECORDED["account_list"][0].ctidTraderAccount:
         if entry.brokerTitleShort:
@@ -351,19 +398,19 @@ async def test_request_before_connect_fails() -> None:
 
 def test_cached_client_is_shared_per_account_and_application() -> None:
     first = get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(),
         environment="auto",
         logger=RecordingLogger(),
     )
     same = get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(access_token="other"),
         environment="live",
         logger=RecordingLogger(),
     )
     other_app = get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(client_id="other-client"),
         environment="auto",
         logger=RecordingLogger(),
@@ -375,7 +422,7 @@ def test_cached_client_is_shared_per_account_and_application() -> None:
 
 def test_a_cached_client_warns_when_another_environment_is_asked_for() -> None:
     get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="demo",
         logger=RecordingLogger(),
@@ -383,7 +430,7 @@ def test_a_cached_client_warns_when_another_environment_is_asked_for() -> None:
     logger = RecordingLogger()
 
     get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="live",
         logger=logger,
@@ -393,12 +440,12 @@ def test_a_cached_client_warns_when_another_environment_is_asked_for() -> None:
     assert len(warnings) == 1
     assert "'demo'" in warnings[0]
     assert "'live'" in warnings[0]
-    assert str(ACCOUNT_ID) not in warnings[0]
+    assert str(TRADER_LOGIN) not in warnings[0]
 
 
 def test_a_cached_client_warns_once_when_the_credentials_differ() -> None:
     get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="demo",
         logger=RecordingLogger(),
@@ -406,7 +453,7 @@ def test_a_cached_client_warns_once_when_the_credentials_differ() -> None:
     logger = RecordingLogger()
 
     get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(
             access_token="second-access-token",
             refresh_token="second-refresh-token",
@@ -432,7 +479,7 @@ def test_a_cached_client_stays_silent_about_a_token_it_refreshed_itself() -> Non
     """
     config_credentials = credentials(token_expires_at=_EXPIRES_AT)
     client = get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=config_credentials,
         environment="demo",
         logger=RecordingLogger(),
@@ -441,7 +488,7 @@ def test_a_cached_client_stays_silent_about_a_token_it_refreshed_itself() -> Non
     logger = RecordingLogger()
 
     get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=config_credentials,
         environment="demo",
         logger=logger,
@@ -452,7 +499,7 @@ def test_a_cached_client_stays_silent_about_a_token_it_refreshed_itself() -> Non
 
 def test_a_cached_client_for_the_same_environment_and_credentials_logs_nothing() -> None:
     get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="demo",
         logger=RecordingLogger(),
@@ -460,7 +507,7 @@ def test_a_cached_client_for_the_same_environment_and_credentials_logs_nothing()
     logger = RecordingLogger()
 
     get_cached_ctrader_account_client(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         credentials=credentials(token_expires_at=_EXPIRES_AT),
         environment="demo",
         logger=logger,
@@ -472,7 +519,7 @@ def test_a_cached_client_for_the_same_environment_and_credentials_logs_nothing()
 def test_unknown_environment_is_rejected() -> None:
     with pytest.raises(ValueError, match="environment"):
         CTraderAccountClient(
-            account_id=ACCOUNT_ID,
+            trader_login=TRADER_LOGIN,
             credentials=credentials(),
             environment="paper",
             logger=RecordingLogger(),
@@ -522,7 +569,7 @@ async def test_concurrent_connects_share_one_attempt() -> None:
 
 
 async def test_a_failed_connect_leaves_the_client_reusable() -> None:
-    server = venue(listed=False)
+    server = venue(logins=())
     await server.start()
     client = account_client(server)
     try:
@@ -655,7 +702,8 @@ async def test_two_concurrent_connects_start_one_session() -> None:
         await held.release()
         await asyncio.gather(first, second)
 
-        assert server.connection_count == 1
+        # One pre-connection to resolve the login, then the one session.
+        assert server.connection_count == 2
         assert client._users == 2
     finally:
         await client.disconnect()
@@ -673,7 +721,8 @@ async def test_a_connect_right_after_the_first_completes_reuses_the_session() ->
         await client.connect()
 
         assert client.session is session
-        assert server.connection_count == 1
+        # One pre-connection to resolve the login, then the one session.
+        assert server.connection_count == 2
     finally:
         await client.disconnect()
         await client.disconnect()
@@ -727,7 +776,8 @@ async def test_cancelling_a_queued_caller_leaves_the_first_connected() -> None:
         await first
 
         assert client._users == 1
-        assert server.connection_count == 1
+        # One pre-connection to resolve the login, then the one session.
+        assert server.connection_count == 2
     finally:
         await client.disconnect()
         await server.stop()
@@ -782,7 +832,8 @@ async def test_a_connect_landing_as_the_first_attempt_finishes_starts_no_second_
         await held.release()
         await asyncio.wait_for(asyncio.gather(first, late), 5.0)
 
-        assert server.connection_count == 1
+        # One pre-connection to resolve the login, then the one session.
+        assert server.connection_count == 2
         assert client._users == 2
     finally:
         if late is not None and not late.done():

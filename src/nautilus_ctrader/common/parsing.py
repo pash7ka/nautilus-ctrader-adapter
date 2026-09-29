@@ -90,7 +90,8 @@ def bar_boundary_secs(utc_minutes: int) -> int:
 
     The venue's value is authoritative and is never moved onto a multiple of the period: a
     period's boundaries are not necessarily aligned to the Unix epoch. A daily bar opens at
-    21:00 UTC, so flooring one put it on the previous calendar day.
+    21:00 or 22:00 UTC depending on the time of year, so flooring one put it on the previous
+    calendar day.
     """
     return utc_minutes * 60
 
@@ -104,8 +105,11 @@ def is_unaligned_boundary(boundary_secs: int, period_secs: int) -> bool:
     period carries the offset instead, so nothing is expected of it.
 
     Confirmed live for every period this adapter supports: M1, M15 and H1 open on multiples of
-    their own length, while H4, H12 and D1 open on the trading day's phase - D1 at 21:00 UTC,
-    and H4 and H12 one hour into their own grid, on every bar observed across two symbols.
+    their own length, while H4, H12 and D1 open on the trading day's phase. That phase is not
+    constant: the trading day rolls at 17:00 in New York, so it follows US daylight saving and
+    the daily open alternates between 21:00 and 22:00 UTC (see docs/protocol.md). Nothing here
+    depends on its current value - only on whether a period divides an hour, which holds
+    whatever the phase is.
     """
     return SECS_PER_HOUR % period_secs == 0 and boundary_secs % period_secs != 0
 

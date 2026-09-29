@@ -11,14 +11,15 @@ places no orders and changes no account state.
 
 Run once per fixture refresh, from the repository root:
 
-    uv run python scripts/record_fixtures.py --account-id <id>
+    uv run python scripts/record_fixtures.py --trader-login <login>
 
-The account id is passed on the command line and never written anywhere. Overwrites
+The trader login is the account number the broker gave you; the `ctidTraderAccountId` every
+request carries is looked up from it. Neither is written anywhere. Overwrites
 `tests/fixtures/m2_recorded.json`.
 
 When `_CLEARED_FIELDS` grows, the committed fixture predates the new entry and still carries
 what it names. Replaying the current scrubbing over the recorded file, without a connection and
-without an account id, rewrites it in place:
+without a trader login, rewrites it in place:
 
     uv run python scripts/record_fixtures.py --rescrub
 """
@@ -374,7 +375,7 @@ async def _fetch_account_list(
         await connection.close()
 
 
-async def record(account_id: int, env: dict[str, str]) -> RecordResult:
+async def record(trader_login: int, env: dict[str, str]) -> RecordResult:
     """Run the full read-only recording flow and return the collected, unscrubbed messages.
 
     `env` is the already-loaded `.env` file (see `main`) - loading it is a blocking filesystem
@@ -390,13 +391,18 @@ async def record(account_id: int, env: dict[str, str]) -> RecordResult:
     refresh_token = env.get("CTRADER_REFRESH_TOKEN", "")
 
     account_list_res = await _fetch_account_list(access_token, client_id, client_secret)
-    target = next(
-        (a for a in account_list_res.ctidTraderAccount if a.ctidTraderAccountId == account_id),
-        None,
-    )
-    if target is None:
-        raise RuntimeError("the access token does not grant the requested account id")
-    real_login = target.traderLogin if target.HasField("traderLogin") else None
+    matched = [
+        a
+        for a in account_list_res.ctidTraderAccount
+        if a.HasField("traderLogin") and a.traderLogin == trader_login
+    ]
+    if not matched:
+        raise RuntimeError("the access token grants no account with that trader login")
+    if len(matched) > 1:
+        raise RuntimeError("more than one granted account has that trader login")
+    target = matched[0]
+    account_id = target.ctidTraderAccountId
+    real_login = target.traderLogin
     host = LIVE_HOST if target.isLive else DEMO_HOST
     _verify_scrubs_cleanly(account_list_res, account_id, real_login)
 
@@ -627,8 +633,9 @@ def _rescrub() -> None:
     print(f"messages rewritten: {changed}, bytes: {len(before)} -> {len(after)}")
 
 
-async def _run(account_id: int, env: dict[str, str]) -> None:
-    result = await record(account_id, env)
+async def _run(trader_login: int, env: dict[str, str]) -> None:
+    result = await record(trader_login, env)
+    account_id = result.secrets.account_id
     real_login = result.secrets.real_login
 
     scrubbed = {
@@ -667,7 +674,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--account-id", type=int, help="record a fresh snapshot from the venue")
+    mode.add_argument(
+        "--trader-login",
+        type=int,
+        help="record a fresh snapshot from the venue, for this broker account number",
+    )
     mode.add_argument(
         "--rescrub",
         action="store_true",
@@ -691,7 +702,7 @@ def main(argv: list[str] | None = None) -> int:
 
     env = get_tokens.load_env(_REPO_ROOT / ".env")
     try:
-        asyncio.run(_run(args.account_id, env))
+        asyncio.run(_run(args.trader_login, env))
     except Exception as e:
         # A raised CTraderRequestError carries the venue's own description; an uncaught
         # traceback would print it. Only the exception's type name reaches the terminal.

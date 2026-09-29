@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from google.protobuf.message import Message
 
@@ -17,7 +17,8 @@ from tests.recording_logger import RecordingLogger
 
 ACCOUNT_ID = 7654321
 # The recorder clears `traderLogin`, so the fake venue supplies its own. A real venue always
-# sends one, and a distinctive value keeps the log-leak check honest.
+# sends one; a client is configured with it and resolves `ACCOUNT_ID` from the account list,
+# and a value distinct from the id keeps the log-leak check honest.
 TRADER_LOGIN = 8901234
 RECORDED = load_recorded()
 
@@ -32,18 +33,27 @@ def for_account(message: Message, account_id: int) -> Message:
     return copy
 
 
-def account_list(*, is_live: bool, listed: bool = True) -> oa.ProtoOAGetAccountListByAccessTokenRes:
+def account_list(
+    *,
+    is_live: bool,
+    logins: Sequence[int] = (TRADER_LOGIN,),
+) -> oa.ProtoOAGetAccountListByAccessTokenRes:
+    """The granted accounts: one entry per login, each on the recorded entry's template.
+
+    `logins` decides how many accounts the token grants and under which login, so a test can
+    serve none at all, or two that share one login.
+    """
+    recorded = RECORDED["account_list"][0]
+    assert recorded.ctidTraderAccount[0].ctidTraderAccountId == FAKE_ACCOUNT_ID
     res = oa.ProtoOAGetAccountListByAccessTokenRes()
-    res.CopyFrom(RECORDED["account_list"][0])
+    res.CopyFrom(recorded)
     del res.ctidTraderAccount[:]
-    if listed:
-        for recorded in RECORDED["account_list"][0].ctidTraderAccount:
-            entry = res.ctidTraderAccount.add()
-            entry.CopyFrom(recorded)
-            assert entry.ctidTraderAccountId == FAKE_ACCOUNT_ID
-            entry.ctidTraderAccountId = ACCOUNT_ID
-            entry.traderLogin = TRADER_LOGIN
-            entry.isLive = is_live
+    for index, login in enumerate(logins):
+        entry = res.ctidTraderAccount.add()
+        entry.CopyFrom(recorded.ctidTraderAccount[0])
+        entry.ctidTraderAccountId = ACCOUNT_ID + index
+        entry.traderLogin = login
+        entry.isLive = is_live
     return res
 
 
@@ -56,7 +66,11 @@ def _symbol_by_id(request: oa.ProtoOASymbolByIdReq) -> oa.ProtoOASymbolByIdRes:
     )
 
 
-def venue(*, is_live: bool = True, listed: bool = True) -> FakeCTraderServer:
+def venue(
+    *,
+    is_live: bool = True,
+    logins: Sequence[int] = (TRADER_LOGIN,),
+) -> FakeCTraderServer:
     """A server that authenticates, lists the account, and serves recorded reference data."""
     server = FakeCTraderServer()
     server.on(
@@ -69,7 +83,7 @@ def venue(*, is_live: bool = True, listed: bool = True) -> FakeCTraderServer:
     )
     server.on(
         oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
-        lambda _r: account_list(is_live=is_live, listed=listed),
+        lambda _r: account_list(is_live=is_live, logins=logins),
     )
     for payload_type, key in (
         (oa_model.PROTO_OA_TRADER_REQ, "trader"),
@@ -106,7 +120,7 @@ def account_client(
 ) -> CTraderAccountClient:
     kwargs.setdefault("credentials", credentials())
     return CTraderAccountClient(
-        account_id=ACCOUNT_ID,
+        trader_login=TRADER_LOGIN,
         environment=environment,
         logger=RecordingLogger() if logger is None else logger,
         demo_host=server.host,

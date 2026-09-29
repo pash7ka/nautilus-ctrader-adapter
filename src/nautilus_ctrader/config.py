@@ -42,8 +42,10 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
         The registered application's credentials.
     access_token : str
         An access token granting this application the account.
-    account_id : int
-        The `ctidTraderAccountId` to trade.
+    trader_login : int
+        The account number the broker gave you, the one the cTrader interface shows. It is
+        not the `ctidTraderAccountId` the protocol addresses internally; the adapter looks
+        that one up from the accounts the token grants.
     refresh_token : str, optional
         Used to renew `access_token`; without it an expired token ends the session.
     token_expires_at : float, optional
@@ -88,7 +90,7 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     client_id: str
     client_secret: str
     access_token: str
-    account_id: int
+    trader_login: int
     refresh_token: str | None = None
     token_expires_at: float | None = None
     environment: Environment = "auto"

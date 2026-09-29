@@ -494,18 +494,20 @@ def _print_accounts(result: AccountsResult, *, live: bool) -> None:
     except ValueError:
         scope_name = str(result.permission_scope)
     print(f"Permission scope: {scope_name}")
+    # The login leads each line because it is the one a client is configured with.
+    print("Accounts granted (configure a client with the traderLogin):")
 
     for account in result.accounts:
         if account.is_live is None:
             is_live_text = "unknown"
         else:
             is_live_text = "live" if account.is_live else "demo"
+        login_text = "not reported" if account.trader_login is None else str(account.trader_login)
         parts = [
+            f"traderLogin={login_text}",
             f"ctidTraderAccountId={account.ctid_trader_account_id}",
             f"isLive={is_live_text}",
         ]
-        if account.trader_login is not None:
-            parts.append(f"traderLogin={account.trader_login}")
         if account.broker_title_short is not None:
             parts.append(f"brokerTitleShort={account.broker_title_short}")
         print("  " + " ".join(parts))
@@ -674,7 +676,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _print_accounts(result, live=args.live)
-    print(f"Add CTRADER_ACCOUNT_ID=<id> to {args.env_file} for the account you want to use.")
+    print(
+        f"Add CTRADER_TRADER_LOGIN=<traderLogin> to {args.env_file} for the account you want "
+        "to use - the traderLogin above, not the ctidTraderAccountId.",
+    )
     return 0
 
 

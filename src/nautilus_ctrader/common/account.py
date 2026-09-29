@@ -62,8 +62,11 @@ class CTraderAccountClient:
     """
     One trading account's connection, shared by reference count.
 
-    - `environment="auto"` reads the account's `isLive` flag over a short pre-connection to
-      `demo_host` and connects to the matching host; `"demo"`/`"live"` connect directly.
+    - The account is named by its `trader_login`. Every bring-up lists the accounts the token
+      grants over a short pre-connection to `demo_host` - the list is served on either host -
+      and reads the `ctidTraderAccountId` the protocol needs off the matching entry.
+    - `environment="auto"` takes the host from that entry's `isLive` flag; `"demo"`/`"live"`
+      force it.
     - `connect()` returns once the session is ready and the reference data is loaded; bad
       credentials fail it at once rather than after `connect_timeout_secs`.
     """
@@ -71,7 +74,7 @@ class CTraderAccountClient:
     def __init__(
         self,
         *,
-        account_id: int,
+        trader_login: int,
         credentials: AccountCredentials,
         environment: Environment,
         logger: Logger,
@@ -84,7 +87,8 @@ class CTraderAccountClient:
     ) -> None:
         if environment not in ENVIRONMENTS:
             raise ValueError(f"environment must be one of {ENVIRONMENTS}, got {environment!r}")
-        self.account_id = account_id
+        self.trader_login = trader_login
+        self._account_id: int | None = None
         self._credentials = credentials
         self._environment = environment
         self._log = logger
@@ -109,6 +113,17 @@ class CTraderAccountClient:
         self.assets: dict[int, om.ProtoOAAsset] = {}
         self.light_symbols: dict[str, om.ProtoOALightSymbol] = {}
         self._symbol_specs: dict[int, om.ProtoOASymbol] = {}
+
+    @property
+    def account_id(self) -> int:
+        """The `ctidTraderAccountId` every request carries, resolved from the trader login.
+
+        A property rather than an attribute so a request built before the account list has
+        been read fails here, instead of going out addressed to nothing.
+        """
+        if self._account_id is None:
+            raise CTraderConnectionError("account id not resolved yet; connect() first")
+        return self._account_id
 
     @property
     def deposit_asset(self) -> om.ProtoOAAsset:
@@ -210,7 +225,7 @@ class CTraderAccountClient:
         session: CTraderSession | None = None
         try:
             async with deadline:
-                host = await self._resolve_host()
+                host = await self._resolve_account()
                 session = self._build_session(host)
                 # Before `start()`, so the first bring-up already restores live subscriptions.
                 self.subscriptions.attach(session)
@@ -247,12 +262,12 @@ class CTraderAccountClient:
             if session is not None:
                 await session.stop()
 
-    async def _resolve_host(self) -> str:
-        if self._environment == "demo":
-            return self._demo_host
-        if self._environment == "live":
-            return self._live_host
+    async def _resolve_account(self) -> str:
+        """Set `self._account_id` from the granted account list, and return the host to use.
 
+        The list is fetched whatever `environment` says, because it is the only thing that
+        maps a trader login to the `ctidTraderAccountId` the protocol addresses.
+        """
         connection = CTraderConnection(
             self._demo_host,
             self._port,
@@ -275,10 +290,28 @@ class CTraderAccountClient:
             await connection.close()
 
         # The list also carries logins and broker names: it is read here and never logged.
-        for entry in accounts.ctidTraderAccount:
-            if entry.ctidTraderAccountId == self.account_id:
-                return self._live_host if entry.isLive else self._demo_host
-        raise CTraderAuthError("account not granted to this token")
+        # TODO(verify): the venue populates `traderLogin` on every listed account. An entry
+        # without it can never be matched, and this reports it as a login not granted.
+        matched = [
+            entry
+            for entry in accounts.ctidTraderAccount
+            if entry.HasField("traderLogin") and entry.traderLogin == self.trader_login
+        ]
+        if not matched:
+            raise CTraderAuthError("no account with that trader login is granted to this token")
+        if len(matched) > 1:
+            # A login is unique per broker server, but one token can grant accounts on several
+            # servers, so picking one here would be a guess at which account to trade.
+            raise CTraderAuthError(
+                "more than one granted account has that trader login; the account is ambiguous",
+            )
+        entry = matched[0]
+        self._account_id = entry.ctidTraderAccountId
+        if self._environment == "demo":
+            return self._demo_host
+        if self._environment == "live":
+            return self._live_host
+        return self._live_host if entry.isLive else self._demo_host
 
     async def _list_accounts(
         self,
@@ -433,13 +466,16 @@ _ACCOUNT_CLIENTS: dict[tuple[int, str], tuple[CTraderAccountClient, AccountCrede
 
 def get_cached_ctrader_account_client(
     *,
-    account_id: int,
+    trader_login: int,
     credentials: AccountCredentials,
     environment: str,
     logger: Logger,
     **kwargs,
 ) -> CTraderAccountClient:
-    """The one client per `(account_id, credentials.client_id)`.
+    """The one client per `(trader_login, credentials.client_id)`.
+
+    The key assumes a login names one account across everything the token grants, which the
+    duplicate check in `_resolve_account()` enforces at connect time.
 
     Later calls with the same key return the first instance; their other arguments are ignored.
     A differing `environment` or credential is reported in one WARNING: the first client's
@@ -447,11 +483,11 @@ def get_cached_ctrader_account_client(
     comparison is against the credentials the client was built from, so a token the client
     refreshed on its own is not reported as the caller's disagreement.
     """
-    key = (account_id, credentials.client_id)
+    key = (trader_login, credentials.client_id)
     entry = _ACCOUNT_CLIENTS.get(key)
     if entry is None:
         client = CTraderAccountClient(
-            account_id=account_id,
+            trader_login=trader_login,
             credentials=credentials,
             environment=environment,
             logger=logger,
@@ -493,7 +529,7 @@ class AccountClientConfig(Protocol):
     Structural, so every client config satisfies it without importing this module's types.
     """
 
-    account_id: int
+    trader_login: int
     environment: Environment
     connect_timeout_secs: float
     restore_retry_interval_secs: float
@@ -511,7 +547,7 @@ def account_client_from_config(
     node config holds, before building the node, and registers its listener on the result.
     """
     return get_cached_ctrader_account_client(
-        account_id=config.account_id,
+        trader_login=config.trader_login,
         credentials=config.credentials(),
         environment=config.environment,
         logger=logger,

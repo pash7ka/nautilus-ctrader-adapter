@@ -27,7 +27,7 @@ from nautilus_ctrader.factories import CTraderLiveDataClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider
-from tests.account_venue import ACCOUNT_ID, venue
+from tests.account_venue import TRADER_LOGIN, venue
 from tests.fake_server import FakeCTraderServer
 from tests.recording_logger import RecordingLogger
 
@@ -42,7 +42,7 @@ def config(**overrides) -> CTraderDataClientConfig:
         "access_token": "access-token",
         "refresh_token": "refresh-token",
         "token_expires_at": 4_102_444_800.0,
-        "account_id": ACCOUNT_ID,
+        "trader_login": TRADER_LOGIN,
         "instrument_provider": InstrumentProviderConfig(),
     }
     values.update(overrides)
@@ -69,7 +69,7 @@ def seed_account(
 ) -> CTraderAccountClient:
     """The account client the factory will find in the cache, pointed at the fake server."""
     return get_cached_ctrader_account_client(
-        account_id=client_config.account_id,
+        trader_login=client_config.trader_login,
         credentials=client_config.credentials(),
         environment=client_config.environment,
         logger=RecordingLogger(),
@@ -127,7 +127,7 @@ async def test_create_builds_the_account_from_the_config_when_none_is_cached() -
 
     account = create(client_config)._account
 
-    assert account.account_id == ACCOUNT_ID
+    assert account.trader_login == TRADER_LOGIN
     assert account._environment == "demo"
     assert account._connect_timeout_secs == 11.0
     assert account._restore_retry_interval_secs == 7.0
