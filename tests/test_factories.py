@@ -11,6 +11,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import pytest
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.live.factories import LiveDataClientFactory
 from nautilus_trader.model.identifiers import ClientId
@@ -152,6 +153,41 @@ async def test_two_clients_for_one_account_share_a_session() -> None:
         second = create(client_config, name="CTRADER-002")
 
         assert first._account is second._account
+
+
+async def test_two_clients_for_one_account_share_an_instrument_provider() -> None:
+    async with running_server() as server:
+        client_config = config()
+        account = seed_account(server, client_config)
+
+        first = create(client_config, name="CTRADER-001")
+        second = create(client_config, name="CTRADER-002")
+
+        assert first.instrument_provider is second.instrument_provider
+        assert first.instrument_provider is account.instrument_provider
+
+
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [
+        ("instrument_provider", InstrumentProviderConfig(load_all=True)),
+        ("asset_class_overrides", {"US100.cash": "INDEX"}),
+        ("fail_on_instrument_error", True),
+    ],
+)
+async def test_a_later_config_with_other_instrument_settings_fails_the_build(
+    setting: str,
+    value: object,
+) -> None:
+    create(config(), name="CTRADER-001")
+
+    with pytest.raises(ValueError, match=setting) as raised:
+        create(config(**{setting: value}), name="CTRADER-002")
+
+    # Names the setting only: nothing that identifies the account or authenticates it.
+    message = str(raised.value)
+    for private in (str(TRADER_LOGIN), "client-id", "client-secret", "access-token"):
+        assert private not in message
 
 
 async def test_a_listener_registered_before_create_sees_the_refresh() -> None:

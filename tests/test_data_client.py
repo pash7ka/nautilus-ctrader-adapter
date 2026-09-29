@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
+from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
@@ -149,12 +150,12 @@ async def harness(
     await server.start()
     logger = RecordingLogger()
     account = account_client(server, logger=logger, credentials=client_config.credentials())
-    provider = CTraderInstrumentProvider(
-        account,
-        client_config.instrument_provider,
-        parse_asset_class_overrides(client_config.asset_class_overrides),
-        client_config.fail_on_instrument_error,
-        logger,
+    # The account's own provider, which its bring-up resets, as the factory hands it over.
+    provider = account.get_instrument_provider(
+        config=client_config.instrument_provider,
+        asset_class_overrides=parse_asset_class_overrides(client_config.asset_class_overrides),
+        fail_on_instrument_error=client_config.fail_on_instrument_error,
+        logger=logger,
     )
     published: list = []
     responses: list = []
@@ -479,6 +480,30 @@ async def test_an_unknown_asset_class_override_fails_construction() -> None:
             )
 
 
+async def test_a_provider_that_is_not_the_accounts_own_fails_construction() -> None:
+    async with harness() as h:
+        client_config = h.client._config
+        # Built from the same settings, so only its identity differs from the account's.
+        separate = CTraderInstrumentProvider(
+            h.account,
+            client_config.instrument_provider,
+            parse_asset_class_overrides(client_config.asset_class_overrides),
+            client_config.fail_on_instrument_error,
+            RecordingLogger(),
+        )
+        with pytest.raises(ValueError, match="get_instrument_provider"):
+            CTraderDataClient(
+                loop=asyncio.get_running_loop(),
+                account=h.account,
+                msgbus=TestComponentStubs.msgbus(),
+                cache=TestComponentStubs.cache(),
+                clock=TestComponentStubs.clock(),
+                instrument_provider=separate,
+                config=client_config,
+                name="CTRADER-002",
+            )
+
+
 # -- Connect --------------------------------------------------------------------------------
 
 
@@ -534,6 +559,38 @@ async def test_connect_re_queries_the_conversion_chain_every_time() -> None:
         await h.client._connect()
         await h.client._disconnect()
         await h.client._connect()
+
+        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 2
+
+
+async def test_a_client_joining_a_running_account_keeps_the_chains_already_resolved() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        second = CTraderDataClient(
+            loop=asyncio.get_running_loop(),
+            account=h.account,
+            msgbus=TestComponentStubs.msgbus(),
+            cache=TestComponentStubs.cache(),
+            clock=TestComponentStubs.clock(),
+            instrument_provider=h.provider,
+            config=h.client._config,
+            name="CTRADER-002",
+        )
+
+        await second._connect()
+        try:
+            assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 1
+        finally:
+            await second._disconnect()
+
+
+async def test_a_conversion_is_prepared_again_once_the_provider_resets_its_chains() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 1
+
+        h.provider.reset_conversion_cache()
+        await subscribe_quotes(h, GER40_ID)
 
         assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 2
 
@@ -690,6 +747,28 @@ async def test_a_symbol_change_on_a_chain_leg_re_queries_the_chain() -> None:
         await subscribe_quotes(h, GER40_ID)
 
         assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 2
+
+
+async def test_a_symbol_change_outside_every_chain_leaves_the_conversions_prepared() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        before = len(h.instruments())
+        await h.server.push(
+            oa.ProtoOASymbolChangedEvent(
+                ctidTraderAccountId=ACCOUNT_ID,
+                symbolId=[GER40_SYMBOL_ID],
+            ),
+        )
+        await wait_until(
+            lambda: any(i.id == GER40_ID for i in h.instruments()[before:]),
+            description="GER40.cash republished",
+        )
+        legs_published = [i.id for i in h.instruments()].count(EURUSD_ID)
+
+        await subscribe_quotes(h, GER40_ID)
+
+        # A conversion prepared again would publish its chain again.
+        assert [i.id for i in h.instruments()].count(EURUSD_ID) == legs_published
 
 
 async def test_request_instrument_answers_from_the_provider() -> None:
@@ -875,6 +954,45 @@ async def test_a_bid_from_before_a_reconnect_is_not_paired_with_a_later_ask(
         await push_spot(h, ASK_ONLY)
 
         assert not h.quotes()
+
+
+@pytest.mark.parametrize("other_owner_first", [False, True], ids=["alone", "another owner first"])
+async def test_a_bid_from_before_a_reconnect_is_not_paired_while_the_restores_run(
+    monkeypatch: pytest.MonkeyPatch,
+    other_owner_first: bool,
+) -> None:
+    # A key another owner held before this client connected is restored before anything this
+    # client registers, so the books must not depend on the order the restores run in.
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+    async with harness() as h:
+        await h.account.connect()  # another client of the account brought it up first
+        if other_owner_first:
+            await h.account.subscriptions.subscribe_spots(EURUSD_SYMBOL_ID, "quotes", "other")
+        await h.client._connect()
+        await subscribe_quotes(h, EURUSD_ID)
+        await push_spot(h, BID_ONLY)
+        assert not h.quotes()
+
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+            lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), 10.0)
+        # The venue has the re-subscribe, and a spot lands before the restores are done.
+        await push_spot(h, ASK_ONLY)
+
+        assert not h.quotes()
+        await held.stop_holding()
+        await held.release()
+        await wait_until(
+            lambda: h.account.session.is_ready,
+            timeout_secs=10.0,
+            description="session ready again",
+        )
+        await h.client._disconnect()
 
 
 # -- Live bars ------------------------------------------------------------------------------
@@ -1106,16 +1224,125 @@ async def test_a_cancelled_bar_unsubscribe_is_repeated_at_disconnect() -> None:
         await held.stop_holding()
 
         assert EURUSD_M1 not in h.client._bars  # no longer routed or closed
-        assert EURUSD_M1 in h.client._releasing_bars  # still on record for the repeat
+        # Still on record for the repeat.
+        bar_hold = (EURUSD_SYMBOL_ID, M1, f"bars:{EURUSD_M1}")
+        assert bar_hold in h.account.subscriptions.trendbar_holds(h.client._owner)
         for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
             await push_spot(h, event)
         assert not h.bars()
 
         await h.client._disconnect()
 
-        assert not h.client._releasing_bars
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
         # The repeat reaches the venue: the cancelled one settled nothing.
         assert len(received(h.server, oa.ProtoOAUnsubscribeLiveTrendbarReq)) == 2
+
+
+def _spot_unsubscribe_reply(request: oa.ProtoOAUnsubscribeSpotsReq) -> Message:
+    return oa.ProtoOAUnsubscribeSpotsRes(ctidTraderAccountId=request.ctidTraderAccountId)
+
+
+def _refusal(request: Message) -> Message:
+    return oa.ProtoOAErrorRes(
+        ctidTraderAccountId=request.ctidTraderAccountId,
+        errorCode="TRADING_DISABLED",
+    )
+
+
+async def test_a_bar_unsubscribe_cancelled_in_its_spots_leg_is_repeated_at_disconnect() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        # GER40's spots are held by its bars alone, so their release reaches the venue.
+        await subscribe_bars(h, GER40_M1)
+        held = HeldReplies(h.server, om.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+
+        cancelled = asyncio.create_task(unsubscribe_bars(h, GER40_M1))
+        await held.arrived.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await held.stop_holding()
+
+        assert GER40_M1 not in h.client._bars
+        await h.client._disconnect()
+
+        assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+        assert h.unsubscribed_symbol_ids().count(GER40_SYMBOL_ID) == 2
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["cancelled", "refused, rollback cancelled"])
+async def test_a_bar_subscribe_cut_short_holding_only_spots_frees_the_bar_type(
+    refused: bool,
+) -> None:
+    server = trendbar_venue()
+    if refused:
+        server.on(om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ, _refusal)
+        # Cut short in the rollback of the spots leg.
+        held_type, reply = om.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply
+    else:
+        held_type = om.PROTO_OA_SUBSCRIBE_SPOTS_REQ
+
+        def reply(r: Message) -> Message:
+            return oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId)
+
+    async with harness(server=server) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        held = HeldReplies(h.server, held_type, reply)
+
+        cancelled = asyncio.create_task(subscribe_bars(h, GER40_M1))
+        await held.arrived.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await held.stop_holding()
+
+        # No live trendbars, so nothing to route, and a retry must not be a silent no-op.
+        assert GER40_M1 not in h.client._bars
+        assert not h.client._bar_routes
+        # The spot leg the registry still counts is released all the same.
+        await h.client._disconnect()
+        assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+
+
+async def test_a_bar_unsubscribe_during_its_subscribe_leaves_no_backfill_restore() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ,
+            lambda r: oa.ProtoOASubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+
+        subscribing = asyncio.create_task(subscribe_bars(h, EURUSD_M1))
+        await held.arrived.wait()
+        unsubscribing = asyncio.create_task(unsubscribe_bars(h, EURUSD_M1))
+        await wait_until(lambda: EURUSD_M1 not in h.client._bars, description="bars forgotten")
+        await held.stop_holding()
+        await asyncio.gather(subscribing, unsubscribing)
+
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
+        assert ("bar_backfill", str(EURUSD_M1)) not in h.account.session._restores
+
+
+async def test_a_refused_bar_subscribe_racing_its_unsubscribe_reports_the_refusal() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        held = HeldReplies(h.server, om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ, _refusal)
+
+        subscribing = asyncio.create_task(subscribe_bars(h, EURUSD_M1))
+        await held.arrived.wait()
+        unsubscribing = asyncio.create_task(unsubscribe_bars(h, EURUSD_M1))
+        await wait_until(lambda: EURUSD_M1 not in h.client._bars, description="bars forgotten")
+        await held.stop_holding()
+
+        with pytest.raises(CTraderRequestError):
+            await subscribing
+        await unsubscribing
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
 
 
 async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconnect() -> None:
@@ -1132,8 +1359,41 @@ async def test_connect_forgets_bar_subscriptions_left_by_an_interrupted_disconne
         # only what this connect subscribed itself is on record.
         assert not h.client._bars
         assert not h.client._bar_routes
-        assert GER40_SYMBOL_ID not in h.client._spot_holds
-        assert h.client._spot_holds == {EURUSD_SYMBOL_ID: {CONVERSION_CONSUMER}}
+        held = h.account.subscriptions.spot_holds(h.client._owner)
+        assert held == {(EURUSD_SYMBOL_ID, CONVERSION_CONSUMER)}
+        active = h.account.subscriptions.active_consumers(EURUSD_SYMBOL_ID, h.client._owner)
+        assert active == {CONVERSION_CONSUMER}
+
+
+async def test_connect_removes_backfill_restores_an_interrupted_disconnect_left_behind() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.account.connect()  # another client keeps the account's session running
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        await subscribe_bars(h, GER40_M1)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQ,
+            lambda r: oa.ProtoOAUnsubscribeLiveTrendbarRes(
+                ctidTraderAccountId=r.ctidTraderAccountId,
+            ),
+        )
+
+        # Cut short in the first bar type's release, so the second keeps its restore.
+        disconnecting = asyncio.create_task(h.client._disconnect())
+        await held.arrived.wait()
+        disconnecting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await disconnecting
+        await held.stop_holding()
+        await held.release()
+        assert ("bar_backfill", str(GER40_M1)) in h.account.session._restores
+
+        await h.client._connect()
+
+        restores = h.account.session._restores
+        assert not [key for key in restores if isinstance(key, tuple) and key[0] == "bar_backfill"]
 
 
 async def test_disconnect_releases_the_trendbar_subscription() -> None:
@@ -1180,7 +1440,8 @@ async def test_bars_are_not_subscribed_for_an_instrument_the_chain_could_not_be_
         assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
         assert GER40_M1 not in h.client._bars
         assert not h.client._bar_routes
-        assert GER40_SYMBOL_ID not in h.client._spot_holds
+        held = h.account.subscriptions.spot_holds(h.client._owner)
+        assert GER40_SYMBOL_ID not in {symbol_id for symbol_id, _ in held}
 
 
 # -- Historical bars ------------------------------------------------------------------------
@@ -1489,7 +1750,8 @@ async def test_a_cancelled_release_does_not_let_a_later_one_re_attach_the_listen
 
         assert not h.quotes()
         # The cancelled release is still on record, so a disconnect repeats its unsubscribe.
-        assert (EURUSD_SYMBOL_ID, CONVERSION_CONSUMER) in h.client._all_holds()
+        held = h.account.subscriptions.spot_holds(h.client._owner)
+        assert (EURUSD_SYMBOL_ID, CONVERSION_CONSUMER) in held
 
 
 async def test_disconnect_forgets_which_instruments_were_converted() -> None:
@@ -1499,3 +1761,61 @@ async def test_disconnect_forgets_which_instruments_were_converted() -> None:
         await h.client._disconnect()
 
         assert not h.client._converted
+
+
+# -- Sharing the account's registry ---------------------------------------------------------
+
+# Another client of the same account, using the very names this client uses.
+OTHER_OWNER = "another client"
+
+
+async def test_another_clients_quote_hold_publishes_nothing_here() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        # The bars keep this client's listener on the symbol.
+        await subscribe_bars(h, GER40_M1)
+        await h.account.subscriptions.subscribe_spots(
+            GER40_SYMBOL_ID,
+            f"quotes:{GER40_ID}",
+            OTHER_OWNER,
+        )
+
+        await push_spot(h, GER40_SPOT)
+
+        assert not h.quotes()
+
+
+async def test_disconnect_releases_only_this_clients_holds() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await h.account.subscriptions.subscribe_spots(
+            EURUSD_SYMBOL_ID,
+            CONVERSION_CONSUMER,
+            OTHER_OWNER,
+        )
+
+        await h.client._disconnect()
+
+        assert CONVERSION_CONSUMER in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert EURUSD_SYMBOL_ID not in h.unsubscribed_symbol_ids()
+
+
+async def test_connect_releases_what_an_interrupted_disconnect_left_in_the_registry() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        await subscribe_quotes(h, GER40_ID)
+        await h.account.disconnect()  # a disconnect that never reached the client
+
+        await h.client._connect()
+
+        # A conversion hold left counted would make this connect's own hold a no-op, with no
+        # listener to publish the chain's quotes.
+        await push_spot(h, TWO_SIDED)
+        assert [q.instrument_id for q in h.quotes()] == [EURUSD_ID]
+        # Neither counted any more nor restored by the new session.
+        assert not h.account.subscriptions.trendbar_holds(h.client._owner)
+        assert not h.account.subscriptions.consumers(GER40_SYMBOL_ID)
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)[1:]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from nautilus_trader.common.component import Logger
 from nautilus_trader.common.providers import InstrumentProvider
@@ -18,7 +19,6 @@ from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import CurrencyPair, Instrument
 
-from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderError,
@@ -27,6 +27,10 @@ from nautilus_ctrader.common.errors import (
 from nautilus_ctrader.common.parsing import instrument_from_symbol
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+
+if TYPE_CHECKING:
+    # The account client builds and owns its provider, so it imports this module.
+    from nautilus_ctrader.common.account import CTraderAccountClient
 
 
 class InstrumentLoadError(CTraderError):

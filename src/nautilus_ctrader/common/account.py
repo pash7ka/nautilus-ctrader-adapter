@@ -1,8 +1,9 @@
 """The per-account client: one session per trading account, shared by every Nautilus client.
 
 It picks the host, owns the only `CTraderSession` for the account (and with it the only party
-allowed to refresh tokens), and caches the account's reference data. Nothing about the account
-it resolves - its id, login or broker - is ever logged or put into an error message.
+allowed to refresh tokens) and the only instrument provider, and caches the account's reference
+data. Nothing about the account it resolves - its id, login or broker - is ever logged or put
+into an error message.
 """
 
 from __future__ import annotations
@@ -12,12 +13,14 @@ import contextlib
 import dataclasses
 import ssl
 import time
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, get_args
 
 from google.protobuf.message import Message
 from nautilus_trader.common.component import Logger
+from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.model.enums import AssetClass
 
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
@@ -38,6 +41,7 @@ from nautilus_ctrader.constants import (
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+from nautilus_ctrader.providers import CTraderInstrumentProvider
 
 TokenListener = Callable[[str, str, float], None]
 
@@ -114,6 +118,10 @@ class CTraderAccountClient:
         self.light_symbols: dict[str, om.ProtoOALightSymbol] = {}
         self._symbol_specs: dict[int, om.ProtoOASymbol] = {}
 
+        self._instrument_provider: CTraderInstrumentProvider | None = None
+        # What the provider was built from, keyed by the config field that carries each setting.
+        self._instrument_settings: dict[str, object] = {}
+
     @property
     def account_id(self) -> int:
         """The `ctidTraderAccountId` every request carries, resolved from the trader login.
@@ -137,6 +145,56 @@ class CTraderAccountClient:
         if self._money_digits is None:
             raise CTraderConnectionError("reference data not loaded; connect() first")
         return self._money_digits
+
+    @property
+    def instrument_provider(self) -> CTraderInstrumentProvider | None:
+        """The account's provider, or `None` until `get_instrument_provider()` builds it."""
+        return self._instrument_provider
+
+    def get_instrument_provider(
+        self,
+        *,
+        config: InstrumentProviderConfig,
+        asset_class_overrides: Mapping[str, AssetClass],
+        fail_on_instrument_error: bool,
+        logger: Logger,
+    ) -> CTraderInstrumentProvider:
+        """The account's one instrument provider, built by the first call.
+
+        Every client of the account shares it, so an instrument unloaded for one is unloaded
+        for all. Its conversion chains are dropped on every bring-up of the account's session.
+
+        Raises `ValueError` naming the settings that differ if a later call asks for other
+        instrument settings than the provider was built from: one of the two would otherwise
+        be ignored. A later call's `logger` is ignored.
+        """
+        settings = {
+            "instrument_provider": config,
+            "asset_class_overrides": dict(asset_class_overrides),
+            "fail_on_instrument_error": fail_on_instrument_error,
+        }
+        if self._instrument_provider is None:
+            self._instrument_provider = CTraderInstrumentProvider(
+                self,
+                config,
+                asset_class_overrides,
+                fail_on_instrument_error,
+                logger,
+            )
+            self._instrument_settings = settings
+            return self._instrument_provider
+
+        # Names only: the caller holds both values, and a filter value could hold anything.
+        differing = [
+            name for name, value in settings.items() if value != self._instrument_settings[name]
+        ]
+        if differing:
+            raise ValueError(
+                "the instrument provider of this account is already built from other "
+                f"instrument settings; differing: {', '.join(differing)}. Every client of one "
+                "account must be given the same instrument settings",
+            )
+        return self._instrument_provider
 
     def add_token_listener(self, callback: TokenListener) -> None:
         """Register `callback(access_token, refresh_token, expires_at_secs)` for every refresh.
@@ -251,6 +309,10 @@ class CTraderAccountClient:
                 cause = session.last_error if session is not None else None
                 raise self._connect_timeout_error() from (cause or e)
             raise
+        if self._instrument_provider is not None:
+            # A chain is venue data that can change, so it is re-queried once per bring-up;
+            # a reconnect of the running session keeps it.
+            self._instrument_provider.reset_conversion_cache()
         self._retry_task = asyncio.create_task(self._retry_restores_loop(session))
         self._log.info("Account session ready")
 

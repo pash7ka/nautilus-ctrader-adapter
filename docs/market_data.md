@@ -142,8 +142,8 @@ client reports connected — so an instrument that cannot be valued is known to 
 before anything can trade it. An instrument that arrived through `load_all` gets its chain on
 its first subscription instead — quotes or bars alike, since the valuation needs it either
 way: resolving a chain for every symbol a broker offers would be pointless work. Chains are
-resolved once per connection, and again if the venue announces that one of their symbols
-changed.
+resolved once each time the account connects, and again if the venue announces that one of
+their symbols changed. A network drop the connection recovers from on its own keeps them.
 
 Two different failures are reported differently, because they need different responses:
 
@@ -234,3 +234,11 @@ ignored too and logged at WARNING, because it would have chosen a different host
 If the listener raises, the failure is logged at ERROR and the session carries on with the new
 tokens in memory. Persisting them is the only thing that survives a restart, so a listener that
 can fail should say so loudly.
+
+The instrument provider belongs to the account client as well, so every client of one account
+sees the same instruments: one dropped as unusable is dropped for all of them. It is built from
+the instrument settings of the first config that asks for it — `instrument_provider`,
+`asset_class_overrides` and `fail_on_instrument_error`. A later config for the same account
+with different instrument settings fails the node build with a `ValueError` naming them,
+rather than having them silently ignored. Passing the same config object, as above, never
+trips this.

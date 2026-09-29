@@ -5,6 +5,9 @@ import time
 
 import pytest
 from google.protobuf.message import Message
+from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.identifiers import InstrumentId, Symbol
 
 from nautilus_ctrader.common import account as account_module
 from nautilus_ctrader.common.account import (
@@ -17,8 +20,10 @@ from nautilus_ctrader.common.errors import (
     CTraderTimeoutError,
 )
 from nautilus_ctrader.common.session import SessionState
+from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
+from nautilus_ctrader.providers import CTraderInstrumentProvider
 from tests.account_venue import (
     ACCOUNT_ID,
     RECORDED,
@@ -37,6 +42,8 @@ from tests.recording_logger import RecordingLogger
 # `credentials()` defaults the expiry to "now + an hour", so the cache tests pin it to keep
 # two calls byte-identical.
 _EXPIRES_AT = 1_700_000_000.0
+# Quoted in EUR, so it needs a conversion chain into the recorded USD deposit.
+GER40_ID = InstrumentId(Symbol("GER40.cash"), CTRADER_VENUE)
 
 
 async def test_auto_connects_to_the_listed_account_and_closes_the_pre_connection() -> None:
@@ -1046,5 +1053,86 @@ async def test_a_later_user_of_a_ready_session_neither_waits_nor_requests(
         assert client._users == 2
     finally:
         await client.disconnect()
+        await client.disconnect()
+        await server.stop()
+
+
+# -- The instrument provider ----------------------------------------------------------------
+
+
+def _instrument_provider(client: CTraderAccountClient, **overrides) -> CTraderInstrumentProvider:
+    settings = {
+        "config": InstrumentProviderConfig(load_ids=frozenset({GER40_ID})),
+        "asset_class_overrides": {},
+        "fail_on_instrument_error": False,
+    }
+    settings.update(overrides)
+    return client.get_instrument_provider(**settings, logger=RecordingLogger())
+
+
+def test_the_account_builds_one_instrument_provider() -> None:
+    client = account_client(venue())
+
+    first = _instrument_provider(client)
+
+    assert _instrument_provider(client) is first
+    assert client.instrument_provider is first
+
+
+@pytest.mark.parametrize(
+    ("setting", "overrides"),
+    [
+        ("instrument_provider", {"config": InstrumentProviderConfig(load_all=True)}),
+        ("asset_class_overrides", {"asset_class_overrides": {"US100.cash": AssetClass.INDEX}}),
+        ("fail_on_instrument_error", {"fail_on_instrument_error": True}),
+    ],
+)
+def test_other_instrument_settings_for_the_same_account_are_refused(
+    setting: str,
+    overrides: dict,
+) -> None:
+    client = account_client(venue())
+    _instrument_provider(client)
+
+    with pytest.raises(ValueError, match=setting) as raised:
+        _instrument_provider(client, **overrides)
+
+    others = {"instrument_provider", "asset_class_overrides", "fail_on_instrument_error"}
+    message = str(raised.value)
+    assert not any(other in message for other in others - {setting})
+    assert str(TRADER_LOGIN) not in message
+
+
+async def test_the_account_bring_up_re_queries_conversion_chains_and_a_reconnect_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    provider = _instrument_provider(client)
+
+    async def resolve_chain() -> int:
+        await provider.conversion_instruments_for(provider.find(GER40_ID))
+        return len(received(server, oa.ProtoOASymbolsForConversionReq))
+
+    try:
+        await client.connect()
+        await provider.initialize()
+        assert await resolve_chain() == 1
+
+        await server.drop_connections()
+        await wait_until(
+            lambda: server.connection_count >= 3 and client.session.is_ready,
+            timeout_secs=10.0,
+            description="session reconnected on its own",
+        )
+        assert await resolve_chain() == 1
+
+        await client.disconnect()
+        await client.connect()
+        assert await resolve_chain() == 2
+    finally:
         await client.disconnect()
         await server.stop()

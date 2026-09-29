@@ -8,7 +8,9 @@ every reconnect. Keys and log lines carry the symbol id and period only, never t
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import contextlib
+from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from google.protobuf.message import Message
@@ -30,6 +32,8 @@ if TYPE_CHECKING:
 SpotListener = Callable[[oa.ProtoOASpotEvent], None]
 
 _Key = tuple[str, int] | tuple[str, int, int]
+# `(owner, name)`: the same name under two owners is two consumers.
+_Consumer = tuple[str, str]
 
 # TODO(verify): the venue answers a duplicate subscribe with ALREADY_SUBSCRIBED rather than
 # silently accepting it or failing with another code.
@@ -52,20 +56,38 @@ def _trendbar_key(symbol_id: int, period: int) -> _Key:
     return ("trendbar", symbol_id, period)
 
 
-def _trendbar_spot_consumer(period: int, consumer: str) -> str:
-    return f"trendbar:{period}:{consumer}"
+def _trendbar_spot_consumer(period: int, consumer: _Consumer) -> _Consumer:
+    owner, name = consumer
+    return owner, f"trendbar:{period}:{name}"
+
+
+@dataclass
+class _Intent:
+    """What one consumer's latest (un)subscribe call asked for, while that is still unsettled."""
+
+    # Whether the consumer should receive data: set by a subscribe, cleared by an unsubscribe.
+    wanted: bool = False
+    # Subscribe calls still running, which may yet leave the consumer counted.
+    pending: int = 0
 
 
 class SubscriptionRegistry:
     """
-    The account's spot and trendbar subscriptions, shared by consumer name.
+    The account's spot and trendbar subscriptions, shared by consumer.
 
+    - A consumer is a name under an `owner`, the client that holds it: every client of the
+      account shares this registry, and the same name under two owners is two consumers.
     - While the session accepts requests, the venue request goes first and the reference is
       counted once it succeeds, or once its outcome is unknown (timeout, cancellation, loss);
       only a venue refusal leaves it uncounted. Otherwise (no session, or reconnecting) only
       the intent is recorded, and the next bring-up's restores act on it; (un)subscribing
       never raises for want of a connection.
     - The same consumer subscribing twice counts once.
+    - Counted and active are different facts. A consumer is active - should receive data -
+      from the moment its subscribe is called until its unsubscribe is, or until the
+      subscribe ends uncounted; it stays counted until that unsubscribe has run its course.
+      `active_consumers()` answers the first, and `spot_holds()` / `trendbar_holds()` what an
+      owner still has to release.
     - A consumer joining a key whose restore is in the session's `failed_restores` gets no
       data until the restore retry succeeds.
     - It outlives sessions: the account client `attach`es each new session before starting it
@@ -76,7 +98,10 @@ class SubscriptionRegistry:
         self._account = account
         self._log = logger
         self._session: CTraderSession | None = None
-        self._consumers: dict[_Key, set[str]] = {}
+        self._consumers: dict[_Key, set[_Consumer]] = {}
+        # Every consumer an (un)subscribe call has named and that is counted or may yet be,
+        # trendbar spot legs excepted: they belong to their trendbar consumer.
+        self._intents: dict[_Key, dict[_Consumer, _Intent]] = {}
         # Per key; a trendbar operation takes its trendbar lock before its spots lock, never
         # the other way round.
         self._locks: dict[_Key, asyncio.Lock] = {}
@@ -97,27 +122,37 @@ class SubscriptionRegistry:
         if session is not None:
             session.remove_event_handler(oa.ProtoOASpotEvent, self._on_spot)
 
-    async def subscribe_spots(self, symbol_id: int, consumer: str) -> None:
+    async def subscribe_spots(self, symbol_id: int, consumer: str, owner: str) -> None:
         """Hold `symbol_id`'s spot subscription for `consumer`.
 
         Raises `CTraderRequestError` only if the venue refuses it. A cancelled or timed-out
         call is still recorded, so the caller must still call `unsubscribe_spots`.
         """
         key = _spots_key(symbol_id)
-        async with self._lock(key):
-            await self._acquire(key, consumer)
+        held = (owner, consumer)
+        with self._subscribing(key, held):
+            async with self._lock(key):
+                await self._acquire(key, held)
 
-    async def unsubscribe_spots(self, symbol_id: int, consumer: str) -> None:
+    async def unsubscribe_spots(self, symbol_id: int, consumer: str, owner: str) -> None:
         """Release `consumer`'s spot reference.
 
         Idempotent, and a cancelled call keeps the reference, so repeating it re-sends the
         unsubscribe rather than finding nothing left to do.
         """
         key = _spots_key(symbol_id)
-        async with self._lock(key):
-            await self._release(key, consumer)
+        held = (owner, consumer)
+        with self._releasing(key, held):
+            async with self._lock(key):
+                await self._release(key, held)
 
-    async def subscribe_trendbars(self, symbol_id: int, period: int, consumer: str) -> None:
+    async def subscribe_trendbars(
+        self,
+        symbol_id: int,
+        period: int,
+        consumer: str,
+        owner: str,
+    ) -> None:
         """Subscribe live trendbars, holding the spot subscription the venue requires for them.
 
         Raises `CTraderRequestError` only if the venue refuses it, and then releases the spot
@@ -126,20 +161,28 @@ class SubscriptionRegistry:
         """
         key = _trendbar_key(symbol_id, period)
         spots = _spots_key(symbol_id)
-        spot_consumer = _trendbar_spot_consumer(period, consumer)
-        async with self._lock(key):
-            if consumer in self._consumers.get(key, ()):
-                return
-            async with self._lock(spots):
-                await self._acquire(spots, spot_consumer)
-            try:
-                await self._acquire(key, consumer)
-            except CTraderRequestError:
+        held = (owner, consumer)
+        spot_consumer = _trendbar_spot_consumer(period, held)
+        with self._subscribing(key, held):
+            async with self._lock(key):
+                if held in self._consumers.get(key, ()):
+                    return
                 async with self._lock(spots):
-                    await self._release(spots, spot_consumer)
-                raise
+                    await self._acquire(spots, spot_consumer)
+                try:
+                    await self._acquire(key, held)
+                except CTraderRequestError:
+                    async with self._lock(spots):
+                        await self._release(spots, spot_consumer)
+                    raise
 
-    async def unsubscribe_trendbars(self, symbol_id: int, period: int, consumer: str) -> None:
+    async def unsubscribe_trendbars(
+        self,
+        symbol_id: int,
+        period: int,
+        consumer: str,
+        owner: str,
+    ) -> None:
         """Release both of `consumer`'s references.
 
         Idempotent, and a cancelled call keeps whichever reference its request was still in
@@ -150,13 +193,15 @@ class SubscriptionRegistry:
         """
         key = _trendbar_key(symbol_id, period)
         spots = _spots_key(symbol_id)
-        async with self._lock(key):
-            try:
-                # Trendbar first: the venue requires the spot subscription while it is live.
-                await self._release(key, consumer)
-            finally:
-                async with self._lock(spots):
-                    await self._release(spots, _trendbar_spot_consumer(period, consumer))
+        held = (owner, consumer)
+        with self._releasing(key, held):
+            async with self._lock(key):
+                try:
+                    # Trendbar first: the venue requires the spot subscription while it is live.
+                    await self._release(key, held)
+                finally:
+                    async with self._lock(spots):
+                        await self._release(spots, _trendbar_spot_consumer(period, held))
 
     def add_spot_listener(self, symbol_id: int, listener: SpotListener) -> None:
         self._spot_listeners.setdefault(symbol_id, []).append(listener)
@@ -172,12 +217,92 @@ class SubscriptionRegistry:
             del self._spot_listeners[symbol_id]
 
     def consumers(self, symbol_id: int) -> frozenset[str]:
-        """The consumers holding `symbol_id`'s spot subscription, trendbar holders included."""
-        return frozenset(self._consumers.get(_spots_key(symbol_id), ()))
+        """Names counted on `symbol_id`'s spots, of every owner, trendbar holders included."""
+        return frozenset(name for _, name in self._consumers.get(_spots_key(symbol_id), ()))
 
-    def trendbar_consumers(self, symbol_id: int, period: int) -> frozenset[str]:
-        """The consumers holding `symbol_id`'s live trendbar subscription for `period`."""
-        return frozenset(self._consumers.get(_trendbar_key(symbol_id, period), ()))
+    def trendbar_consumers(self, symbol_id: int, period: int, owner: str) -> frozenset[str]:
+        """`owner`'s names counted on `symbol_id`'s live trendbars for `period`.
+
+        Unlike `trendbar_holds()`, a consumer whose spot leg alone is counted is not included:
+        it has no live trendbars.
+        """
+        key = _trendbar_key(symbol_id, period)
+        return frozenset(name for o, name in self._consumers.get(key, ()) if o == owner)
+
+    def active_consumers(self, symbol_id: int, owner: str) -> frozenset[str]:
+        """`owner`'s consumers of `symbol_id`'s spots that should receive data now.
+
+        Subscribed, or with a subscribe in flight, and with no unsubscribe started since.
+        Trendbar holders are not included: they hold the spots for the trendbars only.
+        """
+        intents = self._intents.get(_spots_key(symbol_id), {})
+        return frozenset(name for (o, name), i in intents.items() if o == owner and i.wanted)
+
+    def has_active_consumer(self, symbol_id: int, owner: str) -> bool:
+        """Whether `active_consumers()` is non-empty, without building it: asked on every spot."""
+        intents = self._intents.get(_spots_key(symbol_id), {})
+        return any(o == owner and i.wanted for (o, _), i in intents.items())
+
+    def spot_holds(self, owner: str) -> frozenset[tuple[int, str]]:
+        """Every `(symbol id, consumer)` spot hold `owner` still has to release.
+
+        Counted, or with a subscribe in flight - active or not, so a release that was
+        cancelled stays here until one runs its course.
+        """
+        return frozenset((key[1], name) for key, name in self._held(owner, "spots"))
+
+    def trendbar_holds(self, owner: str) -> frozenset[tuple[int, int, str]]:
+        """Every `(symbol id, period, consumer)` trendbar hold `owner` still has to release.
+
+        Either leg counted is enough, so this includes a consumer whose spot leg alone is left
+        by a cancelled call.
+        """
+        return frozenset((key[1], key[2], name) for key, name in self._held(owner, "trendbar"))
+
+    def _held(self, owner: str, kind: str) -> Iterator[tuple[_Key, str]]:
+        for key, intents in self._intents.items():
+            if key[0] == kind:
+                yield from ((key, name) for o, name in intents if o == owner)
+
+    @contextlib.contextmanager
+    def _subscribing(self, key: _Key, consumer: _Consumer) -> Iterator[None]:
+        # Entered before the key lock, so the consumer is active while the call waits for it.
+        intent = self._intents.setdefault(key, {}).setdefault(consumer, _Intent())
+        intent.wanted = True
+        intent.pending += 1
+        try:
+            yield
+        finally:
+            intent.pending -= 1
+            self._settle(key, consumer)
+
+    @contextlib.contextmanager
+    def _releasing(self, key: _Key, consumer: _Consumer) -> Iterator[None]:
+        # Entered before the key lock: nothing is delivered for a release that has started.
+        self._intents.setdefault(key, {}).setdefault(consumer, _Intent()).wanted = False
+        try:
+            yield
+        finally:
+            self._settle(key, consumer)
+
+    def _settle(self, key: _Key, consumer: _Consumer) -> None:
+        """Forget `consumer`'s intent once nothing is counted or pending for it."""
+        intents = self._intents.get(key, {})
+        intent = intents.get(consumer)
+        if intent is None or intent.pending or self._counted(key, consumer):
+            return
+        del intents[consumer]
+        if not intents:
+            del self._intents[key]
+
+    def _counted(self, key: _Key, consumer: _Consumer) -> bool:
+        """Whether any of `consumer`'s references on `key` is counted, a trendbar's spot leg too."""
+        if consumer in self._consumers.get(key, ()):
+            return True
+        if key[0] != "trendbar":
+            return False
+        spot_consumer = _trendbar_spot_consumer(key[2], consumer)
+        return spot_consumer in self._consumers.get(_spots_key(key[1]), ())
 
     def _lock(self, key: _Key) -> asyncio.Lock:
         return self._locks.setdefault(key, asyncio.Lock())
@@ -188,7 +313,7 @@ class SubscriptionRegistry:
             return session
         return None
 
-    async def _acquire(self, key: _Key, consumer: str) -> None:
+    async def _acquire(self, key: _Key, consumer: _Consumer) -> None:
         """Count `consumer` on `key`, subscribing first if it is new. Caller holds the key lock."""
         consumers = self._consumers.get(key)
         if consumers is not None:
@@ -220,21 +345,21 @@ class SubscriptionRegistry:
             # the request went through, its next bring-up restores the key.
             self._record(key, consumer)
 
-    def _record_unknown(self, session: CTraderSession, key: _Key, consumer: str) -> None:
+    def _record_unknown(self, session: CTraderSession, key: _Key, consumer: _Consumer) -> None:
         self._record(key, consumer)
         # A session that stays up would not repeat the restore before its next bring-up; the
         # account's retry loop runs it instead, and ALREADY_SUBSCRIBED keeps that idempotent.
         if self._accepting_session() is session:
             session.mark_restore_failed(key)
 
-    def _record(self, key: _Key, consumer: str) -> None:
+    def _record(self, key: _Key, consumer: _Consumer) -> None:
         # No await in here, so a bring-up either sees both the reference and its restore or
         # neither.
         self._consumers.setdefault(key, set()).add(consumer)
         if self._session is not None:
             self._session.add_restore(key, self._restore(self._session, key))
 
-    async def _release(self, key: _Key, consumer: str) -> None:
+    async def _release(self, key: _Key, consumer: _Consumer) -> None:
         """Drop `consumer`'s reference; the last one also unsubscribes. Caller holds the key lock.
 
         The reference is dropped once the request has run its course, failure included: its
