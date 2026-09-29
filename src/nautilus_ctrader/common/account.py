@@ -149,12 +149,20 @@ class CTraderAccountClient:
     async def connect(self) -> None:
         """Become a user of the account's session, bringing it up if this is the first user.
 
+        Returns once the session is ready, for every caller: a later user that finds it
+        reconnecting waits, under the same `connect_timeout_secs` bound and failing at once on
+        a rejected authentication.
+
         Calls are serialised: a caller queued behind a successful attempt only counts itself,
         and one queued behind a failed attempt tries again. A failed or cancelled attempt
         stops what it started and leaves the user count unchanged.
         """
         async with self._lifecycle_lock:
             if self._users > 0:
+                # Waited on under the lock, so the session cannot be stopped or replaced
+                # meanwhile. Its own reconnect never takes this lock.
+                if not self.session.is_ready:
+                    await self._join(self.session)
                 self._users += 1
                 return
             await self._bring_up()
@@ -241,12 +249,26 @@ class CTraderAccountClient:
                 await session.stop()
             if isinstance(e, TimeoutError) and deadline.expired():
                 cause = session.last_error if session is not None else None
-                raise CTraderTimeoutError(
-                    f"connect did not complete within {self._connect_timeout_secs:g}s",
-                ) from (cause or e)
+                raise self._connect_timeout_error() from (cause or e)
             raise
         self._retry_task = asyncio.create_task(self._retry_restores_loop(session))
         self._log.info("Account session ready")
+
+    async def _join(self, session: CTraderSession) -> None:
+        """Wait for a running session that is not ready, as a later user's `connect()` does."""
+        deadline = asyncio.timeout(self._connect_timeout_secs)
+        try:
+            async with deadline:
+                await self._wait_ready(session)
+        except TimeoutError as e:
+            if not deadline.expired():
+                raise
+            raise self._connect_timeout_error() from (session.last_error or e)
+
+    def _connect_timeout_error(self) -> CTraderTimeoutError:
+        return CTraderTimeoutError(
+            f"connect did not complete within {self._connect_timeout_secs:g}s",
+        )
 
     async def _stop(self, session: CTraderSession | None) -> None:
         self.subscriptions.detach()

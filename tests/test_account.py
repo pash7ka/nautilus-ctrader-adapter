@@ -16,12 +16,14 @@ from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderTimeoutError,
 )
+from nautilus_ctrader.common.session import SessionState
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.account_venue import (
     ACCOUNT_ID,
     RECORDED,
     TRADER_LOGIN,
+    HeldReplies,
     account_client,
     account_list,
     credentials,
@@ -894,4 +896,155 @@ async def test_connect_timeout_bounds_the_whole_connect(unanswered: int) -> None
         assert client.session is None
         await wait_until(lambda: server.open_connection_count == 0, description="all closed")
     finally:
+        await server.stop()
+
+
+# -- A later user joining a session that is not ready ---------------------------------------
+
+
+async def _connect_then_lose_the_connection(
+    server,
+    client: CTraderAccountClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> HeldReplies:
+    """Connect the first user, then drop the connection and hold the reconnect's account auth."""
+    # Reconnect at once rather than after a backoff.
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    held = hold_account_auth(server, answer_first=1)
+    await client.connect()
+    await server.drop_connections()
+    await asyncio.wait_for(held.arrived.wait(), 5.0)
+    assert client.session.state is SessionState.AUTHENTICATING
+    return held
+
+
+async def test_a_later_user_connecting_during_a_reconnect_waits_until_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server, environment="demo")
+    later = None
+    try:
+        held = await _connect_then_lose_the_connection(server, client, monkeypatch)
+
+        later = asyncio.create_task(client.connect())
+        await asyncio.sleep(0.1)
+        assert not later.done()
+
+        await held.release()
+        await asyncio.wait_for(later, 5.0)
+
+        response = await client.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+        assert isinstance(response, oa.ProtoOATraderRes)
+        assert client._users == 2
+    finally:
+        if later is not None and not later.done():
+            later.cancel()
+        await client.disconnect()
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_later_user_whose_wait_times_out_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server, environment="demo", connect_timeout_secs=0.5)
+    try:
+        await _connect_then_lose_the_connection(server, client, monkeypatch)
+
+        started = time.monotonic()
+        with pytest.raises(CTraderTimeoutError, match=r"connect did not complete within 0\.5s"):
+            await asyncio.wait_for(client.connect(), 5.0)
+        assert time.monotonic() - started < 1.5
+        assert client._users == 1
+
+        await client.disconnect()
+        assert client.session is None
+        await wait_until(lambda: server.open_connection_count == 0, description="all closed")
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_later_user_fails_at_once_when_the_reconnect_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    server = venue()
+    await server.start()
+    client = account_client(server, environment="demo", connect_timeout_secs=30.0)
+    try:
+        await client.connect()
+        server.on(
+            oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
+            lambda _r: oa.ProtoOAErrorRes(errorCode="RET_ACCOUNT_DISABLED"),
+        )
+        await server.drop_connections()
+        await wait_until(lambda: not client.session.is_ready, description="loss noticed")
+
+        started = time.monotonic()
+        with pytest.raises(CTraderAuthError, match="RET_ACCOUNT_DISABLED"):
+            await asyncio.wait_for(client.connect(), 5.0)
+        assert time.monotonic() - started < 2.0
+        assert client._users == 1
+
+        await client.disconnect()
+        assert client.session is None
+        await wait_until(lambda: server.open_connection_count == 0, description="all closed")
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_later_user_cancelled_while_waiting_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server, environment="demo")
+    try:
+        await _connect_then_lose_the_connection(server, client, monkeypatch)
+
+        later = asyncio.create_task(client.connect())
+        await asyncio.sleep(0.1)
+        assert not later.done()
+        later.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(later, 5.0)
+        assert client._users == 1
+
+        await client.disconnect()
+        assert client.session is None
+        await wait_until(lambda: server.open_connection_count == 0, description="all closed")
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_later_user_of_a_ready_session_neither_waits_nor_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server, environment="demo")
+    try:
+        await client.connect()
+        session = client.session
+
+        async def no_wait(timeout_secs: float | None = None) -> None:
+            raise AssertionError("a ready session was waited on")
+
+        monkeypatch.setattr(session, "wait_ready", no_wait)
+        before = len(server.received)
+
+        await client.connect()
+
+        assert len(server.received) == before
+        assert client._users == 2
+    finally:
+        await client.disconnect()
+        await client.disconnect()
         await server.stop()
