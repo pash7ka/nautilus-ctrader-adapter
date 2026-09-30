@@ -19,7 +19,13 @@ from dataclasses import dataclass
 # The format's name and version in one token; a change of format changes it.
 MARKER = "ntca1"
 
-# TODO(verify): the venue's own limits on these fields, taken from the schema's comments.
+# TODO(verify): these limits come from the schema's comments. Not yet confirmed live:
+# - the limits themselves;
+# - whether the venue counts characters or bytes (moot while ids are ASCII);
+# - whether it rejects or truncates an over-limit field;
+# - whether it returns `label` and `comment` verbatim, with no trimming or case change.
+# Placing an order with a limit-length label and comment and reading both back from the
+# position would confirm all four.
 LABEL_MAX = 100
 COMMENT_MAX = 512
 CLIENT_ORDER_ID_MAX = 50
@@ -43,7 +49,9 @@ class LegIds:
 
 
 def _is_recordable(order_id: str) -> bool:
-    return bool(order_id) and not any(c.isspace() or c == _FIELD_SEPARATOR for c in order_id)
+    # Printable ASCII only: the venue's limit may count bytes, and invisible characters make
+    # look-alike ids.
+    return bool(order_id) and all("!" <= c <= "~" and c != _FIELD_SEPARATOR for c in order_id)
 
 
 def _require_recordable(order_id: str) -> str:
@@ -68,7 +76,10 @@ def encode_label(entry_id: str) -> str:
 
 
 def parse_label(label: str) -> str | None:
-    """The entry's client order id, or `None` if `label` is not a record written here."""
+    """The entry's client order id, or `None` if `label` is not a record written here.
+
+    `label` is a `str`: an unset protobuf string field is `""`, which is not a record.
+    """
     if len(label) > LABEL_MAX or not label.startswith(_LABEL_PREFIX):
         return None
     entry_id = label[len(_LABEL_PREFIX) :]
@@ -85,7 +96,10 @@ def encode_comment(legs: LegIds) -> str:
 
 
 def parse_comment(comment: str) -> LegIds | None:
-    """The legs' client order ids, or `None` if `comment` is not a record written here."""
+    """The legs' client order ids, or `None` if `comment` is not a record written here.
+
+    `comment` is a `str`: an unset protobuf string field is `""`, which is not a record.
+    """
     if len(comment) > COMMENT_MAX:
         return None
     marker, *fields = comment.split(_FIELD_SEPARATOR)
@@ -95,7 +109,7 @@ def parse_comment(comment: str) -> LegIds | None:
     for item in fields:
         key, separator, order_id = item.partition("=")
         known = key in (_STOP_LOSS_KEY, _TAKE_PROFIT_KEY)
-        if not separator or not known or key in found or not _is_recordable(order_id):
+        if not separator or not known or not _is_recordable(order_id):
             return None
         found[key] = order_id
     legs = LegIds(stop_loss=found.get(_STOP_LOSS_KEY), take_profit=found.get(_TAKE_PROFIT_KEY))
