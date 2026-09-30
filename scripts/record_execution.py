@@ -14,6 +14,10 @@ What is written never holds the account id, the trader login, a token, a balance
 broker's own order, position and deal ids: those are replaced consistently, so a position still
 lines up with its orders and deals. Timestamps are shifted by one constant, which keeps every
 interval and hides when the session took place.
+
+A session is kept however it ends: a failed or interrupted run still writes what it saw, and a
+recording the final check refuses goes to `tests/recordings/`, which git ignores, instead of the
+fixture. A refusal by the venue ends the run at once and is reported by its error code.
 """
 
 from __future__ import annotations
@@ -25,9 +29,11 @@ import contextlib
 import importlib.util
 import json
 import pathlib
+import re
 import sys
+import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from google.protobuf import text_format
@@ -36,7 +42,7 @@ from google.protobuf.message import Message
 
 from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.connection import CTraderConnection
-from nautilus_ctrader.common.errors import CTraderError
+from nautilus_ctrader.common.errors import CTraderError, CTraderRequestError
 from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import (
     BUCKET_DEFAULT,
@@ -49,6 +55,8 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _OUTPUT_PATH = _REPO_ROOT / "tests" / "fixtures" / "m3_execution_recorded.json"
+# Ignored by git: what lands here was refused by the final check and may hold an identifier.
+_REJECTED_DIR = _REPO_ROOT / "tests" / "recordings"
 
 
 def _load_sibling(name: str):
@@ -96,6 +104,12 @@ _SNAPSHOT_DEBOUNCE_SECS = 2.0
 _RECONNECT_WAIT_SECS = (2.0, 5.0, 10.0, 30.0)
 _CLOSING_LOOKBACK_MS = 3_600_000
 
+# What `record()` tells its `status` callback. Fixed texts: no identifier can get into one.
+STATUS_STARTED = "recording started"
+STATUS_LOST = "connection lost, reconnecting"
+STATUS_RECONNECTED = "reconnected"
+STATUS_DEADLINE = "deadline reached"
+
 _ID_KINDS = {"positionId": "position", "orderId": "order", "dealId": "deal"}
 _ID_BASES = {"position": 5_000_000, "order": 6_000_000, "deal": 7_000_000}
 # Free text the account's owner, or a robot of theirs, may have written.
@@ -139,10 +153,16 @@ class IdMap:
         return [real for known in self._fake.values() for real in known]
 
     def replace_in_text(self, text: str) -> str:
+        fakes: dict[str, str] = {}
         for known in self._fake.values():
             for real, fake in known.items():
-                text = text.replace(str(real), str(fake))
-        return text
+                fakes.setdefault(str(real), str(fake))
+        if not fakes:
+            return text
+        # Longest first and in one pass: an id that is part of a longer one must not break it,
+        # and a fake id just written must not be matched again.
+        pattern = "|".join(sorted(fakes, key=len, reverse=True))
+        return re.sub(pattern, lambda match: fakes[match.group()], text)
 
 
 def scrub_execution(
@@ -177,7 +197,13 @@ def _scrub_in_place(message: Message, ids: IdMap, shift_ms: int) -> None:
         elif descriptor.type == FieldDescriptor.TYPE_STRING and name == "description":
             # The broker's own wording is evidence; an id quoted inside it is not.
             setattr(message, name, ids.replace_in_text(value))
-        elif name.endswith("Timestamp") and descriptor.type in _INT_TYPES and value > 0:
+        # Below the shift it is not a wall time in milliseconds, and an unsigned field refuses
+        # the negative result.
+        elif (
+            name.endswith("Timestamp")
+            and descriptor.type in _INT_TYPES
+            and value > max(shift_ms, 0)
+        ):
             setattr(message, name, value - shift_ms)
 
 
@@ -241,9 +267,14 @@ def encode_recording(
             shift_ms=shift_ms,
         )
 
+    # A first pass only to fill the id map, so a text quoting an id is fixed even where the id
+    # itself first appears later in the recording.
+    for message in recording.messages():
+        clean(message)
+
     timeline = []
     for entry in recording.timeline:
-        item: dict = {"t": entry.t, "kind": entry.kind, "note": entry.note}
+        item: dict = {"t": entry.t, "kind": entry.kind, "note": ids.replace_in_text(entry.note)}
         if entry.message is not None:
             item.update(_encode(clean(entry.message)))
         timeline.append(item)
@@ -338,6 +369,10 @@ def _position_ids(message: Message) -> set[int]:
     return found
 
 
+def _silent(_text: str) -> None:
+    pass
+
+
 async def record(
     host: str,
     port: int,
@@ -355,10 +390,15 @@ async def record(
     tick_secs: float = _TICK_SECS,
     reconnect_waits: tuple[float, ...] = _RECONNECT_WAIT_SECS,
     recording: Recording | None = None,
+    status: Callable[[str], None] = _silent,
 ) -> Recording:
     """Listen until `stop` is set or `minutes` pass; reconnect if the connection drops.
 
-    `recording` lets the caller keep what was seen if this raises: it is filled in place.
+    - `recording` lets the caller keep what was seen if this raises: it is filled in place.
+    - `status` is called with one of the `STATUS_*` texts as the run changes state.
+
+    Raises `CTraderRequestError` if the venue refuses authentication or a snapshot: a refusal
+    is not a lost connection, and is not retried.
     """
     recording = Recording(int(time.time() * 1000)) if recording is None else recording
     started = time.monotonic()
@@ -386,48 +426,41 @@ async def record(
             recording.add("snapshot", f"{note}; {shape}", response, now())
 
     async def closing(connection: CTraderConnection) -> None:
+        async def ask(key: str, request: Message) -> None:
+            response = await send(connection, request, bucket=BUCKET_HISTORICAL)
+            recording.closing[key].append(response)
+            if response.hasMore:
+                # Further pages are not asked for; the marker says the list is incomplete.
+                recording.add("marker", f"closing list truncated: {key}", None, now())
+
         window = {
             "fromTimestamp": recording.started_wall_ms - _CLOSING_LOOKBACK_MS,
             "toTimestamp": int(time.time() * 1000),
         }
-        recording.closing["deals"].append(
-            await send(
-                connection,
-                oa.ProtoOADealListReq(ctidTraderAccountId=account_id, **window),
-                bucket=BUCKET_HISTORICAL,
-            ),
-        )
-        recording.closing["orders"].append(
-            await send(
-                connection,
-                oa.ProtoOAOrderListReq(ctidTraderAccountId=account_id, **window),
-                bucket=BUCKET_HISTORICAL,
-            ),
-        )
+        await ask("deals", oa.ProtoOADealListReq(ctidTraderAccountId=account_id, **window))
+        await ask("orders", oa.ProtoOAOrderListReq(ctidTraderAccountId=account_id, **window))
         positions: set[int] = set()
         for message in list(recording.messages()):
             positions |= _position_ids(message)
         for position_id in sorted(positions):
-            recording.closing["position_orders"].append(
-                await send(
-                    connection,
-                    oa.ProtoOAOrderListByPositionIdReq(
-                        ctidTraderAccountId=account_id,
-                        positionId=position_id,
-                    ),
-                    bucket=BUCKET_HISTORICAL,
+            await ask(
+                "position_orders",
+                oa.ProtoOAOrderListByPositionIdReq(
+                    ctidTraderAccountId=account_id,
+                    positionId=position_id,
                 ),
             )
-            recording.closing["position_deals"].append(
-                await send(
-                    connection,
-                    oa.ProtoOADealListByPositionIdReq(
-                        ctidTraderAccountId=account_id,
-                        positionId=position_id,
-                    ),
-                    bucket=BUCKET_HISTORICAL,
+            await ask(
+                "position_deals",
+                oa.ProtoOADealListByPositionIdReq(
+                    ctidTraderAccountId=account_id,
+                    positionId=position_id,
                 ),
             )
+
+    def announce_deadline() -> None:
+        if not stop.is_set():
+            status(STATUS_DEADLINE)
 
     last_event: float | None = None
 
@@ -470,6 +503,7 @@ async def record(
             if not first:
                 recording.add("marker", "reconnected", None, now())
             await snapshot(connection, "start" if first else "after reconnect")
+            status(STATUS_STARTED if first else STATUS_RECONNECTED)
             first = False
             attempt = 0
 
@@ -484,6 +518,7 @@ async def record(
             # A note typed during the last tick.
             drain_markers()
             if not lost.is_set():
+                announce_deadline()
                 try:
                     await closing(connection)
                 except CTraderError as e:
@@ -495,16 +530,28 @@ async def record(
                     )
                 return recording
             recording.add("marker", "connection lost", None, now())
+        except CTraderRequestError:
+            # The venue answered, and refused: asking again on a new connection changes nothing.
+            raise
         except (CTraderError, OSError) as e:
             recording.add("marker", f"connection lost: {type(e).__name__}", None, now())
         finally:
             with contextlib.suppress(CTraderError, OSError):
                 await connection.close()
+        if finished():
+            break
+        status(STATUS_LOST)
         await asyncio.sleep(reconnect_waits[min(attempt, len(reconnect_waits) - 1)])
         attempt += 1
     drain_markers()
+    announce_deadline()
     recording.add("marker", "closing requests skipped: not connected", None, now())
     return recording
+
+
+def rejected_path(output: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
+    """Where a recording that `check_clean` refused is kept instead of `output`."""
+    return directory / f"{output.stem}.rejected.json"
 
 
 async def record_to_file(
@@ -513,18 +560,36 @@ async def record_to_file(
     login: int | None,
     secrets: Iterable[str],
     account_id: int,
+    rejected_dir: pathlib.Path = _REJECTED_DIR,
     **kwargs,
 ) -> None:
     """Run `record()` and write the fixture, whatever way the run ended.
 
-    The owner's manual trades cannot be repeated on demand, so a run that fails, or is
-    interrupted, still writes what it saw before the error is re-raised.
+    The owner's manual trades cannot be repeated on demand, so what the run saw is kept:
+
+    - a run that fails, or is interrupted, still writes what it saw before the error is
+      re-raised;
+    - a recording that `check_clean` refuses leaves `output` untouched and goes, as far as it
+      was scrubbed, to `rejected_path(output, rejected_dir)`, which git ignores. `ScrubError` is
+      then raised, from the run's own error if it had one.
     """
     recording = Recording(int(time.time() * 1000))
 
     def write() -> None:
         data, ids = encode_recording(recording, account_id=account_id, login=login)
-        check_clean(data, recording, account_id=account_id, login=login, ids=ids, secrets=secrets)
+        try:
+            check_clean(
+                data,
+                recording,
+                account_id=account_id,
+                login=login,
+                ids=ids,
+                secrets=secrets,
+            )
+        except record_fixtures.ScrubError:
+            rejected_dir.mkdir(parents=True, exist_ok=True)
+            rejected_path(output, rejected_dir).write_bytes(data)
+            raise
         output.write_bytes(data)
 
     try:
@@ -532,9 +597,28 @@ async def record_to_file(
     except BaseException as e:
         last = recording.timeline[-1].t if recording.timeline else 0.0
         recording.add("marker", f"run failed: {type(e).__name__}", None, last)
-        write()
+        try:
+            write()
+        except record_fixtures.ScrubError as refused:
+            raise refused from e
         raise
     write()
+
+
+class NoSuchAccount(RuntimeError):
+    """The access token does not grant exactly one account with the trader login given.
+
+    The message is a fixed text that names no login and no account id, so it can be printed.
+    """
+
+
+def _match_account(accounts: Iterable[Message], trader_login: int) -> Message:
+    matched = [a for a in accounts if a.HasField("traderLogin") and a.traderLogin == trader_login]
+    if not matched:
+        raise NoSuchAccount("the access token grants no account with that trader login")
+    if len(matched) > 1:
+        raise NoSuchAccount("more than one granted account has that trader login")
+    return matched[0]
 
 
 async def _resolve_account(
@@ -557,28 +641,39 @@ async def _resolve_account(
         )
     finally:
         await connection.close()
-    matched = [
-        a
-        for a in listed.ctidTraderAccount
-        if a.HasField("traderLogin") and a.traderLogin == trader_login
-    ]
-    if len(matched) != 1:
-        raise RuntimeError(f"expected one granted account with that login, found {len(matched)}")
-    return (LIVE_HOST if matched[0].isLive else DEMO_HOST), matched[0].ctidTraderAccountId
+    account = _match_account(listed.ctidTraderAccount, trader_login)
+    return (LIVE_HOST if account.isLive else DEMO_HOST), account.ctidTraderAccountId
 
 
-async def _read_keyboard(stop: asyncio.Event, markers: asyncio.Queue[str]) -> None:
-    """A typed line becomes a marker; `q` stops the recording."""
-    while not stop.is_set():
-        line = await asyncio.to_thread(sys.stdin.readline)
-        if not line:
-            # End of input, where every further read returns at once: stop reading.
-            return
-        line = line.strip()
-        if line.lower() == "q":
-            stop.set()
-        elif line:
-            await markers.put(line)
+def _read_keyboard(
+    loop: asyncio.AbstractEventLoop,
+    stop: asyncio.Event,
+    markers: asyncio.Queue[str],
+) -> None:
+    """A typed line becomes a marker; `q` stops the recording. Runs on its own thread."""
+    # An unreadable stdin, or a loop already closed: there is nobody left to tell.
+    with contextlib.suppress(OSError, ValueError, RuntimeError):
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                # End of input, where every further read returns at once: stop reading.
+                return
+            line = line.strip()
+            if line.lower() == "q":
+                loop.call_soon_threadsafe(stop.set)
+                return
+            if line:
+                loop.call_soon_threadsafe(markers.put_nowait, line)
+
+
+def _start_keyboard(
+    loop: asyncio.AbstractEventLoop,
+    stop: asyncio.Event,
+    markers: asyncio.Queue[str],
+) -> None:
+    # A daemon thread: a read still blocked on stdin must not keep the process alive once the
+    # run is over.
+    threading.Thread(target=_read_keyboard, args=(loop, stop, markers), daemon=True).start()
 
 
 _CHECKLIST = """\
@@ -599,6 +694,7 @@ async def _run(args: argparse.Namespace, env: dict[str, str]) -> None:
     client_id = env["CTRADER_CLIENT_ID"]
     client_secret = env["CTRADER_CLIENT_SECRET"]
     access_token = env["CTRADER_ACCESS_TOKEN"]
+    print("Connecting...")
     host, account_id = await _resolve_account(
         args.trader_login,
         client_id,
@@ -607,28 +703,41 @@ async def _run(args: argparse.Namespace, env: dict[str, str]) -> None:
     )
     stop: asyncio.Event = asyncio.Event()
     markers: asyncio.Queue[str] = asyncio.Queue()
-    print(_CHECKLIST)
-    keyboard = asyncio.create_task(_read_keyboard(stop, markers))
-    try:
-        await record_to_file(
-            args.output,
-            login=args.trader_login,
-            secrets=(client_id, client_secret, access_token, env.get("CTRADER_REFRESH_TOKEN", "")),
-            host=host,
-            port=PROTOBUF_PORT,
-            tls=True,
-            client_id=client_id,
-            client_secret=client_secret,
-            access_token=access_token,
-            account_id=account_id,
-            minutes=args.minutes,
-            stop=stop,
-            markers=markers,
-        )
-    finally:
-        stop.set()
-        keyboard.cancel()
+
+    def on_status(text: str) -> None:
+        # The checklist only once events are really being recorded.
+        if text == STATUS_STARTED:
+            print(_CHECKLIST)
+        else:
+            print(text, file=sys.stderr)
+
+    _start_keyboard(asyncio.get_running_loop(), stop, markers)
+    await record_to_file(
+        args.output,
+        login=args.trader_login,
+        secrets=(client_id, client_secret, access_token, env.get("CTRADER_REFRESH_TOKEN", "")),
+        host=host,
+        port=PROTOBUF_PORT,
+        tls=True,
+        client_id=client_id,
+        client_secret=client_secret,
+        access_token=access_token,
+        account_id=account_id,
+        minutes=args.minutes,
+        stop=stop,
+        markers=markers,
+        status=on_status,
+    )
     print(f"Recording written to {args.output}")
+
+
+def _failure(error: BaseException) -> str:
+    """The error's type and, for a venue refusal, the venue's error code.
+
+    Never its message: a venue's description, or any other text, could quote an identifier.
+    """
+    code = f" {error.error_code}" if isinstance(error, CTraderRequestError) else ""
+    return f"{type(error).__name__}{code}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -647,9 +756,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--trader-login is required to record")
     try:
         asyncio.run(_run(args, get_tokens.load_env(args.env_file)))
-    except (CTraderError, OSError, RuntimeError, KeyError) as e:
-        # The type only: a message could quote an identifier.
-        print(f"error: {type(e).__name__}", file=sys.stderr)
+    except KeyboardInterrupt:
+        # Stopped by hand: `record_to_file` has already written what was seen.
+        return 130
+    except NoSuchAccount as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except record_fixtures.ScrubError as e:
+        print(f"error: {_failure(e)}", file=sys.stderr)
+        if e.__cause__ is not None:
+            print(f"the run itself had failed: {_failure(e.__cause__)}", file=sys.stderr)
+        kept = rejected_path(args.output, _REJECTED_DIR)
+        print(f"the refused recording is kept in {kept}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"error: {_failure(e)}", file=sys.stderr)
         return 1
     return 0
 

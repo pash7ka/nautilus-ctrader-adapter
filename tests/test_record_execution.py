@@ -7,18 +7,21 @@ sequences - is not covered here; this file covers the recorder's own guarantees.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import importlib.util
 import io
 import json
 import pathlib
+import subprocess
 import sys
 
 import pytest
 
-from nautilus_ctrader.common.errors import CTraderTimeoutError
+from nautilus_ctrader.common.errors import CTraderRequestError, CTraderTimeoutError
 from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL
+from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.fake_server import FakeCTraderServer
@@ -258,6 +261,58 @@ def test_check_clean_refuses_a_recording_that_still_holds_a_real_id() -> None:
         )
 
 
+def clean_timeline(recording: r.Recording) -> list[dict]:
+    """The decoded timeline of `recording`, once `check_clean` has accepted it."""
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    r.check_clean(data, recording, account_id=ACCOUNT_ID, login=LOGIN, ids=ids, secrets=())
+    return r.decode_recording(data)["timeline"]
+
+
+def test_an_id_quoted_before_it_first_appears_is_still_replaced() -> None:
+    error = oa.ProtoOAOrderErrorEvent(
+        ctidTraderAccountId=ACCOUNT_ID,
+        errorCode="POSITION_NOT_FOUND",
+        description=f"Position {POSITION_ID} was not found",
+    )
+
+    first, second = clean_timeline(recording_of(error, execution_event()))
+
+    fake = second["message"].position.positionId
+    assert first["message"].description == f"Position {fake} was not found"
+    # Numbered by first appearance in the recording, as a single pass would number them.
+    assert fake == 5_000_001
+
+
+def test_an_id_in_a_typed_note_is_replaced() -> None:
+    recording = recording_of(execution_event())
+    recording.add("marker", f"closed position {POSITION_ID} by hand", None, 5.0)
+
+    event, marker = clean_timeline(recording)
+
+    assert marker["note"] == f"closed position {event['message'].position.positionId} by hand"
+
+
+def test_a_longer_id_is_replaced_before_one_it_contains() -> None:
+    ids = r.IdMap()
+    short, long = ids.fake("position", 4400), ids.fake("order", 440_011_223)
+
+    text = ids.replace_in_text("order 440011223 on position 4400")
+
+    assert text == f"order {long} on position {short}"
+
+
+def test_a_timestamp_below_the_shift_is_left_alone() -> None:
+    # In seconds, where the shift is in milliseconds, and in a field that cannot go negative.
+    notice = common.ProtoErrorRes(
+        errorCode="SERVER_IS_UNDER_MAINTENANCE",
+        maintenanceEndTimestamp=1_790_003_600,
+    )
+
+    clean = scrubbed(notice, shift_ms=190_000_000_000)
+
+    assert clean.maintenanceEndTimestamp == 1_790_003_600
+
+
 def test_describe_prints_no_real_identifier() -> None:
     data, _ = r.encode_recording(
         recording_of(execution_event()), account_id=ACCOUNT_ID, login=LOGIN
@@ -306,22 +361,37 @@ def venue() -> FakeCTraderServer:
     return server
 
 
+def settings(
+    server: FakeCTraderServer,
+    stop: asyncio.Event,
+    markers: asyncio.Queue,
+    **overrides,
+) -> dict:
+    """The arguments of a `record()` run against `server`, fast enough for a test."""
+    return {
+        "host": server.host,
+        "port": server.port,
+        "tls": False,
+        "client_id": "client-id",
+        "client_secret": "client-secret",
+        "access_token": "access-token",
+        "account_id": ACCOUNT_ID,
+        "minutes": 1.0,
+        "stop": stop,
+        "markers": markers,
+        "rate_limiter": FAST,
+        "snapshot_debounce_secs": 0.05,
+        "tick_secs": 0.01,
+        "reconnect_waits": (0.05,),
+    } | overrides
+
+
 async def run(server: FakeCTraderServer, stop: asyncio.Event, markers: asyncio.Queue, **kwargs):
-    timing = {"snapshot_debounce_secs": 0.05, "tick_secs": 0.01, "reconnect_waits": (0.05,)}
-    return await r.record(
-        server.host,
-        server.port,
-        tls=False,
-        client_id="client-id",
-        client_secret="client-secret",
-        access_token="access-token",
-        account_id=ACCOUNT_ID,
-        minutes=1.0,
-        stop=stop,
-        markers=markers,
-        rate_limiter=FAST,
-        **(timing | kwargs),
-    )
+    return await r.record(**settings(server, stop, markers, **kwargs))
+
+
+def refusal(code: str):
+    return lambda _request: oa.ProtoOAErrorRes(errorCode=code)
 
 
 async def test_a_run_records_events_snapshots_and_markers_in_order() -> None:
@@ -403,12 +473,10 @@ async def test_a_dropped_connection_is_reconnected_and_marked() -> None:
     server = venue()
     await server.start()
     stop, markers = asyncio.Event(), asyncio.Queue()
-    task = asyncio.create_task(run(server, stop, markers))
+    statuses: list[str] = []
+    task = asyncio.create_task(run(server, stop, markers, status=statuses.append))
     try:
-        await server.wait_for_connections(1)
-        await wait_until(
-            lambda: any(isinstance(m, oa.ProtoOAReconcileReq) for m in server.received)
-        )
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
         await server.drop_connections()
         await wait_until(lambda: server.connection_count >= 2)
         await server.push(execution_event())
@@ -422,6 +490,103 @@ async def test_a_dropped_connection_is_reconnected_and_marked() -> None:
     assert any("connection lost" in note for note in notes)
     assert any("reconnected" in note for note in notes)
     assert any(entry.kind == "event" for entry in recording.timeline)
+    assert statuses == [r.STATUS_STARTED, r.STATUS_LOST, r.STATUS_RECONNECTED]
+
+
+async def test_the_deadline_ends_the_run_and_is_announced() -> None:
+    server = venue()
+    await server.start()
+    statuses: list[str] = []
+    try:
+        recording = await asyncio.wait_for(
+            run(
+                server,
+                asyncio.Event(),
+                asyncio.Queue(),
+                minutes=0.001,
+                status=statuses.append,
+            ),
+            10,
+        )
+    finally:
+        await server.stop()
+
+    assert statuses == [r.STATUS_STARTED, r.STATUS_DEADLINE]
+    assert len(recording.closing["deals"]) == 1
+
+
+@pytest.mark.parametrize(
+    "refused",
+    [om.PROTO_OA_APPLICATION_AUTH_REQ, om.PROTO_OA_ACCOUNT_AUTH_REQ, om.PROTO_OA_RECONCILE_REQ],
+    ids=["application auth", "account auth", "a snapshot"],
+)
+async def test_a_venue_refusal_ends_the_run_and_the_file_is_still_written(
+    tmp_path,
+    refused,
+) -> None:
+    server = venue()
+    server.on(refused, refusal("INVALID_REQUEST"))
+    await server.start()
+    output = tmp_path / "recording.json"
+    try:
+        with pytest.raises(CTraderRequestError) as raised:
+            await asyncio.wait_for(
+                r.record_to_file(
+                    output,
+                    login=LOGIN,
+                    secrets=(),
+                    **settings(server, asyncio.Event(), asyncio.Queue()),
+                ),
+                2,
+            )
+    finally:
+        await server.stop()
+
+    assert raised.value.error_code == "INVALID_REQUEST"
+    # Asked once: a refusal is not retried the way a lost connection is.
+    assert server.connection_count == 1
+    timeline = r.decode_recording(output.read_bytes())["timeline"]
+    assert timeline[-1]["note"] == "run failed: CTraderRequestError"
+
+
+async def test_a_refusal_after_a_reconnect_ends_the_run_too() -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    task = asyncio.create_task(run(server, stop, markers, status=statuses.append))
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        server.on(om.PROTO_OA_ACCOUNT_AUTH_REQ, refusal("CH_ACCESS_TOKEN_INVALID"))
+        await server.drop_connections()
+        with pytest.raises(CTraderRequestError):
+            await asyncio.wait_for(task, 5)
+    finally:
+        await server.stop()
+
+    assert statuses == [r.STATUS_STARTED, r.STATUS_LOST]
+    assert server.connection_count == 2
+
+
+async def test_a_truncated_closing_list_is_marked() -> None:
+    server = venue()
+    server.on(
+        om.PROTO_OA_DEAL_LIST_REQ,
+        lambda q: oa.ProtoOADealListRes(ctidTraderAccountId=q.ctidTraderAccountId, hasMore=True),
+    )
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    task = asyncio.create_task(run(server, stop, markers, recording=recording))
+    try:
+        await wait_until(lambda: len(recording.timeline) >= 2)
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        await server.stop()
+
+    notes = [entry.note for entry in recording.timeline if entry.kind == "marker"]
+    assert notes == ["closing list truncated: deals"]
 
 
 async def test_a_recording_is_written_even_when_the_run_fails(tmp_path) -> None:
@@ -527,9 +692,9 @@ async def test_typed_lines_become_markers_and_q_stops(monkeypatch) -> None:
     monkeypatch.setattr(sys, "stdin", typed)
     stop, markers = asyncio.Event(), asyncio.Queue()
 
-    await asyncio.wait_for(r._read_keyboard(stop, markers), 5)
+    await asyncio.to_thread(r._read_keyboard, asyncio.get_running_loop(), stop, markers)
+    await asyncio.wait_for(stop.wait(), 5)
 
-    assert stop.is_set()
     assert [markers.get_nowait() for _ in range(markers.qsize())] == ["moved the stop"]
     assert typed.readline() == "never read\n"
 
@@ -539,7 +704,219 @@ async def test_the_keyboard_reader_ends_at_end_of_input(monkeypatch) -> None:
     monkeypatch.setattr(sys, "stdin", io.StringIO("moved the stop\n"))
     stop, markers = asyncio.Event(), asyncio.Queue()
 
-    await asyncio.wait_for(r._read_keyboard(stop, markers), 5)
+    await asyncio.to_thread(r._read_keyboard, asyncio.get_running_loop(), stop, markers)
+    await wait_until(lambda: not markers.empty())
 
     assert not stop.is_set()
     assert markers.get_nowait() == "moved the stop"
+
+
+def test_a_blocked_keyboard_read_does_not_keep_the_process_alive() -> None:
+    program = f"""
+import asyncio, importlib.util, sys
+
+spec = importlib.util.spec_from_file_location("record_execution", {str(_SCRIPT_PATH)!r})
+r = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = r
+spec.loader.exec_module(r)
+
+
+async def main():
+    r._start_keyboard(asyncio.get_running_loop(), asyncio.Event(), asyncio.Queue())
+    await asyncio.sleep(0.2)
+
+
+asyncio.run(main())
+print("ended")
+"""
+    # stdin stays open and silent, so the reader is still blocked when the run is over.
+    process = subprocess.Popen(
+        [sys.executable, "-c", program],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.wait(timeout=60) == 0
+        assert process.stdout.read().split() == [b"ended"]
+        assert process.stderr.read() == b""
+    finally:
+        process.kill()
+        process.wait(timeout=60)
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            pipe.close()
+
+
+async def test_a_refused_recording_is_kept_outside_the_output(tmp_path, monkeypatch) -> None:
+    async def noted(*, recording: r.Recording, **_kwargs) -> r.Recording:
+        recording.add("event", "", execution_event(), 1.0)
+        # The account id is not one of the ids a note is cleaned of.
+        recording.add("marker", f"on account {ACCOUNT_ID}", None, 2.0)
+        return recording
+
+    monkeypatch.setattr(r, "record", noted)
+    output = tmp_path / "recording.json"
+
+    with pytest.raises(r.record_fixtures.ScrubError):
+        await r.record_to_file(
+            output,
+            login=LOGIN,
+            secrets=(),
+            account_id=ACCOUNT_ID,
+            rejected_dir=tmp_path / "recordings",
+        )
+
+    assert not output.exists()
+    rejected = r.rejected_path(output, tmp_path / "recordings")
+    assert rejected == tmp_path / "recordings" / "recording.rejected.json"
+    kinds = [item["kind"] for item in r.decode_recording(rejected.read_bytes())["timeline"]]
+    assert kinds == ["event", "marker"]
+
+
+async def test_a_refused_write_keeps_the_error_the_run_ended_with(tmp_path, monkeypatch) -> None:
+    error = CTraderTimeoutError("no response")
+
+    async def failing(*, recording: r.Recording, **_kwargs) -> r.Recording:
+        recording.add("marker", f"on account {ACCOUNT_ID}", None, 1.0)
+        raise error
+
+    monkeypatch.setattr(r, "record", failing)
+    output = tmp_path / "recording.json"
+
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        await r.record_to_file(
+            output,
+            login=LOGIN,
+            secrets=(),
+            account_id=ACCOUNT_ID,
+            rejected_dir=tmp_path,
+        )
+
+    assert raised.value.__cause__ is error
+    assert not output.exists()
+    timeline = r.decode_recording(r.rejected_path(output, tmp_path).read_bytes())["timeline"]
+    assert timeline[-1]["note"] == "run failed: CTraderTimeoutError"
+
+
+def granted(*logins: int) -> list[om.ProtoOACtidTraderAccount]:
+    return [
+        om.ProtoOACtidTraderAccount(ctidTraderAccountId=ACCOUNT_ID + n, traderLogin=login)
+        for n, login in enumerate(logins)
+    ]
+
+
+def test_the_account_is_the_one_with_the_trader_login() -> None:
+    account = r._match_account(granted(LOGIN + 1, LOGIN), LOGIN)
+
+    assert account.ctidTraderAccountId == ACCOUNT_ID + 1
+
+
+@pytest.mark.parametrize("logins", [(LOGIN + 1,), (LOGIN, LOGIN)], ids=["none", "two"])
+def test_an_unmatched_trader_login_is_reported_without_naming_it(logins) -> None:
+    with pytest.raises(r.NoSuchAccount) as raised:
+        r._match_account(granted(*logins), LOGIN)
+
+    assert "trader login" in str(raised.value)
+    assert not any(char.isdigit() for char in str(raised.value))
+
+
+async def test_the_checklist_waits_for_the_recording_to_start(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    printed: dict[str, str] = {}
+
+    async def resolved(*_args) -> tuple[str, int]:
+        return "127.0.0.1", ACCOUNT_ID
+
+    async def recorded(_output, *, status, **_kwargs) -> None:
+        printed["before"] = capsys.readouterr().out
+        status(r.STATUS_STARTED)
+        printed["started"] = capsys.readouterr().out
+        status(r.STATUS_LOST)
+
+    monkeypatch.setattr(r, "_resolve_account", resolved)
+    monkeypatch.setattr(r, "record_to_file", recorded)
+    monkeypatch.setattr(r, "_start_keyboard", lambda *_args: None)
+    args = argparse.Namespace(
+        trader_login=LOGIN,
+        minutes=1.0,
+        output=tmp_path / "recording.json",
+    )
+    env = {
+        "CTRADER_CLIENT_ID": "client-id",
+        "CTRADER_CLIENT_SECRET": "client-secret",
+        "CTRADER_ACCESS_TOKEN": "access-token",
+    }
+
+    await r._run(args, env)
+
+    assert "Connecting" in printed["before"]
+    assert "Trade by hand" not in printed["before"]
+    assert "Trade by hand" in printed["started"]
+    assert capsys.readouterr().err == f"{r.STATUS_LOST}\n"
+
+
+def main_ending_with(outcome: BaseException, tmp_path, monkeypatch) -> int:
+    """Run `main` with the recording run replaced by one that raises `outcome`."""
+
+    async def ended(_args, _env) -> None:
+        raise outcome
+
+    monkeypatch.setattr(r, "_run", ended)
+    env_file = tmp_path / "env"
+    env_file.write_text("", encoding="utf-8")
+    return r.main(
+        [
+            "--trader-login",
+            str(LOGIN),
+            "--env-file",
+            str(env_file),
+            "--output",
+            str(tmp_path / "recording.json"),
+        ],
+    )
+
+
+def test_a_venue_refusal_is_reported_by_its_code_only(tmp_path, monkeypatch, capsys) -> None:
+    refused = CTraderRequestError("RET_ACCOUNT_DISABLED", f"account {ACCOUNT_ID} is disabled")
+
+    assert main_ending_with(refused, tmp_path, monkeypatch) == 1
+
+    assert capsys.readouterr().err == "error: CTraderRequestError RET_ACCOUNT_DISABLED\n"
+
+
+def test_an_unexpected_error_is_reported_by_its_type_only(tmp_path, monkeypatch, capsys) -> None:
+    assert main_ending_with(ValueError(f"account {ACCOUNT_ID}"), tmp_path, monkeypatch) == 1
+
+    assert capsys.readouterr().err == "error: ValueError\n"
+
+
+def test_an_unmatched_trader_login_is_explained(tmp_path, monkeypatch, capsys) -> None:
+    unmatched = r.NoSuchAccount("the access token grants no account with that trader login")
+
+    assert main_ending_with(unmatched, tmp_path, monkeypatch) == 1
+
+    assert capsys.readouterr().err == f"error: {unmatched}\n"
+
+
+def test_a_refused_recording_is_reported_with_where_it_went(tmp_path, monkeypatch, capsys) -> None:
+    refused = r.record_fixtures.ScrubError(f"found {ACCOUNT_ID}")
+    refused.__cause__ = CTraderRequestError("INVALID_REQUEST", f"account {ACCOUNT_ID}")
+
+    assert main_ending_with(refused, tmp_path, monkeypatch) == 1
+
+    kept = r.rejected_path(tmp_path / "recording.json", r._REJECTED_DIR)
+    assert capsys.readouterr().err.splitlines() == [
+        "error: ScrubError",
+        "the run itself had failed: CTraderRequestError INVALID_REQUEST",
+        f"the refused recording is kept in {kept}",
+    ]
+
+
+def test_an_interrupt_exits_quietly(tmp_path, monkeypatch, capsys) -> None:
+    assert main_ending_with(KeyboardInterrupt(), tmp_path, monkeypatch) == 130
+
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
