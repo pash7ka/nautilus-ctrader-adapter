@@ -125,8 +125,14 @@ STATUS_DEADLINE = "deadline reached"
 # How the recorder's own markers begin when they name a list the recording lacks, in whole or
 # in part: the owner has to read those before trusting it.
 _PROBLEM_MARKERS = ("closing ",)
-# What only the unscrubbed file holds, and so what tells it from a fixture.
-_RAW_KEYS = frozenset({"started_wall_ms", "account_id", "login"})
+# The whole of a fixture's shape. A file with any other key is not one; an unscrubbed
+# recording carries more at both levels.
+_FIXTURE_KEYS = frozenset({"format", "timeline", "closing"})
+_FIXTURE_ENTRY_KEYS = frozenset({"t", "kind", "note", "type", "payload"})
+NOT_A_FIXTURE = (
+    "not a scrubbed fixture, so nothing of it is printed; "
+    "an unscrubbed recording becomes a fixture with --rescrub"
+)
 
 _ID_KINDS = {"positionId": "position", "orderId": "order", "dealId": "deal"}
 _ID_BASES = {"position": 5_000_000, "order": 6_000_000, "deal": 7_000_000}
@@ -136,6 +142,10 @@ _TEXT_FIELDS = frozenset({"label", "comment", "clientOrderId", "externalNote"})
 _VENUE_TEXT_FIELDS = frozenset({"description", "reason"})
 # Money moved in or out of the account: nothing the order logic needs.
 _CLEARED_MESSAGES = frozenset({"depositWithdraw", "bonusDepositWithdraw"})
+# Lists of account ids. They name the owner's other accounts, whose ids no check knows.
+_ACCOUNT_ID_LISTS = frozenset({"ctidTraderAccountIds"})
+# The owner's id at the identity provider. Zeroed, not cleared: the field is `required`.
+_ZEROED_IDS = frozenset({"userId"})
 _INT_TYPES = (FieldDescriptor.TYPE_INT64, FieldDescriptor.TYPE_UINT64)
 _DIGIT_RUN = re.compile(r"\d+")
 # Shorter than any id seen, longer than a price or a volume someone would type in a note.
@@ -254,7 +264,12 @@ def _scrub_in_place(
             for item in items:
                 _scrub_in_place(item, ids, shift_ms, clean)
         elif descriptor.label == FieldDescriptor.LABEL_REPEATED:
-            continue
+            if name in _ACCOUNT_ID_LISTS:
+                # Cut to the one fake id: how many accounts the owner has is theirs to tell.
+                message.ClearField(name)
+                getattr(message, name).append(record_fixtures.FAKE_ACCOUNT_ID)
+        elif name in _ZEROED_IDS and descriptor.type in _INT_TYPES:
+            setattr(message, name, 0)
         elif name in _ID_KINDS and descriptor.type in _INT_TYPES:
             # Zero or less stands for "no id": mapping it would replace every 0 in a text.
             if value > 0:
@@ -419,8 +434,9 @@ def encode_raw(recording: Recording, *, account_id: int, login: int | None) -> b
     timeline = []
     for entry in recording.timeline:
         item: dict = {"t": entry.t, "kind": entry.kind, "note": entry.note}
-        if entry.typed:
-            item["typed"] = True
+        if entry.kind == "marker":
+            # Written for the recorder's own markers too: see `decode_raw()`.
+            item["typed"] = entry.typed
         if entry.message is not None:
             item.update(_encode(entry.message, partial=True))
         timeline.append(item)
@@ -439,7 +455,11 @@ def encode_raw(recording: Recording, *, account_id: int, login: int | None) -> b
 
 
 def decode_raw(data: bytes) -> tuple[Recording, int, int | None]:
-    """The recording, account id and trader login that `encode_raw()` wrote."""
+    """The recording, account id and trader login that `encode_raw()` wrote.
+
+    A marker with no `typed` flag is read as typed: only the recorder's own markers are ever
+    quoted on the terminal, so that is the reading under which a note cannot be.
+    """
     raw = json.loads(data)
     recording = Recording(raw["started_wall_ms"])
     recording.timeline = [
@@ -448,7 +468,7 @@ def decode_raw(data: bytes) -> tuple[Recording, int, int | None]:
             item["kind"],
             item["note"],
             _decode(item) if "payload" in item else None,
-            item.get("typed", False),
+            item.get("typed", item["kind"] == "marker"),
         )
         for item in raw["timeline"]
     ]
@@ -527,26 +547,56 @@ class Refused(RuntimeError):
     """
 
 
+def _holds_a_real_account_id(message: Message) -> bool:
+    """Whether any account id in `message` is other than the fake one scrubbing leaves."""
+    fake = record_fixtures.FAKE_ACCOUNT_ID
+    for descriptor, value in message.ListFields():
+        items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+        if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            real = any(_holds_a_real_account_id(item) for item in items)
+        elif descriptor.name == "ctidTraderAccountId" or descriptor.name in _ACCOUNT_ID_LISTS:
+            real = any(item != fake for item in items)
+        else:
+            real = False
+        if real:
+            return True
+    return False
+
+
 def describe(data: bytes) -> str:
     """One line per timeline entry of a fixture.
 
-    Raises `Refused` for an unscrubbed recording: what it holds is never printed.
+    Raises `Refused(NOT_A_FIXTURE)`, which quotes nothing of `data`, unless it is a scrubbed
+    fixture: exactly the fixture's keys and format, every payload decodable, and no account
+    id in it but the fake one. Anything else may be an unscrubbed recording, and is not printed.
     """
-    if _RAW_KEYS & json.loads(data).keys():
-        raise Refused(
-            "this is an unscrubbed recording, which is never printed; "
-            "build a fixture from it with --rescrub and describe that",
+    try:
+        raw = json.loads(data)
+        entries = [*raw["timeline"], *(item for items in raw["closing"].values() for item in items)]
+        shaped = (
+            raw.keys() == _FIXTURE_KEYS
+            and raw["format"] == FORMAT
+            and all(entry.keys() <= _FIXTURE_ENTRY_KEYS for entry in entries)
         )
-    lines = []
-    for item in decode_recording(data)["timeline"]:
-        head = f"{item['t']:9.3f}  {item['kind']:<8}"
-        message = item["message"]
-        if message is None:
-            lines.append(f"{head}  {item['note']}")
-            continue
-        body = text_format.MessageToString(message, as_one_line=True)
-        note = f"[{item['note']}] " if item["note"] else ""
-        lines.append(f"{head}  {note}{type(message).__name__} {body}")
+        timeline = decode_recording(data)["timeline"] if shaped else []
+        messages = [_decode(entry) for entry in entries if shaped and "payload" in entry]
+        if not shaped or any(_holds_a_real_account_id(message) for message in messages):
+            raise Refused(NOT_A_FIXTURE)
+        lines = []
+        for item in timeline:
+            head = f"{item['t']:9.3f}  {item['kind']:<8}"
+            message = item["message"]
+            if message is None:
+                lines.append(f"{head}  {item['note']}")
+                continue
+            body = text_format.MessageToString(message, as_one_line=True)
+            note = f"[{item['note']}] " if item["note"] else ""
+            lines.append(f"{head}  {note}{type(message).__name__} {body}")
+    except Refused:
+        raise
+    except Exception:
+        # Truncated, not JSON, not this shape: the error's own text could quote the file.
+        raise Refused(NOT_A_FIXTURE) from None
     return "\n".join(lines)
 
 
@@ -1126,6 +1176,9 @@ def main(argv: list[str] | None = None) -> int:
         except Refused as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
+        except OSError as e:
+            print(f"error: {type(e).__name__}", file=sys.stderr)
+            return 1
         return 0
     if args.rescrub is None and args.trader_login is None:
         parser.error("--trader-login is required to record")
@@ -1155,6 +1208,9 @@ def main(argv: list[str] | None = None) -> int:
         if outcome.run_error is not None and outcome.run_error is not e:
             print(f"the run itself had failed: {_failure(outcome.run_error)}", file=sys.stderr)
         code = 1
+    if outcome.recording is None:
+        # A run that ended cleanly with nothing in hand did not do what it was started for.
+        code = code or 1
     for line in _outcome_lines(outcome, args.output, rescrub=args.rescrub is not None):
         print(line)
     return code

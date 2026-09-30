@@ -601,27 +601,64 @@ def fields_of(descriptor, seen: set[str]):
             yield from fields_of(field.message_type, seen)
 
 
-def test_no_repeated_scalar_field_holds_what_the_scrubbing_would_have_to_touch() -> None:
-    """The scrubbing skips repeated scalars; this pins that no id, text or time lives in one.
+# The repeated lists of wide integers or text that may stay in a fixture as they are, and why.
+HARMLESS_LISTS = {
+    "symbolId": "a symbol's id is the same for every account of the venue",
+    "deletedQuotes": "ids of quotes in the venue's order book, which no account owns",
+    "volume": "sizes a margin question is asked about, not ids",
+}
+_WIDE_OR_TEXT = (
+    FieldDescriptor.TYPE_INT64,
+    FieldDescriptor.TYPE_UINT64,
+    FieldDescriptor.TYPE_SINT64,
+    FieldDescriptor.TYPE_FIXED64,
+    FieldDescriptor.TYPE_SFIXED64,
+    FieldDescriptor.TYPE_STRING,
+    FieldDescriptor.TYPE_BYTES,
+)
 
-    Walked over every payload type of the schema, which covers whatever the venue can push
-    and every response to a request on the allow-list.
+
+def test_every_repeated_list_that_could_hold_ids_is_scrubbed_or_judged_harmless() -> None:
+    """The scrubbing of single fields never looks inside a repeated scalar field.
+
+    So every such list wide enough for an id, or holding text, is decided by hand: the
+    scrubber rewrites it, or it is on the list above with its reason. A list the schema gains
+    later fails here until someone has decided. Walked over every payload type, which covers
+    whatever the venue can push and every response it can give.
     """
-    handled = r._ID_KINDS.keys() | r._TEXT_FIELDS | r._VENUE_TEXT_FIELDS
-    payload_types = codec._build_registry().values()
-    assert {oa.ProtoOAExecutionEvent, oa.ProtoOAOrderErrorEvent, oa.ProtoOAReconcileRes} <= set(
-        payload_types,
+    found: set[str] = set()
+    for payload_type in codec._build_registry().values():
+        for owner, field in fields_of(payload_type.DESCRIPTOR, set()):
+            if field.label != FieldDescriptor.LABEL_REPEATED or field.type not in _WIDE_OR_TEXT:
+                continue
+            found.add(field.name)
+            decided = field.name in r._ACCOUNT_ID_LISTS or field.name in HARMLESS_LISTS
+            assert decided, f"{payload_type.__name__}: {owner}.{field.name}"
+
+    # Nothing decided here has left the schema: a stale name would hide a renamed field.
+    assert found == r._ACCOUNT_ID_LISTS | HARMLESS_LISTS.keys()
+
+
+def test_a_list_of_account_ids_keeps_none_of_them() -> None:
+    """The owner's other accounts: no check knows their ids, so the list cannot keep them."""
+    other_account = 99_887_766
+    invalidated = oa.ProtoOAAccountsTokenInvalidatedEvent(
+        ctidTraderAccountIds=[ACCOUNT_ID, other_account],
+        reason=f"Access token expired for accounts {ACCOUNT_ID}, {other_account}",
     )
 
-    for payload_type in payload_types:
-        for owner, field in fields_of(payload_type.DESCRIPTOR, set()):
-            if field.label != FieldDescriptor.LABEL_REPEATED:
-                continue
-            if field.type == FieldDescriptor.TYPE_MESSAGE:
-                continue
-            where = f"{payload_type.__name__}: {owner}.{field.name}"
-            assert field.name not in handled, where
-            assert not field.name.endswith("Timestamp"), where
+    (decoded,) = clean_timeline(recording_of(invalidated))
+
+    clean = decoded["message"]
+    fake = r.record_fixtures.FAKE_ACCOUNT_ID
+    assert list(clean.ctidTraderAccountIds) == [fake]
+    assert clean.reason == f"Access token expired for accounts {fake}, {r.NUMBER_PLACEHOLDER}"
+
+
+def test_the_owner_s_profile_id_is_zeroed() -> None:
+    profile = oa.ProtoOAGetCtidProfileByTokenRes(profile=om.ProtoOACtidProfile(userId=424_242))
+
+    assert scrubbed(profile).profile.userId == 0
 
 
 def test_describe_prints_no_real_identifier() -> None:
@@ -1491,16 +1528,93 @@ def raw_file(tmp_path, *notes: str) -> pathlib.Path:
     return path
 
 
-def test_describe_never_prints_an_unscrubbed_recording(tmp_path, capsys) -> None:
-    raw = raw_file(tmp_path, "moved the stop")
+def stripped(raw: bytes, *, typed: bool) -> bytes:
+    """A raw recording edited by hand to look like a fixture: the raw-only keys removed."""
+    loaded = json.loads(raw)
+    for key in ("started_wall_ms", "account_id", "login"):
+        del loaded[key]
+    if not typed:
+        for item in loaded["timeline"]:
+            item.pop("typed", None)
+    return json.dumps(loaded).encode()
 
-    assert r.main(["--describe", str(raw)]) == 1
+
+def not_a_fixture(name: str, tmp_path) -> bytes:
+    raw = raw_file(tmp_path, "moved the stop").read_bytes()
+    fixture = r.encode_recording(
+        recording_of(execution_event()),
+        account_id=ACCOUNT_ID,
+        login=LOGIN,
+    )[0]
+    return {
+        "a raw recording": raw,
+        "a raw recording without its own keys": stripped(raw, typed=True),
+        "a raw recording without any raw-only key": stripped(raw, typed=False),
+        "not an object": b'["timeline", "closing", "format"]',
+        "a truncated fixture": fixture[: len(fixture) // 2],
+        "another format": fixture.replace(b'"format": 1', b'"format": 2'),
+        "an extra key": fixture.replace(b'"format": 1', b'"format": 1, "extra": 1'),
+        "not text at all": b"\xff\xfe\x00 not json",
+    }[name]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "a raw recording",
+        "a raw recording without its own keys",
+        "a raw recording without any raw-only key",
+        "not an object",
+        "a truncated fixture",
+        "another format",
+        "an extra key",
+        "not text at all",
+    ],
+)
+def test_describe_prints_nothing_of_a_file_that_is_not_a_fixture(tmp_path, capsys, name) -> None:
+    path = tmp_path / "file.json"
+    path.write_bytes(not_a_fixture(name, tmp_path))
+
+    assert r.main(["--describe", str(path)]) == 1
 
     captured = capsys.readouterr()
     assert captured.out == ""
+    assert captured.err == f"error: {r.NOT_A_FIXTURE}\n"
     assert "--rescrub" in captured.err
-    for private in (str(ACCOUNT_ID), str(LOGIN), str(ORDER_ID), "my robot", "moved the stop"):
-        assert private not in captured.err
+
+
+def test_describe_reports_a_file_it_cannot_read_by_the_error_type(tmp_path, capsys) -> None:
+    assert r.main(["--describe", str(tmp_path / "no-such-file.json")]) == 1
+
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "error: FileNotFoundError\n")
+
+
+def test_a_marker_without_its_flag_is_read_as_typed_and_never_printed(tmp_path, capsys) -> None:
+    """The safe reading of a raw file whose flags are missing: no note of it is quoted."""
+    note = f"closing the position on account {ACCOUNT_ID}"
+    raw = raw_file(tmp_path, note)
+    loaded = json.loads(raw.read_bytes())
+    for item in loaded["timeline"]:
+        item.pop("typed", None)
+    raw.write_bytes(json.dumps(loaded).encode())
+
+    assert r.main(rescrub_args(tmp_path, raw)) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[-1] == "1 events, 0 snapshots, 1 notes"
+    assert "closing" not in captured.out + captured.err
+    assert str(ACCOUNT_ID) not in captured.out + captured.err
+
+
+def test_the_recorder_s_own_markers_are_flagged_as_such_in_the_raw_file() -> None:
+    recording = recording_of(execution_event())
+    recording.add("marker", "closing requests skipped: not connected", None, 5.0)
+    recording.add("marker", "moved the stop", None, 6.0, typed=True)
+
+    raw = json.loads(r.encode_raw(recording, account_id=ACCOUNT_ID, login=LOGIN))
+
+    assert [item.get("typed") for item in raw["timeline"]] == [None, False, True]
 
 
 def test_recording_needs_a_trader_login(capsys) -> None:
@@ -1868,8 +1982,10 @@ def test_an_existing_file_is_not_replaced_without_being_asked(
     kept.write_bytes(b"an earlier session")
     runs: list[object] = []
 
-    async def run(args, _env, _outcome) -> None:
+    async def run(args, _env, outcome) -> None:
         runs.append(args)
+        outcome.recording = session(events=1)
+        outcome.fixture = True
 
     assert main_run(tmp_path, monkeypatch, run) == 1
 
@@ -1882,6 +1998,16 @@ def test_an_existing_file_is_not_replaced_without_being_asked(
 
     assert main_run(tmp_path, monkeypatch, run, "--overwrite") == 0
     assert len(runs) == 1
+
+
+def test_a_run_that_recorded_nothing_is_a_failed_run(tmp_path, monkeypatch, capsys) -> None:
+    async def stopped_at_once(_args, _env, _outcome) -> None:
+        return
+
+    assert main_run(tmp_path, monkeypatch, stopped_at_once) == 1
+
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == (NOTHING, "")
 
 
 def test_a_missing_output_directory_is_refused_before_the_run(
