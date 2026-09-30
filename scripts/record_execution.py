@@ -18,11 +18,15 @@ interval and hides when the session took place.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import base64
+import contextlib
 import importlib.util
 import json
 import pathlib
 import sys
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -32,9 +36,14 @@ from google.protobuf.message import Message
 
 from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.connection import CTraderConnection
+from nautilus_ctrader.common.errors import CTraderError
+from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import (
     BUCKET_DEFAULT,
     BUCKET_HISTORICAL,
+    DEMO_HOST,
+    LIVE_HOST,
+    PROTOBUF_PORT,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 
@@ -315,3 +324,335 @@ def describe(data: bytes) -> str:
         note = f"[{item['note']}] " if item["note"] else ""
         lines.append(f"{head}  {note}{type(message).__name__} {body}")
     return "\n".join(lines)
+
+
+def _position_ids(message: Message) -> set[int]:
+    found: set[int] = set()
+    for descriptor, value in message.ListFields():
+        if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+            for item in items:
+                found |= _position_ids(item)
+        elif descriptor.name == "positionId" and descriptor.label != FieldDescriptor.LABEL_REPEATED:
+            found.add(value)
+    return found
+
+
+async def record(
+    host: str,
+    port: int,
+    *,
+    tls: bool,
+    client_id: str,
+    client_secret: str,
+    access_token: str,
+    account_id: int,
+    minutes: float,
+    stop: asyncio.Event,
+    markers: asyncio.Queue[str],
+    rate_limiter: RateLimiter | None = None,
+    snapshot_debounce_secs: float = _SNAPSHOT_DEBOUNCE_SECS,
+    tick_secs: float = _TICK_SECS,
+    reconnect_waits: tuple[float, ...] = _RECONNECT_WAIT_SECS,
+    recording: Recording | None = None,
+) -> Recording:
+    """Listen until `stop` is set or `minutes` pass; reconnect if the connection drops.
+
+    `recording` lets the caller keep what was seen if this raises: it is filled in place.
+    """
+    recording = Recording(int(time.time() * 1000)) if recording is None else recording
+    started = time.monotonic()
+    deadline = started + minutes * 60
+
+    def now() -> float:
+        return time.monotonic() - started
+
+    def finished() -> bool:
+        return stop.is_set() or time.monotonic() >= deadline
+
+    def drain_markers() -> None:
+        while not markers.empty():
+            recording.add("marker", markers.get_nowait(), None, now())
+
+    async def snapshot(connection: CTraderConnection, note: str) -> None:
+        for separate, shape in ((False, "levels on positions"), (True, "protection orders")):
+            response = await send(
+                connection,
+                oa.ProtoOAReconcileReq(
+                    ctidTraderAccountId=account_id,
+                    returnProtectionOrders=separate,
+                ),
+            )
+            recording.add("snapshot", f"{note}; {shape}", response, now())
+
+    async def closing(connection: CTraderConnection) -> None:
+        window = {
+            "fromTimestamp": recording.started_wall_ms - _CLOSING_LOOKBACK_MS,
+            "toTimestamp": int(time.time() * 1000),
+        }
+        recording.closing["deals"].append(
+            await send(
+                connection,
+                oa.ProtoOADealListReq(ctidTraderAccountId=account_id, **window),
+                bucket=BUCKET_HISTORICAL,
+            ),
+        )
+        recording.closing["orders"].append(
+            await send(
+                connection,
+                oa.ProtoOAOrderListReq(ctidTraderAccountId=account_id, **window),
+                bucket=BUCKET_HISTORICAL,
+            ),
+        )
+        positions: set[int] = set()
+        for message in list(recording.messages()):
+            positions |= _position_ids(message)
+        for position_id in sorted(positions):
+            recording.closing["position_orders"].append(
+                await send(
+                    connection,
+                    oa.ProtoOAOrderListByPositionIdReq(
+                        ctidTraderAccountId=account_id,
+                        positionId=position_id,
+                    ),
+                    bucket=BUCKET_HISTORICAL,
+                ),
+            )
+            recording.closing["position_deals"].append(
+                await send(
+                    connection,
+                    oa.ProtoOADealListByPositionIdReq(
+                        ctidTraderAccountId=account_id,
+                        positionId=position_id,
+                    ),
+                    bucket=BUCKET_HISTORICAL,
+                ),
+            )
+
+    last_event: float | None = None
+
+    def on_event(message: Message) -> None:
+        nonlocal last_event
+        # A note typed before the event arrived goes before it, not at the next tick.
+        drain_markers()
+        recording.add("event", "", message, now())
+        last_event = time.monotonic()
+
+    attempt = 0
+    first = True
+    while not finished():
+        connection = CTraderConnection(
+            host,
+            port,
+            logger=record_fixtures._QuietLogger(),
+            tls=tls,
+            rate_limiter=RateLimiter(_RATE_LIMITS) if rate_limiter is None else rate_limiter,
+        )
+        lost = asyncio.Event()
+        last_event = None
+        # TODO(verify): that account authorisation alone gets execution events pushed, with no
+        # subscription request; a recording that holds an event confirms it.
+        connection.set_event_handler(on_event)
+        connection.set_disconnect_handler(lambda _error, lost=lost: lost.set())
+        try:
+            await connection.connect()
+            await send(
+                connection,
+                oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
+            )
+            await send(
+                connection,
+                oa.ProtoOAAccountAuthReq(
+                    ctidTraderAccountId=account_id,
+                    accessToken=access_token,
+                ),
+            )
+            if not first:
+                recording.add("marker", "reconnected", None, now())
+            await snapshot(connection, "start" if first else "after reconnect")
+            first = False
+            attempt = 0
+
+            while not finished() and not lost.is_set():
+                drain_markers()
+                seen = last_event
+                if seen is not None and time.monotonic() - seen >= snapshot_debounce_secs:
+                    last_event = None
+                    await snapshot(connection, "after events")
+                await asyncio.sleep(tick_secs)
+
+            # A note typed during the last tick.
+            drain_markers()
+            if not lost.is_set():
+                try:
+                    await closing(connection)
+                except CTraderError as e:
+                    recording.add(
+                        "marker",
+                        f"closing requests failed: {type(e).__name__}",
+                        None,
+                        now(),
+                    )
+                return recording
+            recording.add("marker", "connection lost", None, now())
+        except (CTraderError, OSError) as e:
+            recording.add("marker", f"connection lost: {type(e).__name__}", None, now())
+        finally:
+            with contextlib.suppress(CTraderError, OSError):
+                await connection.close()
+        await asyncio.sleep(reconnect_waits[min(attempt, len(reconnect_waits) - 1)])
+        attempt += 1
+    drain_markers()
+    recording.add("marker", "closing requests skipped: not connected", None, now())
+    return recording
+
+
+async def record_to_file(
+    output: pathlib.Path,
+    *,
+    login: int | None,
+    secrets: Iterable[str],
+    account_id: int,
+    **kwargs,
+) -> None:
+    """Run `record()` and write the fixture, whatever way the run ended.
+
+    The owner's manual trades cannot be repeated on demand, so a run that fails, or is
+    interrupted, still writes what it saw before the error is re-raised.
+    """
+    recording = Recording(int(time.time() * 1000))
+
+    def write() -> None:
+        data, ids = encode_recording(recording, account_id=account_id, login=login)
+        check_clean(data, recording, account_id=account_id, login=login, ids=ids, secrets=secrets)
+        output.write_bytes(data)
+
+    try:
+        await record(account_id=account_id, recording=recording, **kwargs)
+    except BaseException as e:
+        last = recording.timeline[-1].t if recording.timeline else 0.0
+        recording.add("marker", f"run failed: {type(e).__name__}", None, last)
+        write()
+        raise
+    write()
+
+
+async def _resolve_account(
+    trader_login: int,
+    client_id: str,
+    client_secret: str,
+    access_token: str,
+) -> tuple[str, int]:
+    """The host the account lives on and the account id every request carries."""
+    connection = CTraderConnection(DEMO_HOST, PROTOBUF_PORT, logger=record_fixtures._QuietLogger())
+    await connection.connect()
+    try:
+        await send(
+            connection,
+            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
+        )
+        listed = await send(
+            connection,
+            oa.ProtoOAGetAccountListByAccessTokenReq(accessToken=access_token),
+        )
+    finally:
+        await connection.close()
+    matched = [
+        a
+        for a in listed.ctidTraderAccount
+        if a.HasField("traderLogin") and a.traderLogin == trader_login
+    ]
+    if len(matched) != 1:
+        raise RuntimeError(f"expected one granted account with that login, found {len(matched)}")
+    return (LIVE_HOST if matched[0].isLive else DEMO_HOST), matched[0].ctidTraderAccountId
+
+
+async def _read_keyboard(stop: asyncio.Event, markers: asyncio.Queue[str]) -> None:
+    """A typed line becomes a marker; `q` stops the recording."""
+    while not stop.is_set():
+        line = await asyncio.to_thread(sys.stdin.readline)
+        if not line:
+            # End of input, where every further read returns at once: stop reading.
+            return
+        line = line.strip()
+        if line.lower() == "q":
+            stop.set()
+        elif line:
+            await markers.put(line)
+
+
+_CHECKLIST = """\
+Recording. Trade by hand in the cTrader terminal, at the smallest volume, and after each
+step type what you did and press Enter:
+  1. a market buy with a stop-loss and a take-profit
+  2. move the stop-loss
+  3. remove the take-profit, then add it back
+  4. partially close the position
+  5. let the stop-loss trigger, or close the position by hand
+  6. a second position, closed by its take-profit
+  7. place a pending limit order, then cancel it
+  8. (optional, long) keep a position open across the daily rollover
+Type q and press Enter to stop."""
+
+
+async def _run(args: argparse.Namespace, env: dict[str, str]) -> None:
+    client_id = env["CTRADER_CLIENT_ID"]
+    client_secret = env["CTRADER_CLIENT_SECRET"]
+    access_token = env["CTRADER_ACCESS_TOKEN"]
+    host, account_id = await _resolve_account(
+        args.trader_login,
+        client_id,
+        client_secret,
+        access_token,
+    )
+    stop: asyncio.Event = asyncio.Event()
+    markers: asyncio.Queue[str] = asyncio.Queue()
+    print(_CHECKLIST)
+    keyboard = asyncio.create_task(_read_keyboard(stop, markers))
+    try:
+        await record_to_file(
+            args.output,
+            login=args.trader_login,
+            secrets=(client_id, client_secret, access_token, env.get("CTRADER_REFRESH_TOKEN", "")),
+            host=host,
+            port=PROTOBUF_PORT,
+            tls=True,
+            client_id=client_id,
+            client_secret=client_secret,
+            access_token=access_token,
+            account_id=account_id,
+            minutes=args.minutes,
+            stop=stop,
+            markers=markers,
+        )
+    finally:
+        stop.set()
+        keyboard.cancel()
+    print(f"Recording written to {args.output}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--describe", type=pathlib.Path, metavar="FILE")
+    parser.add_argument("--trader-login", type=int)
+    parser.add_argument("--minutes", type=float, default=120.0)
+    parser.add_argument("--output", type=pathlib.Path, default=_OUTPUT_PATH)
+    parser.add_argument("--env-file", type=pathlib.Path, default=_REPO_ROOT / ".env")
+    args = parser.parse_args(argv)
+
+    if args.describe is not None:
+        print(describe(args.describe.read_bytes()))
+        return 0
+    if args.trader_login is None:
+        parser.error("--trader-login is required to record")
+    try:
+        asyncio.run(_run(args, get_tokens.load_env(args.env_file)))
+    except (CTraderError, OSError, RuntimeError, KeyError) as e:
+        # The type only: a message could quote an identifier.
+        print(f"error: {type(e).__name__}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import json
 import pathlib
 import sys
 
 import pytest
 
+from nautilus_ctrader.common.errors import CTraderTimeoutError
 from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+from tests.fake_server import FakeCTraderServer
+from tests.polling import wait_until
 
 _SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "record_execution.py"
 _SPEC = importlib.util.spec_from_file_location("record_execution", _SCRIPT_PATH)
@@ -264,3 +268,278 @@ def test_describe_prints_no_real_identifier() -> None:
     assert "ORDER_FILLED" in text
     for real in (ACCOUNT_ID, LOGIN, POSITION_ID, ORDER_ID, DEAL_ID):
         assert str(real) not in text
+
+
+def venue() -> FakeCTraderServer:
+    server = FakeCTraderServer()
+    server.on(om.PROTO_OA_APPLICATION_AUTH_REQ, lambda _r: oa.ProtoOAApplicationAuthRes())
+    server.on(
+        om.PROTO_OA_ACCOUNT_AUTH_REQ,
+        lambda q: oa.ProtoOAAccountAuthRes(ctidTraderAccountId=q.ctidTraderAccountId),
+    )
+    server.on(
+        om.PROTO_OA_RECONCILE_REQ,
+        lambda q: oa.ProtoOAReconcileRes(ctidTraderAccountId=q.ctidTraderAccountId),
+    )
+    server.on(
+        om.PROTO_OA_DEAL_LIST_REQ,
+        lambda q: oa.ProtoOADealListRes(ctidTraderAccountId=q.ctidTraderAccountId, hasMore=False),
+    )
+    server.on(
+        om.PROTO_OA_ORDER_LIST_REQ,
+        lambda q: oa.ProtoOAOrderListRes(ctidTraderAccountId=q.ctidTraderAccountId, hasMore=False),
+    )
+    server.on(
+        om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+        lambda q: oa.ProtoOADealListByPositionIdRes(
+            ctidTraderAccountId=q.ctidTraderAccountId,
+            hasMore=False,
+        ),
+    )
+    server.on(
+        om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+        lambda q: oa.ProtoOAOrderListByPositionIdRes(
+            ctidTraderAccountId=q.ctidTraderAccountId,
+            hasMore=False,
+        ),
+    )
+    return server
+
+
+async def run(server: FakeCTraderServer, stop: asyncio.Event, markers: asyncio.Queue, **kwargs):
+    timing = {"snapshot_debounce_secs": 0.05, "tick_secs": 0.01, "reconnect_waits": (0.05,)}
+    return await r.record(
+        server.host,
+        server.port,
+        tls=False,
+        client_id="client-id",
+        client_secret="client-secret",
+        access_token="access-token",
+        account_id=ACCOUNT_ID,
+        minutes=1.0,
+        stop=stop,
+        markers=markers,
+        rate_limiter=FAST,
+        **(timing | kwargs),
+    )
+
+
+async def test_a_run_records_events_snapshots_and_markers_in_order() -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    task = asyncio.create_task(run(server, stop, markers, recording=recording))
+    try:
+        await server.wait_for_connections(1)
+        # Both start snapshots first: an event pushed between them is recorded between them.
+        await wait_until(lambda: len(recording.timeline) >= 2)
+        await markers.put("market buy with stop and target")
+        await server.push(execution_event())
+        # The debounced snapshot follows the event: two more reconcile requests.
+        await wait_until(
+            lambda: sum(isinstance(m, oa.ProtoOAReconcileReq) for m in server.received) >= 4,
+        )
+        stop.set()
+        assert await asyncio.wait_for(task, 10) is recording
+    finally:
+        await server.stop()
+
+    kinds = [entry.kind for entry in recording.timeline]
+    assert kinds[:2] == ["snapshot", "snapshot"]
+    assert "marker" in kinds and "event" in kinds
+    assert kinds.index("marker") < kinds.index("event")
+    times = [entry.t for entry in recording.timeline]
+    assert times == sorted(times)
+    # The position the event named is asked about at the end.
+    assert any(isinstance(m, oa.ProtoOAOrderListByPositionIdReq) for m in server.received)
+    assert len(recording.closing["deals"]) == 1
+    # Nothing sent to the venue changes the account.
+    assert {type(m) for m in server.received} <= r.READ_ONLY_REQUESTS
+
+
+async def test_a_note_typed_before_an_event_is_recorded_before_it() -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    # The tick is too slow to place the note: only the event's own arrival can.
+    task = asyncio.create_task(run(server, stop, markers, recording=recording, tick_secs=0.3))
+    try:
+        await server.wait_for_connections(1)
+        await wait_until(lambda: len(recording.timeline) >= 2)
+        markers.put_nowait("market buy with stop and target")
+        await server.push(execution_event())
+        await wait_until(lambda: len(recording.timeline) >= 4)
+        kinds = [entry.kind for entry in recording.timeline[:4]]
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        await server.stop()
+
+    assert kinds == ["snapshot", "snapshot", "marker", "event"]
+
+
+async def test_a_note_typed_just_before_stopping_is_kept() -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    task = asyncio.create_task(run(server, stop, markers, recording=recording))
+    try:
+        await server.wait_for_connections(1)
+        await wait_until(lambda: len(recording.timeline) >= 2)
+        # No tick runs between the note and the stop.
+        markers.put_nowait("closed by hand")
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        await server.stop()
+
+    assert "closed by hand" in [entry.note for entry in recording.timeline]
+
+
+async def test_a_dropped_connection_is_reconnected_and_marked() -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    task = asyncio.create_task(run(server, stop, markers))
+    try:
+        await server.wait_for_connections(1)
+        await wait_until(
+            lambda: any(isinstance(m, oa.ProtoOAReconcileReq) for m in server.received)
+        )
+        await server.drop_connections()
+        await wait_until(lambda: server.connection_count >= 2)
+        await server.push(execution_event())
+        await wait_until(lambda: server.connection_count >= 2 and len(server.received) > 8)
+        stop.set()
+        recording = await asyncio.wait_for(task, 10)
+    finally:
+        await server.stop()
+
+    notes = [entry.note for entry in recording.timeline if entry.kind == "marker"]
+    assert any("connection lost" in note for note in notes)
+    assert any("reconnected" in note for note in notes)
+    assert any(entry.kind == "event" for entry in recording.timeline)
+
+
+async def test_a_recording_is_written_even_when_the_run_fails(tmp_path) -> None:
+    """A session that ends badly still leaves what it saw: the owner's trades are not repeatable."""
+    server = venue()
+    # The closing request is refused, which fails the run after the timeline is complete.
+    server.on(
+        om.PROTO_OA_DEAL_LIST_REQ,
+        lambda q: oa.ProtoOAErrorRes(
+            ctidTraderAccountId=q.ctidTraderAccountId,
+            errorCode="INVALID_REQUEST",
+        ),
+    )
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    output = tmp_path / "recording.json"
+    task = asyncio.create_task(
+        r.record_to_file(
+            output,
+            login=LOGIN,
+            secrets=("client-secret", "access-token"),
+            host=server.host,
+            port=server.port,
+            tls=False,
+            client_id="client-id",
+            client_secret="client-secret",
+            access_token="access-token",
+            account_id=ACCOUNT_ID,
+            minutes=1.0,
+            stop=stop,
+            markers=markers,
+            rate_limiter=FAST,
+            snapshot_debounce_secs=0.05,
+            tick_secs=0.01,
+            reconnect_waits=(0.05,),
+        ),
+    )
+    try:
+        await server.wait_for_connections(1)
+        await wait_until(
+            lambda: any(isinstance(m, oa.ProtoOAReconcileReq) for m in server.received)
+        )
+        await server.push(execution_event())
+        await wait_until(
+            lambda: sum(isinstance(m, oa.ProtoOAReconcileReq) for m in server.received) >= 4,
+        )
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        await server.stop()
+
+    decoded = r.decode_recording(output.read_bytes())
+    assert any(item["kind"] == "event" for item in decoded["timeline"])
+    assert any("closing requests failed" in item["note"] for item in decoded["timeline"])
+    assert str(ACCOUNT_ID).encode() not in output.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [CTraderTimeoutError("no response"), asyncio.CancelledError()],
+    ids=["an error", "a cancellation"],
+)
+async def test_a_recording_is_written_when_the_run_raises(tmp_path, monkeypatch, error) -> None:
+    """What `record()` does not handle itself still leaves the file, and still propagates."""
+
+    async def failing(*, recording: r.Recording, **_kwargs) -> r.Recording:
+        recording.add("event", "", execution_event(), 1.5)
+        recording.add("marker", "moved the stop", None, 2.5)
+        raise error
+
+    monkeypatch.setattr(r, "record", failing)
+    output = tmp_path / "recording.json"
+
+    with pytest.raises(type(error)):
+        await r.record_to_file(output, login=LOGIN, secrets=(), account_id=ACCOUNT_ID)
+
+    timeline = r.decode_recording(output.read_bytes())["timeline"]
+    assert [item["kind"] for item in timeline] == ["event", "marker", "marker"]
+    assert timeline[-1]["note"] == f"run failed: {type(error).__name__}"
+    assert timeline[-1]["t"] >= timeline[-2]["t"]
+
+
+def test_describe_mode_needs_no_credentials_and_prints_the_timeline(tmp_path, capsys) -> None:
+    data, _ = r.encode_recording(
+        recording_of(execution_event()), account_id=ACCOUNT_ID, login=LOGIN
+    )
+    path = tmp_path / "recording.json"
+    path.write_bytes(data)
+
+    assert r.main(["--describe", str(path)]) == 0
+
+    assert "ORDER_FILLED" in capsys.readouterr().out
+
+
+def test_recording_needs_a_trader_login(capsys) -> None:
+    with pytest.raises(SystemExit):
+        r.main([])
+    assert "--trader-login" in capsys.readouterr().err
+
+
+async def test_typed_lines_become_markers_and_q_stops(monkeypatch) -> None:
+    typed = io.StringIO("moved the stop\n\n Q \nnever read\n")
+    monkeypatch.setattr(sys, "stdin", typed)
+    stop, markers = asyncio.Event(), asyncio.Queue()
+
+    await asyncio.wait_for(r._read_keyboard(stop, markers), 5)
+
+    assert stop.is_set()
+    assert [markers.get_nowait() for _ in range(markers.qsize())] == ["moved the stop"]
+    assert typed.readline() == "never read\n"
+
+
+async def test_the_keyboard_reader_ends_at_end_of_input(monkeypatch) -> None:
+    """A closed stdin returns an empty line for ever; the run goes on to its deadline."""
+    monkeypatch.setattr(sys, "stdin", io.StringIO("moved the stop\n"))
+    stop, markers = asyncio.Event(), asyncio.Queue()
+
+    await asyncio.wait_for(r._read_keyboard(stop, markers), 5)
+
+    assert not stop.is_set()
+    assert markers.get_nowait() == "moved the stop"
