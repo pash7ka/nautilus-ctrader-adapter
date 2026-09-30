@@ -56,7 +56,7 @@ def _is_recordable(order_id: str) -> bool:
 
 def _require_recordable(order_id: str) -> str:
     if not _is_recordable(order_id):
-        raise ValueError("a client order id must be non-empty, with no whitespace and no '|'")
+        raise ValueError("a client order id must be non-empty printable ASCII with no space or '|'")
     return order_id
 
 
