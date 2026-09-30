@@ -22,8 +22,9 @@ later, with no connection:
 
     uv run python scripts/record_execution.py --rescrub tests/recordings/<name>.raw.json
 
-Neither file is replaced without `--overwrite`. A refusal by the venue ends the run at once and
-is reported by its error code.
+The unscrubbed file is never printed, by `--describe` or otherwise. Neither file is replaced
+without `--overwrite`, and a run that recorded nothing writes nothing. A refusal by the venue
+ends the run at once and is reported by its error code.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import base64
 import contextlib
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import sys
@@ -120,17 +122,11 @@ STATUS_LOST = "connection lost, reconnecting"
 STATUS_RECONNECTED = "reconnected"
 STATUS_DEADLINE = "deadline reached"
 
-# How the recorder's own timeline notes begin; a marker that begins otherwise was typed.
-_OWN_MARKERS = (
-    "connection lost",
-    "reconnected",
-    "closing ",
-    "snapshot refused: ",
-    "run failed: ",
-    "unknown fields ",
-)
-# The ones the owner has to read before trusting the recording.
-_PROBLEM_MARKERS = ("closing ", "unknown fields ")
+# How the recorder's own markers begin when they name a list the recording lacks, in whole or
+# in part: the owner has to read those before trusting it.
+_PROBLEM_MARKERS = ("closing ",)
+# What only the unscrubbed file holds, and so what tells it from a fixture.
+_RAW_KEYS = frozenset({"started_wall_ms", "account_id", "login"})
 
 _ID_KINDS = {"positionId": "position", "orderId": "order", "dealId": "deal"}
 _ID_BASES = {"position": 5_000_000, "order": 6_000_000, "deal": 7_000_000}
@@ -187,25 +183,24 @@ class IdMap:
                 fakes.setdefault(str(real), str(fake))
         return fakes
 
-    def replace_in_text(self, text: str) -> str:
-        """Replace each known id that stands in `text` as a whole number.
 
-        An id is matched against a whole run of digits, never a part of one: the digits of an
-        id inside a longer number are not that id.
-        """
-        fakes = self.text_fakes()
-        return _DIGIT_RUN.sub(lambda match: fakes.get(match.group(), match.group()), text)
+def _in_decimal(text: str, start: int, end: int) -> bool:
+    """Whether the digits `text[start:end]` are one side of a decimal number."""
+    fraction_follows = text[end : end + 1] == "." and text[end + 1 : end + 2].isdigit()
+    is_fraction = start >= 2 and text[start - 1] == "." and text[start - 2].isdigit()
+    return fraction_follows or is_fraction
 
 
 def clean_text(text: str, *, account_id: int, login: int | None, ids: IdMap) -> str:
     """Free text with the numbers that could identify the account taken out.
 
-    Works on whole runs of digits, so a price or a volume is never cut into:
+    Works on whole runs of digits: the digits of an id inside a longer number are not that id.
 
     - a known order, position or deal id becomes its fake id;
     - the account id and the trader login become the fake values their own fields get;
     - any other run of `_LONG_NUMBER_DIGITS` digits or more becomes `NUMBER_PLACEHOLDER`: an id
-      quoted only in text was never seen in a field, so it cannot be mapped.
+      quoted only in text was never seen in a field, so it cannot be mapped. A run that is the
+      integer or the fractional part of a decimal number is a price or a rate, and is kept.
     """
     fakes = ids.text_fakes()
     fakes.setdefault(str(account_id), str(record_fixtures.FAKE_ACCOUNT_ID))
@@ -217,9 +212,9 @@ def clean_text(text: str, *, account_id: int, login: int | None, ids: IdMap) -> 
         run = match.group()
         if run in fakes:
             return fakes[run]
-        if len(run) >= _LONG_NUMBER_DIGITS and run not in known_fakes:
-            return NUMBER_PLACEHOLDER
-        return run
+        if len(run) < _LONG_NUMBER_DIGITS or run in known_fakes or _in_decimal(text, *match.span()):
+            return run
+        return NUMBER_PLACEHOLDER
 
     return _DIGIT_RUN.sub(replace, text)
 
@@ -286,12 +281,20 @@ def _has_unknown_fields(message: Message) -> bool:
     return known.ByteSize() != message.ByteSize()
 
 
+def _unknown_fields_note(recording: Recording) -> str:
+    """The marker naming the message types that carried unknown fields; empty if none did."""
+    types = sorted({type(m).__name__ for m in recording.messages() if _has_unknown_fields(m)})
+    return f"unknown fields dropped from: {', '.join(types)}" if types else ""
+
+
 @dataclass
 class Entry:
     t: float
     kind: str  # "event", "snapshot" or "marker"
     note: str
     message: Message | None
+    # A marker the owner typed, as against one the recorder wrote. Not part of the fixture.
+    typed: bool = False
 
 
 @dataclass
@@ -309,8 +312,16 @@ class Recording:
         },
     )
 
-    def add(self, kind: str, note: str, message: Message | None, t: float) -> None:
-        self.timeline.append(Entry(round(t, 3), kind, note, message))
+    def add(
+        self,
+        kind: str,
+        note: str,
+        message: Message | None,
+        t: float,
+        *,
+        typed: bool = False,
+    ) -> None:
+        self.timeline.append(Entry(round(t, 3), kind, note, message, typed))
 
     def messages(self) -> Iterable[Message]:
         for entry in self.timeline:
@@ -345,11 +356,8 @@ def encode_recording(
     """
     ids = IdMap()
     shift_ms = recording.started_wall_ms - FAKE_EPOCH_MS
-    unknown: set[str] = set()
 
     def clean(message: Message) -> Message:
-        if _has_unknown_fields(message):
-            unknown.add(type(message).__name__)
         return scrub_execution(
             message,
             account_id=account_id,
@@ -374,10 +382,10 @@ def encode_recording(
         key: [_encode(clean(message)) for message in items]
         for key, items in recording.closing.items()
     }
+    unknown = _unknown_fields_note(recording)
     if unknown:
-        note = f"unknown fields dropped from: {', '.join(sorted(unknown))}"
         last = timeline[-1]["t"] if timeline else 0.0
-        timeline.append({"t": last, "kind": "marker", "note": note})
+        timeline.append({"t": last, "kind": "marker", "note": unknown})
     output = {"format": FORMAT, "timeline": timeline, "closing": closing}
     return json.dumps(output, indent=2).encode("utf-8"), ids
 
@@ -411,6 +419,8 @@ def encode_raw(recording: Recording, *, account_id: int, login: int | None) -> b
     timeline = []
     for entry in recording.timeline:
         item: dict = {"t": entry.t, "kind": entry.kind, "note": entry.note}
+        if entry.typed:
+            item["typed"] = True
         if entry.message is not None:
             item.update(_encode(entry.message, partial=True))
         timeline.append(item)
@@ -438,6 +448,7 @@ def decode_raw(data: bytes) -> tuple[Recording, int, int | None]:
             item["kind"],
             item["note"],
             _decode(item) if "payload" in item else None,
+            item.get("typed", False),
         )
         for item in raw["timeline"]
     ]
@@ -486,22 +497,46 @@ def write_fixture(
 ) -> bytes:
     """Scrub `recording`, check the result, and only then write it to `output`.
 
-    Returns the bytes written. Raises, with `output` untouched, if the check refuses them.
+    Returns the bytes written. Raises, with `output` untouched, if anything on the way fails.
     """
     data, ids = encode_recording(recording, account_id=account_id, login=login)
     check_clean(data, recording, account_id=account_id, login=login, ids=ids, secrets=secrets)
-    output.write_bytes(data)
+    _write_atomically(output, data)
     return data
 
 
-def rescrub(raw_file: pathlib.Path, output: pathlib.Path, secrets: Iterable[str]) -> bytes:
-    """Build the fixture again from a raw recording; no connection is involved."""
-    recording, account_id, login = decode_raw(raw_file.read_bytes())
-    return write_fixture(output, recording, account_id=account_id, login=login, secrets=secrets)
+def _write_atomically(path: pathlib.Path, data: bytes) -> None:
+    """Replace `path` with `data` in one step: a failed write leaves the file as it was."""
+    # The name ends like the file's own, so a leftover of a raw file is ignored by git too.
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".", suffix=f".{path.name}")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(temporary)
+        raise
+
+
+class Refused(RuntimeError):
+    """A condition `main` reports in the error's own words.
+
+    The message is a fixed text, or names a path or an env key: never a login, an account id
+    or a secret.
+    """
 
 
 def describe(data: bytes) -> str:
-    """One line per timeline entry, from the already scrubbed fixture."""
+    """One line per timeline entry of a fixture.
+
+    Raises `Refused` for an unscrubbed recording: what it holds is never printed.
+    """
+    if _RAW_KEYS & json.loads(data).keys():
+        raise Refused(
+            "this is an unscrubbed recording, which is never printed; "
+            "build a fixture from it with --rescrub and describe that",
+        )
     lines = []
     for item in decode_recording(data)["timeline"]:
         head = f"{item['t']:9.3f}  {item['kind']:<8}"
@@ -515,20 +550,27 @@ def describe(data: bytes) -> str:
     return "\n".join(lines)
 
 
-def summary(data: bytes) -> list[str]:
-    """What the owner has to read about a written fixture.
+def summary(recording: Recording) -> list[str]:
+    """What the owner has to read about a recording.
 
     Each problem the run noted, then one last line with the counts - which says so in words
-    if the recording holds no event at all.
+    if the recording holds no event at all. Only the recorder's own markers are quoted: they
+    hold list names, error codes and type names, never an identifier.
     """
-    timeline = json.loads(data)["timeline"]
-    kinds = Counter(item["kind"] for item in timeline)
-    notes = [item["note"] for item in timeline if item["kind"] == "marker"]
-    typed = sum(1 for note in notes if not note.startswith(_OWN_MARKERS))
+    kinds = Counter(entry.kind for entry in recording.timeline)
+    problems = [
+        entry.note
+        for entry in recording.timeline
+        if entry.kind == "marker" and not entry.typed and entry.note.startswith(_PROBLEM_MARKERS)
+    ]
+    unknown = _unknown_fields_note(recording)
+    if unknown:
+        problems.append(unknown)
+    typed = sum(entry.typed for entry in recording.timeline)
     counts = f"{kinds['event']} events, {kinds['snapshot']} snapshots, {typed} notes"
     if not kinds["event"]:
         counts += " - NO EVENTS: nothing the venue pushed is in this recording"
-    return [*(note for note in notes if note.startswith(_PROBLEM_MARKERS)), counts]
+    return [*problems, counts]
 
 
 def events_status(names: Iterable[str]) -> str:
@@ -600,7 +642,7 @@ async def record(
 
     def drain_markers() -> None:
         while not markers.empty():
-            recording.add("marker", markers.get_nowait(), None, now())
+            recording.add("marker", markers.get_nowait(), None, now(), typed=True)
 
     async def snapshot(connection: CTraderConnection, note: str) -> None:
         # Asked both ways, and named by the flag alone.
@@ -667,8 +709,13 @@ async def record(
             status(STATUS_DEADLINE)
 
     last_event: float | None = None
-    # The types of the events no snapshot has followed yet.
+    # The types of the events the owner has not been told about yet.
     unannounced: list[str] = []
+
+    def announce_events() -> None:
+        if unannounced:
+            status(events_status(unannounced))
+            unannounced.clear()
 
     def on_event(message: Message) -> None:
         nonlocal last_event
@@ -719,8 +766,7 @@ async def record(
                 seen = last_event
                 if seen is not None and time.monotonic() - seen >= snapshot_debounce_secs:
                     last_event = None
-                    status(events_status(unannounced))
-                    unannounced.clear()
+                    announce_events()
                     try:
                         await snapshot(connection, "after events")
                     except CTraderRequestError as e:
@@ -754,6 +800,9 @@ async def record(
         finally:
             with contextlib.suppress(CTraderError, OSError):
                 await connection.close()
+        # Events the drop cut off from their snapshot are announced now, so the count after the
+        # reconnect holds only what came after it.
+        announce_events()
         if finished():
             break
         status(STATUS_LOST)
@@ -777,8 +826,10 @@ def raw_path(output: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
 class Outcome:
     """What a run left behind. Filled in as it happens, so it can be read after the run raised."""
 
+    # Set once the run has recorded at least one message; nothing is written before that.
+    recording: Recording | None = None
     raw: pathlib.Path | None = None
-    fixture: bytes | None = None
+    fixture: bool = False
     run_error: BaseException | None = None
 
 
@@ -799,26 +850,35 @@ async def record_to_file(
     - the recording is first written as it was seen to `raw_path(output, raw_dir)`, with no
       scrubbing and no check in the way. That file holds real identifiers: `raw_dir` must be a
       directory git ignores;
-    - only then is the fixture built, checked and written to `output`. If any of that fails,
-      `output` is left untouched and the error is raised, from the run's own error if it had
-      one; `rescrub()` builds the fixture from the raw file later;
-    - a run that failed or was interrupted is kept the same way, and its error is re-raised.
+    - then the fixture is built, checked and written to `output`, even if the raw file could
+      not be. If any of that fails, `output` is left as it was and the error is raised, from
+      the run's own error if it had one; `rescrub()` builds the fixture from the raw file later;
+    - a run that failed or was interrupted is kept the same way, and its error is re-raised;
+    - a run that recorded no message at all writes nothing: there is nothing to keep, and a
+      file would only stand in the way of the next run.
+
+    Each file is replaced in one step, so a failed write never damages an earlier one.
     """
     recording = Recording(int(time.time() * 1000))
     outcome = Outcome() if outcome is None else outcome
 
     def keep() -> None:
+        if not any(True for _ in recording.messages()):
+            return
+        outcome.recording = recording
         raw = raw_path(output, raw_dir)
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        raw.write_bytes(encode_raw(recording, account_id=account_id, login=login))
-        outcome.raw = raw
-        outcome.fixture = write_fixture(
-            output,
-            recording,
-            account_id=account_id,
-            login=login,
-            secrets=secrets,
-        )
+        raw_failure: Exception | None = None
+        try:
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            _write_atomically(raw, encode_raw(recording, account_id=account_id, login=login))
+            outcome.raw = raw
+        except Exception as e:
+            # The fixture is still worth having without its unscrubbed copy.
+            raw_failure = e
+        write_fixture(output, recording, account_id=account_id, login=login, secrets=secrets)
+        outcome.fixture = True
+        if raw_failure is not None:
+            raise raw_failure
 
     try:
         await record(account_id=account_id, recording=recording, **kwargs)
@@ -834,11 +894,18 @@ async def record_to_file(
     keep()
 
 
-class Refused(RuntimeError):
-    """A condition `main` reports in the error's own words.
-
-    The message is a fixed text, or names a path: never a login, an account id or a secret.
-    """
+def rescrub(
+    raw_file: pathlib.Path,
+    output: pathlib.Path,
+    secrets: Iterable[str],
+    outcome: Outcome | None = None,
+) -> None:
+    """Build the fixture again from a raw recording; no connection is involved."""
+    outcome = Outcome() if outcome is None else outcome
+    recording, account_id, login = decode_raw(raw_file.read_bytes())
+    outcome.recording = recording
+    write_fixture(output, recording, account_id=account_id, login=login, secrets=secrets)
+    outcome.fixture = True
 
 
 class NoSuchAccount(Refused):
@@ -937,12 +1004,18 @@ step type what you did and press Enter:
 A line "events: ..." follows each step the venue reported; if none appears, nothing is being
 recorded. Type q and press Enter to stop."""
 
-_SECRET_KEYS = (
-    "CTRADER_CLIENT_ID",
-    "CTRADER_CLIENT_SECRET",
-    "CTRADER_ACCESS_TOKEN",
-    "CTRADER_REFRESH_TOKEN",
-)
+# Each one is needed to connect, and every one present must stay out of a fixture.
+_REQUIRED_KEYS = ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET", "CTRADER_ACCESS_TOKEN")
+_SECRET_KEYS = (*_REQUIRED_KEYS, "CTRADER_REFRESH_TOKEN")
+
+
+def _credentials(env: dict[str, str]) -> tuple[str, str, str]:
+    """The client id, client secret and access token; `Refused` if the env file lacks one."""
+    missing = [key for key in _REQUIRED_KEYS if not env.get(key)]
+    if missing:
+        raise Refused(f"the env file lacks {', '.join(missing)}")
+    client_id, client_secret, access_token = (env[key] for key in _REQUIRED_KEYS)
+    return client_id, client_secret, access_token
 
 
 def _secrets(env: dict[str, str]) -> tuple[str, ...]:
@@ -951,9 +1024,7 @@ def _secrets(env: dict[str, str]) -> tuple[str, ...]:
 
 
 async def _run(args: argparse.Namespace, env: dict[str, str], outcome: Outcome) -> None:
-    client_id = env["CTRADER_CLIENT_ID"]
-    client_secret = env["CTRADER_CLIENT_SECRET"]
-    access_token = env["CTRADER_ACCESS_TOKEN"]
+    client_id, client_secret, access_token = _credentials(env)
     print("Connecting...")
     host, account_id = await _resolve_account(
         args.trader_login,
@@ -1001,20 +1072,26 @@ def _failure(error: BaseException) -> str:
     return f"{type(error).__name__}{code}"
 
 
-def _outcome_lines(outcome: Outcome, output: pathlib.Path) -> list[str]:
-    """What is on disk once `main` is done, ending with the counts if a fixture was written."""
-    if outcome.fixture is not None:
+def _outcome_lines(outcome: Outcome, output: pathlib.Path, *, rescrub: bool = False) -> list[str]:
+    """What is on disk once `main` is done, and what was recorded: the counts come last.
+
+    `rescrub` leaves the unscrubbed copy out: that mode reads it and never writes it.
+    """
+    if outcome.recording is None:
+        if rescrub:
+            return ["The fixture was NOT written."]
+        return ["Nothing was recorded, and nothing was written."]
+    if outcome.fixture:
         lines = [f"Recording written to {output}"]
-        if outcome.raw is not None:
-            lines.append(f"Unscrubbed copy, never to be committed: {outcome.raw}")
-        return [*lines, *summary(outcome.fixture)]
-    if outcome.raw is not None:
-        return [
-            f"The fixture was NOT written; {output} is untouched.",
-            f"What was recorded is kept, unscrubbed, in {outcome.raw}",
-            f"Rebuild the fixture from it with: --rescrub {outcome.raw}",
-        ]
-    return ["Nothing was recorded, and nothing was written."]
+    else:
+        lines = [f"The fixture was NOT written; {output} is untouched."]
+    if not rescrub and outcome.raw is None:
+        lines.append("The unscrubbed copy could NOT be written.")
+    elif not rescrub:
+        lines.append(f"Unscrubbed copy, never to be committed: {outcome.raw}")
+        if not outcome.fixture:
+            lines.append(f"Rebuild the fixture from it with: --rescrub {outcome.raw}")
+    return [*lines, *summary(outcome.recording)]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1044,7 +1121,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.describe is not None:
-        print(describe(args.describe.read_bytes()))
+        try:
+            print(describe(args.describe.read_bytes()))
+        except Refused as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         return 0
     if args.rescrub is None and args.trader_login is None:
         parser.error("--trader-login is required to record")
@@ -1052,15 +1133,17 @@ def main(argv: list[str] | None = None) -> int:
     outcome = Outcome()
     code = 0
     try:
-        # Before anything is sent: a session must not end on a file that cannot be written.
+        # All of this before anything is sent or written: a session must not end on a missing
+        # key or on a file that cannot be written.
+        env = get_tokens.load_env(args.env_file)
+        _credentials(env)
         _check_target(args.output, overwrite=args.overwrite)
         if args.rescrub is not None:
-            env = get_tokens.load_env(args.env_file)
-            outcome.fixture = rescrub(args.rescrub, args.output, _secrets(env))
+            rescrub(args.rescrub, args.output, _secrets(env), outcome)
         else:
             raw = raw_path(args.output, args.raw_dir)
             _check_target(raw, overwrite=args.overwrite, create_dir=True)
-            asyncio.run(_run(args, get_tokens.load_env(args.env_file), outcome))
+            asyncio.run(_run(args, env, outcome))
     except KeyboardInterrupt:
         # Stopped by hand. Whether anything was written depends on when: the lines below say.
         code = 130
@@ -1072,7 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
         if outcome.run_error is not None and outcome.run_error is not e:
             print(f"the run itself had failed: {_failure(outcome.run_error)}", file=sys.stderr)
         code = 1
-    for line in _outcome_lines(outcome, args.output):
+    for line in _outcome_lines(outcome, args.output, rescrub=args.rescrub is not None):
         print(line)
     return code
 

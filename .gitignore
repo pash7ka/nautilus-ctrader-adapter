@@ -53,3 +53,5 @@ logs/
 # Recordings captured from a live broker before scrubbing.
 # Only scrubbed fixtures under tests/fixtures/ may be committed.
 tests/recordings/
+# The same recordings by name, wherever --raw-dir put them.
+*.raw.json

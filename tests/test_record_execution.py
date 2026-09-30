@@ -13,12 +13,16 @@ import base64
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
 
 import pytest
+from google.protobuf.descriptor import FieldDescriptor
 
+from nautilus_ctrader.common import codec
+from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderRequestError, CTraderTimeoutError
 from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL
@@ -160,13 +164,16 @@ def test_the_allow_list_is_exactly_these_requests() -> None:
 
 
 def test_send_is_the_only_way_to_the_connection() -> None:
-    """One call of the connection's request method, inside `send()`, and none of its raw send."""
+    """One call of the connection's request method, inside `send()`, and no other way out."""
     source = _SCRIPT_PATH.read_text(encoding="utf-8")
     send_body = source.split("async def send(")[1].split("\nclass ")[0]
 
     assert source.count(".request(") == 1
     assert ".request(" in send_body
-    assert ".send(" not in source
+    # The connection's own lower layers: its unanswered send, its frame writers, its socket.
+    for lower in ("send", "_write", "_write_now", "_writer"):
+        assert hasattr(CTraderConnection("127.0.0.1", 1, logger=None), lower), lower
+        assert f".{lower}" not in source, lower
 
 
 def test_ids_are_remapped_consistently_across_messages() -> None:
@@ -308,12 +315,10 @@ def test_check_clean_sees_a_real_id_in_a_nested_numeric_field() -> None:
     ids = r.IdMap()
     event = scrubbed(execution_event(), ids)
     event.deal.positionId = POSITION_ID
-    data = fixture_of(event)
-    assert str(POSITION_ID).encode() not in data
 
     with pytest.raises(r.record_fixtures.ScrubError):
         r.check_clean(
-            data,
+            fixture_of(event),
             recording_of(execution_event()),
             account_id=ACCOUNT_ID,
             login=LOGIN,
@@ -362,11 +367,15 @@ def test_an_id_in_a_typed_note_is_replaced() -> None:
     assert marker["note"] == f"closed position {event['message'].position.positionId} by hand"
 
 
+def cleaned(text: str, ids: r.IdMap | None = None) -> str:
+    return r.clean_text(text, account_id=ACCOUNT_ID, login=LOGIN, ids=ids or r.IdMap())
+
+
 def test_a_longer_id_is_replaced_before_one_it_contains() -> None:
     ids = r.IdMap()
     short, long = ids.fake("position", 4400), ids.fake("order", 440_011_223)
 
-    text = ids.replace_in_text("order 440011223 on position 4400")
+    text = cleaned("order 440011223 on position 4400", ids)
 
     assert text == f"order {long} on position {short}"
 
@@ -398,9 +407,46 @@ def test_a_zero_id_is_not_an_id() -> None:
 
 def test_an_id_inside_a_longer_number_is_not_that_id() -> None:
     ids = r.IdMap()
-    ids.fake("position", POSITION_ID)
+    fake = ids.fake("position", POSITION_ID)
 
-    assert ids.replace_in_text(f"ref 99{POSITION_ID}99") == f"ref 99{POSITION_ID}99"
+    text = cleaned(f"ref 99{POSITION_ID}99, and {POSITION_ID}", ids)
+
+    # The longer number is taken out whole; the fake id is not written into the middle of it.
+    assert text == f"ref {r.NUMBER_PLACEHOLDER}, and {fake}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["TP 1.1050000000000001", "price 1234567.5", "rate 1234567.12345678 exactly"],
+    ids=["a long fraction", "a long integer part", "both"],
+)
+def test_a_decimal_number_is_not_cut_into(text) -> None:
+    assert cleaned(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Order 313131313 not found.", "Order <number> not found."),
+        ("order 313131313.", "order <number>."),
+        ("see 313131313. 5 left", "see <number>. 5 left"),
+    ],
+    ids=["a full stop mid-sentence", "a full stop at the end", "a full stop then a number"],
+)
+def test_a_long_number_before_a_full_stop_is_still_taken_out(text, expected) -> None:
+    assert cleaned(text) == expected.replace("<number>", r.NUMBER_PLACEHOLDER)
+
+
+def test_a_known_id_is_replaced_even_inside_a_decimal() -> None:
+    ids = r.IdMap()
+    fake = ids.fake("position", POSITION_ID)
+
+    text = cleaned(f"position {POSITION_ID}.5, account {ACCOUNT_ID}.0, login 0.{LOGIN}", ids)
+
+    assert text == (
+        f"position {fake}.5, account {r.record_fixtures.FAKE_ACCOUNT_ID}.0, "
+        f"login 0.{r.record_fixtures.FAKE_TRADER_LOGIN}"
+    )
 
 
 def test_the_account_and_login_in_a_text_become_their_fake_values() -> None:
@@ -513,7 +559,8 @@ def test_a_field_the_bindings_do_not_know_is_dropped_and_named() -> None:
 
 def test_a_raw_recording_rebuilds_the_same_fixture() -> None:
     recording = recording_of(execution_event(label="my robot"))
-    recording.add("marker", f"closed position {POSITION_ID}", None, 5.0)
+    recording.add("marker", f"closed position {POSITION_ID}", None, 5.0, typed=True)
+    recording.add("marker", "reconnected", None, 6.0)
     recording.closing["deals"].append(
         oa.ProtoOADealListRes(ctidTraderAccountId=ACCOUNT_ID, hasMore=False),
     )
@@ -522,6 +569,8 @@ def test_a_raw_recording_rebuilds_the_same_fixture() -> None:
     rebuilt, account_id, login = r.decode_raw(raw)
 
     assert (account_id, login) == (ACCOUNT_ID, LOGIN)
+    # Which notes were typed survives, though the fixture itself has no place for it.
+    assert [entry.typed for entry in rebuilt.timeline] == [False, True, False]
     # Unscrubbed: this is what makes the file unfit for a committed path.
     assert rebuilt.timeline[0].message.ctidTraderAccountId == ACCOUNT_ID
     assert (
@@ -530,11 +579,49 @@ def test_a_raw_recording_rebuilds_the_same_fixture() -> None:
     )
 
 
-def test_the_raw_recording_defaults_to_the_directory_git_ignores() -> None:
-    assert pathlib.Path(__file__).resolve().parent / "recordings" == r._RAW_DIR
-    assert r.raw_path(pathlib.Path("a/b/session.json"), r._RAW_DIR) == (
-        r._RAW_DIR / "session.raw.json"
+def test_a_raw_recording_is_ignored_by_git_wherever_it_is_put() -> None:
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    ignored = (repo / ".gitignore").read_text(encoding="utf-8").splitlines()
+
+    # The default directory as a whole, and the file by its name anywhere else.
+    assert repo / "tests" / "recordings" == r._RAW_DIR
+    assert "tests/recordings/" in ignored
+    assert r.raw_path(pathlib.Path("a/b/session.json"), r._RAW_DIR).name == "session.raw.json"
+    assert "*.raw.json" in ignored
+
+
+def fields_of(descriptor, seen: set[str]):
+    """Every field of a message type and of the message types nested in it, each type once."""
+    if descriptor.full_name in seen:
+        return
+    seen.add(descriptor.full_name)
+    for field in descriptor.fields:
+        yield descriptor.name, field
+        if field.type == FieldDescriptor.TYPE_MESSAGE:
+            yield from fields_of(field.message_type, seen)
+
+
+def test_no_repeated_scalar_field_holds_what_the_scrubbing_would_have_to_touch() -> None:
+    """The scrubbing skips repeated scalars; this pins that no id, text or time lives in one.
+
+    Walked over every payload type of the schema, which covers whatever the venue can push
+    and every response to a request on the allow-list.
+    """
+    handled = r._ID_KINDS.keys() | r._TEXT_FIELDS | r._VENUE_TEXT_FIELDS
+    payload_types = codec._build_registry().values()
+    assert {oa.ProtoOAExecutionEvent, oa.ProtoOAOrderErrorEvent, oa.ProtoOAReconcileRes} <= set(
+        payload_types,
     )
+
+    for payload_type in payload_types:
+        for owner, field in fields_of(payload_type.DESCRIPTOR, set()):
+            if field.label != FieldDescriptor.LABEL_REPEATED:
+                continue
+            if field.type == FieldDescriptor.TYPE_MESSAGE:
+                continue
+            where = f"{payload_type.__name__}: {owner}.{field.name}"
+            assert field.name not in handled, where
+            assert not field.name.endswith("Timestamp"), where
 
 
 def test_describe_prints_no_real_identifier() -> None:
@@ -823,12 +910,48 @@ async def test_the_deadline_ends_the_run_and_is_announced() -> None:
     assert len(recording.closing["deals"]) == 1
 
 
+async def test_events_before_a_drop_are_announced_at_the_drop() -> None:
+    """Not carried into the next connection's count, and not lost to the owner either."""
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    # The debounce never fires on the first connection: the drop comes first.
+    task = asyncio.create_task(
+        run(
+            server,
+            stop,
+            markers,
+            recording=recording,
+            status=statuses.append,
+            snapshot_debounce_secs=0.3,
+        ),
+    )
+    one = "events: 1 (ProtoOAExecutionEvent x1)"
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        await server.push(execution_event())
+        await wait_until(lambda: any(entry.kind == "event" for entry in recording.timeline))
+        await server.drop_connections()
+        await wait_until(lambda: r.STATUS_RECONNECTED in statuses)
+        await server.push(execution_event(deal_id=DEAL_ID + 1))
+        await wait_until(lambda: statuses.count(one) == 2)
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await server.stop()
+
+    assert statuses == [r.STATUS_STARTED, one, r.STATUS_LOST, r.STATUS_RECONNECTED, one]
+
+
 @pytest.mark.parametrize(
     "refused",
     [om.PROTO_OA_APPLICATION_AUTH_REQ, om.PROTO_OA_ACCOUNT_AUTH_REQ, om.PROTO_OA_RECONCILE_REQ],
     ids=["application auth", "account auth", "the start snapshot"],
 )
-async def test_a_venue_refusal_ends_the_run_and_the_file_is_still_written(
+async def test_a_refusal_before_anything_is_recorded_ends_the_run_and_writes_nothing(
     tmp_path,
     refused,
 ) -> None:
@@ -836,10 +959,15 @@ async def test_a_venue_refusal_ends_the_run_and_the_file_is_still_written(
     server.on(refused, refusal("INVALID_REQUEST"))
     await server.start()
     output = tmp_path / "recording.json"
+    outcome = r.Outcome()
     try:
         with pytest.raises(CTraderRequestError) as raised:
             await asyncio.wait_for(
-                to_file(output, **settings(server, asyncio.Event(), asyncio.Queue())),
+                to_file(
+                    output,
+                    outcome=outcome,
+                    **settings(server, asyncio.Event(), asyncio.Queue()),
+                ),
                 2,
             )
     finally:
@@ -848,8 +976,75 @@ async def test_a_venue_refusal_ends_the_run_and_the_file_is_still_written(
     assert raised.value.error_code == "INVALID_REQUEST"
     # Asked once: a refusal is not retried the way a lost connection is.
     assert server.connection_count == 1
+    # A file holding nothing but the failure would only stand in the way of the next run.
+    assert not output.exists() and not raw_of(output).exists()
+    assert outcome.recording is None
+
+
+async def test_a_run_that_fails_at_once_leaves_an_earlier_pair_of_files_alone(tmp_path) -> None:
+    server = venue()
+    server.on(om.PROTO_OA_ACCOUNT_AUTH_REQ, refusal("CH_ACCESS_TOKEN_INVALID"))
+    await server.start()
+    output = tmp_path / "recording.json"
+    raw_of(output).parent.mkdir()
+    output.write_bytes(b"an earlier fixture")
+    raw_of(output).write_bytes(b"an earlier raw recording")
+    try:
+        with pytest.raises(CTraderRequestError):
+            await asyncio.wait_for(
+                to_file(output, **settings(server, asyncio.Event(), asyncio.Queue())),
+                2,
+            )
+    finally:
+        await server.stop()
+
+    assert output.read_bytes() == b"an earlier fixture"
+    assert raw_of(output).read_bytes() == b"an earlier raw recording"
+
+
+async def test_an_interrupt_before_recording_started_writes_nothing(tmp_path) -> None:
+    # A venue that accepts the connection and never answers: the run is still authenticating.
+    server = FakeCTraderServer()
+    await server.start()
+    output = tmp_path / "recording.json"
+    task = asyncio.create_task(
+        to_file(output, **settings(server, asyncio.Event(), asyncio.Queue())),
+    )
+    try:
+        await wait_until(lambda: len(server.received) == 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        task.cancel()
+        await server.stop()
+
+    assert not output.exists() and not raw_of(output).exists()
+
+
+async def test_a_refusal_after_the_start_snapshot_still_writes_the_file(tmp_path) -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    output = tmp_path / "recording.json"
+    task = asyncio.create_task(
+        to_file(output, **settings(server, stop, markers, status=statuses.append)),
+    )
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        server.on(om.PROTO_OA_ACCOUNT_AUTH_REQ, refusal("CH_ACCESS_TOKEN_INVALID"))
+        await server.drop_connections()
+        with pytest.raises(CTraderRequestError):
+            await asyncio.wait_for(task, 5)
+    finally:
+        task.cancel()
+        await server.stop()
+
     timeline = r.decode_recording(output.read_bytes())["timeline"]
+    assert [item["kind"] for item in timeline[:2]] == ["snapshot", "snapshot"]
     assert timeline[-1]["note"] == "run failed: CTraderRequestError"
+    assert raw_of(output).exists()
 
 
 @pytest.mark.parametrize(
@@ -1000,13 +1195,14 @@ async def test_a_recording_is_written_even_when_the_run_fails(tmp_path) -> None:
         await server.stop()
 
     decoded = r.decode_recording(output.read_bytes())
-    assert any(item["kind"] == "event" for item in decoded["timeline"])
+    events = [item["message"] for item in decoded["timeline"] if item["kind"] == "event"]
+    assert [event.ctidTraderAccountId for event in events] == [r.record_fixtures.FAKE_ACCOUNT_ID]
+    assert events[0].position.positionId == 5_000_001
     notes = [item["note"] for item in decoded["timeline"] if item["kind"] == "marker"]
     assert notes == ["closing list refused: deals INVALID_REQUEST"]
     assert decoded["closing"]["deals"] == []
     assert len(decoded["closing"]["orders"]) == 1
     assert len(decoded["closing"]["position_orders"]) == 1
-    assert str(ACCOUNT_ID).encode() not in output.read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -1035,18 +1231,22 @@ async def test_a_recording_is_written_when_the_run_raises(tmp_path, monkeypatch,
 
 
 def recorded(*entries) -> object:
-    """A stand-in for `record()` that fills the recording with `entries` and returns."""
+    """A stand-in for `record()` that fills the recording with `entries` and returns.
+
+    An entry is `(kind, note, message, t)`; a marker entry is a typed note.
+    """
 
     async def record(*, recording: r.Recording, **_kwargs) -> r.Recording:
         for kind, note, message, t in entries:
-            recording.add(kind, note, message, t)
+            recording.add(kind, note, message, t, typed=kind == "marker")
         return recording
 
     return record
 
 
 async def test_the_unscrubbed_recording_is_written_beside_the_fixture(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
 ) -> None:
     monkeypatch.setattr(r, "record", recorded(("event", "", execution_event(), 1.0)))
     output = tmp_path / "recording.json"
@@ -1055,10 +1255,27 @@ async def test_the_unscrubbed_recording_is_written_beside_the_fixture(
     await to_file(output, account_id=ACCOUNT_ID, outcome=outcome)
 
     assert outcome.raw == raw_of(output) == tmp_path / "raw" / "recording.raw.json"
-    assert outcome.fixture == output.read_bytes()
+    assert outcome.fixture and output.exists()
     raw, account_id, login = r.decode_raw(outcome.raw.read_bytes())
     assert (account_id, login) == (ACCOUNT_ID, LOGIN)
     assert raw.timeline[0].message.position.positionId == POSITION_ID
+    # Nothing is left of the temporary files the two were written through.
+    assert sorted(path.name for path in tmp_path.rglob("*") if path.is_file()) == [
+        "recording.json",
+        "recording.raw.json",
+    ]
+
+
+async def test_a_run_that_recorded_no_message_writes_nothing(tmp_path, monkeypatch) -> None:
+    """Notes alone are not a recording, however the run ended."""
+    monkeypatch.setattr(r, "record", recorded(("marker", "waiting for the market", None, 1.0)))
+    output = tmp_path / "recording.json"
+    outcome = r.Outcome()
+
+    await to_file(output, account_id=ACCOUNT_ID, outcome=outcome)
+
+    assert not output.exists() and not raw_of(output).exists()
+    assert (outcome.recording, outcome.raw, outcome.fixture) == (None, None, False)
 
 
 async def test_a_refused_fixture_is_not_written_and_the_raw_recording_is(
@@ -1078,7 +1295,7 @@ async def test_a_refused_fixture_is_not_written_and_the_raw_recording_is(
         await to_file(output, account_id=ACCOUNT_ID, secrets=("access-token",), outcome=outcome)
 
     assert not output.exists()
-    assert (outcome.raw, outcome.fixture) == (raw_of(output), None)
+    assert (outcome.raw, outcome.fixture) == (raw_of(output), False)
     raw, _, _ = r.decode_raw(raw_of(output).read_bytes())
     assert [entry.note for entry in raw.timeline] == ["", note]
 
@@ -1110,7 +1327,8 @@ async def test_an_unwritten_fixture_keeps_the_error_the_run_ended_with(
     error = CTraderTimeoutError("no response")
 
     async def failing(*, recording: r.Recording, **_kwargs) -> r.Recording:
-        recording.add("marker", "pasted the access-token by mistake", None, 1.0)
+        recording.add("event", "", execution_event(), 0.5)
+        recording.add("marker", "pasted the access-token by mistake", None, 1.0, typed=True)
         raise error
 
     monkeypatch.setattr(r, "record", failing)
@@ -1127,29 +1345,109 @@ async def test_an_unwritten_fixture_keeps_the_error_the_run_ended_with(
     assert raw.timeline[-1].note == "run failed: CTraderTimeoutError"
 
 
-def env_file(tmp_path) -> pathlib.Path:
+async def test_a_raw_recording_that_cannot_be_written_does_not_cost_the_fixture(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(r, "record", recorded(("event", "", execution_event(), 1.0)))
+    output = tmp_path / "recording.json"
+    # A file where the raw directory should be: nothing can be written into it.
+    blocked = tmp_path / "blocked"
+    blocked.write_bytes(b"")
+    outcome = r.Outcome()
+
+    with pytest.raises(OSError):
+        await to_file(output, account_id=ACCOUNT_ID, raw_dir=blocked, outcome=outcome)
+
+    assert (outcome.raw, outcome.fixture) == (None, True)
+    (event,) = r.decode_recording(output.read_bytes())["timeline"]
+    assert event["message"].position.positionId == 5_000_001
+
+
+async def test_a_write_that_fails_midway_leaves_the_earlier_files_whole(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(r, "record", recorded(("event", "", execution_event(), 1.0)))
+    output = tmp_path / "recording.json"
+    raw_of(output).parent.mkdir()
+    output.write_bytes(b"an earlier fixture")
+    raw_of(output).write_bytes(b"an earlier raw recording")
+    real_fdopen = os.fdopen
+
+    class HalfWritten:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            self._handle.close()
+
+        def write(self, data: bytes) -> None:
+            self._handle.write(data[: len(data) // 2])
+            raise OSError("no space left on device")
+
+    def fdopen(fd, mode="r", *args, **kwargs):
+        handle = real_fdopen(fd, mode, *args, **kwargs)
+        return HalfWritten(handle) if mode == "wb" else handle
+
+    monkeypatch.setattr(r.os, "fdopen", fdopen)
+    outcome = r.Outcome()
+
+    with pytest.raises(OSError, match="no space left"):
+        await to_file(output, account_id=ACCOUNT_ID, outcome=outcome)
+
+    assert output.read_bytes() == b"an earlier fixture"
+    assert raw_of(output).read_bytes() == b"an earlier raw recording"
+    assert sorted(path.name for path in tmp_path.rglob("*") if path.is_file()) == [
+        "recording.json",
+        "recording.raw.json",
+    ]
+    # Something was recorded, and the report must not say otherwise.
+    assert outcome.recording is not None
+    assert (outcome.raw, outcome.fixture) == (None, False)
+
+
+def env_file(tmp_path, *, without: str = "") -> pathlib.Path:
+    values = {
+        "CTRADER_CLIENT_ID": "client-id",
+        "CTRADER_CLIENT_SECRET": "client-secret",
+        "CTRADER_ACCESS_TOKEN": "access-token",
+    }
+    values.pop(without, None)
     path = tmp_path / "env"
-    path.write_text(
-        "CTRADER_CLIENT_ID=client-id\n"
-        "CTRADER_CLIENT_SECRET=client-secret\n"
-        "CTRADER_ACCESS_TOKEN=access-token\n",
-        encoding="utf-8",
-    )
+    path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
     return path
 
 
-async def test_a_raw_recording_is_rescrubbed_into_the_same_fixture(tmp_path) -> None:
+def rescrub_args(tmp_path, raw: pathlib.Path, *extra: str, without: str = "") -> list[str]:
+    output = tmp_path / "rebuilt.json"
+    env = env_file(tmp_path, without=without)
+    return ["--rescrub", str(raw), "--output", str(output), "--env-file", str(env), *extra]
+
+
+async def test_a_raw_recording_is_rescrubbed_into_the_same_fixture(tmp_path, capsys) -> None:
     server = venue()
     await server.start()
     stop, markers = asyncio.Event(), asyncio.Queue()
     statuses: list[str] = []
     output = tmp_path / "recording.json"
+    outcome = r.Outcome()
     task = asyncio.create_task(
-        to_file(output, **settings(server, stop, markers, status=statuses.append)),
+        to_file(
+            output,
+            outcome=outcome,
+            **settings(server, stop, markers, status=statuses.append),
+        ),
     )
     try:
         await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        # Typed notes that read like the recorder's own markers.
         markers.put_nowait(f"market buy, position {POSITION_ID}")
+        markers.put_nowait("closing half the position")
+        markers.put_nowait("connection lost on my side")
         await server.push(execution_event(label="my robot"))
         await wait_until(lambda: len(statuses) >= 2)
         stop.set()
@@ -1158,13 +1456,18 @@ async def test_a_raw_recording_is_rescrubbed_into_the_same_fixture(tmp_path) -> 
         task.cancel()
         await server.stop()
 
-    again = tmp_path / "again.json"
-    arguments = ["--rescrub", str(raw_of(output)), "--output", str(again)]
-    assert r.main([*arguments, "--env-file", str(env_file(tmp_path))]) == 0
+    # As typed notes they are counted, and not reported as problems of the run.
+    live = r.summary(outcome.recording)
+    assert live == ["1 events, 4 snapshots, 3 notes"]
 
+    assert r.main(rescrub_args(tmp_path, raw_of(output))) == 0
+
+    again = tmp_path / "rebuilt.json"
     assert again.read_bytes() == output.read_bytes()
     kinds = [item["kind"] for item in r.decode_recording(again.read_bytes())["timeline"]]
-    assert "event" in kinds and "marker" in kinds
+    assert kinds.count("event") == 1 and kinds.count("marker") == 3
+    # Rebuilt from the raw file, the summary is the same: which notes were typed is kept there.
+    assert capsys.readouterr().out.splitlines() == [f"Recording written to {again}", *live]
 
 
 def test_describe_mode_needs_no_credentials_and_prints_the_timeline(tmp_path, capsys) -> None:
@@ -1177,6 +1480,27 @@ def test_describe_mode_needs_no_credentials_and_prints_the_timeline(tmp_path, ca
     assert r.main(["--describe", str(path)]) == 0
 
     assert "ORDER_FILLED" in capsys.readouterr().out
+
+
+def raw_file(tmp_path, *notes: str) -> pathlib.Path:
+    recording = recording_of(execution_event(label="my robot"))
+    for note in notes:
+        recording.add("marker", note, None, 5.0, typed=True)
+    path = tmp_path / "session.raw.json"
+    path.write_bytes(r.encode_raw(recording, account_id=ACCOUNT_ID, login=LOGIN))
+    return path
+
+
+def test_describe_never_prints_an_unscrubbed_recording(tmp_path, capsys) -> None:
+    raw = raw_file(tmp_path, "moved the stop")
+
+    assert r.main(["--describe", str(raw)]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--rescrub" in captured.err
+    for private in (str(ACCOUNT_ID), str(LOGIN), str(ORDER_ID), "my robot", "moved the stop"):
+        assert private not in captured.err
 
 
 def test_recording_needs_a_trader_login(capsys) -> None:
@@ -1306,22 +1630,24 @@ async def test_the_checklist_waits_for_the_recording_to_start(
     assert capsys.readouterr().err == f"{r.STATUS_LOST}\n"
 
 
-def fixture_with(*markers: str, events: int = 0) -> bytes:
-    """Fixture bytes of a recording that holds `events` events and these marker notes."""
+def session(*own: str, events: int = 0, typed: tuple[str, ...] = ()) -> r.Recording:
+    """A recording of `events` events, the recorder's `own` markers and the `typed` notes."""
     recording = recording_of(*(execution_event(deal_id=DEAL_ID + n) for n in range(events)))
-    for note in markers:
+    for note in own:
         recording.add("marker", note, None, 9.0)
-    return r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)[0]
+    for note in typed:
+        recording.add("marker", note, None, 9.5, typed=True)
+    return recording
 
 
 def test_the_summary_ends_with_the_counts() -> None:
-    lines = r.summary(fixture_with("moved the stop", "reconnected", events=2))
+    lines = r.summary(session("reconnected", events=2, typed=("moved the stop",)))
 
     assert lines == ["2 events, 0 snapshots, 1 notes"]
 
 
 def test_the_summary_says_in_words_that_no_event_was_recorded() -> None:
-    (line,) = r.summary(fixture_with("moved the stop"))
+    (line,) = r.summary(session(typed=("moved the stop",)))
 
     assert line.startswith("0 events, 0 snapshots, 1 notes")
     assert "NO EVENTS" in line
@@ -1333,12 +1659,77 @@ def test_the_summary_lists_every_closing_problem_and_dropped_field() -> None:
         "closing list truncated: orders",
         "closing requests failed: CTraderTimeoutError",
         "closing requests skipped: not connected",
+    ]
+    recording = session(*problems, events=1, typed=("moved the stop",))
+    recording.add("event", "", with_unknown_field(execution_event(), b"private words"), 9.9)
+
+    lines = r.summary(recording)
+
+    assert lines == [
+        *problems,
         "unknown fields dropped from: ProtoOAExecutionEvent",
+        "2 events, 0 snapshots, 1 notes",
     ]
 
-    lines = r.summary(fixture_with("moved the stop", *problems, events=1))
 
-    assert lines == [*problems, "1 events, 0 snapshots, 1 notes"]
+def test_a_typed_note_is_never_taken_for_a_problem_of_the_run() -> None:
+    typed = ("closing half the position", "connection lost on my side")
+
+    assert r.summary(session(events=1, typed=typed)) == ["1 events, 0 snapshots, 2 notes"]
+
+
+@pytest.mark.parametrize(
+    ("raw_kept", "fixture_written", "expected"),
+    [
+        (
+            True,
+            True,
+            ["Recording written to {output}", "Unscrubbed copy, never to be committed: {raw}"],
+        ),
+        (
+            False,
+            True,
+            ["Recording written to {output}", "The unscrubbed copy could NOT be written."],
+        ),
+        (
+            True,
+            False,
+            [
+                "The fixture was NOT written; {output} is untouched.",
+                "Unscrubbed copy, never to be committed: {raw}",
+                "Rebuild the fixture from it with: --rescrub {raw}",
+            ],
+        ),
+        (
+            False,
+            False,
+            [
+                "The fixture was NOT written; {output} is untouched.",
+                "The unscrubbed copy could NOT be written.",
+            ],
+        ),
+    ],
+    ids=["both", "only the fixture", "only the raw recording", "neither"],
+)
+def test_what_is_on_disk_is_reported_as_it_is_and_always_with_the_counts(
+    tmp_path,
+    raw_kept,
+    fixture_written,
+    expected,
+) -> None:
+    output, raw = tmp_path / "recording.json", tmp_path / "raw" / "recording.raw.json"
+    outcome = r.Outcome(
+        recording=session(events=1),
+        raw=raw if raw_kept else None,
+        fixture=fixture_written,
+    )
+
+    lines = r._outcome_lines(outcome, output)
+
+    assert lines == [
+        *(line.format(output=output, raw=raw) for line in expected),
+        "1 events, 0 snapshots, 0 notes",
+    ]
 
 
 def main_run(tmp_path, monkeypatch, run, *extra: str) -> int:
@@ -1412,8 +1803,9 @@ def test_an_interrupt_after_the_recording_prints_its_summary(
     capsys,
 ) -> None:
     async def interrupted(args, _env, outcome) -> None:
+        outcome.recording = session(events=1, typed=("moved the stop",))
         outcome.raw = r.raw_path(args.output, args.raw_dir)
-        outcome.fixture = fixture_with("moved the stop", events=1)
+        outcome.fixture = True
         raise KeyboardInterrupt
 
     assert main_run(tmp_path, monkeypatch, interrupted) == 130
@@ -1429,12 +1821,13 @@ def test_an_interrupt_after_the_recording_prints_its_summary(
 
 def test_a_recording_with_no_event_says_so_last(tmp_path, monkeypatch, capsys) -> None:
     async def silent(_args, _env, outcome) -> None:
-        outcome.fixture = fixture_with("closing requests skipped: not connected")
+        outcome.recording = session("closing requests skipped: not connected")
+        outcome.fixture = True
 
     assert main_run(tmp_path, monkeypatch, silent) == 0
 
     lines = capsys.readouterr().out.splitlines()
-    assert lines[1] == "closing requests skipped: not connected"
+    assert "closing requests skipped: not connected" in lines
     assert lines[-1].startswith("0 events, 0 snapshots, 0 notes") and "NO EVENTS" in lines[-1]
 
 
@@ -1446,6 +1839,7 @@ def test_an_unwritten_fixture_is_reported_with_the_raw_file_and_how_to_rebuild(
     raw = tmp_path / "raw" / "recording.raw.json"
 
     async def unwritten(_args, _env, outcome) -> None:
+        outcome.recording = session(events=2)
         outcome.raw = raw
         outcome.run_error = CTraderRequestError("INVALID_REQUEST", f"account {ACCOUNT_ID}")
         raise r.record_fixtures.ScrubError(f"found {ACCOUNT_ID}") from outcome.run_error
@@ -1457,7 +1851,8 @@ def test_an_unwritten_fixture_is_reported_with_the_raw_file_and_how_to_rebuild(
         "error: ScrubError",
         "the run itself had failed: CTraderRequestError INVALID_REQUEST",
     ]
-    assert str(raw) in captured.out and f"--rescrub {raw}" in captured.out
+    assert f"--rescrub {raw}" in captured.out
+    assert captured.out.splitlines()[-1] == "2 events, 0 snapshots, 0 notes"
     assert str(ACCOUNT_ID) not in captured.out + captured.err
 
 
@@ -1507,28 +1902,15 @@ def test_a_missing_output_directory_is_refused_before_the_run(
     assert capsys.readouterr().err == f"error: cannot write a file in {output.parent}\n"
 
 
-def raw_file(tmp_path, *notes: str) -> pathlib.Path:
-    recording = recording_of(execution_event())
-    for note in notes:
-        recording.add("marker", note, None, 5.0)
-    path = tmp_path / "session.raw.json"
-    path.write_bytes(r.encode_raw(recording, account_id=ACCOUNT_ID, login=LOGIN))
-    return path
-
-
-def rescrub_args(tmp_path, raw: pathlib.Path, *extra: str) -> list[str]:
-    output = tmp_path / "rebuilt.json"
-    env = env_file(tmp_path)
-    return ["--rescrub", str(raw), "--output", str(output), "--env-file", str(env), *extra]
-
-
 def test_rescrub_writes_the_fixture_and_its_summary(tmp_path, capsys) -> None:
     raw = raw_file(tmp_path, "moved the stop")
 
     assert r.main(rescrub_args(tmp_path, raw)) == 0
 
     output = tmp_path / "rebuilt.json"
-    assert str(ACCOUNT_ID).encode() not in output.read_bytes()
+    (event, _) = r.decode_recording(output.read_bytes())["timeline"]
+    assert event["message"].ctidTraderAccountId == r.record_fixtures.FAKE_ACCOUNT_ID
+    assert event["message"].position.tradeData.label == r.SCRUBBED_TEXT
     assert capsys.readouterr().out.splitlines() == [
         f"Recording written to {output}",
         "1 events, 0 snapshots, 1 notes",
@@ -1543,7 +1925,9 @@ def test_rescrub_does_not_replace_a_fixture_without_being_asked(tmp_path, capsys
     assert r.main(rescrub_args(tmp_path, raw)) == 1
 
     assert output.read_bytes() == b"an earlier fixture"
-    assert "already exists" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "already exists" in captured.err
+    assert captured.out == "The fixture was NOT written.\n"
 
     assert r.main(rescrub_args(tmp_path, raw, "--overwrite")) == 0
     assert output.read_bytes() != b"an earlier fixture"
@@ -1554,7 +1938,41 @@ def test_rescrub_checks_the_fixture_against_the_secrets_in_the_env_file(tmp_path
 
     assert r.main(rescrub_args(tmp_path, raw)) == 1
 
-    assert not (tmp_path / "rebuilt.json").exists()
+    output = tmp_path / "rebuilt.json"
+    assert not output.exists()
     captured = capsys.readouterr()
     assert captured.err == "error: ScrubError\n"
+    # What the raw file holds is still reported, and nothing claims it was not recorded.
+    assert captured.out.splitlines() == [
+        f"The fixture was NOT written; {output} is untouched.",
+        "1 events, 0 snapshots, 1 notes",
+    ]
     assert "access-token" not in captured.out + captured.err
+
+
+def test_rescrub_needs_the_same_env_keys_as_a_recording(tmp_path, capsys) -> None:
+    raw = raw_file(tmp_path)
+
+    assert r.main(rescrub_args(tmp_path, raw, without="CTRADER_ACCESS_TOKEN")) == 1
+
+    assert not (tmp_path / "rebuilt.json").exists()
+    assert capsys.readouterr().err == "error: the env file lacks CTRADER_ACCESS_TOKEN\n"
+
+
+def test_a_recording_needs_its_env_keys_before_anything_connects(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    runs: list[object] = []
+
+    async def run(args, _env, _outcome) -> None:
+        runs.append(args)
+
+    (tmp_path / "other").mkdir()
+    env = env_file(tmp_path / "other", without="CTRADER_CLIENT_SECRET")
+
+    assert main_run(tmp_path, monkeypatch, run, "--env-file", str(env)) == 1
+
+    assert runs == []
+    assert capsys.readouterr().err == "error: the env file lacks CTRADER_CLIENT_SECRET\n"
