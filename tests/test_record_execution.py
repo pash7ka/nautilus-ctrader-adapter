@@ -10,13 +10,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import datetime
+import functools
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
+import threading
 
 import pytest
 from google.protobuf.descriptor import FieldDescriptor
@@ -43,6 +47,8 @@ LOGIN = 8901234
 POSITION_ID = 440_011_223
 ORDER_ID = 550_022_334
 DEAL_ID = 660_033_445
+BROKER_NAME = "Example Broker Ltd"
+BROKER_TITLE = "ExampleFX"
 FAST = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
 
 
@@ -367,8 +373,14 @@ def test_an_id_in_a_typed_note_is_replaced() -> None:
     assert marker["note"] == f"closed position {event['message'].position.positionId} by hand"
 
 
-def cleaned(text: str, ids: r.IdMap | None = None) -> str:
-    return r.clean_text(text, account_id=ACCOUNT_ID, login=LOGIN, ids=ids or r.IdMap())
+def cleaned(text: str, ids: r.IdMap | None = None, names: tuple[str, ...] = ()) -> str:
+    return r.clean_text(
+        text,
+        account_id=ACCOUNT_ID,
+        login=LOGIN,
+        ids=ids or r.IdMap(),
+        names=names,
+    )
 
 
 def test_a_longer_id_is_replaced_before_one_it_contains() -> None:
@@ -380,16 +392,84 @@ def test_a_longer_id_is_replaced_before_one_it_contains() -> None:
     assert text == f"order {long} on position {short}"
 
 
-def test_a_timestamp_below_the_shift_is_left_alone() -> None:
-    # In seconds, where the shift is in milliseconds, and in a field that cannot go negative.
-    notice = common.ProtoErrorRes(
+def test_a_maintenance_end_in_seconds_is_shifted_by_the_shift_in_seconds() -> None:
+    shift = 190_000_000_500
+    notice = oa.ProtoOAErrorRes(
         errorCode="SERVER_IS_UNDER_MAINTENANCE",
         maintenanceEndTimestamp=1_790_003_600,
     )
 
+    clean = scrubbed(notice, shift_ms=shift)
+
+    assert clean.maintenanceEndTimestamp == 1_790_003_600 - 190_000_000
+
+
+def test_a_maintenance_end_in_milliseconds_is_shifted_like_any_timestamp() -> None:
+    shift = 190_000_000_000
+    notice = common.ProtoErrorRes(
+        errorCode="SERVER_IS_UNDER_MAINTENANCE",
+        maintenanceEndTimestamp=1_790_003_600_000,
+    )
+
+    clean = scrubbed(notice, shift_ms=shift)
+
+    assert clean.maintenanceEndTimestamp == 1_790_003_600_000 - shift
+
+
+def test_a_spot_timestamp_is_shifted_though_its_name_has_no_prefix() -> None:
+    shift = 190_000_000_000
+    spot = oa.ProtoOASpotEvent(
+        ctidTraderAccountId=ACCOUNT_ID,
+        symbolId=1,
+        timestamp=1_790_000_000_000,
+    )
+
+    assert scrubbed(spot, shift_ms=shift).timestamp == 1_790_000_000_000 - shift
+
+
+def test_a_timestamp_below_the_shift_is_left_alone() -> None:
+    # Not a wall time in milliseconds, and in a field that cannot go negative.
+    notice = common.ProtoErrorRes(
+        errorCode="SERVER_IS_UNDER_MAINTENANCE",
+        maintenanceEndTimestamp=1_000,
+    )
+
     clean = scrubbed(notice, shift_ms=190_000_000_000)
 
-    assert clean.maintenanceEndTimestamp == 1_790_003_600
+    assert clean.maintenanceEndTimestamp == 1_000
+
+
+# Every field of the schema named for a time, and what scrubbing does with it.
+TIME_FIELDS = {
+    # Wall times in milliseconds, shifted by the `*Timestamp` rule.
+    "changeBalanceTimestamp": "shifted, though its message is cleared",
+    "changeBonusTimestamp": "shifted, though its message is cleared",
+    "closeTimestamp": "shifted",
+    "createTimestamp": "shifted",
+    "executionTimestamp": "shifted",
+    "expirationTimestamp": "shifted",
+    "fromTimestamp": "shifted",
+    "openTimestamp": "shifted",
+    "toTimestamp": "shifted",
+    "utcLastUpdateTimestamp": "shifted",
+    "maintenanceEndTimestamp": "shifted; in seconds in ProtoOAErrorRes, by the shift in seconds",
+    "lastBalanceUpdateTimestamp": "cleared",
+    "lastClosingDealTimestamp": "cleared",
+    "registrationTimestamp": "cleared",
+    "timestamp": "shifted by name; a tick's later values are deltas, below the shift",
+    "utcTimestampInMinutes": "kept: a bar's time in minutes, in a field too narrow for the rule",
+    "subscribeToSpotTimestamp": "kept: a flag",
+}
+
+
+def test_every_time_field_of_the_schema_is_decided() -> None:
+    found: set[str] = set()
+    for payload_type in codec._build_registry().values():
+        for _owner, field in fields_of(payload_type.DESCRIPTOR, set()):
+            if "timestamp" in field.name.lower():
+                found.add(field.name)
+
+    assert found == TIME_FIELDS.keys()
 
 
 def test_a_zero_id_is_not_an_id() -> None:
@@ -484,6 +564,81 @@ def test_a_reason_is_cleaned_like_a_description() -> None:
     )
 
 
+def test_a_broker_name_in_a_venue_text_or_a_note_becomes_the_token() -> None:
+    error = oa.ProtoOAOrderErrorEvent(
+        ctidTraderAccountId=ACCOUNT_ID,
+        errorCode="TRADING_DISABLED",
+        description=f"Trading is disabled by {BROKER_NAME}",
+    )
+    gone = oa.ProtoOAClientDisconnectEvent(reason=f"{BROKER_TITLE.upper()} ended the session")
+    recording = recording_of(error, gone)
+    recording.add_name(BROKER_NAME)
+    recording.add_name(BROKER_TITLE)
+    recording.add("marker", "closed by hand in the examplefx terminal", None, 5.0, typed=True)
+
+    first, second, note = clean_timeline(recording)
+
+    token = r.BROKER_PLACEHOLDER
+    assert first["message"].description == f"Trading is disabled by {token}"
+    assert second["message"].reason == f"{token} ended the session"
+    assert note["note"] == f"closed by hand in the {token} terminal"
+
+
+def test_a_longer_name_is_replaced_before_one_it_contains() -> None:
+    text = cleaned(f"refused by {BROKER_NAME}", names=("Example", BROKER_NAME))
+
+    assert text == f"refused by {r.BROKER_PLACEHOLDER}"
+
+
+def test_a_name_is_replaced_only_as_a_whole_word() -> None:
+    """A short title would otherwise rewrite parts of ordinary words."""
+    assert cleaned("next exit, Ex said", names=("Ex",)) == f"next exit, {r.BROKER_PLACEHOLDER} said"
+
+
+def test_an_empty_name_is_no_name() -> None:
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    recording.add_name("")
+    recording.add_name(BROKER_NAME)
+    recording.add_name(BROKER_NAME)
+
+    assert recording.names == [BROKER_NAME]
+
+
+def leaked_name(where: str) -> tuple[bytes, r.Recording, r.IdMap]:
+    """A fixture with `BROKER_NAME` left in it `where`, and what `check_clean` is given with it."""
+    error = oa.ProtoOAOrderErrorEvent(ctidTraderAccountId=ACCOUNT_ID, errorCode="MARKET_CLOSED")
+    if where == "a field the scrubbing keeps":
+        error.errorCode = BROKER_NAME.lower()
+    recording = recording_of(error)
+    recording.add_name(BROKER_NAME)
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    if where == "a note":
+        loaded = json.loads(data)
+        loaded["timeline"][0]["note"] = f"at {BROKER_NAME.upper()}"
+        data = json.dumps(loaded).encode()
+    return data, recording, ids
+
+
+@pytest.mark.parametrize("where", ["a field the scrubbing keeps", "a note"])
+def test_check_clean_refuses_a_broker_name_left_anywhere(where) -> None:
+    data, recording, ids = leaked_name(where)
+
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        r.check_clean(data, recording, account_id=ACCOUNT_ID, login=LOGIN, ids=ids, secrets=())
+
+    assert "example" not in str(raised.value).lower()
+
+
+def test_a_name_the_token_itself_holds_does_not_fail_the_check() -> None:
+    recording = recording_of(execution_event())
+    recording.add_name("Broker")
+    recording.add("marker", "the broker closed it", None, 5.0, typed=True)
+
+    _, note = clean_timeline(recording)
+
+    assert note["note"] == f"the {r.BROKER_PLACEHOLDER} closed it"
+
+
 def test_a_long_number_no_field_identified_is_taken_out_of_a_text() -> None:
     error = oa.ProtoOAOrderErrorEvent(
         ctidTraderAccountId=ACCOUNT_ID,
@@ -559,7 +714,10 @@ def test_a_field_the_bindings_do_not_know_is_dropped_and_named() -> None:
 
 def test_a_raw_recording_rebuilds_the_same_fixture() -> None:
     recording = recording_of(execution_event(label="my robot"))
-    recording.add("marker", f"closed position {POSITION_ID}", None, 5.0, typed=True)
+    recording.add_name(BROKER_NAME)
+    recording.add(
+        "marker", f"closed position {POSITION_ID} at {BROKER_NAME}", None, 5.0, typed=True
+    )
     recording.add("marker", "reconnected", None, 6.0)
     recording.closing["deals"].append(
         oa.ProtoOADealListRes(ctidTraderAccountId=ACCOUNT_ID, hasMore=False),
@@ -569,6 +727,8 @@ def test_a_raw_recording_rebuilds_the_same_fixture() -> None:
     rebuilt, account_id, login = r.decode_raw(raw)
 
     assert (account_id, login) == (ACCOUNT_ID, LOGIN)
+    # Kept for a rebuild with no connection, where nothing else could tell the names.
+    assert rebuilt.names == [BROKER_NAME]
     # Which notes were typed survives, though the fixture itself has no place for it.
     assert [entry.typed for entry in rebuilt.timeline] == [False, True, False]
     # Unscrubbed: this is what makes the file unfit for a committed path.
@@ -679,6 +839,18 @@ def venue() -> FakeCTraderServer:
     server.on(
         om.PROTO_OA_ACCOUNT_AUTH_REQ,
         lambda q: oa.ProtoOAAccountAuthRes(ctidTraderAccountId=q.ctidTraderAccountId),
+    )
+    server.on(
+        om.PROTO_OA_TRADER_REQ,
+        lambda q: oa.ProtoOATraderRes(
+            ctidTraderAccountId=q.ctidTraderAccountId,
+            trader=om.ProtoOATrader(
+                ctidTraderAccountId=q.ctidTraderAccountId,
+                balance=1_000_000,
+                depositAssetId=1,
+                brokerName=BROKER_NAME,
+            ),
+        ),
     )
     server.on(
         om.PROTO_OA_RECONCILE_REQ,
@@ -943,7 +1115,7 @@ async def test_the_deadline_ends_the_run_and_is_announced() -> None:
     finally:
         await server.stop()
 
-    assert statuses == [r.STATUS_STARTED, r.STATUS_DEADLINE]
+    assert statuses == [r.STATUS_STARTED, r.STATUS_DEADLINE, r.STATUS_STOPPING]
     assert len(recording.closing["deals"]) == 1
 
 
@@ -980,13 +1152,25 @@ async def test_events_before_a_drop_are_announced_at_the_drop() -> None:
         task.cancel()
         await server.stop()
 
-    assert statuses == [r.STATUS_STARTED, one, r.STATUS_LOST, r.STATUS_RECONNECTED, one]
+    assert statuses == [
+        r.STATUS_STARTED,
+        one,
+        r.STATUS_LOST,
+        r.STATUS_RECONNECTED,
+        one,
+        r.STATUS_STOPPING,
+    ]
 
 
 @pytest.mark.parametrize(
     "refused",
-    [om.PROTO_OA_APPLICATION_AUTH_REQ, om.PROTO_OA_ACCOUNT_AUTH_REQ, om.PROTO_OA_RECONCILE_REQ],
-    ids=["application auth", "account auth", "the start snapshot"],
+    [
+        om.PROTO_OA_APPLICATION_AUTH_REQ,
+        om.PROTO_OA_ACCOUNT_AUTH_REQ,
+        om.PROTO_OA_TRADER_REQ,
+        om.PROTO_OA_RECONCILE_REQ,
+    ],
+    ids=["application auth", "account auth", "the trader", "the start snapshot"],
 )
 async def test_a_refusal_before_anything_is_recorded_ends_the_run_and_writes_nothing(
     tmp_path,
@@ -1105,7 +1289,7 @@ async def test_a_refusal_after_a_reconnect_ends_the_run_too(refused) -> None:
         task.cancel()
         await server.stop()
 
-    assert statuses == [r.STATUS_STARTED, r.STATUS_LOST]
+    assert statuses == [r.STATUS_STARTED, r.STATUS_LOST, r.STATUS_STOPPING]
     assert server.connection_count == 2
 
 
@@ -1158,6 +1342,109 @@ async def test_a_stop_takes_effect_during_a_reconnect_wait() -> None:
         await server.stop()
 
     assert marker_notes(recording)[-1] == "closing requests skipped: not connected"
+    assert statuses[-1] == r.STATUS_STOPPING
+
+
+async def test_the_owner_is_told_at_once_that_the_run_is_stopping() -> None:
+    """Before the closing lists are asked: those and the writing can take a while."""
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    lists_asked_when_told: list[int] = []
+
+    def status(text: str) -> None:
+        statuses.append(text)
+        if text == r.STATUS_STOPPING:
+            asked = [m for m in server.received if isinstance(m, oa.ProtoOADealListReq)]
+            lists_asked_when_told.append(len(asked))
+
+    task = asyncio.create_task(run(server, stop, markers, status=status))
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await server.stop()
+
+    assert statuses == [r.STATUS_STARTED, r.STATUS_STOPPING]
+    assert lists_asked_when_told == [0]
+
+
+@pytest.mark.parametrize("dropped", [False, True], ids=["connected", "waiting to reconnect"])
+async def test_an_interrupted_run_says_once_that_it_is_stopping(dropped) -> None:
+    server = venue()
+    await server.start()
+    statuses: list[str] = []
+    task = asyncio.create_task(
+        run(
+            server,
+            asyncio.Event(),
+            asyncio.Queue(),
+            status=statuses.append,
+            reconnect_waits=(30.0,),
+        ),
+    )
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        if dropped:
+            await server.drop_connections()
+            await wait_until(lambda: r.STATUS_LOST in statuses)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await server.stop()
+
+    assert statuses[-1] == r.STATUS_STOPPING
+    assert statuses.count(r.STATUS_STOPPING) == 1
+
+
+async def test_a_closing_list_that_gets_no_answer_is_marked(monkeypatch) -> None:
+    server = venue()
+    server.on(om.PROTO_OA_DEAL_LIST_REQ, lambda _request: None)
+    monkeypatch.setattr(r, "_REQUEST_TIMEOUT_SECS", 0.5)
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    task = asyncio.create_task(run(server, stop, markers, recording=recording))
+    try:
+        await wait_until(lambda: len(recording.timeline) >= 2)
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await server.stop()
+
+    assert marker_notes(recording) == ["closing requests failed: CTraderTimeoutError"]
+    assert recording.closing["deals"] == []
+
+
+async def test_the_trader_is_asked_once_for_the_broker_s_name_and_not_recorded() -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    task = asyncio.create_task(
+        run(server, stop, markers, recording=recording, status=statuses.append),
+    )
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        await server.drop_connections()
+        await wait_until(lambda: r.STATUS_RECONNECTED in statuses)
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await server.stop()
+
+    assert sum(isinstance(m, oa.ProtoOATraderReq) for m in server.received) == 1
+    assert recording.names == [BROKER_NAME]
+    assert not any(isinstance(m, oa.ProtoOATraderRes) for m in recording.messages())
+    assert not any(BROKER_NAME in text for text in statuses)
 
 
 async def test_a_truncated_closing_list_is_marked() -> None:
@@ -1447,6 +1734,112 @@ async def test_a_write_that_fails_midway_leaves_the_earlier_files_whole(
     assert (outcome.raw, outcome.fixture) == (None, False)
 
 
+def interrupting_write(handlers: list[object]):
+    """`_write_atomically` as a Ctrl+C during it would leave it, unless the signal is ignored."""
+    real = r._write_atomically
+
+    def write(path: pathlib.Path, data: bytes) -> None:
+        handler = signal.getsignal(signal.SIGINT)
+        handlers.append(handler)
+        if handler is not signal.SIG_IGN:
+            raise KeyboardInterrupt
+        real(path, data)
+
+    return write
+
+
+async def test_a_ctrl_c_while_the_files_are_written_does_not_lose_them(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(r, "record", recorded(("event", "", execution_event(), 1.0)))
+    handlers: list[object] = []
+    monkeypatch.setattr(r, "_write_atomically", interrupting_write(handlers))
+    output = tmp_path / "recording.json"
+    before = signal.getsignal(signal.SIGINT)
+
+    await to_file(output, account_id=ACCOUNT_ID)
+
+    assert handlers == [signal.SIG_IGN, signal.SIG_IGN]
+    assert output.exists() and raw_of(output).exists()
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+async def test_ctrl_c_is_restored_when_the_fixture_is_refused(tmp_path, monkeypatch) -> None:
+    note = "pasted the access-token by mistake"
+    monkeypatch.setattr(
+        r,
+        "record",
+        recorded(("event", "", execution_event(), 1.0), ("marker", note, None, 2.0)),
+    )
+    before = signal.getsignal(signal.SIGINT)
+
+    with pytest.raises(r.record_fixtures.ScrubError):
+        await to_file(tmp_path / "recording.json", account_id=ACCOUNT_ID, secrets=("access-token",))
+
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_the_files_are_written_off_the_main_thread_too(tmp_path, monkeypatch) -> None:
+    """Only the main thread may set a signal handler; elsewhere the files are written as is."""
+    monkeypatch.setattr(r, "record", recorded(("event", "", execution_event(), 1.0)))
+    output = tmp_path / "recording.json"
+    errors: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            asyncio.run(to_file(output, account_id=ACCOUNT_ID))
+        except BaseException as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    thread.join(timeout=60)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert output.exists() and raw_of(output).exists()
+
+
+async def test_the_broker_s_names_are_scrubbed_and_kept_for_a_rescrub(tmp_path, capsys) -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    output = tmp_path / "recording.json"
+    task = asyncio.create_task(
+        to_file(
+            output,
+            names=(BROKER_TITLE, ""),
+            **settings(server, stop, markers, status=statuses.append),
+        ),
+    )
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        markers.put_nowait(f"bought in the {BROKER_NAME.upper()} terminal, {BROKER_TITLE.lower()}")
+        await server.push(execution_event())
+        await wait_until(lambda: len(statuses) >= 2)
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await server.stop()
+
+    token = r.BROKER_PLACEHOLDER
+    timeline = r.decode_recording(output.read_bytes())["timeline"]
+    assert [item["note"] for item in timeline if item["kind"] == "marker"] == [
+        f"bought in the {token} terminal, {token}",
+    ]
+    raw = json.loads(raw_of(output).read_bytes())
+    assert raw["names"] == [BROKER_TITLE, BROKER_NAME]
+
+    assert r.main(rescrub_args(tmp_path, raw_of(output))) == 0
+
+    assert (tmp_path / "rebuilt.json").read_bytes() == output.read_bytes()
+    printed = "\n".join(statuses) + "".join(capsys.readouterr())
+    assert "example" not in printed.lower()
+
+
 def env_file(tmp_path, *, without: str = "") -> pathlib.Path:
     values = {
         "CTRADER_CLIENT_ID": "client-id",
@@ -1519,6 +1912,27 @@ def test_describe_mode_needs_no_credentials_and_prints_the_timeline(tmp_path, ca
     assert "ORDER_FILLED" in capsys.readouterr().out
 
 
+def test_describe_prints_a_character_the_terminal_cannot_show_as_an_escape(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    recording = recording_of(execution_event())
+    recording.add("marker", "stop moved → 1.1050", None, 5.0)
+    data, _ = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    path = tmp_path / "recording.json"
+    path.write_bytes(data)
+    # A Windows console or pipe with a Cyrillic code page, which has no arrow.
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1251")
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    assert r.main(["--describe", str(path)]) == 0
+
+    stdout.flush()
+    printed = stdout.buffer.getvalue()
+    assert b"stop moved \\u2192 1.1050" in printed
+    assert b"ORDER_FILLED" in printed
+
+
 def raw_file(tmp_path, *notes: str) -> pathlib.Path:
     recording = recording_of(execution_event(label="my robot"))
     for note in notes:
@@ -1531,7 +1945,7 @@ def raw_file(tmp_path, *notes: str) -> pathlib.Path:
 def stripped(raw: bytes, *, typed: bool) -> bytes:
     """A raw recording edited by hand to look like a fixture: the raw-only keys removed."""
     loaded = json.loads(raw)
-    for key in ("started_wall_ms", "account_id", "login"):
+    for key in ("started_wall_ms", "account_id", "login", "names"):
         del loaded[key]
     if not typed:
         for item in loaded["timeline"]:
@@ -1696,6 +2110,40 @@ def test_the_account_is_the_one_with_the_trader_login() -> None:
     assert account.ctidTraderAccountId == ACCOUNT_ID + 1
 
 
+@pytest.mark.parametrize("is_live", [True, False], ids=["live", "demo"])
+async def test_the_account_s_host_follows_its_live_flag(monkeypatch, is_live) -> None:
+    server = FakeCTraderServer()
+    server.on(om.PROTO_OA_APPLICATION_AUTH_REQ, lambda _r: oa.ProtoOAApplicationAuthRes())
+    account = om.ProtoOACtidTraderAccount(
+        ctidTraderAccountId=ACCOUNT_ID,
+        traderLogin=LOGIN,
+        isLive=is_live,
+        brokerTitleShort=BROKER_TITLE,
+    )
+    server.on(
+        om.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda q: oa.ProtoOAGetAccountListByAccessTokenRes(
+            accessToken=q.accessToken,
+            ctidTraderAccount=[account],
+        ),
+    )
+    await server.start()
+    # The account list is asked on the demo host, which is the fake server here.
+    monkeypatch.setattr(r, "DEMO_HOST", server.host)
+    monkeypatch.setattr(r, "PROTOBUF_PORT", server.port)
+    monkeypatch.setattr(r, "CTraderConnection", functools.partial(CTraderConnection, tls=False))
+    try:
+        resolved = await asyncio.wait_for(
+            r._resolve_account(LOGIN, "client-id", "client-secret", "access-token"),
+            10,
+        )
+    finally:
+        await server.stop()
+
+    host = r.LIVE_HOST if is_live else server.host
+    assert resolved == (host, ACCOUNT_ID, BROKER_TITLE)
+
+
 @pytest.mark.parametrize("logins", [(LOGIN + 1,), (LOGIN, LOGIN)], ids=["none", "two"])
 def test_an_unmatched_trader_login_is_reported_without_naming_it(logins) -> None:
     with pytest.raises(r.NoSuchAccount) as raised:
@@ -1711,11 +2159,13 @@ async def test_the_checklist_waits_for_the_recording_to_start(
     capsys,
 ) -> None:
     printed: dict[str, str] = {}
+    given: dict[str, object] = {}
 
-    async def resolved(*_args) -> tuple[str, int]:
-        return "127.0.0.1", ACCOUNT_ID
+    async def resolved(*_args) -> tuple[str, int, str]:
+        return "127.0.0.1", ACCOUNT_ID, BROKER_TITLE
 
-    async def record_to_file(_output, *, status, **_kwargs) -> None:
+    async def record_to_file(_output, *, status, names, **_kwargs) -> None:
+        given["names"] = names
         printed["before"] = capsys.readouterr().out
         status(r.STATUS_STARTED)
         printed["started"] = capsys.readouterr().out
@@ -1741,7 +2191,35 @@ async def test_the_checklist_waits_for_the_recording_to_start(
     assert "Connecting" in printed["before"]
     assert "Trade by hand" not in printed["before"]
     assert "Trade by hand" in printed["started"]
+    assert "--minutes 1)" in printed["started"]
     assert capsys.readouterr().err == f"{r.STATUS_LOST}\n"
+    # The title the account list gave goes to the scrubbing, and is printed nowhere.
+    assert list(given["names"]) == [BROKER_TITLE]
+    assert BROKER_TITLE not in printed["before"] + printed["started"]
+
+
+def test_the_checklist_states_when_the_recording_ends() -> None:
+    text = r.checklist(480.0, datetime.datetime(2026, 1, 2, 17, 5))
+
+    assert "2026-01-02 17:05" in text
+    assert "--minutes 480)" in text
+    # The one step that needs more time than the default gives says so.
+    (step,) = [line for line in text.splitlines() if "rollover" in line]
+    assert "--minutes" in step
+    assert "no names and no account numbers" in text
+
+
+def test_a_recording_lasts_eight_hours_unless_told_otherwise(tmp_path, monkeypatch) -> None:
+    minutes: list[float] = []
+
+    async def run(args, _env, outcome) -> None:
+        minutes.append(args.minutes)
+        outcome.recording = session(events=1)
+        outcome.fixture = True
+
+    assert main_run(tmp_path, monkeypatch, run) == 0
+
+    assert minutes == [480.0]
 
 
 def session(*own: str, events: int = 0, typed: tuple[str, ...] = ()) -> r.Recording:

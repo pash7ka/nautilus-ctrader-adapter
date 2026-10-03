@@ -10,10 +10,10 @@ places, changes or closes an order is named anywhere in this module.
 While it runs, type a short note and press Enter to mark what you just did in the terminal
 ("moved the stop"); type `q` and Enter to stop. `--describe` prints a recording back.
 
-The fixture never holds the account id, the trader login, a token, a balance, or the broker's
-own order, position and deal ids: those are replaced consistently, so a position still lines up
-with its orders and deals. A timestamp in milliseconds is shifted by one constant, which keeps
-every interval; a time the venue gives in another unit keeps its value.
+The fixture never holds the account id, the trader login, a token, a balance, the broker's
+name, or the broker's own order, position and deal ids: those are replaced consistently, so a
+position still lines up with its orders and deals. A wall time in milliseconds or seconds is
+shifted by one constant, which keeps every interval; a bar's time in minutes keeps its value.
 
 A session is kept however it ends. What was seen is first written unscrubbed to
 `tests/recordings/`, which git ignores, and only then scrubbed, checked and written as the
@@ -33,11 +33,13 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import datetime
 import importlib.util
 import json
 import os
 import pathlib
 import re
+import signal
 import sys
 import tempfile
 import threading
@@ -103,6 +105,8 @@ READ_ONLY_REQUESTS: frozenset[type[Message]] = frozenset(
 SCRUBBED_TEXT = "scrubbed"
 # Stands in for a long number in free text that no field identified.
 NUMBER_PLACEHOLDER = "<number>"
+# Stands in for the broker's name in free text.
+BROKER_PLACEHOLDER = "<broker>"
 # An arbitrary fixed instant: every timestamp is moved so the recording starts here.
 FAKE_EPOCH_MS = 1_600_000_000_000
 FORMAT = 1
@@ -121,6 +125,7 @@ STATUS_STARTED = "recording started"
 STATUS_LOST = "connection lost, reconnecting"
 STATUS_RECONNECTED = "reconnected"
 STATUS_DEADLINE = "deadline reached"
+STATUS_STOPPING = "stopping: asking the closing lists and writing the recording; please wait"
 
 # How the recorder's own markers begin when they name a list the recording lacks, in whole or
 # in part: the owner has to read those before trusting it.
@@ -147,6 +152,9 @@ _ACCOUNT_ID_LISTS = frozenset({"ctidTraderAccountIds"})
 # The owner's id at the identity provider. Zeroed, not cleared: the field is `required`.
 _ZEROED_IDS = frozenset({"userId"})
 _INT_TYPES = (FieldDescriptor.TYPE_INT64, FieldDescriptor.TYPE_UINT64)
+# Wall times the schema gives in seconds, by message and field: the same name elsewhere is in
+# milliseconds.
+_SECONDS_TIMESTAMPS = frozenset({("ProtoOAErrorRes", "maintenanceEndTimestamp")})
 _DIGIT_RUN = re.compile(r"\d+")
 # Shorter than any id seen, longer than a price or a volume someone would type in a note.
 _LONG_NUMBER_DIGITS = 7
@@ -201,17 +209,42 @@ def _in_decimal(text: str, start: int, end: int) -> bool:
     return fraction_follows or is_fraction
 
 
-def clean_text(text: str, *, account_id: int, login: int | None, ids: IdMap) -> str:
-    """Free text with the numbers that could identify the account taken out.
+def _names_pattern(names: Iterable[str]) -> re.Pattern[str] | None:
+    """What matches any of `names` as whole words, in any case; `None` if there is no name.
 
-    Works on whole runs of digits: the digits of an id inside a longer number are not that id.
+    Whole words only: a short name would otherwise match inside ordinary words. The longest
+    name is tried first, so a name inside a longer one does not leave the rest behind.
+    """
+    ordered = sorted({name for name in names if name}, key=len, reverse=True)
+    if not ordered:
+        return None
+    alternatives = "|".join(re.escape(name) for name in ordered)
+    return re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.IGNORECASE)
 
+
+def clean_text(
+    text: str,
+    *,
+    account_id: int,
+    login: int | None,
+    ids: IdMap,
+    names: Iterable[str] = (),
+) -> str:
+    """Free text with the names and numbers that could identify the account taken out.
+
+    Numbers are matched as whole runs of digits: the digits of an id inside a longer number are
+    not that id.
+
+    - each of `names`, the broker's, becomes `BROKER_PLACEHOLDER`, as a whole word in any case;
     - a known order, position or deal id becomes its fake id;
     - the account id and the trader login become the fake values their own fields get;
     - any other run of `_LONG_NUMBER_DIGITS` digits or more becomes `NUMBER_PLACEHOLDER`: an id
       quoted only in text was never seen in a field, so it cannot be mapped. A run that is the
       integer or the fractional part of a decimal number is a price or a rate, and is kept.
     """
+    pattern = _names_pattern(names)
+    if pattern is not None:
+        text = pattern.sub(BROKER_PLACEHOLDER, text)
     fakes = ids.text_fakes()
     fakes.setdefault(str(account_id), str(record_fixtures.FAKE_ACCOUNT_ID))
     if login is not None:
@@ -236,6 +269,7 @@ def scrub_execution(
     login: int | None,
     ids: IdMap,
     shift_ms: int,
+    names: Iterable[str] = (),
 ) -> Message:
     """`record_fixtures.scrub()`, then what execution messages add to it."""
     result = record_fixtures.scrub(message, account_id, login)
@@ -243,7 +277,7 @@ def scrub_execution(
     result.DiscardUnknownFields()
 
     def clean(text: str) -> str:
-        return clean_text(text, account_id=account_id, login=login, ids=ids)
+        return clean_text(text, account_id=account_id, login=login, ids=ids, names=names)
 
     _scrub_in_place(result, ids, shift_ms, clean)
     return result
@@ -278,14 +312,13 @@ def _scrub_in_place(
             setattr(message, name, SCRUBBED_TEXT)
         elif descriptor.type == FieldDescriptor.TYPE_STRING and name in _VENUE_TEXT_FIELDS:
             setattr(message, name, clean(value))
-        # Below the shift it is not a wall time in milliseconds, and an unsigned field refuses
-        # the negative result.
-        elif (
-            name.endswith("Timestamp")
-            and descriptor.type in _INT_TYPES
-            and value > max(shift_ms, 0)
-        ):
-            setattr(message, name, value - shift_ms)
+        elif descriptor.type in _INT_TYPES and (name == "timestamp" or name.endswith("Timestamp")):
+            in_seconds = (message.DESCRIPTOR.name, name) in _SECONDS_TIMESTAMPS
+            shift = shift_ms // 1000 if in_seconds else shift_ms
+            # Below the shift it is not a wall time in its unit, and an unsigned field refuses
+            # the negative result.
+            if value > max(shift, 0):
+                setattr(message, name, value - shift)
 
 
 def _has_unknown_fields(message: Message) -> bool:
@@ -326,6 +359,12 @@ class Recording:
             "position_deals": [],
         },
     )
+    # The broker's names, as the venue gave them: what scrubbing takes out of free text.
+    names: list[str] = field(default_factory=list)
+
+    def add_name(self, name: str) -> None:
+        if name and name not in self.names:
+            self.names.append(name)
 
     def add(
         self,
@@ -379,6 +418,7 @@ def encode_recording(
             login=login,
             ids=ids,
             shift_ms=shift_ms,
+            names=recording.names,
         )
 
     # A first pass only to fill the id map, so a text quoting an id is fixed even where the id
@@ -388,7 +428,13 @@ def encode_recording(
 
     timeline = []
     for entry in recording.timeline:
-        note = clean_text(entry.note, account_id=account_id, login=login, ids=ids)
+        note = clean_text(
+            entry.note,
+            account_id=account_id,
+            login=login,
+            ids=ids,
+            names=recording.names,
+        )
         item: dict = {"t": entry.t, "kind": entry.kind, "note": note}
         if entry.message is not None:
             item.update(_encode(clean(entry.message)))
@@ -445,6 +491,7 @@ def encode_raw(recording: Recording, *, account_id: int, login: int | None) -> b
         "started_wall_ms": recording.started_wall_ms,
         "account_id": account_id,
         "login": login,
+        "names": recording.names,
         "timeline": timeline,
         "closing": {
             key: [_encode(message, partial=True) for message in items]
@@ -461,7 +508,8 @@ def decode_raw(data: bytes) -> tuple[Recording, int, int | None]:
     quoted on the terminal, so that is the reading under which a note cannot be.
     """
     raw = json.loads(data)
-    recording = Recording(raw["started_wall_ms"])
+    # A file written before names were kept has none.
+    recording = Recording(raw["started_wall_ms"], names=list(raw.get("names", [])))
     recording.timeline = [
         Entry(
             item["t"],
@@ -487,10 +535,14 @@ def check_clean(
     ids: IdMap,
     secrets: Iterable[str],
 ) -> None:
-    """Raise `ScrubError` if a real identifier or secret survives in what is about to be written.
+    """Raise `ScrubError` if a real identifier, secret or name survives in what is to be written.
 
     Checked twice: each scrubbed message's own serialized bytes, where an int64 is a varint and
     no decimal search can see it, and the final JSON, where a text field or a note could hold it.
+
+    The broker's names are looked for in every note and every text field instead, the way
+    `clean_text()` matches them: in the JSON or the bytes, a short name would turn up by chance
+    inside the base64 of a payload.
     """
     numbers = [n for n in (account_id, login, *ids.real_ids()) if n is not None]
     text = [str(n).encode() for n in numbers] + [s.encode() for s in secrets if s]
@@ -505,6 +557,27 @@ def check_clean(
         raise record_fixtures.ScrubError("the encoded recording lost a message")
     for message in messages:
         record_fixtures.assert_clean(message.SerializeToString(), text + varints)
+
+    names = _names_pattern(recording.names)
+    if names is None:
+        return
+    texts = [item["note"] for item in decoded["timeline"]]
+    for message in messages:
+        texts.extend(_strings(message))
+    # The token itself may read as a name: "<broker>" for a broker called "Broker".
+    if any(names.search(t.replace(BROKER_PLACEHOLDER, " ")) for t in texts):
+        raise record_fixtures.ScrubError("a broker name was found in recorded fixture data")
+
+
+def _strings(message: Message) -> Iterable[str]:
+    """Every text field of `message`, at any depth."""
+    for descriptor, value in message.ListFields():
+        items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+        if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            for item in items:
+                yield from _strings(item)
+        elif descriptor.type == FieldDescriptor.TYPE_STRING:
+            yield from items
 
 
 def write_fixture(
@@ -674,11 +747,16 @@ async def record(
     - `recording` lets the caller keep what was seen if this raises: it is filled in place.
     - `status` is called as the run changes state: with a `STATUS_*` text, with
       `events_status()` when a burst of events is over, or with the text of a
-      `snapshot refused` marker.
+      `snapshot refused` marker. `STATUS_STOPPING` comes once, as the run starts to end,
+      however it ends.
 
-    Raises `CTraderRequestError` if the venue refuses authentication, or the snapshot taken at
-    the start or right after a reconnect: a refusal is not a lost connection, and asking again
-    changes nothing. A snapshot refused later, after events, is only marked, and the run goes on.
+    The broker's name, from the trader asked for once on the first connection, is added to the
+    recording's names; that response itself is not recorded.
+
+    Raises `CTraderRequestError` if the venue refuses authentication, the trader, or the
+    snapshot taken at the start or right after a reconnect: a refusal is not a lost connection,
+    and asking again changes nothing. A snapshot refused later, after events, is only marked,
+    and the run goes on.
     """
     recording = Recording(int(time.time() * 1000)) if recording is None else recording
     started = time.monotonic()
@@ -758,6 +836,14 @@ async def record(
         if not stop.is_set():
             status(STATUS_DEADLINE)
 
+    stopping_announced = False
+
+    def announce_stopping() -> None:
+        nonlocal stopping_announced
+        if not stopping_announced:
+            stopping_announced = True
+            status(STATUS_STOPPING)
+
     last_event: float | None = None
     # The types of the events the owner has not been told about yet.
     unannounced: list[str] = []
@@ -804,7 +890,13 @@ async def record(
                     accessToken=access_token,
                 ),
             )
-            if not first:
+            if first:
+                trader = await send(
+                    connection,
+                    oa.ProtoOATraderReq(ctidTraderAccountId=account_id),
+                )
+                recording.add_name(trader.trader.brokerName)
+            else:
                 recording.add("marker", "reconnected", None, now())
             await snapshot(connection, "start" if first else "after reconnect")
             status(STATUS_STARTED if first else STATUS_RECONNECTED)
@@ -831,6 +923,7 @@ async def record(
             drain_markers()
             if not lost.is_set():
                 announce_deadline()
+                announce_stopping()
                 try:
                     await closing(connection)
                 except CTraderError as e:
@@ -844,9 +937,15 @@ async def record(
             recording.add("marker", "connection lost", None, now())
         except CTraderRequestError:
             # The venue answered, and refused: asking again on a new connection changes nothing.
+            announce_stopping()
             raise
         except (CTraderError, OSError) as e:
             recording.add("marker", f"connection lost: {type(e).__name__}", None, now())
+        except BaseException:
+            # A cancellation, which Ctrl+C is, or a bug: told before the close, which can take
+            # a while.
+            announce_stopping()
+            raise
         finally:
             with contextlib.suppress(CTraderError, OSError):
                 await connection.close()
@@ -856,15 +955,35 @@ async def record(
         if finished():
             break
         status(STATUS_LOST)
-        # Not a plain sleep: a stop typed during the wait takes effect at once.
-        with contextlib.suppress(TimeoutError):
-            wait = reconnect_waits[min(attempt, len(reconnect_waits) - 1)]
-            await asyncio.wait_for(stop.wait(), wait)
+        wait = reconnect_waits[min(attempt, len(reconnect_waits) - 1)]
+        try:
+            # Not a plain sleep: a stop typed during the wait takes effect at once.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), wait)
+        except BaseException:
+            announce_stopping()
+            raise
         attempt += 1
     drain_markers()
     announce_deadline()
+    announce_stopping()
     recording.add("marker", "closing requests skipped: not connected", None, now())
     return recording
+
+
+@contextlib.contextmanager
+def _sigint_ignored():
+    """Ignore Ctrl+C inside: a second one while the files are written would lose them both."""
+    # Only the main thread may set a handler, and only it receives the signal.
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        # `None` is a handler not set from Python, which cannot be set back.
+        signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
 
 
 def raw_path(output: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
@@ -891,9 +1010,12 @@ async def record_to_file(
     account_id: int,
     raw_dir: pathlib.Path = _RAW_DIR,
     outcome: Outcome | None = None,
+    names: Iterable[str] = (),
     **kwargs,
 ) -> None:
     """Run `record()` and keep what it saw, whatever way the run ended.
+
+    `names` are the broker's names known before the run; `record()` adds the one it learns.
 
     The owner's manual trades cannot be repeated on demand, so:
 
@@ -907,12 +1029,19 @@ async def record_to_file(
     - a run that recorded no message at all writes nothing: there is nothing to keep, and a
       file would only stand in the way of the next run.
 
-    Each file is replaced in one step, so a failed write never damages an earlier one.
+    Each file is replaced in one step, so a failed write never damages an earlier one, and
+    Ctrl+C is ignored while they are written.
     """
     recording = Recording(int(time.time() * 1000))
+    for name in names:
+        recording.add_name(name)
     outcome = Outcome() if outcome is None else outcome
 
     def keep() -> None:
+        with _sigint_ignored():
+            write_both()
+
+    def write_both() -> None:
         if not any(True for _ in recording.messages()):
             return
         outcome.recording = recording
@@ -976,8 +1105,8 @@ async def _resolve_account(
     client_id: str,
     client_secret: str,
     access_token: str,
-) -> tuple[str, int]:
-    """The host the account lives on and the account id every request carries."""
+) -> tuple[str, int, str]:
+    """The account's host and id, and its broker's short title (empty if the list gave none)."""
     connection = CTraderConnection(DEMO_HOST, PROTOBUF_PORT, logger=record_fixtures._QuietLogger())
     await connection.connect()
     try:
@@ -992,7 +1121,8 @@ async def _resolve_account(
     finally:
         await connection.close()
     account = _match_account(listed.ctidTraderAccount, trader_login)
-    return (LIVE_HOST if account.isLive else DEMO_HOST), account.ctidTraderAccountId
+    host = LIVE_HOST if account.isLive else DEMO_HOST
+    return host, account.ctidTraderAccountId, account.brokerTitleShort
 
 
 def _check_target(path: pathlib.Path, *, overwrite: bool, create_dir: bool = False) -> None:
@@ -1041,8 +1171,10 @@ def _start_keyboard(
 
 
 _CHECKLIST = """\
-Recording. Trade by hand in the cTrader terminal, at the smallest volume, and after each
-step type what you did and press Enter:
+Recording until {ends} local time (--minutes {minutes}), when it stops by itself.
+Trade by hand in the cTrader terminal, at the smallest volume, and after each step type what
+you did and press Enter.
+Notes are published with the fixture: write no names and no account numbers.
   1. a market buy with a stop-loss and a take-profit
   2. move the stop-loss
   3. remove the take-profit, then add it back
@@ -1050,9 +1182,16 @@ step type what you did and press Enter:
   5. let the stop-loss trigger, or close the position by hand
   6. a second position, closed by its take-profit
   7. place a pending limit order, then cancel it
-  8. (optional, long) keep a position open across the daily rollover
+  8. (optional, long) keep a position open across the daily rollover: needs a --minutes
+     that reaches past it
 A line "events: ..." follows each step the venue reported; if none appears, nothing is being
 recorded. Type q and press Enter to stop."""
+
+
+def checklist(minutes: float, ends: datetime.datetime) -> str:
+    """What the owner reads once the recording has started; `ends` is the local deadline."""
+    return _CHECKLIST.format(ends=ends.strftime("%Y-%m-%d %H:%M"), minutes=f"{minutes:g}")
+
 
 # Each one is needed to connect, and every one present must stay out of a fixture.
 _REQUIRED_KEYS = ("CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET", "CTRADER_ACCESS_TOKEN")
@@ -1076,7 +1215,7 @@ def _secrets(env: dict[str, str]) -> tuple[str, ...]:
 async def _run(args: argparse.Namespace, env: dict[str, str], outcome: Outcome) -> None:
     client_id, client_secret, access_token = _credentials(env)
     print("Connecting...")
-    host, account_id = await _resolve_account(
+    host, account_id, broker_title = await _resolve_account(
         args.trader_login,
         client_id,
         client_secret,
@@ -1084,11 +1223,13 @@ async def _run(args: argparse.Namespace, env: dict[str, str], outcome: Outcome) 
     )
     stop: asyncio.Event = asyncio.Event()
     markers: asyncio.Queue[str] = asyncio.Queue()
+    # `record()` counts its deadline from its own start, a moment from now.
+    ends = datetime.datetime.now() + datetime.timedelta(minutes=args.minutes)
 
     def on_status(text: str) -> None:
         # The checklist only once events are really being recorded.
         if text == STATUS_STARTED:
-            print(_CHECKLIST)
+            print(checklist(args.minutes, ends))
         else:
             print(text, file=sys.stderr)
 
@@ -1099,6 +1240,7 @@ async def _run(args: argparse.Namespace, env: dict[str, str], outcome: Outcome) 
         secrets=_secrets(env),
         raw_dir=args.raw_dir,
         outcome=outcome,
+        names=(broker_title,),
         host=host,
         port=PROTOBUF_PORT,
         tls=True,
@@ -1154,7 +1296,12 @@ def main(argv: list[str] | None = None) -> int:
         help="build the fixture again from an unscrubbed recording, offline",
     )
     parser.add_argument("--trader-login", type=int)
-    parser.add_argument("--minutes", type=float, default=120.0)
+    parser.add_argument(
+        "--minutes",
+        type=float,
+        default=480.0,
+        help="how long to record before stopping by itself",
+    )
     parser.add_argument("--output", type=pathlib.Path, default=_OUTPUT_PATH)
     parser.add_argument(
         "--raw-dir",
@@ -1172,7 +1319,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.describe is not None:
         try:
-            print(describe(args.describe.read_bytes()))
+            text = describe(args.describe.read_bytes())
+            # A note may hold a character the terminal's code page lacks: escaped, not fatal.
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(encoding, "backslashreplace").decode(encoding))
         except Refused as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
