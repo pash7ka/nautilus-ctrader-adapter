@@ -647,6 +647,14 @@ def test_an_amend_leaves_out_a_level_that_is_to_be_removed() -> None:
     assert request.HasField("takeProfit")
 
 
+def test_an_amend_with_no_level_removes_both() -> None:
+    request = tr.amend_levels(ACCOUNT_ID, 5_000_001, stop_loss=None, take_profit=None)
+
+    assert request.positionId == 5_000_001
+    assert not request.HasField("stopLoss")
+    assert not request.HasField("takeProfit")
+
+
 def test_an_id_too_long_for_the_venue_is_refused() -> None:
     # Set explicitly: the factory builds its ids from the strategy's short tag, so a long
     # strategy name does not make a long id.

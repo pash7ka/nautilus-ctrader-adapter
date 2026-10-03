@@ -150,6 +150,9 @@ def _new_order(
         comment = order_record.encode_comment(legs)
     except ValueError as e:
         raise Unsupported(str(e)) from e
+    # TODO(verify): that a MARKET request left at the schema's default `timeInForce`
+    # (GOOD_TILL_CANCEL) fills as a plain market order; the order as the venue reports it back
+    # after placement shows the time in force it got.
     return oa.ProtoOANewOrderReq(
         ctidTraderAccountId=account_id,
         symbolId=instrument.info["symbol_id"],
@@ -242,6 +245,9 @@ def bracket(
     buying = entry.side == OrderSide.BUY
     reference = ask if buying else bid
     if stop_loss is not None:
+        # TODO(verify): that the stop-loss level, with `stopTriggerMethod` left at the schema's
+        # default, triggers on the price a DEFAULT trigger means; the position as the venue
+        # reports it back after placement shows the method it got.
         _require_on_price_grid(instrument, stop_loss.trigger_price)
         request.relativeStopLoss = relative_level(
             reference, stop_loss.trigger_price.as_decimal(), below=buying
