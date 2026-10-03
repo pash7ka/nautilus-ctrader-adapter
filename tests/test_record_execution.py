@@ -602,6 +602,29 @@ def test_an_empty_name_is_no_name() -> None:
     assert recording.names == [BROKER_NAME]
 
 
+def test_a_padded_name_is_trimmed_and_replaced() -> None:
+    recording = recording_of(execution_event())
+    recording.add_name(f" {BROKER_TITLE} ")
+    recording.add("marker", "closed in the examplefx terminal", None, 5.0, typed=True)
+
+    _, note = clean_timeline(recording)
+
+    assert recording.names == [BROKER_TITLE]
+    assert note["note"] == f"closed in the {r.BROKER_PLACEHOLDER} terminal"
+
+
+def test_a_name_too_short_to_be_one_rewrites_nothing() -> None:
+    recording = recording_of(execution_event())
+    recording.add_name("A")
+    recording.add_name(" ab ")
+    recording.add("marker", "a stop at a price, ab initio", None, 5.0, typed=True)
+
+    _, note = clean_timeline(recording)
+
+    assert recording.names == []
+    assert note["note"] == "a stop at a price, ab initio"
+
+
 def leaked_name(where: str) -> tuple[bytes, r.Recording, r.IdMap]:
     """A fixture with `BROKER_NAME` left in it `where`, and what `check_clean` is given with it."""
     error = oa.ProtoOAOrderErrorEvent(ctidTraderAccountId=ACCOUNT_ID, errorCode="MARKET_CLOSED")
@@ -1750,8 +1773,10 @@ async def test_a_raw_recording_that_cannot_be_written_does_not_cost_the_fixture(
         await to_file(output, account_id=ACCOUNT_ID, raw_dir=blocked, outcome=outcome)
 
     assert (outcome.raw, outcome.fixture) == (None, True)
-    (event,) = r.decode_recording(output.read_bytes())["timeline"]
+    # The journal, in the same directory, could not be written either, and says so.
+    event, journal = r.decode_recording(output.read_bytes())["timeline"]
     assert event["message"].position.positionId == 5_000_001
+    assert journal["note"] == r.JOURNAL_STOPPED
 
 
 async def test_a_write_that_fails_midway_leaves_the_earlier_files_whole(
@@ -1801,6 +1826,28 @@ async def test_a_write_that_fails_midway_leaves_the_earlier_files_whole(
     assert outcome.recording is not None
     assert (outcome.raw, outcome.fixture) == (None, False)
     assert outcome.journal == journal_of(output)
+
+
+def test_a_file_is_on_disk_before_it_replaces_another(tmp_path, monkeypatch) -> None:
+    """The journal is removed once the raw file is written: that must survive a power cut."""
+    steps: list[str] = []
+    real_fsync, real_replace = r.os.fsync, r.os.replace
+
+    def fsync(fd) -> None:
+        steps.append("fsync")
+        real_fsync(fd)
+
+    def replace(source, target) -> None:
+        steps.append("replace")
+        real_replace(source, target)
+
+    monkeypatch.setattr(r.os, "fsync", fsync)
+    monkeypatch.setattr(r.os, "replace", replace)
+
+    r._write_atomically(tmp_path / "file.json", b"data")
+
+    assert steps == ["fsync", "replace"]
+    assert (tmp_path / "file.json").read_bytes() == b"data"
 
 
 async def test_the_broker_s_names_are_scrubbed_and_kept_for_a_rescrub(tmp_path, capsys) -> None:
@@ -1936,8 +1983,72 @@ async def test_a_journal_that_cannot_be_written_is_told_once_and_the_run_goes_on
 
     assert statuses == [r.STATUS_JOURNAL_FAILED]
     assert outcome.fixture and output.exists()
+    assert r.JOURNAL_STOPPED in r.summary(outcome.recording)
     # Not this run's journal, so not this run's to remove.
     assert journal_of(output).read_bytes() == b"an earlier journal"
+
+
+async def test_a_journal_that_stops_midway_is_marked_in_the_recording(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def record(*, recording: r.Recording, **_kwargs) -> r.Recording:
+        recording.add("event", "", execution_event(), 1.0)
+        journal = recording.journal
+        real = journal._handle
+
+        class Full:
+            def write(self, _data: bytes) -> None:
+                raise OSError("no space left on device")
+
+            def close(self) -> None:
+                real.close()
+
+        journal._handle = Full()
+        recording.add("event", "", execution_event(deal_id=DEAL_ID + 1), 2.0)
+        return recording
+
+    monkeypatch.setattr(r, "record", record)
+    output = tmp_path / "recording.json"
+    statuses: list[str] = []
+    outcome = r.Outcome()
+
+    await to_file(output, account_id=ACCOUNT_ID, outcome=outcome, status=statuses.append)
+
+    assert statuses == [r.STATUS_JOURNAL_FAILED]
+    timeline = r.decode_recording(output.read_bytes())["timeline"]
+    assert [item["note"] for item in timeline] == ["", "", r.JOURNAL_STOPPED]
+    assert r.JOURNAL_STOPPED in r.summary(outcome.recording)
+    # The raw file holds it all, so the journal goes as usual.
+    assert not journal_of(output).exists()
+
+
+async def test_the_journal_holds_each_entry_while_the_run_is_still_going(tmp_path) -> None:
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    output = tmp_path / "recording.json"
+    task = asyncio.create_task(
+        to_file(output, **settings(server, stop, markers, status=statuses.append)),
+    )
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        markers.put_nowait("bought by hand")
+        await server.push(execution_event())
+        await wait_until(lambda: len(statuses) >= 2)
+        # Read from disk mid-run, as a later process would after a crash.
+        recording, _, _ = r.read_journal(journal_of(output).read_bytes())
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await server.stop()
+
+    kinds = [entry.kind for entry in recording.timeline]
+    assert kinds[:2] == ["snapshot", "snapshot"]
+    assert "event" in kinds
+    assert "bought by hand" in [entry.note for entry in recording.timeline]
 
 
 def finishing_settings(server: FakeCTraderServer, output: pathlib.Path) -> dict:
@@ -2002,6 +2113,7 @@ async def test_an_abrupt_end_leaves_a_journal_that_the_next_run_finishes(
         # The next run.
         dying[0] = False
         outcome = r.Outcome()
+        finishing: list[str] = []
         await r.finish(
             journal,
             recording,
@@ -2009,6 +2121,7 @@ async def test_an_abrupt_end_leaves_a_journal_that_the_next_run_finishes(
             account_id=account_id,
             login=login,
             outcome=outcome,
+            status=finishing.append,
             **finishing_settings(server, output),
         )
     finally:
@@ -2025,6 +2138,8 @@ async def test_an_abrupt_end_leaves_a_journal_that_the_next_run_finishes(
     assert r.JOURNAL_FINISHED in notes and "bought by hand" in notes
     assert len(r.decode_recording(output.read_bytes())["closing"]["deals"]) == 1
     assert r.JOURNAL_FINISHED in r.summary(outcome.recording)
+    # The owner is told what a run's own end would tell.
+    assert finishing == [r.STATUS_CLOSING_LISTS, r.STATUS_WRITING]
 
 
 async def test_finishing_that_fails_keeps_the_journal(tmp_path) -> None:
@@ -2120,6 +2235,66 @@ def test_a_journal_of_another_trader_login_is_refused(tmp_path, monkeypatch, cap
     captured = capsys.readouterr()
     assert captured.err == f"error: {r.JOURNAL_OTHER_ACCOUNT}\n"
     assert str(LOGIN) not in captured.out + captured.err
+
+
+def test_a_journal_of_an_account_no_longer_granted_is_refused(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    journal = journal_file(tmp_path)
+    before = journal.read_bytes()
+
+    async def resolved(*_args) -> tuple[str, int, str]:
+        return "127.0.0.1", ACCOUNT_ID + 1, BROKER_TITLE
+
+    async def never(*_args):
+        raise AssertionError("a new session started while a journal was waiting")
+
+    monkeypatch.setattr(r, "_resolve_account", resolved)
+
+    assert main_run(tmp_path, monkeypatch, never) == 1
+
+    assert journal.read_bytes() == before
+    captured = capsys.readouterr()
+    assert captured.err == f"error: {r.JOURNAL_OTHER_ACCOUNT}\n"
+    assert captured.out.splitlines()[-1] == f"{r.JOURNAL_KEPT}: {journal}"
+    assert str(ACCOUNT_ID) not in captured.out + captured.err
+
+
+def unreadable(name: str, path: pathlib.Path) -> bytes:
+    header, event = path.read_bytes().split(b"\n")[:2]
+    return {
+        "empty": b"",
+        "a partly written header": header[: len(header) // 2],
+        "a damaged line before the last": header + b"\n" + event[:10] + b"\n" + event + b"\n",
+    }[name]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["empty", "a partly written header", "a damaged line before the last"],
+)
+def test_a_journal_that_cannot_be_read_is_kept_and_not_finished(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    name,
+) -> None:
+    journal = journal_file(tmp_path)
+    journal.write_bytes(unreadable(name, journal))
+    before = journal.read_bytes()
+
+    async def never(*_args) -> None:
+        raise AssertionError("an unreadable journal is not finished")
+
+    assert journal_run(tmp_path, monkeypatch, never) == 1
+
+    assert journal.read_bytes() == before
+    captured = capsys.readouterr()
+    assert captured.err == f"error: {r.JOURNAL_UNREADABLE}\n"
+    # Not the promise that the next run finishes it: it would not.
+    assert captured.out.splitlines() == [f"{r.JOURNAL_UNREADABLE_KEPT}: {journal}"]
 
 
 def test_a_finishing_that_fails_says_the_journal_is_kept(tmp_path, monkeypatch, capsys) -> None:

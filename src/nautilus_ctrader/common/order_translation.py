@@ -245,9 +245,9 @@ def bracket(
     buying = entry.side == OrderSide.BUY
     reference = ask if buying else bid
     if stop_loss is not None:
-        # TODO(verify): that the stop-loss level, with `stopTriggerMethod` left at the schema's
-        # default, triggers on the price a DEFAULT trigger means; the position as the venue
-        # reports it back after placement shows the method it got.
+        # TODO(verify): which trigger method the venue applies to a stop-loss level set by a
+        # relative distance (a new order cannot set the position's `stopLossTriggerMethod`,
+        # whose schema default is TRADE); reading the position back after placement shows it.
         _require_on_price_grid(instrument, stop_loss.trigger_price)
         request.relativeStopLoss = relative_level(
             reference, stop_loss.trigger_price.as_decimal(), below=buying

@@ -111,6 +111,7 @@ SCRUBBED_TEXT = "scrubbed"
 NUMBER_PLACEHOLDER = "<number>"
 # Stands in for the broker's name in free text.
 BROKER_PLACEHOLDER = "<broker>"
+_MIN_NAME_CHARS = 3
 # An arbitrary fixed instant: every timestamp is moved so the recording starts here.
 FAKE_EPOCH_MS = 1_600_000_000_000
 FORMAT = 1
@@ -136,12 +137,17 @@ STATUS_JOURNAL_FAILED = "the journal could not be written: an abrupt end would n
 # The recorder's own markers about a recording finished from its journal.
 JOURNAL_FINISHED = "recording finished after an interruption: closing lists asked on a later run"
 JOURNAL_TORN = "recording journal ended in a partly written line, which was dropped"
+JOURNAL_STOPPED = "recording journal stopped here: an abrupt end after this would lose the rest"
 # What `main` prints about a journal: fixed texts, followed at most by its path.
 JOURNAL_FOUND = "An interrupted recording was found and is finished first, from its journal"
 JOURNAL_DISCARD_HINT = (
     "To discard it instead, move that journal away by hand; --overwrite does not discard it."
 )
 JOURNAL_KEPT = "The journal is kept, and the next run with this output finishes it"
+JOURNAL_UNREADABLE = (
+    "the journal of an interrupted recording cannot be read, so it cannot be finished automatically"
+)
+JOURNAL_UNREADABLE_KEPT = "The journal is kept; move it away by hand to record again"
 JOURNAL_OTHER_ACCOUNT = (
     "the interrupted recording is of another account: finish it with that account's trader "
     "login, or move its journal away by hand"
@@ -385,7 +391,9 @@ class Recording:
     journal: Journal | None = field(default=None, repr=False, compare=False)
 
     def add_name(self, name: str) -> None:
-        if name and name not in self.names:
+        name = name.strip()
+        # A shorter one would take letters out of ordinary words ("a", "of").
+        if len(name) >= _MIN_NAME_CHARS and name not in self.names:
             self.names.append(name)
             if self.journal is not None:
                 self.journal.add_name(name)
@@ -570,7 +578,7 @@ class Journal:
 
     The file is created at the first entry, so a run that records nothing leaves none, and
     never over an existing one. A failed write stops the journal, not the run: `status` is told
-    once.
+    once, and a marker in the recording says from where on the journal holds nothing.
     """
 
     def __init__(
@@ -587,10 +595,13 @@ class Journal:
         self._status = status
         self._handle = None
         self._failed = False
+        self._closed = False
+        self._recording: Recording | None = None
         # Set once this object has created the file: only such a file is ever removed.
         self.created = False
 
     def add(self, recording: Recording, entry: Entry) -> None:
+        self._recording = recording
         items = [_raw_entry(entry)]
         if not self.created:
             header = {
@@ -609,7 +620,7 @@ class Journal:
             self._append([{"name": name}])
 
     def _append(self, items: list[dict]) -> None:
-        if self._failed:
+        if self._failed or self._closed:
             return
         try:
             if self._handle is None:
@@ -624,8 +635,15 @@ class Journal:
             self._failed = True
             self.close()
             self._status(STATUS_JOURNAL_FAILED)
+            recording = self._recording
+            if recording is not None:
+                # Added after `_failed` is set, so it does not come back here.
+                last = recording.timeline[-1].t if recording.timeline else 0.0
+                recording.add("marker", JOURNAL_STOPPED, None, last)
 
     def close(self) -> None:
+        """Stop the journal: what is added after this is not written."""
+        self._closed = True
         if self._handle is not None:
             with contextlib.suppress(OSError):
                 self._handle.close()
@@ -749,6 +767,9 @@ def _write_atomically(path: pathlib.Path, data: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
+            # On disk before it replaces anything: the journal is removed once this returns.
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -1150,8 +1171,10 @@ class Outcome:
     raw: pathlib.Path | None = None
     fixture: bool = False
     run_error: BaseException | None = None
-    # A journal left on disk, which the next run with the same output finishes.
+    # A journal left on disk, which the next run with the same output finishes if it can be
+    # read.
     journal: pathlib.Path | None = None
+    journal_readable: bool = True
 
 
 def _write_recording(
@@ -1283,13 +1306,15 @@ async def finish(
     raw_dir: pathlib.Path = _RAW_DIR,
     outcome: Outcome | None = None,
     rate_limiter: RateLimiter | None = None,
+    status: Callable[[str], None] = _silent,
 ) -> None:
     """Finish a recording an abrupt end left in `journal_file`, read as `recording`.
 
     Asks the closing lists, as a run's own end would have, for the window from the recording's
     start and for the positions it saw; then writes the raw file and the fixture as
     `record_to_file()` does, and removes the journal once the raw file is written. If anything
-    on the way fails, the journal is left as it was and the error is raised.
+    on the way fails, the journal is left as it was and the error is raised. `status` is told
+    what a run's own end tells it: `STATUS_CLOSING_LISTS`, then `STATUS_WRITING`.
     """
     outcome = Outcome() if outcome is None else outcome
     outcome.journal = journal_file
@@ -1312,10 +1337,13 @@ async def finish(
             oa.ProtoOAAccountAuthReq(ctidTraderAccountId=account_id, accessToken=access_token),
         )
         recording.add("marker", JOURNAL_FINISHED, None, last)
+        status(STATUS_CLOSING_LISTS)
         await _ask_closing_lists(connection, recording, account_id, lambda: last)
     finally:
         with contextlib.suppress(CTraderError, OSError):
             await connection.close()
+    if any(True for _ in recording.messages()):
+        status(STATUS_WRITING)
     _write_finished(
         journal_file,
         recording,
@@ -1578,6 +1606,7 @@ async def _finish_run(
         secrets=_secrets(env),
         raw_dir=args.raw_dir,
         outcome=outcome,
+        status=lambda text: print(text, file=sys.stderr),
     )
 
 
@@ -1595,7 +1624,8 @@ def _outcome_lines(outcome: Outcome, output: pathlib.Path, *, rescrub: bool = Fa
 
     `rescrub` leaves the unscrubbed copy out: that mode reads it and never writes it.
     """
-    kept = [f"{JOURNAL_KEPT}: {outcome.journal}"] if outcome.journal is not None else []
+    kept_text = JOURNAL_KEPT if outcome.journal_readable else JOURNAL_UNREADABLE_KEPT
+    kept = [f"{kept_text}: {outcome.journal}"] if outcome.journal is not None else []
     if outcome.recording is None:
         if rescrub:
             return ["The fixture was NOT written."]
@@ -1611,6 +1641,19 @@ def _outcome_lines(outcome: Outcome, output: pathlib.Path, *, rescrub: bool = Fa
         if not outcome.fixture:
             lines.append(f"Rebuild the fixture from it with: --rescrub {outcome.raw}")
     return [*lines, *kept, *summary(outcome.recording)]
+
+
+def _read_journal_file(
+    journal: pathlib.Path,
+    outcome: Outcome,
+) -> tuple[Recording, int, int | None]:
+    """`read_journal()` of `journal`; `Refused`, which quotes nothing of it, if it cannot be."""
+    try:
+        return read_journal(journal.read_bytes())
+    except Exception:
+        # Empty, a partly written header, a damaged line: whatever it says could quote the file.
+        outcome.journal_readable = False
+        raise Refused(JOURNAL_UNREADABLE) from None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1672,6 +1715,7 @@ def main(argv: list[str] | None = None) -> int:
         finishing = args.rescrub is None and journal.exists()
         if finishing:
             outcome.journal = journal
+            journaled = _read_journal_file(journal, outcome)
             print(f"{JOURNAL_FOUND}: {journal}")
             print(JOURNAL_DISCARD_HINT)
         _check_target(args.output, overwrite=args.overwrite)
@@ -1681,7 +1725,6 @@ def main(argv: list[str] | None = None) -> int:
             raw = raw_path(args.output, args.raw_dir)
             _check_target(raw, overwrite=args.overwrite, create_dir=True)
             if finishing:
-                journaled = read_journal(journal.read_bytes())
                 asyncio.run(_finish_run(args, env, outcome, journal, journaled))
             else:
                 asyncio.run(_run(args, env, outcome))
