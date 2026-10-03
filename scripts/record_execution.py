@@ -22,9 +22,14 @@ later, with no connection:
 
     uv run python scripts/record_execution.py --rescrub tests/recordings/<name>.raw.json
 
-The unscrubbed file is never printed, by `--describe` or otherwise. Neither file is replaced
-without `--overwrite`, and a run that recorded nothing writes nothing. A refusal by the venue
-ends the run at once and is reported by its error code.
+The first Ctrl+C, like `q`, ends the run and writes both files. If the process ends before it
+can - a second Ctrl+C, a crash - what was seen is still in the journal it appended to as it
+went, `tests/recordings/<name>.raw.jsonl`; the next run with the same output finishes that
+recording before anything else, and only a later run records a new session.
+
+The unscrubbed files are never printed, by `--describe` or otherwise. Neither file is replaced
+without `--overwrite`, which never discards a journal, and a run that recorded nothing writes
+nothing. A refusal by the venue ends the run at once and is reported by its error code.
 """
 
 from __future__ import annotations
@@ -39,7 +44,6 @@ import json
 import os
 import pathlib
 import re
-import signal
 import sys
 import tempfile
 import threading
@@ -125,11 +129,27 @@ STATUS_STARTED = "recording started"
 STATUS_LOST = "connection lost, reconnecting"
 STATUS_RECONNECTED = "reconnected"
 STATUS_DEADLINE = "deadline reached"
-STATUS_STOPPING = "stopping: asking the closing lists and writing the recording; please wait"
+STATUS_CLOSING_LISTS = "stopping: asking the closing lists"
+STATUS_WRITING = "stopping: writing the recording"
+STATUS_JOURNAL_FAILED = "the journal could not be written: an abrupt end would now lose the session"
 
-# How the recorder's own markers begin when they name a list the recording lacks, in whole or
-# in part: the owner has to read those before trusting it.
-_PROBLEM_MARKERS = ("closing ",)
+# The recorder's own markers about a recording finished from its journal.
+JOURNAL_FINISHED = "recording finished after an interruption: closing lists asked on a later run"
+JOURNAL_TORN = "recording journal ended in a partly written line, which was dropped"
+# What `main` prints about a journal: fixed texts, followed at most by its path.
+JOURNAL_FOUND = "An interrupted recording was found and is finished first, from its journal"
+JOURNAL_DISCARD_HINT = (
+    "To discard it instead, move that journal away by hand; --overwrite does not discard it."
+)
+JOURNAL_KEPT = "The journal is kept, and the next run with this output finishes it"
+JOURNAL_OTHER_ACCOUNT = (
+    "the interrupted recording is of another account: finish it with that account's trader "
+    "login, or move its journal away by hand"
+)
+
+# How the recorder's own markers begin when the owner has to read them before trusting the
+# recording: a list it lacks, in whole or in part, or a recording finished from its journal.
+_PROBLEM_MARKERS = ("closing ", "recording ")
 # The whole of a fixture's shape. A file with any other key is not one; an unscrubbed
 # recording carries more at both levels.
 _FIXTURE_KEYS = frozenset({"format", "timeline", "closing"})
@@ -361,10 +381,14 @@ class Recording:
     )
     # The broker's names, as the venue gave them: what scrubbing takes out of free text.
     names: list[str] = field(default_factory=list)
+    # Where each entry and name is also written as it is added, if anywhere.
+    journal: Journal | None = field(default=None, repr=False, compare=False)
 
     def add_name(self, name: str) -> None:
         if name and name not in self.names:
             self.names.append(name)
+            if self.journal is not None:
+                self.journal.add_name(name)
 
     def add(
         self,
@@ -375,7 +399,10 @@ class Recording:
         *,
         typed: bool = False,
     ) -> None:
-        self.timeline.append(Entry(round(t, 3), kind, note, message, typed))
+        entry = Entry(round(t, 3), kind, note, message, typed)
+        self.timeline.append(entry)
+        if self.journal is not None:
+            self.journal.add(self, entry)
 
     def messages(self) -> Iterable[Message]:
         for entry in self.timeline:
@@ -477,22 +504,13 @@ def encode_raw(recording: Recording, *, account_id: int, login: int | None) -> b
     The fixture's shape, but nothing is scrubbed and nothing is checked, so neither step can
     stop it being written. It holds real identifiers: for a directory git ignores, only.
     """
-    timeline = []
-    for entry in recording.timeline:
-        item: dict = {"t": entry.t, "kind": entry.kind, "note": entry.note}
-        if entry.kind == "marker":
-            # Written for the recorder's own markers too: see `decode_raw()`.
-            item["typed"] = entry.typed
-        if entry.message is not None:
-            item.update(_encode(entry.message, partial=True))
-        timeline.append(item)
     output = {
         "format": FORMAT,
         "started_wall_ms": recording.started_wall_ms,
         "account_id": account_id,
         "login": login,
         "names": recording.names,
-        "timeline": timeline,
+        "timeline": [_raw_entry(entry) for entry in recording.timeline],
         "closing": {
             key: [_encode(message, partial=True) for message in items]
             for key, items in recording.closing.items()
@@ -510,20 +528,146 @@ def decode_raw(data: bytes) -> tuple[Recording, int, int | None]:
     raw = json.loads(data)
     # A file written before names were kept has none.
     recording = Recording(raw["started_wall_ms"], names=list(raw.get("names", [])))
-    recording.timeline = [
-        Entry(
-            item["t"],
-            item["kind"],
-            item["note"],
-            _decode(item) if "payload" in item else None,
-            item.get("typed", item["kind"] == "marker"),
-        )
-        for item in raw["timeline"]
-    ]
+    recording.timeline = [_entry_from_raw(item) for item in raw["timeline"]]
     recording.closing = {
         key: [_decode(item) for item in items] for key, items in raw["closing"].items()
     }
     return recording, raw["account_id"], raw["login"]
+
+
+def _raw_entry(entry: Entry) -> dict:
+    """A timeline entry as the raw file and the journal hold it: unscrubbed."""
+    item: dict = {"t": entry.t, "kind": entry.kind, "note": entry.note}
+    if entry.kind == "marker":
+        # Written for the recorder's own markers too: see `decode_raw()`.
+        item["typed"] = entry.typed
+    if entry.message is not None:
+        item.update(_encode(entry.message, partial=True))
+    return item
+
+
+def _entry_from_raw(item: dict) -> Entry:
+    return Entry(
+        item["t"],
+        item["kind"],
+        item["note"],
+        _decode(item) if "payload" in item else None,
+        item.get("typed", item["kind"] == "marker"),
+    )
+
+
+def journal_path(output: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
+    """Where the journal of a recording that will become the fixture `output` is kept."""
+    return directory / f"{output.stem}.raw.jsonl"
+
+
+class Journal:
+    """A recording appended to a file entry by entry, as it is made, for an abrupt end.
+
+    Unscrubbed, like the raw file. One JSON object per line: a header first, with what a
+    rebuild needs, then each timeline entry in the raw file's form, and a `name` line for a
+    broker name learned after the header. Every line is flushed to disk as it is written.
+
+    The file is created at the first entry, so a run that records nothing leaves none, and
+    never over an existing one. A failed write stops the journal, not the run: `status` is told
+    once.
+    """
+
+    def __init__(
+        self,
+        path: pathlib.Path,
+        *,
+        account_id: int,
+        login: int | None,
+        status: Callable[[str], None],
+    ) -> None:
+        self.path = path
+        self._account_id = account_id
+        self._login = login
+        self._status = status
+        self._handle = None
+        self._failed = False
+        # Set once this object has created the file: only such a file is ever removed.
+        self.created = False
+
+    def add(self, recording: Recording, entry: Entry) -> None:
+        items = [_raw_entry(entry)]
+        if not self.created:
+            header = {
+                "format": FORMAT,
+                "started_wall_ms": recording.started_wall_ms,
+                "account_id": self._account_id,
+                "login": self._login,
+                "names": recording.names,
+            }
+            items.insert(0, header)
+        self._append(items)
+
+    def add_name(self, name: str) -> None:
+        # Before the header is written, the header itself carries it.
+        if self.created:
+            self._append([{"name": name}])
+
+    def _append(self, items: list[dict]) -> None:
+        if self._failed:
+            return
+        try:
+            if self._handle is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                # Held open across writes, so not a `with`.
+                self._handle = open(self.path, "xb")  # noqa: SIM115
+                self.created = True
+            self._handle.write(b"".join(json.dumps(item).encode() + b"\n" for item in items))
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+        except OSError:
+            self._failed = True
+            self.close()
+            self._status(STATUS_JOURNAL_FAILED)
+
+    def close(self) -> None:
+        if self._handle is not None:
+            with contextlib.suppress(OSError):
+                self._handle.close()
+            self._handle = None
+
+    def remove(self) -> None:
+        self.close()
+        if self.created:
+            self.path.unlink(missing_ok=True)
+            self.created = False
+
+
+def read_journal(data: bytes) -> tuple[Recording, int, int | None]:
+    """The recording, account id and trader login a journal holds.
+
+    A last line that is not whole JSON - the process ended while writing it - is dropped, and a
+    marker says so. Anything else that does not read raises.
+    """
+    lines = data.split(b"\n")
+    if lines and not lines[-1]:
+        lines.pop()
+    header = json.loads(lines[0])
+    if header["format"] != FORMAT:
+        raise ValueError("a journal of another format")
+    recording = Recording(header["started_wall_ms"], names=list(header["names"]))
+    torn = False
+    for index, line in enumerate(lines[1:], start=1):
+        try:
+            item = json.loads(line)
+        except ValueError:
+            if index < len(lines) - 1:
+                raise
+            torn = True
+            break
+        if "name" in item:
+            recording.add_name(item["name"])
+        else:
+            recording.timeline.append(_entry_from_raw(item))
+    if torn:
+        last = recording.timeline[-1].t if recording.timeline else 0.0
+        recording.add("marker", JOURNAL_TORN, None, last)
+    return recording, header["account_id"], header["login"]
 
 
 def check_clean(
@@ -723,6 +867,75 @@ def _silent(_text: str) -> None:
     pass
 
 
+async def _ask_closing_lists(
+    connection: CTraderConnection,
+    recording: Recording,
+    account_id: int,
+    now: Callable[[], float],
+) -> None:
+    """Ask the lists that hold what the recording's session did, into `recording.closing`.
+
+    A list refused is marked and the rest are asked. A list that fails otherwise - no answer,
+    no connection - ends the asking: each list left is marked as skipped.
+    """
+    failed = False
+
+    async def ask(key: str, request: Message) -> None:
+        nonlocal failed
+        if failed:
+            recording.add("marker", f"closing list skipped: {key}", None, now())
+            return
+        try:
+            response = await send(connection, request, bucket=BUCKET_HISTORICAL)
+        except CTraderRequestError as e:
+            # One list refused says nothing about the next: note it and ask the rest.
+            note = f"closing list refused: {key} {e.error_code}"
+            recording.add("marker", note, None, now())
+            return
+        except CTraderError as e:
+            # No answer, or no connection: every list after it would only wait as long, so
+            # each is marked as skipped instead.
+            failed = True
+            note = f"closing list failed: {key} {type(e).__name__}"
+            recording.add("marker", note, None, now())
+            return
+        recording.closing[key].append(response)
+        # TODO(verify): that `hasMore` on these lists means what it says, and at how many
+        # rows; a session with more deals than one response holds shows it.
+        if response.hasMore:
+            # Further pages are not asked for; the marker says the list is incomplete.
+            recording.add("marker", f"closing list truncated: {key}", None, now())
+
+    # TODO(verify): the widest window these two requests accept; a refusal here is marked
+    # `closing list refused` with the venue's code.
+    window = {
+        "fromTimestamp": recording.started_wall_ms - _CLOSING_LOOKBACK_MS,
+        "toTimestamp": int(time.time() * 1000),
+    }
+    await ask("deals", oa.ProtoOADealListReq(ctidTraderAccountId=account_id, **window))
+    await ask("orders", oa.ProtoOAOrderListReq(ctidTraderAccountId=account_id, **window))
+    positions: set[int] = set()
+    for message in list(recording.messages()):
+        positions |= _position_ids(message)
+    # TODO(verify): that the by-position requests answer without a time window; a refusal
+    # is marked like any other.
+    for position_id in sorted(positions):
+        await ask(
+            "position_orders",
+            oa.ProtoOAOrderListByPositionIdReq(
+                ctidTraderAccountId=account_id,
+                positionId=position_id,
+            ),
+        )
+        await ask(
+            "position_deals",
+            oa.ProtoOADealListByPositionIdReq(
+                ctidTraderAccountId=account_id,
+                positionId=position_id,
+            ),
+        )
+
+
 async def record(
     host: str,
     port: int,
@@ -747,8 +960,9 @@ async def record(
     - `recording` lets the caller keep what was seen if this raises: it is filled in place.
     - `status` is called as the run changes state: with a `STATUS_*` text, with
       `events_status()` when a burst of events is over, or with the text of a
-      `snapshot refused` marker. `STATUS_STOPPING` comes once, as the run starts to end,
-      however it ends.
+      `snapshot refused` marker. However the run ends, `STATUS_WRITING` comes once at the end
+      if anything was recorded; `STATUS_CLOSING_LISTS` comes before it only when the closing
+      lists are asked.
 
     The broker's name, from the trader asked for once on the first connection, is added to the
     recording's names; that response itself is not recorded.
@@ -787,62 +1001,18 @@ async def record(
             shape = f"returnProtectionOrders={str(flag).lower()}"
             recording.add("snapshot", f"{note}; {shape}", response, now())
 
-    async def closing(connection: CTraderConnection) -> None:
-        async def ask(key: str, request: Message) -> None:
-            try:
-                response = await send(connection, request, bucket=BUCKET_HISTORICAL)
-            except CTraderRequestError as e:
-                # One list refused says nothing about the next: note it and ask the rest.
-                note = f"closing list refused: {key} {e.error_code}"
-                recording.add("marker", note, None, now())
-                return
-            recording.closing[key].append(response)
-            # TODO(verify): that `hasMore` on these lists means what it says, and at how many
-            # rows; a session with more deals than one response holds shows it.
-            if response.hasMore:
-                # Further pages are not asked for; the marker says the list is incomplete.
-                recording.add("marker", f"closing list truncated: {key}", None, now())
-
-        # TODO(verify): the widest window these two requests accept; a refusal here is marked
-        # `closing list refused` with the venue's code.
-        window = {
-            "fromTimestamp": recording.started_wall_ms - _CLOSING_LOOKBACK_MS,
-            "toTimestamp": int(time.time() * 1000),
-        }
-        await ask("deals", oa.ProtoOADealListReq(ctidTraderAccountId=account_id, **window))
-        await ask("orders", oa.ProtoOAOrderListReq(ctidTraderAccountId=account_id, **window))
-        positions: set[int] = set()
-        for message in list(recording.messages()):
-            positions |= _position_ids(message)
-        # TODO(verify): that the by-position requests answer without a time window; a refusal
-        # is marked like any other.
-        for position_id in sorted(positions):
-            await ask(
-                "position_orders",
-                oa.ProtoOAOrderListByPositionIdReq(
-                    ctidTraderAccountId=account_id,
-                    positionId=position_id,
-                ),
-            )
-            await ask(
-                "position_deals",
-                oa.ProtoOADealListByPositionIdReq(
-                    ctidTraderAccountId=account_id,
-                    positionId=position_id,
-                ),
-            )
-
     def announce_deadline() -> None:
         if not stop.is_set():
             status(STATUS_DEADLINE)
 
-    stopping_announced = False
+    writing_announced = False
 
-    def announce_stopping() -> None:
-        nonlocal stopping_announced
-        if not stopping_announced:
-            stopping_announced = True
-            status(STATUS_STOPPING)
+    def announce_writing() -> None:
+        nonlocal writing_announced
+        # A run that recorded nothing has nothing to write.
+        if not writing_announced and any(True for _ in recording.messages()):
+            writing_announced = True
+            status(STATUS_WRITING)
 
     last_event: float | None = None
     # The types of the events the owner has not been told about yet.
@@ -863,127 +1033,107 @@ async def record(
 
     attempt = 0
     first = True
-    while not finished():
-        connection = CTraderConnection(
-            host,
-            port,
-            logger=record_fixtures._QuietLogger(),
-            tls=tls,
-            rate_limiter=RateLimiter(_RATE_LIMITS) if rate_limiter is None else rate_limiter,
-        )
-        lost = asyncio.Event()
-        last_event = None
-        # TODO(verify): that account authorisation alone gets execution events pushed, with no
-        # subscription request; a recording that holds an event confirms it.
-        connection.set_event_handler(on_event)
-        connection.set_disconnect_handler(lambda _error, lost=lost: lost.set())
-        try:
-            await connection.connect()
-            await send(
-                connection,
-                oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
+    try:
+        while not finished():
+            connection = CTraderConnection(
+                host,
+                port,
+                logger=record_fixtures._QuietLogger(),
+                tls=tls,
+                rate_limiter=RateLimiter(_RATE_LIMITS) if rate_limiter is None else rate_limiter,
             )
-            await send(
-                connection,
-                oa.ProtoOAAccountAuthReq(
-                    ctidTraderAccountId=account_id,
-                    accessToken=access_token,
-                ),
-            )
-            if first:
-                trader = await send(
+            lost = asyncio.Event()
+            last_event = None
+            # TODO(verify): that account authorisation alone gets execution events pushed, with no
+            # subscription request; a recording that holds an event confirms it.
+            connection.set_event_handler(on_event)
+            connection.set_disconnect_handler(lambda _error, lost=lost: lost.set())
+            try:
+                await connection.connect()
+                await send(
                     connection,
-                    oa.ProtoOATraderReq(ctidTraderAccountId=account_id),
+                    oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
                 )
-                recording.add_name(trader.trader.brokerName)
-            else:
-                recording.add("marker", "reconnected", None, now())
-            await snapshot(connection, "start" if first else "after reconnect")
-            status(STATUS_STARTED if first else STATUS_RECONNECTED)
-            first = False
-            attempt = 0
-
-            while not finished() and not lost.is_set():
-                drain_markers()
-                seen = last_event
-                if seen is not None and time.monotonic() - seen >= snapshot_debounce_secs:
-                    last_event = None
-                    announce_events()
-                    try:
-                        await snapshot(connection, "after events")
-                    except CTraderRequestError as e:
-                        # The events are recorded either way; only this view of the account
-                        # is missing.
-                        refused = f"snapshot refused: {e.error_code}"
-                        recording.add("marker", refused, None, now())
-                        status(refused)
-                await asyncio.sleep(tick_secs)
-
-            # A note typed during the last tick.
-            drain_markers()
-            if not lost.is_set():
-                announce_deadline()
-                announce_stopping()
-                try:
-                    await closing(connection)
-                except CTraderError as e:
-                    recording.add(
-                        "marker",
-                        f"closing requests failed: {type(e).__name__}",
-                        None,
-                        now(),
+                await send(
+                    connection,
+                    oa.ProtoOAAccountAuthReq(
+                        ctidTraderAccountId=account_id,
+                        accessToken=access_token,
+                    ),
+                )
+                if first:
+                    trader = await send(
+                        connection,
+                        oa.ProtoOATraderReq(ctidTraderAccountId=account_id),
                     )
-                return recording
-            recording.add("marker", "connection lost", None, now())
-        except CTraderRequestError:
-            # The venue answered, and refused: asking again on a new connection changes nothing.
-            announce_stopping()
-            raise
-        except (CTraderError, OSError) as e:
-            recording.add("marker", f"connection lost: {type(e).__name__}", None, now())
-        except BaseException:
-            # A cancellation, which Ctrl+C is, or a bug: told before the close, which can take
-            # a while.
-            announce_stopping()
-            raise
-        finally:
-            with contextlib.suppress(CTraderError, OSError):
-                await connection.close()
-        # Events the drop cut off from their snapshot are announced now, so the count after the
-        # reconnect holds only what came after it.
-        announce_events()
-        if finished():
-            break
-        status(STATUS_LOST)
-        wait = reconnect_waits[min(attempt, len(reconnect_waits) - 1)]
-        try:
+                    recording.add_name(trader.trader.brokerName)
+                else:
+                    recording.add("marker", "reconnected", None, now())
+                await snapshot(connection, "start" if first else "after reconnect")
+                status(STATUS_STARTED if first else STATUS_RECONNECTED)
+                first = False
+                attempt = 0
+
+                while not finished() and not lost.is_set():
+                    drain_markers()
+                    seen = last_event
+                    if seen is not None and time.monotonic() - seen >= snapshot_debounce_secs:
+                        last_event = None
+                        announce_events()
+                        try:
+                            await snapshot(connection, "after events")
+                        except CTraderRequestError as e:
+                            # The events are recorded either way; only this view of the account
+                            # is missing.
+                            refused = f"snapshot refused: {e.error_code}"
+                            recording.add("marker", refused, None, now())
+                            status(refused)
+                    await asyncio.sleep(tick_secs)
+
+                # A note typed during the last tick.
+                drain_markers()
+                if not lost.is_set():
+                    announce_deadline()
+                    status(STATUS_CLOSING_LISTS)
+                    await _ask_closing_lists(connection, recording, account_id, now)
+                    announce_writing()
+                    return recording
+                recording.add("marker", "connection lost", None, now())
+            except CTraderRequestError:
+                # The venue answered, and refused: asking again on a new connection changes nothing.
+                announce_writing()
+                raise
+            except (CTraderError, OSError) as e:
+                recording.add("marker", f"connection lost: {type(e).__name__}", None, now())
+            except BaseException:
+                # A cancellation (the first Ctrl+C) or a bug: told before the close, which can
+                # take a while.
+                announce_writing()
+                raise
+            finally:
+                with contextlib.suppress(CTraderError, OSError):
+                    await connection.close()
+            # Events the drop cut off from their snapshot are announced now, so the count after the
+            # reconnect holds only what came after it.
+            announce_events()
+            if finished():
+                break
+            status(STATUS_LOST)
             # Not a plain sleep: a stop typed during the wait takes effect at once.
             with contextlib.suppress(TimeoutError):
+                wait = reconnect_waits[min(attempt, len(reconnect_waits) - 1)]
                 await asyncio.wait_for(stop.wait(), wait)
-        except BaseException:
-            announce_stopping()
-            raise
-        attempt += 1
+            attempt += 1
+    except BaseException:
+        # Whatever ends the run outside a connection: a cancellation during a reconnect
+        # wait, or during the close of a lost connection.
+        announce_writing()
+        raise
     drain_markers()
     announce_deadline()
-    announce_stopping()
+    announce_writing()
     recording.add("marker", "closing requests skipped: not connected", None, now())
     return recording
-
-
-@contextlib.contextmanager
-def _sigint_ignored():
-    """Ignore Ctrl+C inside: a second one while the files are written would lose them both."""
-    # Only the main thread may set a handler, and only it receives the signal.
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    try:
-        yield
-    finally:
-        # `None` is a handler not set from Python, which cannot be set back.
-        signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
 
 
 def raw_path(output: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
@@ -1000,6 +1150,43 @@ class Outcome:
     raw: pathlib.Path | None = None
     fixture: bool = False
     run_error: BaseException | None = None
+    # A journal left on disk, which the next run with the same output finishes.
+    journal: pathlib.Path | None = None
+
+
+def _write_recording(
+    recording: Recording,
+    output: pathlib.Path,
+    raw_dir: pathlib.Path,
+    outcome: Outcome,
+    *,
+    account_id: int,
+    login: int | None,
+    secrets: Iterable[str],
+) -> None:
+    """The raw file, then the fixture, as `record_to_file()` describes; nothing if no message."""
+    if not any(True for _ in recording.messages()):
+        return
+    outcome.recording = recording
+    raw = raw_path(output, raw_dir)
+    raw_failure: Exception | None = None
+    try:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        _write_atomically(raw, encode_raw(recording, account_id=account_id, login=login))
+        outcome.raw = raw
+    except Exception as e:
+        # The fixture is still worth having without its unscrubbed copy.
+        raw_failure = e
+    write_fixture(output, recording, account_id=account_id, login=login, secrets=secrets)
+    outcome.fixture = True
+    if raw_failure is not None:
+        raise raw_failure
+
+
+def _journal_done(recording: Recording, outcome: Outcome) -> bool:
+    """Whether a journal of `recording` holds nothing that is not kept elsewhere by now."""
+    # The raw file holds all the journal does, and the closing lists too.
+    return outcome.raw is not None or not any(True for _ in recording.messages())
 
 
 async def record_to_file(
@@ -1019,6 +1206,9 @@ async def record_to_file(
 
     The owner's manual trades cannot be repeated on demand, so:
 
+    - while the run goes on, each entry is appended to a `Journal` at
+      `journal_path(output, raw_dir)`: if the process ends before anything below can happen,
+      the next run with the same output finishes the recording from it (`finish()`);
     - the recording is first written as it was seen to `raw_path(output, raw_dir)`, with no
       scrubbing and no check in the way. That file holds real identifiers: `raw_dir` must be a
       directory git ignores;
@@ -1027,37 +1217,40 @@ async def record_to_file(
       the run's own error if it had one; `rescrub()` builds the fixture from the raw file later;
     - a run that failed or was interrupted is kept the same way, and its error is re-raised;
     - a run that recorded no message at all writes nothing: there is nothing to keep, and a
-      file would only stand in the way of the next run.
+      file would only stand in the way of the next run;
+    - the journal is removed once the raw file is written, or if there was nothing to keep.
 
-    Each file is replaced in one step, so a failed write never damages an earlier one, and
-    Ctrl+C is ignored while they are written.
+    Each file is replaced in one step, so a failed write never damages an earlier one.
     """
     recording = Recording(int(time.time() * 1000))
     for name in names:
         recording.add_name(name)
     outcome = Outcome() if outcome is None else outcome
+    journal = Journal(
+        journal_path(output, raw_dir),
+        account_id=account_id,
+        login=login,
+        status=kwargs.get("status", _silent),
+    )
+    recording.journal = journal
 
     def keep() -> None:
-        with _sigint_ignored():
-            write_both()
-
-    def write_both() -> None:
-        if not any(True for _ in recording.messages()):
-            return
-        outcome.recording = recording
-        raw = raw_path(output, raw_dir)
-        raw_failure: Exception | None = None
+        journal.close()
         try:
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            _write_atomically(raw, encode_raw(recording, account_id=account_id, login=login))
-            outcome.raw = raw
-        except Exception as e:
-            # The fixture is still worth having without its unscrubbed copy.
-            raw_failure = e
-        write_fixture(output, recording, account_id=account_id, login=login, secrets=secrets)
-        outcome.fixture = True
-        if raw_failure is not None:
-            raise raw_failure
+            _write_recording(
+                recording,
+                output,
+                raw_dir,
+                outcome,
+                account_id=account_id,
+                login=login,
+                secrets=secrets,
+            )
+        finally:
+            if _journal_done(recording, outcome):
+                journal.remove()
+            elif journal.created:
+                outcome.journal = journal.path
 
     try:
         await record(account_id=account_id, recording=recording, **kwargs)
@@ -1071,6 +1264,95 @@ async def record_to_file(
             raise unkept from e
         raise
     keep()
+
+
+async def finish(
+    journal_file: pathlib.Path,
+    recording: Recording,
+    output: pathlib.Path,
+    *,
+    host: str,
+    port: int,
+    tls: bool,
+    client_id: str,
+    client_secret: str,
+    access_token: str,
+    account_id: int,
+    login: int | None,
+    secrets: Iterable[str],
+    raw_dir: pathlib.Path = _RAW_DIR,
+    outcome: Outcome | None = None,
+    rate_limiter: RateLimiter | None = None,
+) -> None:
+    """Finish a recording an abrupt end left in `journal_file`, read as `recording`.
+
+    Asks the closing lists, as a run's own end would have, for the window from the recording's
+    start and for the positions it saw; then writes the raw file and the fixture as
+    `record_to_file()` does, and removes the journal once the raw file is written. If anything
+    on the way fails, the journal is left as it was and the error is raised.
+    """
+    outcome = Outcome() if outcome is None else outcome
+    outcome.journal = journal_file
+    last = recording.timeline[-1].t if recording.timeline else 0.0
+    connection = CTraderConnection(
+        host,
+        port,
+        logger=record_fixtures._QuietLogger(),
+        tls=tls,
+        rate_limiter=RateLimiter(_RATE_LIMITS) if rate_limiter is None else rate_limiter,
+    )
+    await connection.connect()
+    try:
+        await send(
+            connection,
+            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
+        )
+        await send(
+            connection,
+            oa.ProtoOAAccountAuthReq(ctidTraderAccountId=account_id, accessToken=access_token),
+        )
+        recording.add("marker", JOURNAL_FINISHED, None, last)
+        await _ask_closing_lists(connection, recording, account_id, lambda: last)
+    finally:
+        with contextlib.suppress(CTraderError, OSError):
+            await connection.close()
+    _write_finished(
+        journal_file,
+        recording,
+        output,
+        raw_dir,
+        outcome,
+        account_id=account_id,
+        login=login,
+        secrets=secrets,
+    )
+
+
+def _write_finished(
+    journal_file: pathlib.Path,
+    recording: Recording,
+    output: pathlib.Path,
+    raw_dir: pathlib.Path,
+    outcome: Outcome,
+    *,
+    account_id: int,
+    login: int | None,
+    secrets: Iterable[str],
+) -> None:
+    try:
+        _write_recording(
+            recording,
+            output,
+            raw_dir,
+            outcome,
+            account_id=account_id,
+            login=login,
+            secrets=secrets,
+        )
+    finally:
+        if _journal_done(recording, outcome):
+            journal_file.unlink(missing_ok=True)
+            outcome.journal = None
 
 
 def rescrub(
@@ -1255,6 +1537,50 @@ async def _run(args: argparse.Namespace, env: dict[str, str], outcome: Outcome) 
     )
 
 
+class OtherAccount(Refused):
+    """A journal found for the output belongs to an account other than the one asked for."""
+
+
+async def _finish_run(
+    args: argparse.Namespace,
+    env: dict[str, str],
+    outcome: Outcome,
+    journal_file: pathlib.Path,
+    journaled: tuple[Recording, int, int | None],
+) -> None:
+    """Finish the recording `journal_file` holds, read as `journaled` by `read_journal()`."""
+    client_id, client_secret, access_token = _credentials(env)
+    recording, account_id, login = journaled
+    if login != args.trader_login:
+        raise OtherAccount(JOURNAL_OTHER_ACCOUNT)
+    print("Connecting...")
+    host, granted_id, broker_title = await _resolve_account(
+        login,
+        client_id,
+        client_secret,
+        access_token,
+    )
+    if granted_id != account_id:
+        raise OtherAccount(JOURNAL_OTHER_ACCOUNT)
+    recording.add_name(broker_title)
+    await finish(
+        journal_file,
+        recording,
+        args.output,
+        host=host,
+        port=PROTOBUF_PORT,
+        tls=True,
+        client_id=client_id,
+        client_secret=client_secret,
+        access_token=access_token,
+        account_id=account_id,
+        login=login,
+        secrets=_secrets(env),
+        raw_dir=args.raw_dir,
+        outcome=outcome,
+    )
+
+
 def _failure(error: BaseException) -> str:
     """The error's type and, for a venue refusal, the venue's error code.
 
@@ -1269,10 +1595,11 @@ def _outcome_lines(outcome: Outcome, output: pathlib.Path, *, rescrub: bool = Fa
 
     `rescrub` leaves the unscrubbed copy out: that mode reads it and never writes it.
     """
+    kept = [f"{JOURNAL_KEPT}: {outcome.journal}"] if outcome.journal is not None else []
     if outcome.recording is None:
         if rescrub:
             return ["The fixture was NOT written."]
-        return ["Nothing was recorded, and nothing was written."]
+        return kept or ["Nothing was recorded, and nothing was written."]
     if outcome.fixture:
         lines = [f"Recording written to {output}"]
     else:
@@ -1283,7 +1610,7 @@ def _outcome_lines(outcome: Outcome, output: pathlib.Path, *, rescrub: bool = Fa
         lines.append(f"Unscrubbed copy, never to be committed: {outcome.raw}")
         if not outcome.fixture:
             lines.append(f"Rebuild the fixture from it with: --rescrub {outcome.raw}")
-    return [*lines, *summary(outcome.recording)]
+    return [*lines, *kept, *summary(outcome.recording)]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1340,13 +1667,24 @@ def main(argv: list[str] | None = None) -> int:
         # key or on a file that cannot be written.
         env = get_tokens.load_env(args.env_file)
         _credentials(env)
+        journal = journal_path(args.output, args.raw_dir)
+        # An interrupted session comes first, whatever was asked: a new one is a separate run.
+        finishing = args.rescrub is None and journal.exists()
+        if finishing:
+            outcome.journal = journal
+            print(f"{JOURNAL_FOUND}: {journal}")
+            print(JOURNAL_DISCARD_HINT)
         _check_target(args.output, overwrite=args.overwrite)
         if args.rescrub is not None:
             rescrub(args.rescrub, args.output, _secrets(env), outcome)
         else:
             raw = raw_path(args.output, args.raw_dir)
             _check_target(raw, overwrite=args.overwrite, create_dir=True)
-            asyncio.run(_run(args, env, outcome))
+            if finishing:
+                journaled = read_journal(journal.read_bytes())
+                asyncio.run(_finish_run(args, env, outcome, journal, journaled))
+            else:
+                asyncio.run(_run(args, env, outcome))
     except KeyboardInterrupt:
         # Stopped by hand. Whether anything was written depends on when: the lines below say.
         code = 130

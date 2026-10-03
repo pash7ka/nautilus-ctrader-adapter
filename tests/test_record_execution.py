@@ -17,10 +17,8 @@ import io
 import json
 import os
 import pathlib
-import signal
 import subprocess
 import sys
-import threading
 
 import pytest
 from google.protobuf.descriptor import FieldDescriptor
@@ -748,6 +746,11 @@ def test_a_raw_recording_is_ignored_by_git_wherever_it_is_put() -> None:
     assert "tests/recordings/" in ignored
     assert r.raw_path(pathlib.Path("a/b/session.json"), r._RAW_DIR).name == "session.raw.json"
     assert "*.raw.json" in ignored
+    # And the journal a recording is appended to as it is made.
+    assert r.journal_path(pathlib.Path("a/b/session.json"), r._RAW_DIR).name == (
+        "session.raw.jsonl"
+    )
+    assert "*.raw.jsonl" in ignored
 
 
 def fields_of(descriptor, seen: set[str]):
@@ -918,6 +921,10 @@ async def to_file(output: pathlib.Path, **kwargs) -> None:
 
 def raw_of(output: pathlib.Path) -> pathlib.Path:
     return r.raw_path(output, output.parent / "raw")
+
+
+def journal_of(output: pathlib.Path) -> pathlib.Path:
+    return r.journal_path(output, output.parent / "raw")
 
 
 def refusal(code: str):
@@ -1115,7 +1122,12 @@ async def test_the_deadline_ends_the_run_and_is_announced() -> None:
     finally:
         await server.stop()
 
-    assert statuses == [r.STATUS_STARTED, r.STATUS_DEADLINE, r.STATUS_STOPPING]
+    assert statuses == [
+        r.STATUS_STARTED,
+        r.STATUS_DEADLINE,
+        r.STATUS_CLOSING_LISTS,
+        r.STATUS_WRITING,
+    ]
     assert len(recording.closing["deals"]) == 1
 
 
@@ -1158,7 +1170,8 @@ async def test_events_before_a_drop_are_announced_at_the_drop() -> None:
         r.STATUS_LOST,
         r.STATUS_RECONNECTED,
         one,
-        r.STATUS_STOPPING,
+        r.STATUS_CLOSING_LISTS,
+        r.STATUS_WRITING,
     ]
 
 
@@ -1181,13 +1194,14 @@ async def test_a_refusal_before_anything_is_recorded_ends_the_run_and_writes_not
     await server.start()
     output = tmp_path / "recording.json"
     outcome = r.Outcome()
+    statuses: list[str] = []
     try:
         with pytest.raises(CTraderRequestError) as raised:
             await asyncio.wait_for(
                 to_file(
                     output,
                     outcome=outcome,
-                    **settings(server, asyncio.Event(), asyncio.Queue()),
+                    **settings(server, asyncio.Event(), asyncio.Queue(), status=statuses.append),
                 ),
                 2,
             )
@@ -1195,6 +1209,8 @@ async def test_a_refusal_before_anything_is_recorded_ends_the_run_and_writes_not
         await server.stop()
 
     assert raised.value.error_code == "INVALID_REQUEST"
+    # Nothing to write, so the owner is not told that something is being written.
+    assert statuses == []
     # Asked once: a refusal is not retried the way a lost connection is.
     assert server.connection_count == 1
     # A file holding nothing but the failure would only stand in the way of the next run.
@@ -1289,7 +1305,7 @@ async def test_a_refusal_after_a_reconnect_ends_the_run_too(refused) -> None:
         task.cancel()
         await server.stop()
 
-    assert statuses == [r.STATUS_STARTED, r.STATUS_LOST, r.STATUS_STOPPING]
+    assert statuses == [r.STATUS_STARTED, r.STATUS_LOST, r.STATUS_WRITING]
     assert server.connection_count == 2
 
 
@@ -1342,7 +1358,8 @@ async def test_a_stop_takes_effect_during_a_reconnect_wait() -> None:
         await server.stop()
 
     assert marker_notes(recording)[-1] == "closing requests skipped: not connected"
-    assert statuses[-1] == r.STATUS_STOPPING
+    assert statuses[-1] == r.STATUS_WRITING
+    assert r.STATUS_CLOSING_LISTS not in statuses
 
 
 async def test_the_owner_is_told_at_once_that_the_run_is_stopping() -> None:
@@ -1355,9 +1372,8 @@ async def test_the_owner_is_told_at_once_that_the_run_is_stopping() -> None:
 
     def status(text: str) -> None:
         statuses.append(text)
-        if text == r.STATUS_STOPPING:
-            asked = [m for m in server.received if isinstance(m, oa.ProtoOADealListReq)]
-            lists_asked_when_told.append(len(asked))
+        asked = [m for m in server.received if isinstance(m, oa.ProtoOADealListReq)]
+        lists_asked_when_told.append(len(asked))
 
     task = asyncio.create_task(run(server, stop, markers, status=status))
     try:
@@ -1368,8 +1384,8 @@ async def test_the_owner_is_told_at_once_that_the_run_is_stopping() -> None:
         task.cancel()
         await server.stop()
 
-    assert statuses == [r.STATUS_STARTED, r.STATUS_STOPPING]
-    assert lists_asked_when_told == [0]
+    assert statuses == [r.STATUS_STARTED, r.STATUS_CLOSING_LISTS, r.STATUS_WRITING]
+    assert lists_asked_when_told == [0, 0, 1]
 
 
 @pytest.mark.parametrize("dropped", [False, True], ids=["connected", "waiting to reconnect"])
@@ -1398,28 +1414,78 @@ async def test_an_interrupted_run_says_once_that_it_is_stopping(dropped) -> None
         task.cancel()
         await server.stop()
 
-    assert statuses[-1] == r.STATUS_STOPPING
-    assert statuses.count(r.STATUS_STOPPING) == 1
+    # No closing list is asked after a cancellation, so none is announced.
+    assert statuses[-1] == r.STATUS_WRITING
+    assert statuses.count(r.STATUS_WRITING) == 1
+    assert r.STATUS_CLOSING_LISTS not in statuses
 
 
-async def test_a_closing_list_that_gets_no_answer_is_marked(monkeypatch) -> None:
+def silent_on(server: FakeCTraderServer, payload_type: int) -> None:
+    server.on(payload_type, lambda _request: None)
+
+
+@pytest.mark.parametrize(
+    ("silent", "expected", "asked"),
+    [
+        (
+            om.PROTO_OA_DEAL_LIST_REQ,
+            [
+                "closing list failed: deals CTraderTimeoutError",
+                "closing list skipped: orders",
+                "closing list skipped: position_orders",
+                "closing list skipped: position_deals",
+            ],
+            {oa.ProtoOADealListReq},
+        ),
+        (
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            [
+                "closing list failed: position_orders CTraderTimeoutError",
+                "closing list skipped: position_deals",
+            ],
+            {oa.ProtoOADealListReq, oa.ProtoOAOrderListReq, oa.ProtoOAOrderListByPositionIdReq},
+        ),
+    ],
+    ids=["the deals", "a position's orders"],
+)
+async def test_a_closing_list_that_gets_no_answer_ends_them_and_names_each_one_left(
+    monkeypatch,
+    silent,
+    expected,
+    asked,
+) -> None:
+    """The connection is not to be trusted after that, but no list goes missing unsaid."""
     server = venue()
-    server.on(om.PROTO_OA_DEAL_LIST_REQ, lambda _request: None)
+    silent_on(server, silent)
     monkeypatch.setattr(r, "_REQUEST_TIMEOUT_SECS", 0.5)
     await server.start()
     stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
     recording = r.Recording(started_wall_ms=1_790_000_000_000)
-    task = asyncio.create_task(run(server, stop, markers, recording=recording))
+    task = asyncio.create_task(
+        run(server, stop, markers, recording=recording, status=statuses.append),
+    )
     try:
-        await wait_until(lambda: len(recording.timeline) >= 2)
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        # One position, so there are lists to ask about it.
+        await server.push(execution_event())
+        await wait_until(lambda: len(statuses) >= 2)
         stop.set()
         await asyncio.wait_for(task, 10)
     finally:
         task.cancel()
         await server.stop()
 
-    assert marker_notes(recording) == ["closing requests failed: CTraderTimeoutError"]
-    assert recording.closing["deals"] == []
+    assert marker_notes(recording) == expected
+    lists = (
+        oa.ProtoOADealListReq,
+        oa.ProtoOAOrderListReq,
+        oa.ProtoOAOrderListByPositionIdReq,
+        oa.ProtoOADealListByPositionIdReq,
+    )
+    assert {type(m) for m in server.received if isinstance(m, lists)} == asked
+    # Each missing list is one line of what the owner reads.
+    assert r.summary(recording)[:-1] == expected
 
 
 async def test_the_trader_is_asked_once_for_the_broker_s_name_and_not_recorded() -> None:
@@ -1725,80 +1791,16 @@ async def test_a_write_that_fails_midway_leaves_the_earlier_files_whole(
 
     assert output.read_bytes() == b"an earlier fixture"
     assert raw_of(output).read_bytes() == b"an earlier raw recording"
+    # Nothing is left of the temporary files; the journal stays, since nothing else holds it.
     assert sorted(path.name for path in tmp_path.rglob("*") if path.is_file()) == [
         "recording.json",
         "recording.raw.json",
+        "recording.raw.jsonl",
     ]
     # Something was recorded, and the report must not say otherwise.
     assert outcome.recording is not None
     assert (outcome.raw, outcome.fixture) == (None, False)
-
-
-def interrupting_write(handlers: list[object]):
-    """`_write_atomically` as a Ctrl+C during it would leave it, unless the signal is ignored."""
-    real = r._write_atomically
-
-    def write(path: pathlib.Path, data: bytes) -> None:
-        handler = signal.getsignal(signal.SIGINT)
-        handlers.append(handler)
-        if handler is not signal.SIG_IGN:
-            raise KeyboardInterrupt
-        real(path, data)
-
-    return write
-
-
-async def test_a_ctrl_c_while_the_files_are_written_does_not_lose_them(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(r, "record", recorded(("event", "", execution_event(), 1.0)))
-    handlers: list[object] = []
-    monkeypatch.setattr(r, "_write_atomically", interrupting_write(handlers))
-    output = tmp_path / "recording.json"
-    before = signal.getsignal(signal.SIGINT)
-
-    await to_file(output, account_id=ACCOUNT_ID)
-
-    assert handlers == [signal.SIG_IGN, signal.SIG_IGN]
-    assert output.exists() and raw_of(output).exists()
-    assert signal.getsignal(signal.SIGINT) is before
-
-
-async def test_ctrl_c_is_restored_when_the_fixture_is_refused(tmp_path, monkeypatch) -> None:
-    note = "pasted the access-token by mistake"
-    monkeypatch.setattr(
-        r,
-        "record",
-        recorded(("event", "", execution_event(), 1.0), ("marker", note, None, 2.0)),
-    )
-    before = signal.getsignal(signal.SIGINT)
-
-    with pytest.raises(r.record_fixtures.ScrubError):
-        await to_file(tmp_path / "recording.json", account_id=ACCOUNT_ID, secrets=("access-token",))
-
-    assert signal.getsignal(signal.SIGINT) is before
-
-
-def test_the_files_are_written_off_the_main_thread_too(tmp_path, monkeypatch) -> None:
-    """Only the main thread may set a signal handler; elsewhere the files are written as is."""
-    monkeypatch.setattr(r, "record", recorded(("event", "", execution_event(), 1.0)))
-    output = tmp_path / "recording.json"
-    errors: list[BaseException] = []
-
-    def work() -> None:
-        try:
-            asyncio.run(to_file(output, account_id=ACCOUNT_ID))
-        except BaseException as e:
-            errors.append(e)
-
-    thread = threading.Thread(target=work)
-    thread.start()
-    thread.join(timeout=60)
-
-    assert not thread.is_alive()
-    assert errors == []
-    assert output.exists() and raw_of(output).exists()
+    assert outcome.journal == journal_of(output)
 
 
 async def test_the_broker_s_names_are_scrubbed_and_kept_for_a_rescrub(tmp_path, capsys) -> None:
@@ -1838,6 +1840,300 @@ async def test_the_broker_s_names_are_scrubbed_and_kept_for_a_rescrub(tmp_path, 
     assert (tmp_path / "rebuilt.json").read_bytes() == output.read_bytes()
     printed = "\n".join(statuses) + "".join(capsys.readouterr())
     assert "example" not in printed.lower()
+
+
+def journal_file(tmp_path, *notes: str, stem: str = "recording") -> pathlib.Path:
+    """A journal as a run leaves it: an event, the typed `notes`, and the broker's name."""
+    path = tmp_path / "raw" / f"{stem}.raw.jsonl"
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    recording.add_name(BROKER_NAME)
+    recording.journal = r.Journal(path, account_id=ACCOUNT_ID, login=LOGIN, status=_unexpected)
+    recording.add("event", "", execution_event(), 1.0)
+    for note in notes:
+        recording.add("marker", note, None, 2.0, typed=True)
+    recording.journal.close()
+    return path
+
+
+def _unexpected(text: str) -> None:
+    raise AssertionError(f"unexpected status: {text}")
+
+
+def test_a_journal_reads_back_as_the_recording_it_was_written_from(tmp_path) -> None:
+    path = journal_file(tmp_path, "moved the stop")
+
+    recording, account_id, login = r.read_journal(path.read_bytes())
+
+    assert (account_id, login) == (ACCOUNT_ID, LOGIN)
+    assert recording.started_wall_ms == 1_790_000_000_000
+    assert recording.names == [BROKER_NAME]
+    assert [(e.kind, e.note, e.typed) for e in recording.timeline] == [
+        ("event", "", False),
+        ("marker", "moved the stop", True),
+    ]
+    # Unscrubbed, like the raw file.
+    assert recording.timeline[0].message.position.positionId == POSITION_ID
+
+
+def test_a_name_learned_after_the_journal_began_is_journalled_too(tmp_path) -> None:
+    path = tmp_path / "raw" / "recording.raw.jsonl"
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    recording.journal = r.Journal(path, account_id=ACCOUNT_ID, login=LOGIN, status=_unexpected)
+    recording.add("event", "", execution_event(), 1.0)
+    recording.add_name(BROKER_NAME)
+    recording.journal.close()
+
+    assert r.read_journal(path.read_bytes())[0].names == [BROKER_NAME]
+
+
+def test_a_partly_written_last_line_is_dropped_and_marked(tmp_path) -> None:
+    path = journal_file(tmp_path, "moved the stop")
+    whole = path.read_bytes()
+    path.write_bytes(whole + b'{"t": 3.0, "kind": "marker", "no')
+
+    recording, _, _ = r.read_journal(path.read_bytes())
+
+    assert [e.note for e in recording.timeline] == ["", "moved the stop", r.JOURNAL_TORN]
+    assert not recording.timeline[-1].typed
+    assert r.JOURNAL_TORN in r.summary(recording)
+
+
+def test_a_partly_written_line_before_the_last_is_not_a_torn_end(tmp_path) -> None:
+    path = journal_file(tmp_path)
+    header, event = path.read_bytes().split(b"\n")[:2]
+    path.write_bytes(header + b"\n" + event[:10] + b"\n" + event + b"\n")
+
+    with pytest.raises(ValueError):
+        r.read_journal(path.read_bytes())
+
+
+def test_a_run_that_records_nothing_leaves_no_journal(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(r, "record", recorded())
+    output = tmp_path / "recording.json"
+
+    asyncio.run(to_file(output, account_id=ACCOUNT_ID))
+
+    assert not journal_of(output).exists()
+
+
+async def test_a_journal_that_cannot_be_written_is_told_once_and_the_run_goes_on(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        r,
+        "record",
+        recorded(("event", "", execution_event(), 1.0), ("marker", "moved", None, 2.0)),
+    )
+    output = tmp_path / "recording.json"
+    # A journal from an earlier session is never written over.
+    journal_of(output).parent.mkdir()
+    journal_of(output).write_bytes(b"an earlier journal")
+    statuses: list[str] = []
+    outcome = r.Outcome()
+
+    await to_file(output, account_id=ACCOUNT_ID, outcome=outcome, status=statuses.append)
+
+    assert statuses == [r.STATUS_JOURNAL_FAILED]
+    assert outcome.fixture and output.exists()
+    # Not this run's journal, so not this run's to remove.
+    assert journal_of(output).read_bytes() == b"an earlier journal"
+
+
+def finishing_settings(server: FakeCTraderServer, output: pathlib.Path) -> dict:
+    return {
+        "host": server.host,
+        "port": server.port,
+        "tls": False,
+        "client_id": "client-id",
+        "client_secret": "client-secret",
+        "access_token": "access-token",
+        "secrets": ("client-secret", "access-token"),
+        "raw_dir": output.parent / "raw",
+        "rate_limiter": FAST,
+    }
+
+
+async def test_an_abrupt_end_leaves_a_journal_that_the_next_run_finishes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The process ending before it can write is played by a cancellation with no writing."""
+    dying = [True]
+    real_write = r._write_recording
+
+    def write(*args, **kwargs) -> None:
+        if not dying[0]:
+            real_write(*args, **kwargs)
+
+    monkeypatch.setattr(r, "_write_recording", write)
+    server = venue()
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    output = tmp_path / "recording.json"
+    task = asyncio.create_task(
+        to_file(
+            output,
+            names=(BROKER_TITLE,),
+            **settings(server, stop, markers, status=statuses.append),
+        ),
+    )
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        markers.put_nowait("bought by hand")
+        await server.push(execution_event())
+        await wait_until(lambda: len(statuses) >= 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        cut = len(server.received)
+
+        # What the abrupt end left: the journal, and nothing else.
+        journal = journal_of(output)
+        assert not output.exists() and not raw_of(output).exists()
+        recording, account_id, login = r.read_journal(journal.read_bytes())
+        kinds = [entry.kind for entry in recording.timeline]
+        assert kinds.count("event") == 1 and kinds.count("snapshot") >= 2
+        assert "bought by hand" in [entry.note for entry in recording.timeline]
+        assert recording.names == [BROKER_TITLE, BROKER_NAME]
+        assert oa.ProtoOADealListReq not in {type(m) for m in server.received}
+
+        # The next run.
+        dying[0] = False
+        outcome = r.Outcome()
+        await r.finish(
+            journal,
+            recording,
+            output,
+            account_id=account_id,
+            login=login,
+            outcome=outcome,
+            **finishing_settings(server, output),
+        )
+    finally:
+        task.cancel()
+        await server.stop()
+
+    asked = [type(m) for m in server.received[cut:]]
+    assert oa.ProtoOADealListReq in asked and oa.ProtoOAOrderListByPositionIdReq in asked
+    assert set(asked) <= r.READ_ONLY_REQUESTS
+    assert not journal.exists() and outcome.journal is None
+    assert output.exists() and raw_of(output).exists()
+    timeline = r.decode_recording(output.read_bytes())["timeline"]
+    notes = [item["note"] for item in timeline if item["kind"] == "marker"]
+    assert r.JOURNAL_FINISHED in notes and "bought by hand" in notes
+    assert len(r.decode_recording(output.read_bytes())["closing"]["deals"]) == 1
+    assert r.JOURNAL_FINISHED in r.summary(outcome.recording)
+
+
+async def test_finishing_that_fails_keeps_the_journal(tmp_path) -> None:
+    server = venue()
+    server.on(om.PROTO_OA_ACCOUNT_AUTH_REQ, refusal("CH_ACCESS_TOKEN_INVALID"))
+    await server.start()
+    output = tmp_path / "recording.json"
+    journal = journal_file(tmp_path, "moved the stop")
+    before = journal.read_bytes()
+    recording, account_id, login = r.read_journal(before)
+    outcome = r.Outcome()
+    try:
+        with pytest.raises(CTraderRequestError):
+            await r.finish(
+                journal,
+                recording,
+                output,
+                account_id=account_id,
+                login=login,
+                outcome=outcome,
+                **finishing_settings(server, output),
+            )
+    finally:
+        await server.stop()
+
+    assert journal.read_bytes() == before
+    assert not output.exists() and not raw_of(output).exists()
+    assert r._outcome_lines(outcome, output) == [f"{r.JOURNAL_KEPT}: {journal}"]
+
+
+def journal_run(tmp_path, monkeypatch, finish_run, *extra: str) -> int:
+    """`main` in recording mode with a journal present; a new session must not start."""
+
+    async def new_session(*_args) -> None:
+        raise AssertionError("a new session started while a journal was waiting")
+
+    monkeypatch.setattr(r, "_finish_run", finish_run)
+    return main_run(tmp_path, monkeypatch, new_session, *extra)
+
+
+def finishing_into(seen: list[tuple]):
+    async def finish_run(args, _env, outcome, journal, journaled) -> None:
+        seen.append((journal, journaled[1], journaled[2]))
+        outcome.recording = journaled[0]
+        outcome.fixture = True
+
+    return finish_run
+
+
+def test_a_journal_found_is_finished_before_anything_else(tmp_path, monkeypatch, capsys) -> None:
+    journal = journal_file(tmp_path, "moved the stop")
+    seen: list[tuple] = []
+
+    assert journal_run(tmp_path, monkeypatch, finishing_into(seen)) == 0
+
+    assert seen == [(journal, ACCOUNT_ID, LOGIN)]
+    out = capsys.readouterr().out.splitlines()
+    assert out[:2] == [f"{r.JOURNAL_FOUND}: {journal}", r.JOURNAL_DISCARD_HINT]
+    # Nothing of the journal's content is printed.
+    assert not any("moved the stop" in line or "Example" in line for line in out)
+
+
+def test_overwrite_does_not_discard_a_journal(tmp_path, monkeypatch, capsys) -> None:
+    journal = journal_file(tmp_path, "moved the stop")
+    before = journal.read_bytes()
+    (tmp_path / "recording.json").write_bytes(b"an earlier fixture")
+    seen: list[tuple] = []
+
+    # The files it would replace are guarded as ever.
+    assert journal_run(tmp_path, monkeypatch, finishing_into(seen)) == 1
+    assert seen == []
+    assert journal.read_bytes() == before
+    assert f"{r.JOURNAL_KEPT}: {journal}" in capsys.readouterr().out.splitlines()
+
+    # Allowed to replace them, it still finishes the journal rather than discard it.
+    assert journal_run(tmp_path, monkeypatch, finishing_into(seen), "--overwrite") == 0
+    assert seen == [(journal, ACCOUNT_ID, LOGIN)]
+    assert journal.read_bytes() == before
+
+
+def test_a_journal_of_another_trader_login_is_refused(tmp_path, monkeypatch, capsys) -> None:
+    journal = journal_file(tmp_path)
+    before = journal.read_bytes()
+
+    async def never(*_args):
+        raise AssertionError("no account is resolved for a journal of another login")
+
+    monkeypatch.setattr(r, "_resolve_account", never)
+    code = main_run(tmp_path, monkeypatch, never, "--trader-login", str(LOGIN + 1))
+
+    assert code == 1
+    assert journal.read_bytes() == before
+    captured = capsys.readouterr()
+    assert captured.err == f"error: {r.JOURNAL_OTHER_ACCOUNT}\n"
+    assert str(LOGIN) not in captured.out + captured.err
+
+
+def test_a_finishing_that_fails_says_the_journal_is_kept(tmp_path, monkeypatch, capsys) -> None:
+    journal = journal_file(tmp_path)
+
+    async def refused(*_args) -> None:
+        raise CTraderRequestError("CH_ACCESS_TOKEN_INVALID", f"account {ACCOUNT_ID}")
+
+    assert journal_run(tmp_path, monkeypatch, refused) == 1
+
+    captured = capsys.readouterr()
+    assert captured.err == "error: CTraderRequestError CH_ACCESS_TOKEN_INVALID\n"
+    assert captured.out.splitlines()[-1] == f"{r.JOURNAL_KEPT}: {journal}"
+    assert journal.exists()
 
 
 def env_file(tmp_path, *, without: str = "") -> pathlib.Path:
@@ -1935,6 +2231,8 @@ def test_describe_prints_a_character_the_terminal_cannot_show_as_an_escape(
 
 def raw_file(tmp_path, *notes: str) -> pathlib.Path:
     recording = recording_of(execution_event(label="my robot"))
+    # A raw file holds the broker's names: nothing that reads one may print them.
+    recording.add_name(BROKER_NAME)
     for note in notes:
         recording.add("marker", note, None, 5.0, typed=True)
     path = tmp_path / "session.raw.json"
@@ -1969,6 +2267,10 @@ def not_a_fixture(name: str, tmp_path) -> bytes:
         "another format": fixture.replace(b'"format": 1', b'"format": 2'),
         "an extra key": fixture.replace(b'"format": 1', b'"format": 1, "extra": 1'),
         "not text at all": b"\xff\xfe\x00 not json",
+        "a journal": journal_file(tmp_path, "moved the stop", stem="whole").read_bytes(),
+        "a journal's header alone": (
+            journal_file(tmp_path, stem="header").read_bytes().split(b"\n")[0]
+        ),
     }[name]
 
 
@@ -1983,6 +2285,8 @@ def not_a_fixture(name: str, tmp_path) -> bytes:
         "another format",
         "an extra key",
         "not text at all",
+        "a journal",
+        "a journal's header alone",
     ],
 )
 def test_describe_prints_nothing_of_a_file_that_is_not_a_fixture(tmp_path, capsys, name) -> None:
@@ -2249,7 +2553,8 @@ def test_the_summary_lists_every_closing_problem_and_dropped_field() -> None:
     problems = [
         "closing list refused: deals INVALID_REQUEST",
         "closing list truncated: orders",
-        "closing requests failed: CTraderTimeoutError",
+        "closing list failed: position_orders CTraderTimeoutError",
+        "closing list skipped: position_deals",
         "closing requests skipped: not connected",
     ]
     recording = session(*problems, events=1, typed=("moved the stop",))
