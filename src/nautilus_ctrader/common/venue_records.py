@@ -3,12 +3,20 @@
 The model speaks in broker facts, not Nautilus objects: prices, volumes and money are `Decimal`,
 ids are the broker's or the node's own strings, times are milliseconds. The execution client
 turns each record into a Nautilus event or report.
+
+Conventions across the records:
+
+- `side` is `"BUY"` or `"SELL"`, and `units` is a positive magnitude, never signed.
+- A broker position id is an `int` where it identifies a position for the model
+  (`AwaitProtection`, `ProtectionMissing`, `Operations`), and its decimal `str` where it
+  travels to Nautilus (`venue_position_id`).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from enum import Enum
 from typing import Protocol
 
@@ -33,9 +41,21 @@ def price_of(value: float, precision: int) -> Decimal:
     """A price the venue sent as a double, at `precision` decimals.
 
     Built from the double's shortest decimal form, not its binary value, so `85197.2` is
-    `85197.20` and not `85197.199999…`.
+    `85197.20` and not `85197.199999…`. The venue sends prices at the symbol's own digits, so
+    any extra digit is noise of the double; it is rounded half-even rather than refused, because
+    a refusal inside a live event's handling would stop the model.
+
+    Raises `ValueError` for a non-finite value or one too large to hold at `precision`.
     """
-    return Decimal(repr(value)).quantize(Decimal(1).scaleb(-precision))
+    if not math.isfinite(value):
+        raise ValueError(f"a price must be finite, got {value!r}")
+    exponent = Decimal(1).scaleb(-precision)
+    try:
+        price = Decimal(repr(value)).quantize(exponent, rounding=ROUND_HALF_EVEN)
+    except InvalidOperation:
+        raise ValueError(f"price {value!r} does not fit at {precision} decimals") from None
+    # A negative zero would print as "-0.00".
+    return exponent * 0 if price == 0 else price
 
 
 def units_of(volume: int) -> Decimal:
@@ -44,7 +64,10 @@ def units_of(volume: int) -> Decimal:
 
 
 def money_of(amount: int, money_digits: int) -> Decimal:
-    """A venue money amount, scaled by its own message's `moneyDigits`."""
+    """A venue money amount, scaled by its own message's `moneyDigits`.
+
+    Keep the `Decimal`, not its `str`: a small amount prints in exponent form.
+    """
     return Decimal(amount).scaleb(-money_digits)
 
 
@@ -59,7 +82,10 @@ class OrderEventKind(Enum):
 
 @dataclass(frozen=True)
 class Fill:
-    """One deal. `commission` is in the account's currency; a charge is negative."""
+    """One deal.
+
+    `commission` is in the account's currency; a charge is negative, as the broker reports it.
+    """
 
     trade_id: str
     venue_position_id: str
@@ -102,7 +128,8 @@ class ExternalType(Enum):
 class ExternalOrder:
     """An order Nautilus does not know yet, as it stood before any fill; `fills` follow it.
 
-    Reported with its pre-fill status so that Nautilus never infers a fill of its own.
+    Reported with its pre-fill status so that Nautilus never infers a fill of its own. A `LIMIT`
+    fills `price`; a `STOP_MARKET`, `trigger_price`; a `STOP_LIMIT`, both; a `MARKET`, neither.
     """
 
     venue_order_id: str
@@ -181,6 +208,8 @@ class Operations(Protocol):
 
     def amending(self, position_id: int) -> bool:
         """Whether the node's own level amend of that position is in flight."""
+        ...
 
     def closing(self, position_id: int, volume: int) -> str | None:
         """The client order id of the node's close of `volume` on that position, if in flight."""
+        ...

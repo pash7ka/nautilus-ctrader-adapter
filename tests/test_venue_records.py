@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 
 import pytest
@@ -23,12 +24,32 @@ from nautilus_ctrader.common.venue_records import (
         (1.1005, 5, "1.10050"),
         (0.1 + 0.2, 1, "0.3"),
         (152.123, 3, "152.123"),
+        (1e-05, 5, "0.00001"),
+        (1e-05, 8, "0.00001000"),
+        (1e16, 0, "10000000000000000"),
+        (1e16, 2, "10000000000000000.00"),
+        (85197.0, 0, "85197"),
+        (-85197.2, 2, "-85197.20"),
+        (-0.0, 2, "0.00"),
+        (0.125, 2, "0.12"),
+        (0.135, 2, "0.14"),
     ],
 )
 def test_a_price_is_its_shortest_decimal_at_the_instruments_precision(
     value, precision, expected
 ) -> None:
     assert str(price_of(value, precision)) == expected
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_a_non_finite_price_is_refused(value) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        price_of(value, 2)
+
+
+def test_a_price_too_large_for_its_precision_is_refused_as_a_value_error() -> None:
+    with pytest.raises(ValueError, match="does not fit"):
+        price_of(1e30, 5)
 
 
 @pytest.mark.parametrize(
