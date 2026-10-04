@@ -1536,8 +1536,7 @@ async def record(
             )
             lost = asyncio.Event()
             last_event = None
-            # TODO(verify): that account authorisation alone gets execution events pushed, with no
-            # subscription request; a recording that holds an event confirms it.
+            # Execution events are pushed after account authorisation alone; nothing subscribes.
             connection.set_event_handler(on_event)
             connection.set_disconnect_handler(lambda _error, lost=lost: lost.set())
             try:

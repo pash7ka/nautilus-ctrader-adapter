@@ -13,13 +13,15 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from tests.fixtures import FAKE_ACCOUNT_ID, load_execution_recording
 
 RECORDING = load_execution_recording()
-_FAKE_RANGES = {
-    "positionId": range(5_000_001, 6_000_000),
-    "orderId": range(6_000_001, 7_000_000),
-    "dealId": range(7_000_001, 8_000_000),
-    "balanceHistoryId": range(8_000_001, 9_000_000),
+# The scrubber numbers each kind of id from its own base, in order of first appearance.
+_FAKE_BASES = {
+    "positionId": 5_000_000,
+    "orderId": 6_000_000,
+    "dealId": 7_000_000,
+    "balanceHistoryId": 8_000_000,
 }
-_TEXT_FIELDS = {"label", "comment", "clientOrderId", "externalNote"}
+# The scrubbed free text, and the venue's own name for a symbol's unit.
+_ALLOWED_TEXT = {"scrubbed", "Contracts"}
 
 
 def messages():
@@ -61,7 +63,9 @@ def balance_changes() -> list[tuple[int, int, int]]:
 def test_the_recording_has_a_timeline_with_events_and_markers() -> None:
     kinds = {item["kind"] for item in RECORDING["timeline"]}
     assert {"event", "snapshot", "marker"} <= kinds
-    times = [item["t"] for item in RECORDING["timeline"]]
+    # Events only: a snapshot is stamped when its first answer arrived, so it may sit after a
+    # later event.
+    times = [item["t"] for item in RECORDING["timeline"] if item["kind"] == "event"]
     assert times == sorted(times)
     assert any(isinstance(m, oa.ProtoOAExecutionEvent) for m in messages())
 
@@ -71,17 +75,34 @@ def test_every_identifier_in_the_recording_is_a_fake_one() -> None:
         for name, value in fields(message):
             if name in ("ctidTraderAccountId", "ctidTraderAccountIds"):
                 assert value == FAKE_ACCOUNT_ID
-            elif name in _FAKE_RANGES:
-                assert value in _FAKE_RANGES[name], (name, value)
             elif name == "traderLogin":
                 raise AssertionError("a trader login survived the scrub")
+
+
+def test_each_kind_of_id_runs_from_its_fake_base_without_gaps() -> None:
+    seen: dict[str, set[int]] = {name: set() for name in _FAKE_BASES}
+    for message in messages():
+        for name, value in fields(message):
+            if name in seen:
+                seen[name].add(value)
+    for name, values in seen.items():
+        base = _FAKE_BASES[name]
+        assert values == set(range(base + 1, base + 1 + len(values))), name
 
 
 def test_no_free_text_survives() -> None:
     for message in messages():
         for name, value in fields(message):
-            if name in _TEXT_FIELDS:
-                assert value == "scrubbed", name
+            if isinstance(value, str | bytes):
+                assert value in _ALLOWED_TEXT, name
+
+
+def test_no_field_unknown_to_the_bindings_survives() -> None:
+    for message in messages():
+        known = type(message)()
+        known.CopyFrom(message)
+        known.DiscardUnknownFields()
+        assert known.SerializeToString() == message.SerializeToString(), type(message).__name__
 
 
 def test_hidden_balances_keep_their_arithmetic() -> None:
@@ -93,3 +114,11 @@ def test_hidden_balances_keep_their_arithmetic() -> None:
     for (_, before, _), (_, after, change) in pairwise(changes):
         assert after == before + change
     assert all(balance != 0 for _, balance, _ in changes)
+
+
+def test_every_balance_in_the_recording_is_one_of_the_chain() -> None:
+    chain = {balance for _, balance, _ in balance_changes()}
+    for message in messages():
+        for name, value in fields(message):
+            if name == "balance":
+                assert value in chain, value
