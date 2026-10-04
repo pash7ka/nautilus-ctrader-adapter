@@ -10,17 +10,38 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.identifiers import AccountId
-from nautilus_trader.model.objects import Money
+from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientOrderId,
+    PositionId,
+    TradeId,
+    VenueOrderId,
+)
+from nautilus_trader.model.objects import Money, Price, Quantity
 
+from nautilus_ctrader.activity import CTraderAccountActivity
 from nautilus_ctrader.common.account import account_client_from_config
 from nautilus_ctrader.common.errors import CTraderAccountError
 from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.execution_replay import FIRST, as_ours, position_orders, snapshot_with_protection
+from tests.account_venue import HeldReplies
+from tests.execution_replay import (
+    FIRST,
+    as_ours,
+    make_event,
+    make_order,
+    position_orders,
+    snapshot_with_protection,
+)
 from tests.execution_venue import (
+    ENTRY,
+    FIRST_EVENTS,
+    STOP,
+    TARGET,
     TRADER_ID,
     US100_ID,
     US100_SYMBOL_ID,
@@ -28,8 +49,12 @@ from tests.execution_venue import (
     exec_config,
     harness,
     on_us100,
+    push,
+    status,
+    submitted,
     trader,
 )
+from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
 ACCOUNT = AccountId("CTRADER-001")
@@ -228,3 +253,161 @@ async def test_disconnect_releases_only_the_account_user_this_client_holds() -> 
         finally:
             await h.account.disconnect()
         assert h.account.session is None
+
+
+async def test_the_nodes_entry_and_legs_reach_nautilus_under_their_ids() -> None:
+    async with harness() as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS[:3])
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+
+        assert status(h, ENTRY) == OrderStatus.FILLED
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+        assert h.cache.order(ClientOrderId(ENTRY)).venue_order_id == VenueOrderId("6000001")
+        assert h.cache.order(ClientOrderId(STOP)).venue_order_id == VenueOrderId("6000001-SL")
+        assert h.cache.order(ClientOrderId(TARGET)).venue_order_id == VenueOrderId("6000001-TP")
+        (filled,) = [e for e in h.events_of(ENTRY) if isinstance(e, OrderFilled)]
+        assert filled.trade_id == TradeId("7000001")
+        assert filled.last_px == Price.from_str("85287.21")
+        assert filled.last_qty == Quantity.from_str("1.00")
+        assert filled.commission == Money(Decimal("27.72"), USD)
+        assert filled.position_id == PositionId("5000001")
+        position = h.cache.position(PositionId("5000001"))
+        assert position.is_open
+        assert position.quantity == Quantity.from_str("1.00")
+        assert h.logger.errors() == []
+
+
+async def test_the_first_recorded_position_reaches_nautilus_step_by_step() -> None:
+    async with harness() as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS)
+        await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
+
+        assert h.kinds_of(ENTRY) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+        assert h.kinds_of(STOP) == [
+            "OrderSubmitted",
+            "OrderAccepted",
+            "OrderUpdated",  # moved by hand
+            "OrderUpdated",  # its quantity follows the partial close
+            "OrderUpdated",  # moved by hand again
+            "OrderFilled",
+        ]
+        assert h.kinds_of(TARGET) == ["OrderSubmitted", "OrderAccepted", "OrderCanceled"]
+        stop = h.cache.order(ClientOrderId(STOP))
+        assert stop.trigger_price == Price.from_str("85206.20")
+        assert stop.filled_qty == Quantity.from_str("0.99")
+        (stop_fill,) = [e for e in h.events_of(STOP) if isinstance(e, OrderFilled)]
+        assert stop_fill.venue_order_id == VenueOrderId("6000001-SL")
+        assert stop_fill.last_px == Price.from_str("85205.58")
+        # The trader's partial close: reported as an external closing order, then filled.
+        (report,) = h.reports
+        assert report.venue_order_id == VenueOrderId("6000003")
+        assert report.reduce_only
+        assert report.order_status == OrderStatus.ACCEPTED
+        external = h.cache.order(h.cache.client_order_id(VenueOrderId("6000003")))
+        assert external.status == OrderStatus.FILLED
+        assert external.is_reduce_only
+        assert h.cache.position(PositionId("5000001")).is_closed
+        assert [(a.kind, a.action) for a in h.activity] == [
+            ("manual_change", "level_moved"),
+            ("manual_change", "level_removed"),
+            ("manual_change", "level_added"),
+            ("manual_change", "partially_closed"),
+            ("manual_change", "level_moved"),
+        ]
+        assert all(isinstance(a, CTraderAccountActivity) for a in h.activity)
+        assert h.activity[3].symbol == "US100.cash"
+        assert h.activity[3].volume == Decimal("0.01")
+        assert h.logger.errors() == []
+
+
+async def test_a_response_applied_after_a_later_event_reports_each_step_once() -> None:
+    async with harness() as h:
+        await submitted(h)
+        accepted, filled, protected = FIRST_EVENTS[:3]
+        # The transport hands buffered frames to the event handlers before the waiting request
+        # resumes, so the order's acceptance can come after its fill.
+        h.client._on_execution_event(filled)
+        h.client._on_execution_event(accepted)
+        h.client._on_execution_event(protected)
+        h.client._on_execution_event(filled)
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+
+        assert h.kinds_of(ENTRY) == ["OrderSubmitted", "OrderFilled"]
+        assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderAccepted"]
+
+
+async def test_events_arriving_while_the_model_is_rebuilt_are_applied_after_it() -> None:
+    async with harness() as h:
+        await submitted(h)
+        held = HeldReplies(h.server, om.PROTO_OA_RECONCILE_REQ, lambda _r: h.venue.snapshot)
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+
+        for message in FIRST_EVENTS[:3]:
+            await h.server.push(message)
+        await held.stop_holding()
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED, timeout_secs=10)
+
+        assert status(h, ENTRY) == OrderStatus.FILLED
+        # Applied before the rebuild, the events would be wiped by the older, empty snapshot.
+        assert h.client._book.view(FIRST).open
+        assert any("Rebuilding the venue model" in line for line in h.logger.warnings())
+
+
+async def test_an_event_the_model_cannot_apply_is_an_error_and_the_client_carries_on() -> None:
+    async with harness() as h:
+        await submitted(h)
+        accepted, filled, _ = FIRST_EVENTS[:3]
+        broken = type(filled)()
+        broken.CopyFrom(filled)
+        broken.deal.executionPrice = float("nan")
+        h.client._on_execution_event(accepted)
+        h.client._on_execution_event(broken)
+        h.client._on_execution_event(filled)
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.FILLED)
+
+        assert any("could not be applied" in line for line in h.logger.errors())
+        assert h.cache.position(PositionId("5000001")).quantity == Quantity.from_str("1.00")
+
+
+async def test_an_event_for_an_order_nautilus_does_not_hold_is_a_warning() -> None:
+    async with harness() as h:
+        await push(h, FIRST_EVENTS[0])
+
+        assert any("No Nautilus order" in line for line in h.logger.warnings())
+        assert h.events == []
+
+
+async def test_an_order_error_nobody_waits_for_is_a_warning() -> None:
+    async with harness() as h:
+        await push(
+            h,
+            oa.ProtoOAOrderErrorEvent(
+                ctidTraderAccountId=1, errorCode="POSITION_NOT_FOUND", description="gone"
+            ),
+        )
+
+        assert any("POSITION_NOT_FOUND: gone" in line for line in h.logger.warnings())
+
+
+async def test_activity_on_an_unloaded_symbol_is_published_with_its_name() -> None:
+    async with harness() as h:
+        order = make_order(6_900_001, 5_900_001, order_type=om.LIMIT, limit=1.1, symbol=1)
+        await push(h, make_event(om.ORDER_ACCEPTED, order))
+
+        assert h.activity == [
+            CTraderAccountActivity(
+                kind="unloaded_symbol",
+                symbol="EURUSD",
+                subject="order",
+                side="BUY",
+                volume=Decimal("1"),
+                action="opened",
+                ts_event=1_000_000,
+                ts_init=h.activity[0].ts_init,
+            ),
+        ]
+        assert h.events == []
+        assert h.reports == []

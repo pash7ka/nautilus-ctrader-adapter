@@ -21,7 +21,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import SubmitOrderList
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderSide, OrderStatus
 from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
@@ -48,7 +48,9 @@ from tests.account_venue import (
     for_account,
     venue,
 )
+from tests.execution_replay import FIRST, as_ours, events, first_n
 from tests.fake_server import FakeCTraderServer
+from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
 US100_ID = InstrumentId(Symbol("US100.cash"), CTRADER_VENUE)
@@ -335,3 +337,30 @@ async def submit_bracket(h: Harness, orders: OrderList) -> None:
             ts_init=0,
         ),
     )
+
+
+ENTRY, STOP, TARGET = "O-E-5000001", "O-SL-5000001", "O-TP-5000001"
+# The recorded first position, made the node's, on US100.cash: accepted, filled, protected,
+# both levels changed by hand, partly closed by hand, then closed by its stop-loss.
+FIRST_EVENTS = on_us100(first_n(as_ours(events(), [FIRST]), FIRST))
+
+
+async def submitted(h: Harness, orders: OrderList | None = None) -> OrderList:
+    """The bracket in Nautilus as sent, with no venue behind it: the test brings the events."""
+    orders = orders or bracket(h)
+    for order in orders.orders:
+        h.cache.add_order(order)
+        h.client.generate_order_submitted(
+            order.strategy_id, order.instrument_id, order.client_order_id, 0
+        )
+    await wait_until(
+        lambda: all(
+            h.cache.order(o.client_order_id).status == OrderStatus.SUBMITTED for o in orders.orders
+        ),
+        description="orders submitted",
+    )
+    return orders
+
+
+def status(h: Harness, client_order_id: str) -> OrderStatus:
+    return h.cache.order(ClientOrderId(client_order_id)).status

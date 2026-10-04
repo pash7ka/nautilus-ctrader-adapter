@@ -14,6 +14,7 @@ An order or a close whose outcome is unknown is never resent: the lost answer ma
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -28,10 +29,20 @@ from nautilus_trader.execution.messages import (
 )
 from nautilus_trader.execution.reports import FillReport, OrderStatusReport, PositionStatusReport
 from nautilus_trader.live.execution_client import LiveExecutionClient
-from nautilus_trader.model.enums import AccountType, OmsType
-from nautilus_trader.model.identifiers import AccountId, ClientId, InstrumentId
+from nautilus_trader.model.enums import AccountType, LiquiditySide, OmsType
+from nautilus_trader.model.identifiers import (
+    AccountId,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    PositionId,
+    TradeId,
+    VenueOrderId,
+)
 from nautilus_trader.model.objects import Currency
+from nautilus_trader.model.orders import Order
 
+from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
 from nautilus_ctrader.common import execution_reports as reports
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import (
@@ -39,10 +50,22 @@ from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderRequestError,
 )
+from nautilus_ctrader.common.operations import OperationsInFlight
 from nautilus_ctrader.common.parsing import PRICE_SCALE
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.common.venue_book import VenueBook
-from nautilus_ctrader.common.venue_records import money_of
+from nautilus_ctrader.common.venue_records import (
+    Activity,
+    ActivityKind,
+    AwaitProtection,
+    ExternalOrder,
+    Notice,
+    OrderEvent,
+    OrderEventKind,
+    ProtectionMissing,
+    Record,
+    money_of,
+)
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import BUCKET_HISTORICAL, CTRADER, CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -78,6 +101,11 @@ def check_account(trader: om.ProtoOATrader) -> None:
             "the account is a limited-risk account, which needs a guaranteed stop on every "
             "order; not supported",
         )
+
+
+def _reason(code: str, description: str | None) -> str:
+    # TODO(verify): that the venue's description never carries an account id or login.
+    return f"{code}: {description}" if description else code
 
 
 class CTraderExecutionClient(LiveExecutionClient):
@@ -163,6 +191,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._margin_times: dict[int, int] = {}
         self._quotes: dict[int, _Quote] = {}
         self._spot_symbols: set[int] = set()
+        self._operations = OperationsInFlight()
+        # Execution events held while the model is rebuilt, or `None` when it stands.
+        self._buffer: list[oa.ProtoOAExecutionEvent] | None = None
+        self._restore_key = ("execution", self._owner)
         # The account counts its users without knowing who releases, and Nautilus calls
         # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
         self._holds_account = False
@@ -179,6 +211,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             session = self._account.session
             assert session is not None  # `connect()` returned, so the session is up
             self._session = session
+            session.add_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
+            session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
             trader = await self._trader()
             check_account(trader)
             self._currency = Currency.from_str(self._account.deposit_asset.name)
@@ -187,18 +221,37 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._load()
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
+            # The first bring-up has run its restores already; this one serves every later one.
+            session.add_restore(self._restore_key, self._reload)
         except BaseException:
             await self._disconnect()
             raise
 
     async def _disconnect(self) -> None:
-        self._session = None
+        self._detach()
         try:
             await self._release_reference_spots()
         finally:
             if self._holds_account:
                 self._holds_account = False
                 await self._account.disconnect()
+
+    def _detach(self) -> None:
+        session, self._session = self._session, None
+        if session is None:
+            return
+        session.remove_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
+        session.remove_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
+        session.remove_restore(self._restore_key)
+
+    async def _reload(self) -> None:
+        """Rebuild the model on a reconnect: the broker may have changed meanwhile."""
+        self._log.warning("Rebuilding the venue model after a reconnect")
+        trader = await self._trader()
+        self._balance = money_of(trader.balance, trader.moneyDigits)
+        self._balance_version = trader.balanceVersion
+        await self._load()
+        self._emit_account_state(self._clock.timestamp_ns())
 
     # Reconciliation reports are not built yet. Until they are, these report nothing, and
     # Nautilus resolves orders in flight through its own in-flight check.
@@ -239,23 +292,31 @@ class CTraderExecutionClient(LiveExecutionClient):
         return response.trader
 
     async def _load(self) -> None:
-        """Rebuild the venue model from the broker's open positions and orders."""
-        snapshot = await self._request(
-            oa.ProtoOAReconcileReq(
-                ctidTraderAccountId=self._account.account_id,
-                returnProtectionOrders=True,
-            ),
-        )
-        position_orders = {
-            position.positionId: await self._position_orders(position.positionId)
-            for position in snapshot.position
-        }
-        for notice in self._book.load(snapshot, position_orders):
-            self._log.warning(notice.text)
-        self._margins = {}
-        self._margin_times = {}
-        for position in snapshot.position:
-            self._set_margin(position)
+        """Rebuild the venue model from the broker's open positions and orders.
+
+        Execution events that arrive meanwhile are applied once it stands, in order.
+        """
+        self._buffer = []
+        try:
+            snapshot = await self._request(
+                oa.ProtoOAReconcileReq(
+                    ctidTraderAccountId=self._account.account_id,
+                    returnProtectionOrders=True,
+                ),
+            )
+            position_orders = {
+                position.positionId: await self._position_orders(position.positionId)
+                for position in snapshot.position
+            }
+            self._handle_records(self._book.load(snapshot, position_orders))
+            self._margins = {}
+            self._margin_times = {}
+            for position in snapshot.position:
+                self._set_margin(position)
+        finally:
+            held, self._buffer = self._buffer, None
+            for event in held:
+                self._on_execution_event(event)
 
     async def _position_orders(self, position_id: int) -> list[om.ProtoOAOrder]:
         """Every order of one position: its entry tells whose position it is."""
@@ -328,6 +389,163 @@ class CTraderExecutionClient(LiveExecutionClient):
                 ts_init=self._clock.timestamp_ns(),
             ),
         )
+
+    # -- Execution events -----------------------------------------------------------------------
+
+    def _on_execution_event(self, event: oa.ProtoOAExecutionEvent) -> list[Record]:
+        """The one way an execution event reaches the model, pushed or as a request's response.
+
+        Returns the records it produced, so a command can tell what its response meant.
+        """
+        if self._buffer is not None:
+            self._buffer.append(event)
+            return []
+        try:
+            records = self._book.apply(event, self._operations)
+        except Exception as e:
+            # The model does not mark it seen, so a repeat of the event is applied again.
+            self._log.exception("An execution event could not be applied to the venue model", e)
+            records = []
+        self._handle_records(records)
+        return records
+
+    def _on_order_error_event(self, event: oa.ProtoOAOrderErrorEvent) -> None:
+        # One answering a request goes to that request; this one found nobody waiting.
+        self._log.warning(
+            "Order error with no request waiting: "
+            f"{_reason(event.errorCode, event.description or None)}",
+        )
+
+    def _handle_records(self, records: Iterable[Record]) -> None:
+        for record in records:
+            try:
+                if isinstance(record, OrderEvent):
+                    self._order_event(record)
+                elif isinstance(record, ExternalOrder):
+                    self._external_order(record)
+                elif isinstance(record, Activity):
+                    self._activity(record)
+                elif isinstance(record, Notice):
+                    self._log.warning(record.text)
+                else:
+                    self._on_protection(record)
+            except Exception as e:
+                self._log.exception(f"{type(record).__name__} could not be reported", e)
+
+    def _on_protection(self, record: AwaitProtection | ProtectionMissing) -> None:
+        self._log.debug(f"{type(record).__name__} for position {record.position_id}")
+
+    def _nautilus_order(self, record: OrderEvent) -> Order | None:
+        """The order a record is about: the node's by its own id, an external one by venue id."""
+        if record.client_order_id is not None:
+            return self._cache.order(ClientOrderId(record.client_order_id))
+        if record.venue_order_id is None:
+            return None
+        client_order_id = self._cache.client_order_id(VenueOrderId(record.venue_order_id))
+        return None if client_order_id is None else self._cache.order(client_order_id)
+
+    def _order_event(self, record: OrderEvent) -> None:
+        order = self._nautilus_order(record)
+        if order is None:
+            self._log.warning(
+                f"No Nautilus order for {record.client_order_id or record.venue_order_id}; "
+                f"its {record.kind.value} event is not reported",
+            )
+            return
+        if record.client_order_id is not None:
+            # Matched to its broker order: the model knows the close from now on.
+            self._operations.end_close(record.client_order_id)
+        instrument = self._instrument_provider.find(order.instrument_id)
+        venue_order_id = (
+            VenueOrderId(record.venue_order_id) if record.venue_order_id else order.venue_order_id
+        )
+        ids = (order.strategy_id, order.instrument_id, order.client_order_id)
+        ts = reports.nanos(record.ts_ms)
+        kind = record.kind
+        if kind == OrderEventKind.ACCEPTED:
+            self.generate_order_accepted(*ids, venue_order_id, ts)
+            if record.quantity is not None and record.quantity != order.quantity.as_decimal():
+                # A leg takes the protective order's volume, which a partial entry leaves short.
+                quantity = reports.quantity(record.quantity, instrument)
+                self.generate_order_updated(*ids, venue_order_id, quantity, None, None, ts)
+        elif kind == OrderEventKind.FILLED:
+            fill = record.fill
+            self.generate_order_filled(
+                *ids,
+                venue_order_id,
+                PositionId(fill.venue_position_id),
+                TradeId(fill.trade_id),
+                reports.order_side(fill.side),
+                order.order_type,
+                reports.quantity(fill.units, instrument),
+                reports.price(fill.price, instrument),
+                instrument.quote_currency,
+                reports.commission(fill, self._currency),
+                LiquiditySide.NO_LIQUIDITY_SIDE,
+                ts,
+            )
+        elif kind == OrderEventKind.UPDATED:
+            quantity = (
+                order.quantity
+                if record.quantity is None
+                else reports.quantity(record.quantity, instrument)
+            )
+            price = None if record.price is None else reports.price(record.price, instrument)
+            trigger = (
+                None
+                if record.trigger_price is None
+                else reports.price(record.trigger_price, instrument)
+            )
+            self.generate_order_updated(*ids, venue_order_id, quantity, price, trigger, ts)
+        elif kind == OrderEventKind.CANCELED:
+            self.generate_order_canceled(*ids, venue_order_id, ts)
+        elif kind == OrderEventKind.REJECTED:
+            self.generate_order_rejected(*ids, record.reason or "rejected by the venue", ts)
+        elif kind == OrderEventKind.EXPIRED:
+            self.generate_order_expired(*ids, venue_order_id, ts)
+
+    def _external_order(self, record: ExternalOrder) -> None:
+        """An order Nautilus does not know yet: its report, then a report of each fill."""
+        instrument = self._instrument_provider.instrument_for_symbol_id(record.symbol_id)
+        if instrument is None:
+            self._log.warning(f"Order {record.venue_order_id} is on an instrument no longer loaded")
+            return
+        ts_init = self._clock.timestamp_ns()
+        self._send_order_status_report(
+            reports.order_status_report(record, instrument, self.account_id, ts_init),
+        )
+        for fill in record.fills:
+            self._send_fill_report(
+                reports.fill_report(
+                    fill,
+                    record.venue_order_id,
+                    instrument,
+                    self.account_id,
+                    self._currency,
+                    ts_init,
+                ),
+            )
+
+    def _activity(self, record: Activity) -> None:
+        symbol = self._symbol_name(record.symbol_id)
+        self._msgbus.publish(
+            topic=ACCOUNT_ACTIVITY_TOPIC,
+            msg=reports.account_activity(record, symbol, self._clock.timestamp_ns()),
+        )
+        text = (
+            f"Account activity: {record.kind.value} {record.action.value} {record.subject} "
+            f"{record.side} {record.units} {symbol}"
+        )
+        if record.kind == ActivityKind.STOP_OUT:
+            self._log.warning(text)
+        else:
+            self._log.info(text)
+
+    def _symbol_name(self, symbol_id: int) -> str:
+        for name, light in self._account.light_symbols.items():
+            if light.symbolId == symbol_id:
+                return name
+        return str(symbol_id)
 
     # -- Reference prices -----------------------------------------------------------------------
 
