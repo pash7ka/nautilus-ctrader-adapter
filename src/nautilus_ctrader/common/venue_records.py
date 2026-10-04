@@ -211,5 +211,8 @@ class Operations(Protocol):
         ...
 
     def closing(self, position_id: int, volume: int) -> str | None:
-        """The client order id of the node's close of `volume` on that position, if in flight."""
+        """The client order id of the node's close of `volume` on that position, if in flight.
+
+        The id identifies one close; the execution client consumes it once matched.
+        """
         ...

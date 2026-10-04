@@ -60,9 +60,13 @@ _LEVELS = (Level.STOP_LOSS, Level.TAKE_PROFIT)
 
 @dataclass
 class _Leg:
+    """A leg as Nautilus knows it; `quantity` and `filled` are venue volumes."""
+
     client_order_id: str
     alive: bool = True
     accepted: bool = False
+    quantity: int = 0
+    filled: int = 0
 
 
 @dataclass
@@ -74,6 +78,7 @@ class _Position:
     open: bool = False
     entry_order_id: int | None = None
     entry_client_order_id: str | None = None
+    entry_accepted: bool = False
     legs: dict[Level, _Leg] = field(default_factory=dict)
     awaiting_protection: bool = False
     protective_order_id: int | None = None
@@ -108,6 +113,19 @@ def _entry_of(orders: Sequence[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
         if not order.closingOrder and order.orderType != om.STOP_LOSS_TAKE_PROFIT:
             return order
     return None
+
+
+def _opposite(side: int) -> int:
+    return om.SELL if side == om.BUY else om.BUY
+
+
+def _levels_of(order: om.ProtoOAOrder, precision: int) -> dict[Level, Decimal]:
+    levels: dict[Level, Decimal] = {}
+    if order.HasField("stopPrice"):
+        levels[Level.STOP_LOSS] = price_of(order.stopPrice, precision)
+    if order.HasField("limitPrice"):
+        levels[Level.TAKE_PROFIT] = price_of(order.limitPrice, precision)
+    return levels
 
 
 def _which_level(
@@ -149,8 +167,9 @@ class VenueBook:
         # Broker orders Nautilus knows besides the node's entries: its closes, by broker id, and
         # external orders reported once.
         self._closes: dict[int, str] = {}
+        self._closes_accepted: set[int] = set()
         self._reported: set[int] = set()
-        self._seen: set[tuple[int, int, int, int]] = set()
+        self._seen: set[tuple] = set()
 
     def view(self, position_id: int) -> PositionView | None:
         position = self._positions.get(position_id)
@@ -208,6 +227,9 @@ class VenueBook:
                 if position is not None:
                     position.protective_order_id = order.orderId
                     position.protective_volume = order.tradeData.volume
+                    for leg in position.legs.values():
+                        if leg.accepted:
+                            leg.quantity = order.tradeData.volume
             else:
                 # Reconciliation reports every other open order, so Nautilus knows it from then on.
                 self._reported.add(order.orderId)
@@ -218,17 +240,32 @@ class VenueBook:
         if not event.HasField("order"):
             # Swap and cash-flow events change the account, not an order.
             return []
-        order = event.order
-        # A level change has no deal; only its update time tells the second from a repeat.
-        key = (
-            order.orderId,
-            event.executionType,
-            event.deal.dealId if event.HasField("deal") else 0,
-            order.utcLastUpdateTimestamp,
-        )
+        key = self._key(event)
         if key in self._seen:
             return []
+        records = self._handle(event, operations)
+        # Marked only once handled, so an event whose handling raised can be applied again.
         self._seen.add(key)
+        return records
+
+    @staticmethod
+    def _key(event: oa.ProtoOAExecutionEvent) -> tuple:
+        order = event.order
+        if event.HasField("deal"):
+            return (order.orderId, event.executionType, event.deal.dealId)
+        # A level change has no deal, and two can share a millisecond: the content tells them
+        # apart from a repeat.
+        return (
+            order.orderId,
+            event.executionType,
+            order.utcLastUpdateTimestamp,
+            order.stopPrice if order.HasField("stopPrice") else None,
+            order.limitPrice if order.HasField("limitPrice") else None,
+            order.tradeData.volume if order.HasField("tradeData") else None,
+        )
+
+    def _handle(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
+        order = event.order
         precision = self._precision(order.tradeData.symbolId)
         if precision is None:
             return self._unloaded(event)
@@ -255,21 +292,25 @@ class VenueBook:
         return records
 
     def protection_timed_out(self, position_id: int) -> list[Record]:
-        """Called when the wait for a filled entry's protective order ends."""
+        """Called when the wait for a filled entry's protective order ends.
+
+        Reports the live legs the broker holds no level for: all of them without a protective
+        order, and those never accepted with one.
+        """
         position = self._positions.get(position_id)
-        if (
-            position is None
-            or not position.ours
-            or not position.open
-            or position.protective_order_id is not None
-        ):
+        if position is None or not position.ours or not position.open:
             return []
-        alive = {level: leg.client_order_id for level, leg in position.legs.items() if leg.alive}
-        if not alive:
+        unprotected = position.protective_order_id is None
+        missing = {
+            level: leg.client_order_id
+            for level, leg in position.legs.items()
+            if leg.alive and (unprotected or not leg.accepted)
+        }
+        if not missing:
             return []
         return [
             ProtectionMissing(
-                position_id, alive.get(Level.STOP_LOSS), alive.get(Level.TAKE_PROFIT)
+                position_id, missing.get(Level.STOP_LOSS), missing.get(Level.TAKE_PROFIT)
             ),
         ]
 
@@ -281,22 +322,40 @@ class VenueBook:
         return position
 
     def _position_for(self, event: oa.ProtoOAExecutionEvent) -> _Position:
+        """The event's position, created from the event if the model never saw it.
+
+        An order without a `positionId` gets a position of its own that is not kept.
+        """
         order = event.order
-        position = self._positions.get(order.positionId)
-        if position is not None:
-            return position
+        # TODO(verify): whether a rejected order carries a positionId; none was recorded.
+        kept = order.HasField("positionId")
+        if kept and order.positionId in self._positions:
+            return self._positions[order.positionId]
         if event.HasField("position"):
-            data = event.position.tradeData
-            return self._new_position(order.positionId, data.symbolId, data.tradeSide)
-        return self._new_position(
-            order.positionId, order.tradeData.symbolId, order.tradeData.tradeSide
-        )
+            symbol_id, side = event.position.tradeData.symbolId, event.position.tradeData.tradeSide
+        else:
+            symbol_id, side = order.tradeData.symbolId, order.tradeData.tradeSide
+            if order.closingOrder:
+                side = _opposite(side)
+        if kept:
+            return self._new_position(order.positionId, symbol_id, side)
+        return _Position(order.positionId, symbol_id, _SIDE[side])
 
     @staticmethod
     def _sync(position: _Position, event: oa.ProtoOAExecutionEvent) -> None:
         if event.HasField("position"):
             position.volume = event.position.tradeData.volume
             position.open = event.position.positionStatus == om.POSITION_STATUS_OPEN
+        elif (
+            event.order.closingOrder
+            and event.executionType in _FILLS
+            and event.HasField("deal")
+            and position.open
+        ):
+            # TODO(verify): whether a closing fill always carries the position; until then the
+            # volumes tell a full close.
+            position.volume = max(position.volume - event.deal.filledVolume, 0)
+            position.open = position.volume > 0
 
     def _adopt(
         self, position: _Position, entry: om.ProtoOAOrder, *, restored: bool
@@ -307,6 +366,7 @@ class VenueBook:
             return []
         position.entry_order_id = entry.orderId
         position.entry_client_order_id = entry_id
+        position.entry_accepted = restored
         legs = order_record.parse_comment(entry.tradeData.comment)
         if legs is None:
             return [
@@ -320,7 +380,10 @@ class VenueBook:
                 # After a restart a leg lives exactly while its level does.
                 alive = level in position.levels if restored else True
                 position.legs[level] = _Leg(
-                    client_order_id, alive=alive, accepted=restored and alive
+                    client_order_id,
+                    alive=alive,
+                    accepted=restored and alive,
+                    quantity=position.volume if restored and alive else 0,
                 )
         return []
 
@@ -374,6 +437,13 @@ class VenueBook:
                 records.append(self._leg_event(OrderEventKind.CANCELED, position, level, ts_ms))
         return records
 
+    def _closed_by(self, position: _Position, deal: om.ProtoOADeal) -> list[Record]:
+        """What is left of a position a deal has closed."""
+        position.protective_order_id = None
+        position.levels = {}
+        # The deal is what ended the legs, so their cancels take its time, as reconciliation's do.
+        return self._cancel_legs(position, deal.executionTimestamp)
+
     @staticmethod
     def _activity(
         kind: ActivityKind,
@@ -400,8 +470,15 @@ class VenueBook:
         reduce_only: bool,
         fills: tuple[Fill, ...] = (),
         order_type: ExternalType | None = None,
+        levels: dict[Level, Decimal] | None = None,
     ) -> ExternalOrder:
+        """`order` as an external order; `levels` stands in for its own prices if given.
+
+        A stop price is read from `STOP_LOSS` and a limit price from `TAKE_PROFIT`, as
+        `_levels_of` reads `stopPrice` and `limitPrice`.
+        """
         kind = order_type or _EXTERNAL_TYPE.get(order.orderType, ExternalType.MARKET)
+        prices = _levels_of(order, precision) if levels is None else levels
         priced = kind in (ExternalType.LIMIT, ExternalType.STOP_LIMIT)
         triggered = kind in (ExternalType.STOP_MARKET, ExternalType.STOP_LIMIT)
         self._reported.add(order.orderId)
@@ -414,16 +491,8 @@ class VenueBook:
             reduce_only=reduce_only,
             venue_position_id=str(order.positionId) if order.HasField("positionId") else None,
             ts_ms=order.utcLastUpdateTimestamp,
-            price=(
-                price_of(order.limitPrice, precision)
-                if priced and order.HasField("limitPrice")
-                else None
-            ),
-            trigger_price=(
-                price_of(order.stopPrice, precision)
-                if triggered and order.HasField("stopPrice")
-                else None
-            ),
+            price=prices.get(Level.TAKE_PROFIT) if priced else None,
+            trigger_price=prices.get(Level.STOP_LOSS) if triggered else None,
             fills=fills,
         )
 
@@ -493,8 +562,13 @@ class VenueBook:
         venue_order_id, entry_id = str(order.orderId), position.entry_client_order_id
         ts = order.utcLastUpdateTimestamp
         if kind == om.ORDER_ACCEPTED:
+            # A repeat past the dedupe key, or a late one after the fill, says nothing new.
+            if position.entry_accepted:
+                return []
+            position.entry_accepted = True
             return [OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, entry_id, ts)]
         if kind in _FILLS:
+            position.entry_accepted = True
             fill = self._fill(event.deal, precision)
             records: list[Record] = [
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, entry_id, fill.ts_ms, fill=fill),
@@ -525,15 +599,15 @@ class VenueBook:
         position = self._position_for(event)
         if kind in _FILLS:
             return self._triggered(event, position, precision)
-        old_levels, old_volume = dict(position.levels), position.protective_volume
+        current = position.protective_order_id
+        if kind != om.ORDER_ACCEPTED and current is not None and order.orderId != current:
+            # A late event of a protective order the broker has since replaced with a new one.
+            return []
+        old_levels = dict(position.levels)
         if kind in (om.ORDER_ACCEPTED, om.ORDER_REPLACED):
             position.protective_order_id = order.orderId
             position.protective_volume = order.tradeData.volume
-            position.levels = {}
-            if order.HasField("stopPrice"):
-                position.levels[Level.STOP_LOSS] = price_of(order.stopPrice, precision)
-            if order.HasField("limitPrice"):
-                position.levels[Level.TAKE_PROFIT] = price_of(order.limitPrice, precision)
+            position.levels = _levels_of(order, precision)
             position.awaiting_protection = False
         elif kind == om.ORDER_CANCELLED:
             position.protective_order_id = None
@@ -544,15 +618,12 @@ class VenueBook:
         if not position.ours:
             return []
         manual = not event.isServerEvent and not operations.amending(position.position_id)
-        return self._level_changes(
-            position, old_levels, old_volume, manual, order.utcLastUpdateTimestamp
-        )
+        return self._level_changes(position, old_levels, manual, order.utcLastUpdateTimestamp)
 
     def _level_changes(
         self,
         position: _Position,
         old_levels: dict[Level, Decimal],
-        old_volume: int,
         manual: bool,
         ts: int,
     ) -> list[Record]:
@@ -563,16 +634,20 @@ class VenueBook:
             alive = leg is not None and leg.alive
             if new is not None and alive and not leg.accepted:
                 leg.accepted = True
+                leg.quantity = leg.filled + position.protective_volume
                 records.append(
                     self._leg_event(
                         OrderEventKind.ACCEPTED,
                         position,
                         level,
                         ts,
-                        quantity=units_of(position.protective_volume),
+                        quantity=units_of(leg.quantity),
                         price=new,
                     ),
                 )
+                if manual:
+                    action = Action.LEVEL_ADDED if old is None else Action.LEVEL_MOVED
+                    records.append(self._activity(ActivityKind.MANUAL_CHANGE, position, action, ts))
             elif old == new:
                 continue
             elif new is None:
@@ -600,19 +675,17 @@ class VenueBook:
                     records.append(
                         self._activity(ActivityKind.MANUAL_CHANGE, position, Action.LEVEL_MOVED, ts)
                     )
-        if old_volume and position.protective_volume != old_volume:
-            # The protective order follows the position's volume, and so do the legs.
-            for level, leg in position.legs.items():
-                if leg.alive and leg.accepted:
-                    records.append(
-                        self._leg_event(
-                            OrderEventKind.UPDATED,
-                            position,
-                            level,
-                            ts,
-                            quantity=units_of(position.protective_volume),
-                        ),
-                    )
+        # The protective order follows the position's volume, and so do the legs; a leg already
+        # partly filled keeps what it filled.
+        for level, leg in position.legs.items():
+            quantity = leg.filled + position.protective_volume
+            if leg.alive and leg.accepted and leg.quantity != quantity:
+                leg.quantity = quantity
+                records.append(
+                    self._leg_event(
+                        OrderEventKind.UPDATED, position, level, ts, quantity=units_of(quantity)
+                    ),
+                )
         return records
 
     def _triggered(
@@ -621,39 +694,53 @@ class VenueBook:
         position: _Position,
         precision: int,
     ) -> list[Record]:
-        order = event.order
-        levels: dict[Level, Decimal] = {}
-        if order.HasField("stopPrice"):
-            levels[Level.STOP_LOSS] = price_of(order.stopPrice, precision)
-        if order.HasField("limitPrice"):
-            levels[Level.TAKE_PROFIT] = price_of(order.limitPrice, precision)
-        fill = self._fill(event.deal, precision)
-        level, records = _which_level(position.side, levels, fill.price)
-        leg_units = units_of(position.protective_volume)
+        order, deal = event.order, event.deal
+        fill = self._fill(deal, precision)
+        level: Level | None = None
+        levels = _levels_of(order, precision) or dict(position.levels)
+        if levels:
+            level, records = _which_level(position.side, levels, fill.price)
+        else:
+            records = [
+                Notice(
+                    f"a protective order filled at {fill.price} with no level known; "
+                    "read as a market close",
+                ),
+            ]
         self._sync(position, event)
-        leg = position.legs.get(level)
+        # TODO(verify): whether a protective order can fill partially; none was recorded.
+        position.protective_volume = max(position.protective_volume - deal.filledVolume, 0)
+        leg = position.legs.get(level) if level is not None else None
         if position.ours and leg is not None and leg.alive:
             records.append(
                 self._leg_event(OrderEventKind.FILLED, position, level, fill.ts_ms, fill=fill)
             )
-            leg.alive = False
-            if not position.open and position.protective_volume and fill.units < leg_units:
-                records.append(
-                    self._leg_event(OrderEventKind.CANCELED, position, level, fill.ts_ms)
-                )
-        else:
-            order_type = (
-                ExternalType.STOP_MARKET if level == Level.STOP_LOSS else ExternalType.LIMIT
+            leg.filled += deal.filledVolume
+            # A leg left with a remainder lives while the position does.
+            if leg.filled >= leg.quantity:
+                leg.alive = False
+        elif order.orderId in self._reported:
+            records.append(
+                OrderEvent(OrderEventKind.FILLED, str(order.orderId), None, fill.ts_ms, fill=fill)
             )
+        else:
+            order_type = {
+                None: ExternalType.MARKET,
+                Level.STOP_LOSS: ExternalType.STOP_MARKET,
+                Level.TAKE_PROFIT: ExternalType.LIMIT,
+            }[level]
             records.append(
                 self._external_report(
-                    order, precision, reduce_only=True, fills=(fill,), order_type=order_type
+                    order,
+                    precision,
+                    reduce_only=True,
+                    fills=(fill,),
+                    order_type=order_type,
+                    levels=levels,
                 ),
             )
         if not position.open:
-            records += self._cancel_legs(position, fill.ts_ms)
-            position.protective_order_id = None
-            position.levels = {}
+            records += self._closed_by(position, deal)
         return records
 
     def _closing(
@@ -666,10 +753,15 @@ class VenueBook:
         position = self._position_for(event)
         self._sync(position, event)
         close_id = self._closes.get(order.orderId)
-        if close_id is None and order.orderId not in self._reported:
-            close_id = operations.closing(position.position_id, order.tradeData.volume)
-            if close_id is not None:
-                self._closes[order.orderId] = close_id
+        # A close the broker made itself is never the node's, whatever the node has in flight.
+        asked = not event.isServerEvent and not order.isStopOut
+        if close_id is None and asked and order.orderId not in self._reported:
+            # TODO(verify): that the broker's closing order carries the volume the node's close
+            # asked for; the match rests on it.
+            candidate = operations.closing(position.position_id, order.tradeData.volume)
+            # One close id names one broker order; a second match is somebody else's close.
+            if candidate is not None and candidate not in self._closes.values():
+                close_id = self._closes[order.orderId] = candidate
         if close_id is not None:
             records = self._node_close(event, close_id, precision)
         else:
@@ -677,9 +769,7 @@ class VenueBook:
             if kind in _FILLS:
                 records += self._close_activity(event, position)
         if kind in _FILLS and not position.open:
-            records += self._cancel_legs(position, event.deal.executionTimestamp)
-            position.protective_order_id = None
-            position.levels = {}
+            records += self._closed_by(position, event.deal)
         return records
 
     def _node_close(
@@ -691,8 +781,12 @@ class VenueBook:
         order, kind = event.order, event.executionType
         venue_order_id, ts = str(order.orderId), order.utcLastUpdateTimestamp
         if kind == om.ORDER_ACCEPTED:
+            if order.orderId in self._closes_accepted:
+                return []
+            self._closes_accepted.add(order.orderId)
             return [OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, close_id, ts)]
         if kind in _FILLS:
+            self._closes_accepted.add(order.orderId)
             fill = self._fill(event.deal, precision)
             return [
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, close_id, fill.ts_ms, fill=fill)
@@ -725,9 +819,13 @@ class VenueBook:
         order, kind = event.order, event.executionType
         data = order.tradeData
         has_position = event.HasField("position")
-        position_side = (
-            _SIDE[event.position.tradeData.tradeSide] if has_position else _SIDE[data.tradeSide]
-        )
+        if has_position:
+            position_side = _SIDE[event.position.tradeData.tradeSide]
+        else:
+            # A closing order trades against its position.
+            position_side = _SIDE[
+                _opposite(data.tradeSide) if order.closingOrder else data.tradeSide
+            ]
         if kind in _FILLS:
             if order.closingOrder:
                 open_after = (
