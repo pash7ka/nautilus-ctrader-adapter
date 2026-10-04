@@ -85,13 +85,22 @@ FIRST_AS_OURS = [
     tp(A, FIRST, 6000001, 1600000124775, quantity=d("1"), price=d("85387.22")),
 ]
 FIRST_AFTER_PROTECTION = [
-    sl(U, FIRST, 6000001, 1600000168184, trigger_price=d("85200.20")),
+    sl(U, FIRST, 6000001, 1600000168184, quantity=d("1"), trigger_price=d("85200.20")),
     trader(Action.LEVEL_MOVED, 1600000168184),
     tp(C, FIRST, 6000001, 1600000226406),
     trader(Action.LEVEL_REMOVED, 1600000226406),
     trader(Action.LEVEL_ADDED, 1600000254312),
     ExternalOrder(
-        "6000003", SYMBOL, "SELL", ExternalType.MARKET, d("0.01"), True, str(FIRST), 1600000355411
+        "6000003",
+        SYMBOL,
+        "SELL",
+        ExternalType.MARKET,
+        d("0.01"),
+        True,
+        str(FIRST),
+        1600000355411,
+        time_in_force="IMMEDIATE_OR_CANCEL",
+        ts_accepted_ms=1600000355411,
     ),
     OrderEvent(
         F,
@@ -102,7 +111,7 @@ FIRST_AFTER_PROTECTION = [
     ),
     trader(Action.PARTIALLY_CLOSED, 1600000355547, units="0.01"),
     sl(U, FIRST, 6000001, 1600000355553, quantity=d("0.99")),
-    sl(U, FIRST, 6000001, 1600000405318, trigger_price=d("85206.20")),
+    sl(U, FIRST, 6000001, 1600000405318, quantity=d("0.99"), trigger_price=d("85206.20")),
     trader(Action.LEVEL_MOVED, 1600000405318, units="0.99"),
     sl(
         F,
@@ -125,19 +134,19 @@ SECOND_AS_OURS = [
     AwaitProtection(SECOND),
     sl(A, SECOND, 6000004, 1600000442969, quantity=d("1"), trigger_price=d("85119.09")),
     tp(A, SECOND, 6000004, 1600000442969, quantity=d("1"), price=d("85309.11")),
-    sl(U, SECOND, 6000004, 1600000480280, trigger_price=d("85089.09")),
+    sl(U, SECOND, 6000004, 1600000480280, quantity=d("1"), trigger_price=d("85089.09")),
     trader(Action.LEVEL_MOVED, 1600000480280),
-    sl(U, SECOND, 6000004, 1600000486155, trigger_price=d("85031.14")),
+    sl(U, SECOND, 6000004, 1600000486155, quantity=d("1"), trigger_price=d("85031.14")),
     trader(Action.LEVEL_MOVED, 1600000486155),
-    tp(U, SECOND, 6000004, 1600000502124, price=d("85224.52")),
+    tp(U, SECOND, 6000004, 1600000502124, quantity=d("1"), price=d("85224.52")),
     trader(Action.LEVEL_MOVED, 1600000502124),
-    tp(U, SECOND, 6000004, 1600000516910, price=d("85220.52")),
+    tp(U, SECOND, 6000004, 1600000516910, quantity=d("1"), price=d("85220.52")),
     trader(Action.LEVEL_MOVED, 1600000516910),
-    tp(U, SECOND, 6000004, 1600000620673, price=d("85168.40")),
+    tp(U, SECOND, 6000004, 1600000620673, quantity=d("1"), price=d("85168.40")),
     trader(Action.LEVEL_MOVED, 1600000620673),
-    tp(U, SECOND, 6000004, 1600000622601, price=d("85206.52")),
+    tp(U, SECOND, 6000004, 1600000622601, quantity=d("1"), price=d("85206.52")),
     trader(Action.LEVEL_MOVED, 1600000622601),
-    tp(U, SECOND, 6000004, 1600000657476, price=d("85179.30")),
+    tp(U, SECOND, 6000004, 1600000657476, quantity=d("1"), price=d("85179.30")),
     trader(Action.LEVEL_MOVED, 1600000657476),
     tp(
         F,
@@ -160,13 +169,20 @@ PENDING_AS_RECORDED = [
         str(PENDING),
         1600000694986,
         price=d("85100.00"),
+        time_in_force="GOOD_TILL_CANCEL",
+        ts_accepted_ms=1600000694986,
     ),
     OrderEvent(C, "6000006", None, 1600000760269),
 ]
 
 
 def test_the_first_position_as_the_nodes() -> None:
-    assert run(first_n(as_ours(events(), [FIRST]), FIRST)) == FIRST_AS_OURS + FIRST_AFTER_PROTECTION
+    records = run(first_n(as_ours(events(), [FIRST]), FIRST))
+
+    assert records == FIRST_AS_OURS + FIRST_AFTER_PROTECTION
+    # `Decimal` equality ignores the exponent; the text Nautilus receives does not.
+    assert str(records[1].fill.price) == "85287.21"
+    assert str(records[3].trigger_price) == "85197.20"
 
 
 def test_the_second_position_as_the_nodes_take_profit_moved_through_the_market() -> None:
@@ -176,7 +192,16 @@ def test_the_second_position_as_the_nodes_take_profit_moved_through_the_market()
 def test_the_first_position_as_recorded_is_foreign() -> None:
     assert run(first_n(events(), FIRST)) == [
         ExternalOrder(
-            "6000001", SYMBOL, "BUY", ExternalType.MARKET, d("1"), False, str(FIRST), 1600000124634
+            "6000001",
+            SYMBOL,
+            "BUY",
+            ExternalType.MARKET,
+            d("1"),
+            False,
+            str(FIRST),
+            1600000124634,
+            time_in_force="IMMEDIATE_OR_CANCEL",
+            ts_accepted_ms=1600000124634,
         ),
         OrderEvent(
             F,
@@ -194,6 +219,8 @@ def test_the_first_position_as_recorded_is_foreign() -> None:
             True,
             str(FIRST),
             1600000355411,
+            time_in_force="IMMEDIATE_OR_CANCEL",
+            ts_accepted_ms=1600000355411,
         ),
         OrderEvent(
             F,
@@ -213,25 +240,48 @@ def test_the_first_position_as_recorded_is_foreign() -> None:
             1600000406510,
             trigger_price=d("85206.20"),
             fills=(fill(7000003, FIRST, "SELL", "0.99", "85205.58", "-27.41", 1600000406510),),
+            time_in_force="GOOD_TILL_CANCEL",
+            ts_accepted_ms=1600000124775,
         ),
     ]
 
 
 def test_the_second_positions_take_profit_as_recorded_is_a_foreign_limit_close() -> None:
-    records = run(first_n(events(), SECOND))
-
-    assert records[-1] == ExternalOrder(
-        "6000005",
-        SYMBOL,
-        "SELL",
-        ExternalType.LIMIT,
-        d("1"),
-        True,
-        str(SECOND),
-        1600000658056,
-        price=d("85179.30"),
-        fills=(fill(7000005, SECOND, "SELL", "1", "85187.89", "-27.69", 1600000658056),),
-    )
+    assert run(first_n(events(), SECOND)) == [
+        ExternalOrder(
+            "6000004",
+            SYMBOL,
+            "BUY",
+            ExternalType.MARKET,
+            d("1"),
+            False,
+            str(SECOND),
+            1600000442831,
+            time_in_force="IMMEDIATE_OR_CANCEL",
+            ts_accepted_ms=1600000442831,
+        ),
+        OrderEvent(
+            F,
+            "6000004",
+            None,
+            1600000442966,
+            fill=fill(7000004, SECOND, "BUY", "1", "85209.10", "-27.69", 1600000442966),
+        ),
+        ExternalOrder(
+            "6000005",
+            SYMBOL,
+            "SELL",
+            ExternalType.LIMIT,
+            d("1"),
+            True,
+            str(SECOND),
+            1600000658056,
+            price=d("85179.30"),
+            fills=(fill(7000005, SECOND, "SELL", "1", "85187.89", "-27.69", 1600000658056),),
+            time_in_force="GOOD_TILL_CANCEL",
+            ts_accepted_ms=1600000442969,
+        ),
+    ]
 
 
 def test_the_pending_order_as_recorded() -> None:

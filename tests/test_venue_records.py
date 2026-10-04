@@ -8,6 +8,8 @@ from decimal import Decimal
 import pytest
 
 from nautilus_ctrader.common.venue_records import (
+    ExternalOrder,
+    ExternalType,
     Level,
     leg_venue_order_id,
     money_of,
@@ -76,3 +78,10 @@ def test_a_legs_venue_order_id_is_never_read_as_a_spread_leg() -> None:
     # Nautilus treats a fill whose venue order id contains this as a spread leg's.
     for level in Level:
         assert "-LEG-" not in leg_venue_order_id(6000001, level)
+
+
+def test_an_external_orders_added_fields_come_last_and_default_to_none() -> None:
+    # Built positionally from the fields it had first, as existing callers do.
+    order = ExternalOrder("1", 2, "BUY", ExternalType.MARKET, Decimal("1"), False, None, 3)
+
+    assert (order.time_in_force, order.expire_ts_ms, order.ts_accepted_ms) == (None, None, None)

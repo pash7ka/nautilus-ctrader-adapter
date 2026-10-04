@@ -84,7 +84,8 @@ class OrderEventKind(Enum):
 class Fill:
     """One deal.
 
-    `commission` is in the account's currency; a charge is negative, as the broker reports it.
+    `commission` is in the account's deposit currency, and a charge is negative, as the broker
+    reports it. Nautilus counts a charge positive: the execution client flips the sign.
     """
 
     trade_id: str
@@ -130,6 +131,12 @@ class ExternalOrder:
 
     Reported with its pre-fill status so that Nautilus never infers a fill of its own. A `LIMIT`
     fills `price`; a `STOP_MARKET`, `trigger_price`; a `STOP_LIMIT`, both; a `MARKET`, neither.
+
+    - `time_in_force`: the broker's `ProtoOATimeInForce` name, e.g. `"GOOD_TILL_CANCEL"`, or
+      `None` when the order does not carry one.
+    - `expire_ts_ms`: the order's expiry, when it has one.
+    - `ts_accepted_ms`: when the broker opened the order; `ts_ms` is its last update, which for an
+      order first seen at its fill is the fill's time.
     """
 
     venue_order_id: str
@@ -143,6 +150,9 @@ class ExternalOrder:
     price: Decimal | None = None
     trigger_price: Decimal | None = None
     fills: tuple[Fill, ...] = ()
+    time_in_force: str | None = None
+    expire_ts_ms: int | None = None
+    ts_accepted_ms: int | None = None
 
 
 class ActivityKind(Enum):
