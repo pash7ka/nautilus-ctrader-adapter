@@ -107,7 +107,11 @@ def _require_on_price_grid(instrument: Instrument, price: Price) -> None:
         )
 
 
-def _require_expressible(order: Order) -> None:
+# A market order fills now whatever Nautilus calls it; the request says so explicitly.
+_MARKET_TIME_IN_FORCE = (TimeInForce.GTC, TimeInForce.IOC)
+
+
+def _require_expressible(order: Order, *, market: bool = False) -> None:
     """Refuse what no request built here can carry, on every order this module reads."""
     if order.is_quote_quantity:
         raise Unsupported("a quantity in the quote currency is not supported, only base units")
@@ -115,7 +119,8 @@ def _require_expressible(order: Order) -> None:
         raise Unsupported("emulated orders are not supported: the venue has no local trigger")
     if order.exec_algorithm_id is not None:
         raise Unsupported("an execution algorithm is not supported: orders go out as given")
-    if order.time_in_force != TimeInForce.GTC:
+    allowed = _MARKET_TIME_IN_FORCE if market else (TimeInForce.GTC,)
+    if order.time_in_force not in allowed:
         raise Unsupported(f"time in force {TimeInForce(order.time_in_force).name} is not supported")
 
 
@@ -132,7 +137,7 @@ def _require_opening_market_order(instrument: Instrument, entry: Order) -> None:
         )
     if entry.is_reduce_only:
         raise Unsupported("a reduce-only order cannot open a position; it must name the position")
-    _require_expressible(entry)
+    _require_expressible(entry, market=True)
 
 
 def _new_order(
@@ -150,15 +155,15 @@ def _new_order(
         comment = order_record.encode_comment(legs)
     except ValueError as e:
         raise Unsupported(str(e)) from e
-    # TODO(verify): that a MARKET request left at the schema's default `timeInForce`
-    # (GOOD_TILL_CANCEL) fills as a plain market order; the order as the venue reports it back
-    # after placement shows the time in force it got.
+    # TODO(verify): the broker's own terminal sends market orders immediate-or-cancel; the first
+    # order the adapter sends, read back from the broker, confirms it fills the same way.
     return oa.ProtoOANewOrderReq(
         ctidTraderAccountId=account_id,
         symbolId=instrument.info["symbol_id"],
         orderType=om.MARKET,
         tradeSide=_TRADE_SIDE[entry.side],
         volume=volume,
+        timeInForce=om.IMMEDIATE_OR_CANCEL,
         clientOrderId=client_order_id,
         label=label,
         comment=comment,
@@ -280,7 +285,7 @@ def close_position(
     """
     if order.order_type != OrderType.MARKET or not order.is_reduce_only:
         raise Unsupported("a position is closed by a reduce-only MARKET order")
-    _require_expressible(order)
+    _require_expressible(order, market=True)
     _require_not_linked(order)
     if position_side not in (PositionSide.LONG, PositionSide.SHORT):
         raise Unsupported(
