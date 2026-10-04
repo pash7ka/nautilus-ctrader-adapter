@@ -71,8 +71,9 @@ server heartbeats at the 30-second tolerance — as a lost connection and reconn
 checked periodically, so the loss is detected within a few seconds after the 90 seconds, not at
 exactly 90 seconds.
 The server does send frames on an otherwise idle authenticated connection (confirmed): in a
-recorded session with no market-data subscription, a stretch of 100 seconds with no other
-message passed without the 90-second detector firing.
+recorded session with no market-data subscription, stretches of up to two minutes with no
+other message passed without the 90-second detector firing. Heartbeats themselves were not
+recorded, so this is inferred from the detector staying silent.
 
 ## 4. Authentication
 
@@ -283,16 +284,17 @@ it.
 ## 10. Execution events
 
 Everything in this section was observed in one recorded session on a hedging account, in which
-a person traded a crypto symbol (quoted to 2 decimals) by hand in the broker's terminal while a
-read-only connection listened. The scrubbed recording is the fixture
+a person traded one symbol priced near 85,000 with 2-decimal prices by hand in the broker's
+terminal while a read-only connection listened; the history lists also hold one earlier trade
+on another symbol. The scrubbed recording is the fixture
 `tests/fixtures/m3_execution_recorded.json`. What it did not exercise is marked **unconfirmed**.
 
 ### Delivery
 
 - **Execution events are pushed after account authentication alone** (confirmed). No
   subscription request exists for them, and none is needed: every order, position and deal
-  change on the account arrives as a `ProtoOAExecutionEvent`, including changes made by another
-  client such as the broker's own terminal.
+  change made in the session arrived as a `ProtoOAExecutionEvent`, including changes made by
+  another client such as the broker's own terminal.
 - `isServerEvent` is `false` for an action a client asked for (placing, amending, cancelling)
   and `true` for what the venue did on its own (creating the protective order, a level
   triggering, a protective order following a partial close) (confirmed).
@@ -317,9 +319,11 @@ The terminal sends a `MARKET` order with `timeInForce = IMMEDIATE_OR_CANCEL` and
    its own `orderId`, `closingOrder = true`, `GOOD_TILL_CANCEL`, the stop-loss in `stopPrice` and
    the take-profit in `limitPrice`; the position now carries `stopLoss` and `takeProfit` too.
 
-**The relative levels are applied to the fill price**, not to the price at which the order was
-sent (confirmed): a fill at `85287.21` with distances `90.01` and `100.01` gave a stop-loss of
-`85197.20` and a take-profit of `85387.22`.
+**The relative levels are applied to the fill price** (`executionPrice`), not to the
+position's `marginRate` (confirmed): a fill at `85287.21` with distances `90.01` and `100.01`
+gave a stop-loss of `85197.20` and a take-profit of `85387.22`, and the second position
+matched the same way. **Unconfirmed**: how far the quote at the moment of sending was from the
+fill; the recording holds no quote.
 
 So the two protective levels of a position are **one** venue order, not two, and that order has
 a real `orderId` from the moment the position opens.
@@ -340,8 +344,8 @@ cancelled or stays with neither field.
 A triggered level fills the protective order: an `ORDER_FILLED` server event carrying that
 order, a closing deal, and the position in `POSITION_STATUS_CLOSED` (confirmed, for a stop-loss
 and for a take-profit). The order still holds both levels as they stood; the deal's
-`executionPrice` is the fill, which can differ from the level (a stop-loss at `85206.20`
-filled at `85205.58`).
+`executionPrice` is the fill, which can differ from the level: a stop-loss at `85206.20`
+filled at `85205.58`.
 
 **Unconfirmed**: a field that says which of the two levels triggered. None in this adapter's
 bindings does; telling them apart from the fill price against `stopPrice` and `limitPrice` is
@@ -377,12 +381,14 @@ and **already names a new `positionId`**, in `POSITION_STATUS_CREATED` with zero
   pnlConversionFee`, with the commission covering both the opening and the closing side of the
   closed volume. `closePositionDetail.balance` is the balance after the deal, and
   `balanceVersion` increases by one for each change.
-- **Swap is realised when the position closes** (confirmed, on a position held for several days
-  before the session): its `closePositionDetail.swap` was part of the change above.
+- **Swap is realised when the position closes** (confirmed, on a position held a few hours and
+  closed some days before the session): its `closePositionDetail.swap` was part of the change
+  above.
   **Unconfirmed**: when swap accrues on an open position, and how that is reported.
-- **The cash-flow history reaches the account's first deposit**, and the deal history the
-  account's registration (confirmed). The first deposit has `balance == delta`. Together they
-  rebuild the balance at any past moment.
+- **The cash-flow history reaches the account's first deposit** (confirmed), which has
+  `balance == delta`. The deal list answered for a window starting at the account's
+  registration; **unconfirmed** that it would have returned deals older than its window allows.
+  Together the two lists rebuild the balance at any past moment the deal history covers.
 - **Unconfirmed**: the sign of `delta` for a withdrawal; the session had none.
 
 ### Messages not seen
