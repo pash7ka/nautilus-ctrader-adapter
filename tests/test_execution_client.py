@@ -206,3 +206,25 @@ async def test_disconnect_releases_the_spots_and_the_account() -> None:
             [US100_SYMBOL_ID]
         ]
         assert h.account.session is None
+
+
+async def test_disconnect_releases_only_the_account_user_this_client_holds() -> None:
+    execution_venue = ExecutionVenue()
+    execution_venue.trader = trader(accountType=om.NETTED)
+    async with harness(execution_venue=execution_venue, connect=False) as h:
+        # Another client of the same account, which must keep its session.
+        await h.account.connect()
+        try:
+            with pytest.raises(CTraderAccountError):
+                await h.client._connect()
+            await h.client._disconnect()
+            assert h.account.session is not None
+
+            execution_venue.trader = trader()
+            await h.client._connect()
+            await h.client._disconnect()
+            await h.client._disconnect()
+            assert h.account.session is not None
+        finally:
+            await h.account.disconnect()
+        assert h.account.session is None

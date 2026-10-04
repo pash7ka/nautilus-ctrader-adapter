@@ -163,6 +163,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._margin_times: dict[int, int] = {}
         self._quotes: dict[int, _Quote] = {}
         self._spot_symbols: set[int] = set()
+        # The account counts its users without knowing who releases, and Nautilus calls
+        # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
+        self._holds_account = False
 
     @property
     def instrument_provider(self) -> CTraderInstrumentProvider:
@@ -170,6 +173,7 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     async def _connect(self) -> None:
         await self._account.connect()
+        self._holds_account = True
         try:
             await self._instrument_provider.initialize()
             session = self._account.session
@@ -184,11 +188,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
         except BaseException:
-            self._session = None
-            try:
-                await self._release_reference_spots()
-            finally:
-                await self._account.disconnect()
+            await self._disconnect()
             raise
 
     async def _disconnect(self) -> None:
@@ -196,7 +196,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         try:
             await self._release_reference_spots()
         finally:
-            await self._account.disconnect()
+            if self._holds_account:
+                self._holds_account = False
+                await self._account.disconnect()
 
     # Reconciliation reports are not built yet. Until they are, these report nothing, and
     # Nautilus resolves orders in flight through its own in-flight check.
