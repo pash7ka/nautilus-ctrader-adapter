@@ -1864,6 +1864,7 @@ def test_a_stop_out_without_closing_order_still_ends_the_legs() -> None:
             40,
             fills=(fill(9_200_003, "84000.00", 41),),
         ),
+        Activity(ActivityKind.STOP_OUT, SYMBOL, "position", "BUY", Decimal("1"), Action.CLOSED, 41),
         leg(OrderEventKind.CANCELED, Level.STOP_LOSS, 41),
         leg(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 41),
     ]
@@ -1891,7 +1892,6 @@ def test_a_close_the_broker_made_for_no_named_reason_is_a_notice() -> None:
             f"the broker closed 1 of position {P} on its own, for a reason the event does not name"
         ),
         external_close(9_100_004, "1", 41),
-        manual(Action.CLOSED, 41),
         leg(OrderEventKind.CANCELED, Level.STOP_LOSS, 41),
         leg(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 41),
     ]
@@ -2055,3 +2055,166 @@ def test_an_entry_whose_remainder_ended_after_a_fill_is_kept() -> None:
     b.apply(make_event(om.ORDER_CANCELLED, our_entry(P, ENTRY, utc=21)), NOTHING)
 
     assert b.view(P) is not None and b.view(P).open
+
+
+# Residuals: server fills on the opening route, fills on an ended entry, partial protection.
+
+
+def test_a_server_fill_that_reduces_a_position_on_the_opening_route_is_a_notice() -> None:
+    b = book()
+    opened(b)
+
+    records = b.apply(
+        make_event(
+            om.ORDER_FILLED,
+            make_order(9_100_003, P, side=om.SELL, utc=40),
+            position=closed(),
+            deal=make_deal(9_200_003, 9_100_003, P, side=om.SELL, volume=100, price=84000.0, ts=41),
+            server=True,
+        ),
+        NOTHING,
+    )
+
+    assert records == [
+        Notice(
+            f"the broker closed 1 of position {P} on its own, for a reason the event does not name"
+        ),
+        ExternalOrder(
+            "9100003",
+            SYMBOL,
+            "SELL",
+            ExternalType.MARKET,
+            Decimal("1"),
+            False,
+            str(P),
+            40,
+            fills=(fill(9_200_003, "84000.00", 41),),
+        ),
+        leg(OrderEventKind.CANCELED, Level.STOP_LOSS, 41),
+        leg(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 41),
+    ]
+
+
+def test_a_triggered_pending_order_is_a_server_fill_without_a_notice() -> None:
+    b = book()
+    order = make_order(17, 18, order_type=om.LIMIT, utc=10, limit=84000.0)
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            order,
+            position=make_position(18, volume=0, status=om.POSITION_STATUS_CREATED),
+        ),
+        NOTHING,
+    )
+
+    records = b.apply(
+        make_event(
+            om.ORDER_FILLED,
+            order,
+            position=make_position(18),
+            deal=make_deal(19, 17, 18, side=om.BUY, volume=100, price=84000.0, ts=11),
+            server=True,
+        ),
+        NOTHING,
+    )
+
+    assert records == [
+        OrderEvent(
+            OrderEventKind.FILLED,
+            "17",
+            None,
+            11,
+            fill=fill(19, "84000.00", 11, side="BUY", position=18),
+        )
+    ]
+
+
+def test_a_fill_on_an_ended_entry_is_reported_with_a_notice_and_its_legs_dead() -> None:
+    b = book()
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            our_entry(P, ENTRY, utc=10),
+            position=make_position(P, volume=0, status=om.POSITION_STATUS_CREATED),
+        ),
+        NOTHING,
+    )
+    b.apply(make_event(om.ORDER_CANCELLED, our_entry(P, ENTRY, utc=11)), NOTHING)
+
+    records = b.apply(
+        make_event(
+            om.ORDER_PARTIAL_FILL,
+            our_entry(P, ENTRY, utc=12),
+            position=make_position(P, volume=40),
+            deal=make_deal(1, ENTRY, P, side=om.BUY, volume=40, price=85250.0, ts=12),
+        ),
+        NOTHING,
+    )
+
+    assert records == [
+        Notice(f"entry {ENTRY} filled after it ended"),
+        OrderEvent(
+            OrderEventKind.FILLED,
+            str(ENTRY),
+            entry_id(P),
+            12,
+            fill=fill(1, "85250.00", 12, units="0.4", side="BUY"),
+        ),
+    ]
+    view = b.view(P)
+    assert view.open
+    assert view.legs == {
+        Level.STOP_LOSS: (stop_id(P), False),
+        Level.TAKE_PROFIT: (target_id(P), False),
+    }
+
+
+def test_a_leg_the_early_protective_order_lacks_still_awaits_protection() -> None:
+    b = book()
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            protective(15, stop=85000.0),
+            position=make_position(P),
+            server=True,
+        ),
+        NOTHING,
+    )
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            our_entry(P, ENTRY, utc=10),
+            position=make_position(P, volume=0, status=om.POSITION_STATUS_CREATED),
+        ),
+        NOTHING,
+    )
+
+    records = b.apply(
+        make_event(
+            om.ORDER_FILLED,
+            our_entry(P, ENTRY, utc=19),
+            position=make_position(P),
+            deal=make_deal(9_200_001, ENTRY, P, side=om.BUY, volume=100, price=85250.0, ts=20),
+        ),
+        NOTHING,
+    )
+
+    assert records == [
+        OrderEvent(
+            OrderEventKind.FILLED,
+            str(ENTRY),
+            entry_id(P),
+            20,
+            fill=fill(9_200_001, "85250.00", 20, side="BUY"),
+        ),
+        # The legs are accepted at the deal's time, never before the entry's fill.
+        leg(
+            OrderEventKind.ACCEPTED,
+            Level.STOP_LOSS,
+            20,
+            quantity=Decimal("1"),
+            trigger_price=Decimal("85000.00"),
+        ),
+        AwaitProtection(P),
+    ]
+    assert b.protection_timed_out(P) == [ProtectionMissing(P, None, target_id(P))]

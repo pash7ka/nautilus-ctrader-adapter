@@ -575,19 +575,45 @@ class VenueBook:
     # Event kinds
 
     def _opening(self, event: oa.ProtoOAExecutionEvent, precision: int) -> list[Record]:
-        order = event.order
-        if order.orderId in self._ended_entries:
+        order, kind = event.order, event.executionType
+        filled = kind in _FILLS
+        ended = order.orderId in self._ended_entries
+        if ended and not filled:
             return []
         position = self._position_for(event)
         records: list[Record] = []
         if position.entry_order_id is None:
             records += self._adopt(position, order, restored=False)
+        if ended:
+            # A fill is never dropped. Nautilus holds the entry and its legs ended: the fill is
+            # legal after that, the legs are not live again.
+            records.append(Notice(f"entry {order.orderId} filled after it ended"))
+            position.entry_accepted = True
+            for leg in position.legs.values():
+                leg.alive = False
+        was_open, volume_before = position.open, position.volume
         self._sync(position, event)
+        reduced = was_open and (not position.open or position.volume < volume_before)
+        # A triggered pending order is a server event too; only one that took volume away is
+        # a close.
+        if filled and event.isServerEvent and not order.isStopOut and reduced:
+            records.append(self._unnamed_close(position, event.deal))
         if position.ours and position.entry_order_id == order.orderId:
             records += self._entry_event(event, position, precision)
         else:
             records += self._external_event(event, precision, reduce_only=False)
-        if event.executionType in _FILLS and position.legs and not position.open:
+        if filled and order.isStopOut:
+            action = Action.PARTIALLY_CLOSED if position.open else Action.CLOSED
+            records.append(
+                self._activity(
+                    ActivityKind.STOP_OUT,
+                    position,
+                    action,
+                    event.deal.executionTimestamp,
+                    units_of(event.deal.filledVolume),
+                )
+            )
+        if filled and position.legs and not position.open:
             records += self._closed_by(position, event.deal)
         return records
 
@@ -613,9 +639,11 @@ class VenueBook:
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, entry_id, fill.ts_ms, fill=fill),
             ]
             if position.protective_order_id is not None:
-                # The protective order came first: its levels accept the legs now.
-                records += self._level_changes(position, {}, False, ts)
-            elif position.legs and not position.awaiting_protection:
+                # The protective order came first: its levels accept the legs now, at the deal's
+                # time so that they never predate the fill.
+                records += self._level_changes(position, {}, False, fill.ts_ms)
+            waiting = any(leg.alive and not leg.accepted for leg in position.legs.values())
+            if waiting and not position.awaiting_protection:
                 position.awaiting_protection = True
                 records.append(AwaitProtection(position.position_id))
             return records
@@ -838,12 +866,7 @@ class VenueBook:
                 close_id = self._closes[order.orderId] = candidate
         records: list[Record] = []
         if kind in _FILLS and event.isServerEvent and not order.isStopOut:
-            records.append(
-                Notice(
-                    f"the broker closed {units_of(event.deal.filledVolume)} of position "
-                    f"{position.position_id} on its own, for a reason the event does not name",
-                )
-            )
+            records.append(self._unnamed_close(position, event.deal))
         if close_id is not None:
             records += self._node_close(event, close_id, precision)
         else:
@@ -881,6 +904,13 @@ class VenueBook:
             ]
         return []
 
+    @staticmethod
+    def _unnamed_close(position: _Position, deal: om.ProtoOADeal) -> Notice:
+        return Notice(
+            f"the broker closed {units_of(deal.filledVolume)} of position "
+            f"{position.position_id} on its own, for a reason the event does not name",
+        )
+
     def _close_activity(
         self,
         event: oa.ProtoOAExecutionEvent,
@@ -892,7 +922,7 @@ class VenueBook:
         # TODO(verify): that a stop-out's closing order carries `isStopOut`; none was recorded.
         if event.order.isStopOut:
             return [self._activity(ActivityKind.STOP_OUT, position, action, ts, units)]
-        if position.ours:
+        if position.ours and not event.isServerEvent:
             return [self._activity(ActivityKind.MANUAL_CHANGE, position, action, ts, units)]
         return []
 
