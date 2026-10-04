@@ -615,10 +615,10 @@ def test_a_close_in_the_quote_currency_is_refused() -> None:
         tr.close_position(ACCOUNT_ID, 5_000_001, order, position_side=PositionSide.LONG)
 
 
-def test_a_close_with_a_time_in_force_other_than_gtc_is_refused() -> None:
-    order = market_entry(OrderSide.SELL, reduce_only=True, time_in_force=TimeInForce.IOC)
+def test_a_close_with_a_time_in_force_other_than_gtc_or_ioc_is_refused() -> None:
+    order = market_entry(OrderSide.SELL, reduce_only=True, time_in_force=TimeInForce.FOK)
 
-    with pytest.raises(tr.Unsupported, match="IOC"):
+    with pytest.raises(tr.Unsupported, match="FOK"):
         tr.close_position(ACCOUNT_ID, 5_000_001, order, position_side=PositionSide.LONG)
 
 
@@ -699,3 +699,38 @@ def test_a_leg_id_the_record_cannot_hold_is_refused(bad) -> None:
         build([entry, stop, target_leg(entry)])
     with pytest.raises(tr.Unsupported, match="client order id"):
         build([entry, stop_leg(entry), target])
+
+
+def test_a_market_entry_goes_out_immediate_or_cancel() -> None:
+    request = tr.market_order(ACCOUNT_ID, EURUSD, market_entry())
+
+    assert request.timeInForce == om.IMMEDIATE_OR_CANCEL
+
+
+def test_a_bracket_entry_goes_out_immediate_or_cancel() -> None:
+    bracket = build(eurusd_bracket(stop="1.10000", target="1.12000"))
+
+    assert bracket.request.timeInForce == om.IMMEDIATE_OR_CANCEL
+
+
+@pytest.mark.parametrize("time_in_force", [TimeInForce.GTC, TimeInForce.IOC])
+def test_a_market_order_with_gtc_or_ioc_is_accepted(time_in_force) -> None:
+    request = tr.market_order(ACCOUNT_ID, EURUSD, market_entry(time_in_force=time_in_force))
+
+    assert request.timeInForce == om.IMMEDIATE_OR_CANCEL
+
+
+@pytest.mark.parametrize("time_in_force", [TimeInForce.FOK, TimeInForce.DAY])
+def test_a_market_order_with_another_time_in_force_is_refused(time_in_force) -> None:
+    order = market_entry(time_in_force=time_in_force)
+
+    with pytest.raises(tr.Unsupported, match=TimeInForce(time_in_force).name):
+        tr.market_order(ACCOUNT_ID, EURUSD, order)
+
+
+def test_a_close_with_ioc_is_accepted() -> None:
+    order = market_entry(OrderSide.SELL, reduce_only=True, time_in_force=TimeInForce.IOC)
+
+    request = tr.close_position(ACCOUNT_ID, 5_000_001, order, position_side=PositionSide.LONG)
+
+    assert request.positionId == 5_000_001
