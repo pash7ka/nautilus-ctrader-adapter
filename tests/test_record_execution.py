@@ -19,6 +19,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 
 import pytest
 from google.protobuf.descriptor import FieldDescriptor
@@ -164,6 +165,7 @@ def test_the_allow_list_is_exactly_these_requests() -> None:
         oa.ProtoOAOrderListReq,
         oa.ProtoOADealListByPositionIdReq,
         oa.ProtoOAOrderListByPositionIdReq,
+        oa.ProtoOACashFlowHistoryListReq,
     } == r.READ_ONLY_REQUESTS
 
 
@@ -859,7 +861,16 @@ def test_describe_prints_no_real_identifier() -> None:
         assert str(real) not in text
 
 
-def venue() -> FakeCTraderServer:
+WEEK_MS = 604_800_000
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def venue(*, registered_ms: int | None = None) -> FakeCTraderServer:
+    """A venue that answers every read-only request; the account was registered ten days ago."""
+    registered = now_ms() - 10 * 86_400_000 if registered_ms is None else registered_ms
     server = FakeCTraderServer()
     server.on(om.PROTO_OA_APPLICATION_AUTH_REQ, lambda _r: oa.ProtoOAApplicationAuthRes())
     server.on(
@@ -875,8 +886,13 @@ def venue() -> FakeCTraderServer:
                 balance=1_000_000,
                 depositAssetId=1,
                 brokerName=BROKER_NAME,
+                registrationTimestamp=registered,
             ),
         ),
+    )
+    server.on(
+        om.PROTO_OA_CASH_FLOW_HISTORY_LIST_REQ,
+        lambda q: oa.ProtoOACashFlowHistoryListRes(ctidTraderAccountId=q.ctidTraderAccountId),
     )
     server.on(
         om.PROTO_OA_RECONCILE_REQ,
@@ -1013,14 +1029,15 @@ async def test_a_snapshot_is_named_by_the_flag_it_was_asked_with() -> None:
     recording = r.Recording(started_wall_ms=1_790_000_000_000)
     task = asyncio.create_task(run(server, stop, markers, recording=recording))
     try:
-        await wait_until(lambda: len(recording.timeline) >= 2)
+        await wait_until(lambda: len(recording.timeline) >= 3)
         stop.set()
         await asyncio.wait_for(task, 10)
     finally:
         task.cancel()
         await server.stop()
 
-    assert [entry.note for entry in recording.timeline[:2]] == [
+    assert [entry.note for entry in recording.timeline[:3]] == [
+        "start; trader",
         "start; returnProtectionOrders=false",
         "start; returnProtectionOrders=true",
     ]
@@ -1037,18 +1054,18 @@ async def test_a_note_typed_before_an_event_is_recorded_before_it() -> None:
     task = asyncio.create_task(run(server, stop, markers, recording=recording, tick_secs=0.3))
     try:
         await server.wait_for_connections(1)
-        await wait_until(lambda: len(recording.timeline) >= 2)
+        await wait_until(lambda: len(recording.timeline) >= 3)
         markers.put_nowait("market buy with stop and target")
         await server.push(execution_event())
-        await wait_until(lambda: len(recording.timeline) >= 4)
-        kinds = [entry.kind for entry in recording.timeline[:4]]
+        await wait_until(lambda: len(recording.timeline) >= 5)
+        kinds = [entry.kind for entry in recording.timeline[:5]]
         stop.set()
         await asyncio.wait_for(task, 10)
     finally:
         task.cancel()
         await server.stop()
 
-    assert kinds == ["snapshot", "snapshot", "marker", "event"]
+    assert kinds == ["snapshot", "snapshot", "snapshot", "marker", "event"]
 
 
 async def test_a_note_typed_just_before_stopping_is_kept() -> None:
@@ -1408,7 +1425,8 @@ async def test_the_owner_is_told_at_once_that_the_run_is_stopping() -> None:
         await server.stop()
 
     assert statuses == [r.STATUS_STARTED, r.STATUS_CLOSING_LISTS, r.STATUS_WRITING]
-    assert lists_asked_when_told == [0, 0, 1]
+    # The deals of the session's window, then those of the account's whole history.
+    assert lists_asked_when_told == [0, 0, 2]
 
 
 @pytest.mark.parametrize("dropped", [False, True], ids=["connected", "waiting to reconnect"])
@@ -1457,6 +1475,8 @@ def silent_on(server: FakeCTraderServer, payload_type: int) -> None:
                 "closing list skipped: orders",
                 "closing list skipped: position_orders",
                 "closing list skipped: position_deals",
+                "closing list skipped: account_deals",
+                "closing list skipped: cash_flow",
             ],
             {oa.ProtoOADealListReq},
         ),
@@ -1465,11 +1485,24 @@ def silent_on(server: FakeCTraderServer, payload_type: int) -> None:
             [
                 "closing list failed: position_orders CTraderTimeoutError",
                 "closing list skipped: position_deals",
+                "closing list skipped: account_deals",
+                "closing list skipped: cash_flow",
             ],
             {oa.ProtoOADealListReq, oa.ProtoOAOrderListReq, oa.ProtoOAOrderListByPositionIdReq},
         ),
+        (
+            om.PROTO_OA_CASH_FLOW_HISTORY_LIST_REQ,
+            ["closing list failed: cash_flow CTraderTimeoutError"],
+            {
+                oa.ProtoOADealListReq,
+                oa.ProtoOAOrderListReq,
+                oa.ProtoOAOrderListByPositionIdReq,
+                oa.ProtoOADealListByPositionIdReq,
+                oa.ProtoOACashFlowHistoryListReq,
+            },
+        ),
     ],
-    ids=["the deals", "a position's orders"],
+    ids=["the deals", "a position's orders", "the cash flow"],
 )
 async def test_a_closing_list_that_gets_no_answer_ends_them_and_names_each_one_left(
     monkeypatch,
@@ -1505,13 +1538,15 @@ async def test_a_closing_list_that_gets_no_answer_ends_them_and_names_each_one_l
         oa.ProtoOAOrderListReq,
         oa.ProtoOAOrderListByPositionIdReq,
         oa.ProtoOADealListByPositionIdReq,
+        oa.ProtoOACashFlowHistoryListReq,
     )
     assert {type(m) for m in server.received if isinstance(m, lists)} == asked
     # Each missing list is one line of what the owner reads.
     assert r.summary(recording)[:-1] == expected
 
 
-async def test_the_trader_is_asked_once_for_the_broker_s_name_and_not_recorded() -> None:
+async def test_every_snapshot_records_the_trader_and_the_start_asks_it_once() -> None:
+    """The balance before and after each step; the one at the start also gives the broker's name."""
     server = venue()
     await server.start()
     stop, markers = asyncio.Event(), asyncio.Queue()
@@ -1522,6 +1557,9 @@ async def test_the_trader_is_asked_once_for_the_broker_s_name_and_not_recorded()
     )
     try:
         await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        asked_at_start = sum(isinstance(m, oa.ProtoOATraderReq) for m in server.received)
+        await server.push(execution_event())
+        await wait_until(lambda: len(statuses) >= 2)
         await server.drop_connections()
         await wait_until(lambda: r.STATUS_RECONNECTED in statuses)
         stop.set()
@@ -1530,9 +1568,13 @@ async def test_the_trader_is_asked_once_for_the_broker_s_name_and_not_recorded()
         task.cancel()
         await server.stop()
 
-    assert sum(isinstance(m, oa.ProtoOATraderReq) for m in server.received) == 1
+    assert asked_at_start == 1
+    traders = [
+        entry.note for entry in recording.timeline if isinstance(entry.message, oa.ProtoOATraderRes)
+    ]
+    assert traders == ["start; trader", "after events; trader", "after reconnect; trader"]
+    assert sum(isinstance(m, oa.ProtoOATraderReq) for m in server.received) == 3
     assert recording.names == [BROKER_NAME]
-    assert not any(isinstance(m, oa.ProtoOATraderRes) for m in recording.messages())
     assert not any(BROKER_NAME in text for text in statuses)
 
 
@@ -1554,7 +1596,155 @@ async def test_a_truncated_closing_list_is_marked() -> None:
         task.cancel()
         await server.stop()
 
-    assert marker_notes(recording) == ["closing list truncated: deals"]
+    # The account's history is followed page by page; a page with nothing in it cannot be.
+    assert marker_notes(recording) == [
+        "closing list truncated: deals",
+        "closing list truncated: account_deals",
+    ]
+
+
+async def closing_run(server: FakeCTraderServer) -> r.Recording:
+    """A run stopped as soon as it has started, so it does little but ask the closing lists."""
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    statuses: list[str] = []
+    # Started now: the session's own one-hour lists hold nothing the account's history does.
+    recording = r.Recording(started_wall_ms=now_ms())
+    task = asyncio.create_task(
+        run(server, stop, markers, recording=recording, status=statuses.append),
+    )
+    try:
+        await wait_until(lambda: statuses == [r.STATUS_STARTED])
+        stop.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await server.stop()
+    return recording
+
+
+def asked(server: FakeCTraderServer, request_type: type) -> list:
+    return [m for m in server.received if isinstance(m, request_type)]
+
+
+async def test_the_account_s_history_is_asked_from_its_registration() -> None:
+    registered = now_ms() - 17 * 86_400_000
+    server = venue(registered_ms=registered)
+
+    recording = await closing_run(server)
+
+    session, history = asked(server, oa.ProtoOADealListReq)
+    assert session.fromTimestamp == recording.started_wall_ms - 3_600_000
+    assert history.fromTimestamp == registered
+    windows = [
+        (q.fromTimestamp, q.toTimestamp) for q in asked(server, oa.ProtoOACashFlowHistoryListReq)
+    ]
+    # Consecutive windows of at most a week, from the registration to the time the deals end.
+    assert len(windows) == 3
+    assert windows[0][0] == registered and windows[-1][1] == history.toTimestamp
+    assert all(to - start <= WEEK_MS for start, to in windows)
+    assert all(windows[i][1] == windows[i + 1][0] for i in range(len(windows) - 1))
+    assert (len(recording.closing["account_deals"]), len(recording.closing["cash_flow"])) == (1, 3)
+    assert marker_notes(recording) == []
+
+
+def paged_deals(server: FakeCTraderServer, deals: list, *, newest_first: bool, rows: int) -> None:
+    """Answer the deal list `rows` deals at a time, the rest announced by `hasMore`."""
+
+    def handler(q):
+        found = [d for d in deals if q.fromTimestamp <= d.executionTimestamp <= q.toTimestamp]
+        found.sort(key=lambda d: d.executionTimestamp, reverse=newest_first)
+        return oa.ProtoOADealListRes(
+            ctidTraderAccountId=q.ctidTraderAccountId,
+            deal=found[:rows],
+            hasMore=len(found) > rows,
+        )
+
+    server.on(om.PROTO_OA_DEAL_LIST_REQ, handler)
+
+
+def history_deals(registered: int, count: int) -> list:
+    return [
+        om.ProtoOADeal(
+            dealId=DEAL_ID + n,
+            orderId=ORDER_ID,
+            positionId=POSITION_ID,
+            volume=100_000,
+            filledVolume=100_000,
+            symbolId=1,
+            createTimestamp=registered + n * 1000,
+            executionTimestamp=registered + n * 1000,
+            tradeSide=om.BUY,
+            dealStatus=om.FILLED,
+        )
+        for n in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize("newest_first", [False, True], ids=["oldest first", "newest first"])
+async def test_the_account_s_deals_are_followed_page_by_page(newest_first) -> None:
+    registered = now_ms() - 3 * 86_400_000
+    server = venue(registered_ms=registered)
+    deals = history_deals(registered, 5)
+    paged_deals(server, deals, newest_first=newest_first, rows=2)
+
+    recording = await closing_run(server)
+
+    pages = recording.closing["account_deals"]
+    assert [page.hasMore for page in pages] == [True, True, True, False]
+    # A deal at a page's edge is asked again rather than risked: the window keeps that edge.
+    seen = {deal.dealId for page in pages for deal in page.deal}
+    assert seen == {deal.dealId for deal in deals}
+    assert marker_notes(recording) == []
+
+
+async def test_the_account_s_deals_stop_at_the_page_limit_and_say_so(monkeypatch) -> None:
+    monkeypatch.setattr(r, "_MAX_HISTORY_PAGES", 2)
+    registered = now_ms() - 3 * 86_400_000
+    server = venue(registered_ms=registered)
+    paged_deals(server, history_deals(registered, 5), newest_first=False, rows=2)
+
+    recording = await closing_run(server)
+
+    assert len(recording.closing["account_deals"]) == 2
+    assert marker_notes(recording) == ["closing list truncated: account_deals"]
+
+
+async def test_the_cash_flow_stops_at_the_window_limit_and_says_so(monkeypatch) -> None:
+    monkeypatch.setattr(r, "_MAX_CASH_FLOW_WINDOWS", 2)
+    registered = now_ms() - 17 * 86_400_000
+    server = venue(registered_ms=registered)
+
+    recording = await closing_run(server)
+
+    windows = asked(server, oa.ProtoOACashFlowHistoryListReq)
+    # From the registration on: the first deposit is what the rest of the history builds on.
+    assert [q.fromTimestamp for q in windows] == [registered, registered + WEEK_MS]
+    assert marker_notes(recording) == ["closing list truncated: cash_flow"]
+
+
+async def test_the_account_s_history_is_skipped_without_a_registration_time() -> None:
+    server = venue()
+    server.on(
+        om.PROTO_OA_TRADER_REQ,
+        lambda q: oa.ProtoOATraderRes(
+            ctidTraderAccountId=q.ctidTraderAccountId,
+            trader=om.ProtoOATrader(
+                ctidTraderAccountId=q.ctidTraderAccountId,
+                balance=1_000_000,
+                depositAssetId=1,
+            ),
+        ),
+    )
+
+    recording = await closing_run(server)
+
+    assert marker_notes(recording) == [
+        "closing list skipped: account_deals, no registration time",
+        "closing list skipped: cash_flow, no registration time",
+    ]
+    assert len(asked(server, oa.ProtoOADealListReq)) == 1
+    assert asked(server, oa.ProtoOACashFlowHistoryListReq) == []
 
 
 async def test_a_recording_is_written_even_when_the_run_fails(tmp_path) -> None:
@@ -1612,8 +1802,12 @@ async def test_a_recording_is_written_even_when_the_run_fails(tmp_path) -> None:
     assert [event.ctidTraderAccountId for event in events] == [r.record_fixtures.FAKE_ACCOUNT_ID]
     assert events[0].position.positionId == 5_000_001
     notes = [item["note"] for item in decoded["timeline"] if item["kind"] == "marker"]
-    assert notes == ["closing list refused: deals INVALID_REQUEST"]
+    assert notes == [
+        "closing list refused: deals INVALID_REQUEST",
+        "closing list refused: account_deals INVALID_REQUEST",
+    ]
     assert decoded["closing"]["deals"] == []
+    assert len(decoded["closing"]["cash_flow"]) == 2
     assert len(decoded["closing"]["orders"]) == 1
     assert len(decoded["closing"]["position_orders"]) == 1
 
@@ -2130,6 +2324,9 @@ async def test_an_abrupt_end_leaves_a_journal_that_the_next_run_finishes(
 
     asked = [type(m) for m in server.received[cut:]]
     assert oa.ProtoOADealListReq in asked and oa.ProtoOAOrderListByPositionIdReq in asked
+    # The account's history too, from the registration time the journalled trader gave.
+    assert oa.ProtoOACashFlowHistoryListReq in asked
+    assert asked.count(oa.ProtoOADealListReq) == 2
     assert set(asked) <= r.READ_ONLY_REQUESTS
     assert not journal.exists() and outcome.journal is None
     assert output.exists() and raw_of(output).exists()
@@ -2359,7 +2556,7 @@ async def test_a_raw_recording_is_rescrubbed_into_the_same_fixture(tmp_path, cap
 
     # As typed notes they are counted, and not reported as problems of the run.
     live = r.summary(outcome.recording)
-    assert live == ["1 events, 4 snapshots, 3 notes"]
+    assert live == ["1 events, 6 snapshots, 3 notes"]
 
     assert r.main(rescrub_args(tmp_path, raw_of(output))) == 0
 

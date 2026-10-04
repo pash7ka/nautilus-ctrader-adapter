@@ -1,7 +1,8 @@
 """Record a cTrader account's execution events while its owner trades by hand.
 
 Read-only. The script listens for the events the venue pushes, asks for snapshots of the
-account's positions and orders, and writes a scrubbed fixture. Every message it sends goes
+account's balance, positions and orders, and on stopping for the account's history of deals and
+deposits; it writes a scrubbed fixture. Every message it sends goes
 through `send()`, which refuses any request class outside `READ_ONLY_REQUESTS`; no request that
 places, changes or closes an order is named anywhere in this module.
 
@@ -103,6 +104,7 @@ READ_ONLY_REQUESTS: frozenset[type[Message]] = frozenset(
         oa.ProtoOAOrderListReq,
         oa.ProtoOADealListByPositionIdReq,
         oa.ProtoOAOrderListByPositionIdReq,
+        oa.ProtoOACashFlowHistoryListReq,
     },
 )
 
@@ -124,6 +126,12 @@ _TICK_SECS = 0.2
 _SNAPSHOT_DEBOUNCE_SECS = 2.0
 _RECONNECT_WAIT_SECS = (2.0, 5.0, 10.0, 30.0)
 _CLOSING_LOOKBACK_MS = 3_600_000
+# The widest window the cash-flow request accepts, by its schema.
+_CASH_FLOW_WINDOW_MS = 604_800_000
+# Bounds on the account's whole history, so stopping cannot take unboundedly long: at one
+# historical request a second, a few minutes at most.
+_MAX_HISTORY_PAGES = 50
+_MAX_CASH_FLOW_WINDOWS = 156
 
 # What `record()` tells its `status` callback. Fixed texts: no identifier can get into one.
 STATUS_STARTED = "recording started"
@@ -383,6 +391,8 @@ class Recording:
             "orders": [],
             "position_orders": [],
             "position_deals": [],
+            "account_deals": [],
+            "cash_flow": [],
         },
     )
     # The broker's names, as the venue gave them: what scrubbing takes out of free text.
@@ -896,65 +906,152 @@ async def _ask_closing_lists(
 ) -> None:
     """Ask the lists that hold what the recording's session did, into `recording.closing`.
 
+    Then the account's whole history, from its registration: every deal, and every deposit
+    and withdrawal, from which its balance at a past moment is rebuilt.
+
     A list refused is marked and the rest are asked. A list that fails otherwise - no answer,
     no connection - ends the asking: each list left is marked as skipped.
     """
     failed = False
 
-    async def ask(key: str, request: Message) -> None:
+    def mark(text: str) -> None:
+        recording.add("marker", text, None, now())
+
+    async def ask(key: str, request: Message) -> Message | None:
         nonlocal failed
         if failed:
-            recording.add("marker", f"closing list skipped: {key}", None, now())
-            return
+            mark(f"closing list skipped: {key}")
+            return None
         try:
             response = await send(connection, request, bucket=BUCKET_HISTORICAL)
         except CTraderRequestError as e:
             # One list refused says nothing about the next: note it and ask the rest.
-            note = f"closing list refused: {key} {e.error_code}"
-            recording.add("marker", note, None, now())
-            return
+            mark(f"closing list refused: {key} {e.error_code}")
+            return None
         except CTraderError as e:
             # No answer, or no connection: every list after it would only wait as long, so
             # each is marked as skipped instead.
             failed = True
-            note = f"closing list failed: {key} {type(e).__name__}"
-            recording.add("marker", note, None, now())
-            return
+            mark(f"closing list failed: {key} {type(e).__name__}")
+            return None
         recording.closing[key].append(response)
+        return response
+
+    async def ask_one(key: str, request: Message) -> None:
+        response = await ask(key, request)
         # TODO(verify): that `hasMore` on these lists means what it says, and at how many
         # rows; a session with more deals than one response holds shows it.
-        if response.hasMore:
+        if response is not None and response.hasMore:
             # Further pages are not asked for; the marker says the list is incomplete.
-            recording.add("marker", f"closing list truncated: {key}", None, now())
+            mark(f"closing list truncated: {key}")
 
+    now_ms = int(time.time() * 1000)
     # TODO(verify): the widest window these two requests accept; a refusal here is marked
     # `closing list refused` with the venue's code.
     window = {
         "fromTimestamp": recording.started_wall_ms - _CLOSING_LOOKBACK_MS,
-        "toTimestamp": int(time.time() * 1000),
+        "toTimestamp": now_ms,
     }
-    await ask("deals", oa.ProtoOADealListReq(ctidTraderAccountId=account_id, **window))
-    await ask("orders", oa.ProtoOAOrderListReq(ctidTraderAccountId=account_id, **window))
+    await ask_one("deals", oa.ProtoOADealListReq(ctidTraderAccountId=account_id, **window))
+    await ask_one("orders", oa.ProtoOAOrderListReq(ctidTraderAccountId=account_id, **window))
     positions: set[int] = set()
     for message in list(recording.messages()):
         positions |= _position_ids(message)
     # TODO(verify): that the by-position requests answer without a time window; a refusal
     # is marked like any other.
     for position_id in sorted(positions):
-        await ask(
+        await ask_one(
             "position_orders",
             oa.ProtoOAOrderListByPositionIdReq(
                 ctidTraderAccountId=account_id,
                 positionId=position_id,
             ),
         )
-        await ask(
+        await ask_one(
             "position_deals",
             oa.ProtoOADealListByPositionIdReq(
                 ctidTraderAccountId=account_id,
                 positionId=position_id,
             ),
         )
+
+    registered = _registration_ms(recording)
+    if registered is None:
+        for key in ("account_deals", "cash_flow"):
+            mark(f"closing list skipped: {key}, no registration time")
+        return
+    # TODO(verify): that the history reaches back to the registration, and that the deal list
+    # has no window limit of its own (its schema states none; a refusal here would show one).
+    deals_window = (registered, now_ms)
+    for _ in range(_MAX_HISTORY_PAGES):
+        page = await ask(
+            "account_deals",
+            oa.ProtoOADealListReq(
+                ctidTraderAccountId=account_id,
+                fromTimestamp=deals_window[0],
+                toTimestamp=deals_window[1],
+            ),
+        )
+        if page is None or not page.hasMore:
+            break
+        deals_window = _next_deals_window(page, deals_window)
+        if deals_window is None:
+            mark("closing list truncated: account_deals")
+            break
+    else:
+        mark("closing list truncated: account_deals")
+
+    # From the registration on, so the first deposit is always there; the windows overlap at
+    # their edges, so an operation at an edge is listed twice rather than missed.
+    # TODO(verify): whether either end of a cash-flow window is inclusive.
+    start = registered
+    for _ in range(_MAX_CASH_FLOW_WINDOWS):
+        end = min(start + _CASH_FLOW_WINDOW_MS, now_ms)
+        listed = await ask(
+            "cash_flow",
+            oa.ProtoOACashFlowHistoryListReq(
+                ctidTraderAccountId=account_id,
+                fromTimestamp=start,
+                toTimestamp=end,
+            ),
+        )
+        if listed is None or end >= now_ms:
+            break
+        start = end
+    else:
+        mark("closing list truncated: cash_flow")
+
+
+def _registration_ms(recording: Recording) -> int | None:
+    """When the account was registered, by any trader the recording holds; `None` if none says."""
+    for message in recording.messages():
+        if isinstance(message, oa.ProtoOATraderRes) and message.trader.HasField(
+            "registrationTimestamp",
+        ):
+            return message.trader.registrationTimestamp
+    return None
+
+
+def _next_deals_window(page: Message, window: tuple[int, int]) -> tuple[int, int] | None:
+    """The window left to ask after `page`, narrowed at its last deal; `None` if it cannot be.
+
+    The last deal's own time stays in the window: other deals of the same millisecond may not
+    have fitted in the page. So that deal is listed again, and a page of one millisecond only
+    cannot be got past.
+    """
+    # TODO(verify): the order the deal list comes in, which the schema does not state, and the
+    # order of deals within one millisecond; a session with more deals than one page shows it.
+    deals = page.deal
+    if not deals:
+        return None
+    first, last = deals[0].executionTimestamp, deals[-1].executionTimestamp
+    if first < last:
+        narrowed = (last, window[1])
+    elif first > last:
+        narrowed = (window[0], last)
+    else:
+        return None
+    return narrowed if narrowed != window else None
 
 
 async def record(
@@ -985,13 +1082,13 @@ async def record(
       if anything was recorded; `STATUS_CLOSING_LISTS` comes before it only when the closing
       lists are asked.
 
-    The broker's name, from the trader asked for once on the first connection, is added to the
-    recording's names; that response itself is not recorded.
+    A snapshot is the trader, for the balance, then the open positions and orders asked both
+    ways. The broker's name, from the trader, is added to the recording's names.
 
-    Raises `CTraderRequestError` if the venue refuses authentication, the trader, or the
-    snapshot taken at the start or right after a reconnect: a refusal is not a lost connection,
-    and asking again changes nothing. A snapshot refused later, after events, is only marked,
-    and the run goes on.
+    Raises `CTraderRequestError` if the venue refuses authentication or the snapshot taken at
+    the start or right after a reconnect: a refusal is not a lost connection, and asking again
+    changes nothing. A snapshot refused later, after events, is only marked, and the run goes
+    on.
     """
     recording = Recording(int(time.time() * 1000)) if recording is None else recording
     started = time.monotonic()
@@ -1008,6 +1105,11 @@ async def record(
             recording.add("marker", markers.get_nowait(), None, now(), typed=True)
 
     async def snapshot(connection: CTraderConnection, note: str) -> None:
+        trader: Message | None = await send(
+            connection,
+            oa.ProtoOATraderReq(ctidTraderAccountId=account_id),
+        )
+        recording.add_name(trader.trader.brokerName)
         # Asked both ways, and named by the flag alone.
         # TODO(verify): what `returnProtectionOrders` changes in the response; comparing the
         # two snapshots of a position that has a stop-loss shows it.
@@ -1019,6 +1121,11 @@ async def record(
                     returnProtectionOrders=flag,
                 ),
             )
+            if trader is not None:
+                # Recorded only once the venue answers the next request too: a snapshot it
+                # refuses at the start leaves nothing recorded, so nothing is written.
+                recording.add("snapshot", f"{note}; trader", trader, now())
+                trader = None
             shape = f"returnProtectionOrders={str(flag).lower()}"
             recording.add("snapshot", f"{note}; {shape}", response, now())
 
@@ -1082,13 +1189,7 @@ async def record(
                         accessToken=access_token,
                     ),
                 )
-                if first:
-                    trader = await send(
-                        connection,
-                        oa.ProtoOATraderReq(ctidTraderAccountId=account_id),
-                    )
-                    recording.add_name(trader.trader.brokerName)
-                else:
+                if not first:
                     recording.add("marker", "reconnected", None, now())
                 await snapshot(connection, "start" if first else "after reconnect")
                 status(STATUS_STARTED if first else STATUS_RECONNECTED)
@@ -1311,7 +1412,8 @@ async def finish(
     """Finish a recording an abrupt end left in `journal_file`, read as `recording`.
 
     Asks the closing lists, as a run's own end would have, for the window from the recording's
-    start and for the positions it saw; then writes the raw file and the fixture as
+    start, for the positions it saw and for the account's history since the registration time
+    a recorded trader gives; then writes the raw file and the fixture as
     `record_to_file()` does, and removes the journal once the raw file is written. If anything
     on the way fails, the journal is left as it was and the error is raised. `status` is told
     what a run's own end tells it: `STATUS_CLOSING_LISTS`, then `STATUS_WRITING`.
