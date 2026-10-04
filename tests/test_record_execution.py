@@ -1352,19 +1352,26 @@ def halved(withdrawn: int) -> r.Recording:
     return recording
 
 
+def check(data: bytes, recording: r.Recording, ids: r.IdMap) -> None:
+    r.check_clean(data, recording, account_id=ACCOUNT_ID, login=LOGIN, ids=ids, secrets=())
+
+
 @pytest.mark.parametrize("withdrawn", [2_000_000, -2_000_000], ids=["magnitude", "signed"])
-def test_a_withdrawal_that_leaves_its_own_amount_is_not_shifted(withdrawn) -> None:
-    """A withdrawal is not made on a balance of zero, whatever sign its amount is given."""
+def test_a_withdrawal_that_leaves_its_own_amount_is_not_shifted_nor_published(withdrawn) -> None:
+    """Not made on a balance of zero, so its amount stays real; but then one reading of it, by
+    the sign convention the venue does not use, gives the shift: no fixture is written.
+    """
     recording = halved(withdrawn)
 
-    start, _, listed = fixture_messages(checked_fixture(recording))
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
 
+    _, _, listed = fixture_messages(data)
     deposit, withdrawal = listed.depositWithdraw
     assert deposit.delta == 4_000_000 + recording.money_shift
     assert withdrawal.delta == withdrawn
-    # What a reader would take for the shift: the amount, less what the balance fell by.
-    before = start.trader.balance
-    assert abs(withdrawal.delta) - (before - withdrawal.balance) == 0
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        check(data, recording, ids)
+    assert str(raised.value) == r.SHIFT_READABLE
 
 
 def test_check_clean_refuses_a_shifted_withdrawal() -> None:
@@ -1387,24 +1394,73 @@ def test_check_clean_refuses_a_shifted_withdrawal() -> None:
         )
 
 
-# The deposit types the script does not take for money arriving in the balance, and why.
-NOT_ARRIVING = {
-    "BALANCE_DEPOSIT_NONWITHDRAWABLE_BONUS": "a bonus, kept apart from the balance",
-    "BALANCE_DEPOSIT_FROM_SUBACCOUNT": "its schema comment and its name give opposite directions",
-    "BALANCE_DEPOSIT_NEGATIVE_BALANCE_PROTECTION": "brings a negative balance back to zero",
-}
-
-
 def test_every_balance_operation_type_is_decided() -> None:
-    """Only money arriving is ever shifted; a type the schema gains fails here until decided."""
+    """A type the schema gains fails here until it is said to bring money in or take it out."""
     names = om.ProtoOAChangeBalanceType.keys()
-    deposits = {name for name in names if name.startswith("BALANCE_DEPOSIT")}
+    withdrawals = {name for name in names if name.startswith("BALANCE_WITHDRAW")}
 
-    assert {om.ProtoOAChangeBalanceType.Name(v) for v in r._MONEY_ARRIVING} == (
-        deposits - NOT_ARRIVING.keys()
-    )
-    assert NOT_ARRIVING.keys() <= deposits
+    assert {om.ProtoOAChangeBalanceType.Name(v) for v in r._MONEY_LEAVING} == withdrawals
     assert all(name.startswith(("BALANCE_DEPOSIT", "BALANCE_WITHDRAW")) for name in names)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [om.BALANCE_DEPOSIT_FROM_SUBACCOUNT, om.BALANCE_DEPOSIT_NONWITHDRAWABLE_BONUS],
+    ids=["from a subaccount", "a non-withdrawable bonus"],
+)
+def test_any_deposit_made_on_a_balance_of_zero_is_shifted(kind) -> None:
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    recording.add("snapshot", "start; trader", trader_at(4_000_000), 0.0)
+    recording.closing["cash_flow"].append(
+        oa.ProtoOACashFlowHistoryListRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            depositWithdraw=[
+                cash(1, delta=4_000_000, balance=4_000_000, at=1_780_000_000_000, kind=kind),
+            ],
+        ),
+    )
+
+    _, listed = fixture_messages(checked_fixture(recording))
+
+    (first,) = listed.depositWithdraw
+    shift = recording.money_shift
+    assert first.delta == first.balance == 4_000_000 + shift
+    readings = {first.balance - first.delta, first.balance + first.delta}
+    assert shift not in readings
+
+
+def test_check_clean_refuses_an_operation_that_reads_as_the_shift_whatever_the_scrubber_did(
+    monkeypatch,
+) -> None:
+    """The check does not trust the scrubber's own judgement of an operation."""
+    recording = balance_history()
+    # The scrubber, and the check's own field rules, now take no operation for a first deposit.
+    monkeypatch.setattr(r, "_made_from_zero", lambda *_args: False)
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+
+    _, _, _, listed = fixture_messages(data)
+    assert listed.depositWithdraw[1].delta == 10_000_000
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        check(data, recording, ids)
+    assert str(raised.value) == r.SHIFT_READABLE
+
+
+def test_check_clean_refuses_a_closing_deal_that_reads_as_the_shift() -> None:
+    recording = balance_history()
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    loaded = json.loads(data)
+    item = loaded["closing"]["account_deals"][0]
+    message = r._decode(item)
+    detail = message.deal[0].closePositionDetail
+    change = detail.grossProfit + detail.swap + detail.commission + detail.pnlConversionFee
+    # As if the balance before it had been a real zero.
+    detail.balance = recording.money_shift + change
+    item.update(r._encode(message))
+
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        check(json.dumps(loaded).encode(), recording, ids)
+
+    assert str(raised.value) == r.SHIFT_READABLE
 
 
 def test_check_clean_refuses_an_equity_not_given_that_was_shifted() -> None:

@@ -181,6 +181,10 @@ NOT_A_FIXTURE = (
     "not a scrubbed fixture, so nothing of it is printed; "
     "an unscrubbed recording becomes a fixture with --rescrub"
 )
+SHIFT_READABLE = (
+    "a balance before an operation or a closing deal reads as the shift: a real zero balance "
+    "was published with a real amount"
+)
 NO_MONEY_SHIFT = (
     "the recording was written by an earlier version of this script, without the shift that "
     "hides its balances, so no fixture can be built from it"
@@ -246,27 +250,12 @@ _OPERATION_AMOUNT = ("ProtoOADepositWithdraw", "delta")
 # A level the venue may send as 0 for "not given". Kept 0: shifted, it would be the shift.
 # TODO(verify): whether an operation listed in the cash-flow history carries its equity at all.
 _ZERO_IS_NOT_GIVEN = frozenset({("ProtoOADepositWithdraw", "equity")})
-# The operation types that bring money into the balance: every deposit type but a bonus, kept
-# apart from the balance; a transfer from a subaccount, whose schema comment and name give
-# opposite directions; and the reset of a negative balance to zero.
-_MONEY_ARRIVING = frozenset(
-    om.ProtoOAChangeBalanceType.Value(name)
-    for name in (
-        "BALANCE_DEPOSIT",
-        "BALANCE_DEPOSIT_STRATEGY_COMMISSION_INNER",
-        "BALANCE_DEPOSIT_IB_COMMISSIONS",
-        "BALANCE_DEPOSIT_IB_SHARED_PERCENTAGE_FROM_SUB_IB",
-        "BALANCE_DEPOSIT_IB_SHARED_PERCENTAGE_FROM_BROKER",
-        "BALANCE_DEPOSIT_REBATE",
-        "BALANCE_DEPOSIT_STRATEGY_COMMISSION_OUTER",
-        "BALANCE_DEPOSIT_DIVIDENDS",
-        "BALANCE_DEPOSIT_SWAP",
-        "BALANCE_DEPOSIT_MANAGEMENT_FEE",
-        "BALANCE_DEPOSIT_PERFORMANCE_FEE",
-        "BALANCE_DEPOSIT_TO_SUBACCOUNT",
-        "BALANCE_DEPOSIT_TRANSFER",
-        "BALANCE_DEPOSIT_CONVERTED_BONUS",
-    )
+# The operation types that take money out of the balance. A withdrawal that leaves exactly its
+# own amount has `balance == delta` if the amount is sent unsigned, and is not made on zero.
+_MONEY_LEAVING = frozenset(
+    value
+    for name, value in om.ProtoOAChangeBalanceType.items()
+    if name.startswith("BALANCE_WITHDRAW")
 )
 # Lists of account ids. They name the owner's other accounts, whose ids no check knows.
 _ACCOUNT_ID_LISTS = frozenset({"ctidTraderAccountIds"})
@@ -502,11 +491,14 @@ def _made_from_zero(message: Message, name: str) -> bool:
     Only there is the shifted amount still what the shifted balance grew by. Anywhere else,
     the shifted amount less that growth would be the shift.
     """
-    # TODO(verify): whether a withdrawal's `delta` is signed or a magnitude; the type is what
-    # says money arrived either way.
+    # TODO(verify): whether a withdrawal's `delta` is signed or a magnitude; its type rules it
+    # out either way, and `_check_amounts_hidden()` refuses whatever still reads as the shift.
     is_amount = (message.DESCRIPTOR.name, name) == _OPERATION_AMOUNT
     return (
-        is_amount and message.operationType in _MONEY_ARRIVING and message.balance == message.delta
+        is_amount
+        and message.operationType not in _MONEY_LEAVING
+        and message.delta > 0
+        and message.balance == message.delta
     )
 
 
@@ -1043,6 +1035,7 @@ def _check_amounts_hidden(recording: Recording, scrubbed: list[Message]) -> None
     def refuse(text: str) -> None:
         raise record_fixtures.ScrubError(text)
 
+    shift = recording.money_shift
     for original, kept in zip(recording.messages(), scrubbed, strict=True):
         for message, target, name, value in _paired_fields(original, kept):
             key = (message.DESCRIPTOR.name, name)
@@ -1060,6 +1053,36 @@ def _check_amounts_hidden(recording: Recording, scrubbed: list[Message]) -> None
                     refuse("an operation made on a balance of zero kept its real amount")
                 elif not _made_from_zero(message, name) and published != value:
                     refuse("an operation's amount was shifted in the fixture")
+    for message in scrubbed:
+        if any(shift in readings for readings in _balances_before(message)):
+            refuse(SHIFT_READABLE)
+
+
+def _balances_before(message: Message) -> Iterable[set[int]]:
+    """For each operation and closing deal in `message`, the balances before it that its
+    published amounts imply, read by every sign convention an amount may follow.
+
+    One equals the shift where a real balance of zero before it was published with a real
+    amount, or where a withdrawal left exactly its own amount. Either way the shift can be read
+    off, whatever the scrubber judged.
+    """
+    for operation in _nested(message, "ProtoOADepositWithdraw"):
+        balance, delta = operation.balance, operation.delta
+        yield {balance - delta, balance + delta, balance - abs(delta)}
+    for detail in _nested(message, "ProtoOAClosePositionDetail"):
+        change = detail.grossProfit + detail.swap + detail.commission + detail.pnlConversionFee
+        yield {detail.balance - change}
+
+
+def _nested(message: Message, type_name: str) -> Iterable[Message]:
+    """`message` and every message in it, at any depth, whose type is called `type_name`."""
+    if message.DESCRIPTOR.name == type_name:
+        yield message
+    for descriptor, value in message.ListFields():
+        if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+            for item in items:
+                yield from _nested(item, type_name)
 
 
 def _strings(message: Message) -> Iterable[str]:
