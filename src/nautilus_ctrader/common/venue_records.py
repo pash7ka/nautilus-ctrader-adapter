@@ -18,7 +18,7 @@ import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from enum import Enum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from nautilus_ctrader.common.parsing import volume_to_units
 
@@ -213,6 +213,7 @@ class Notice:
 Record = OrderEvent | ExternalOrder | Activity | AwaitProtection | ProtectionMissing | Notice
 
 
+@runtime_checkable
 class Operations(Protocol):
     """What the node has asked of the broker and not yet heard back about."""
 
