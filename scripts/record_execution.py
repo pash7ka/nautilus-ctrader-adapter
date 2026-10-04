@@ -11,10 +11,13 @@ places, changes or closes an order is named anywhere in this module.
 While it runs, type a short note and press Enter to mark what you just did in the terminal
 ("moved the stop"); type `q` and Enter to stop. `--describe` prints a recording back.
 
-The fixture never holds the account id, the trader login, a token, a balance, the broker's
-name, or the broker's own order, position and deal ids: those are replaced consistently, so a
-position still lines up with its orders and deals. A wall time in milliseconds or seconds is
-shifted by one constant, which keeps every interval; a bar's time in minutes keeps its value.
+The fixture never holds the account id, the trader login, a token, the broker's name, or the
+broker's own order, position, deal and balance-operation ids: those are replaced consistently,
+so a position still lines up with its orders and deals. A wall time in milliseconds or seconds
+is shifted by one constant, which keeps every interval; a bar's time in minutes keeps its value.
+Every balance, and the first deposit that made the first one, is raised by one secret random
+amount, kept only in the unscrubbed files: what each deal or operation changed stays exact, and
+the real balance cannot be read back.
 
 A session is kept however it ends. What was seen is first written unscrubbed to
 `tests/recordings/`, which git ignores, and only then scrubbed, checked and written as the
@@ -45,6 +48,7 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import sys
 import tempfile
 import threading
@@ -173,14 +177,63 @@ NOT_A_FIXTURE = (
     "an unscrubbed recording becomes a fixture with --rescrub"
 )
 
-_ID_KINDS = {"positionId": "position", "orderId": "order", "dealId": "deal"}
-_ID_BASES = {"position": 5_000_000, "order": 6_000_000, "deal": 7_000_000}
+_ID_KINDS = {
+    "positionId": "position",
+    "orderId": "order",
+    "dealId": "deal",
+    "balanceHistoryId": "balance operation",
+}
+_ID_BASES = {
+    "position": 5_000_000,
+    "order": 6_000_000,
+    "deal": 7_000_000,
+    "balance operation": 8_000_000,
+}
 # Free text the account's owner, or a robot of theirs, may have written.
 _TEXT_FIELDS = frozenset({"label", "comment", "clientOrderId", "externalNote"})
 # The venue's own wording: kept as evidence, with the numbers that identify taken out.
 _VENUE_TEXT_FIELDS = frozenset({"description", "reason"})
-# Money moved in or out of the account: nothing the order logic needs.
-_CLEARED_MESSAGES = frozenset({"depositWithdraw", "bonusDepositWithdraw"})
+# A bonus is kept apart from the balance, and its message names the introducing broker.
+_CLEARED_MESSAGES = frozenset({"bonusDepositWithdraw"})
+
+# What scrubbing does with each amount of the schema, by message and field:
+# - `LEVEL`, a balance or equity, is raised by the recording's money shift;
+# - `DELTA`, what one deal, position or operation changed or holds, is kept: it does not tell
+#   how much the account has. The first deposit's amount is the exception, raised like the
+#   balance it made, which would otherwise be that balance;
+# - `ZEROED` is a sum of the account's with no part in the balance arithmetic.
+LEVEL = "level"
+DELTA = "delta"
+ZEROED = "zeroed"
+_MONEY_FIELDS: dict[tuple[str, str], str] = {
+    ("ProtoOATrader", "balance"): LEVEL,
+    ("ProtoOATrader", "managerBonus"): ZEROED,
+    ("ProtoOATrader", "ibBonus"): ZEROED,
+    ("ProtoOATrader", "nonWithdrawableBonus"): ZEROED,
+    ("ProtoOADepositWithdraw", "balance"): LEVEL,
+    ("ProtoOADepositWithdraw", "equity"): LEVEL,
+    ("ProtoOADepositWithdraw", "delta"): DELTA,
+    ("ProtoOABonusDepositWithdraw", "managerBonus"): ZEROED,
+    ("ProtoOABonusDepositWithdraw", "managerDelta"): ZEROED,
+    ("ProtoOABonusDepositWithdraw", "ibBonus"): ZEROED,
+    ("ProtoOABonusDepositWithdraw", "ibDelta"): ZEROED,
+    ("ProtoOAClosePositionDetail", "balance"): LEVEL,
+    ("ProtoOAClosePositionDetail", "grossProfit"): DELTA,
+    ("ProtoOAClosePositionDetail", "swap"): DELTA,
+    ("ProtoOAClosePositionDetail", "commission"): DELTA,
+    ("ProtoOAClosePositionDetail", "pnlConversionFee"): DELTA,
+    ("ProtoOADeal", "commission"): DELTA,
+    ("ProtoOAPosition", "swap"): DELTA,
+    ("ProtoOAPosition", "commission"): DELTA,
+    ("ProtoOAPosition", "mirroringCommission"): DELTA,
+    ("ProtoOAPosition", "usedMargin"): DELTA,
+    ("ProtoOAMarginChangedEvent", "usedMargin"): DELTA,
+    ("ProtoOAExpectedMargin", "buyMargin"): DELTA,
+    ("ProtoOAExpectedMargin", "sellMargin"): DELTA,
+    ("ProtoOAPositionUnrealizedPnL", "grossUnrealizedPnL"): DELTA,
+    ("ProtoOAPositionUnrealizedPnL", "netUnrealizedPnL"): DELTA,
+}
+_FIRST_DEPOSIT = ("ProtoOADepositWithdraw", "delta")
 # Lists of account ids. They name the owner's other accounts, whose ids no check knows.
 _ACCOUNT_ID_LISTS = frozenset({"ctidTraderAccountIds"})
 # The owner's id at the identity provider. Zeroed, not cleared: the field is `required`.
@@ -192,6 +245,18 @@ _SECONDS_TIMESTAMPS = frozenset({("ProtoOAErrorRes", "maintenanceEndTimestamp")}
 _DIGIT_RUN = re.compile(r"\d+")
 # Shorter than any id seen, longer than a price or a volume someone would type in a note.
 _LONG_NUMBER_DIGITS = 7
+
+
+def _draw_money_shift() -> int:
+    """One recording's money shift, in the account's raw money units.
+
+    At two money digits, 1 to 100 million of the deposit currency: far above a real balance, so
+    none shifted can be negative or read back. Its last two digits are never 00, so the shifted
+    first deposit does not look like a round amount. Below 10**10, so a shifted balance is still
+    an ordinary amount for the platform's money type.
+    """
+    units = 10**6 + secrets.randbelow(10**8 - 10**6)
+    return units * 100 + 1 + secrets.randbelow(99)
 
 
 class ReadOnlyViolation(RuntimeError):
@@ -303,9 +368,16 @@ def scrub_execution(
     login: int | None,
     ids: IdMap,
     shift_ms: int,
+    money_shift: int,
+    first_deposit: int | None = None,
     names: Iterable[str] = (),
 ) -> Message:
-    """`record_fixtures.scrub()`, then what execution messages add to it."""
+    """`record_fixtures.scrub()`, then what execution messages add to it.
+
+    Amounts follow `_MONEY_FIELDS`, with `money_shift` as the shift. `first_deposit` is the
+    real `balanceHistoryId` of the account's earliest balance operation, whose amount is
+    shifted too.
+    """
     result = record_fixtures.scrub(message, account_id, login)
     # A field newer than these bindings is scrubbed by nothing here, and may hold anything.
     result.DiscardUnknownFields()
@@ -313,8 +385,87 @@ def scrub_execution(
     def clean(text: str) -> str:
         return clean_text(text, account_id=account_id, login=login, ids=ids, names=names)
 
+    # From the original: the base scrubbing has cleared or zeroed the balances by then.
+    _shift_money(message, result, money_shift, first_deposit)
     _scrub_in_place(result, ids, shift_ms, clean)
     return result
+
+
+def _paired_fields(
+    original: Message,
+    scrubbed: Message,
+) -> Iterable[tuple[Message, Message, str, object]]:
+    """Each single scalar set in `original`, at any depth, with the messages holding it in both.
+
+    A submessage `scrubbed` no longer has, or a list it holds fewer of, is left out. So is a
+    list of scalars: no amount of the schema is one.
+    """
+    for descriptor, value in original.ListFields():
+        name = descriptor.name
+        repeated = descriptor.label == FieldDescriptor.LABEL_REPEATED
+        if descriptor.type != FieldDescriptor.TYPE_MESSAGE:
+            if not repeated:
+                yield original, scrubbed, name, value
+        elif repeated:
+            kept = getattr(scrubbed, name)
+            if len(kept) == len(value):
+                for item, kept_item in zip(value, kept, strict=True):
+                    yield from _paired_fields(item, kept_item)
+        elif scrubbed.HasField(name):
+            yield from _paired_fields(value, getattr(scrubbed, name))
+
+
+def _is_first_deposit(message: Message, name: str, first_deposit: int | None) -> bool:
+    return (
+        (message.DESCRIPTOR.name, name) == _FIRST_DEPOSIT
+        and first_deposit is not None
+        and message.balanceHistoryId == first_deposit
+    )
+
+
+def _shift_money(
+    original: Message,
+    scrubbed: Message,
+    money_shift: int,
+    first_deposit: int | None,
+) -> None:
+    for message, target, name, value in _paired_fields(original, scrubbed):
+        role = _MONEY_FIELDS.get((message.DESCRIPTOR.name, name))
+        if role == LEVEL or _is_first_deposit(message, name, first_deposit):
+            setattr(target, name, value + money_shift)
+        elif role == ZEROED:
+            if target.HasField(name):
+                setattr(target, name, 0)
+        elif name == "balanceVersion":
+            # The base scrubbing clears it; here it stays: a counter, not an amount, which
+            # orders the balance changes.
+            setattr(target, name, value)
+
+
+def _first_deposit(recording: Recording) -> int | None:
+    """The real id of the earliest balance operation in `recording`; `None` if it has none."""
+    operations = [
+        found
+        for message in recording.messages()
+        for found in _messages_named(message, "ProtoOADepositWithdraw")
+    ]
+    if not operations:
+        return None
+    # TODO(verify): that the earliest operation listed is the account's initial deposit, which
+    # holds only if the cash-flow history reaches back to the registration.
+    first = min(operations, key=lambda o: (o.changeBalanceTimestamp, o.balanceHistoryId))
+    return first.balanceHistoryId
+
+
+def _messages_named(message: Message, name: str) -> Iterable[Message]:
+    """`message` and every message in it, at any depth, whose type is called `name`."""
+    if message.DESCRIPTOR.name == name:
+        yield message
+    for descriptor, value in message.ListFields():
+        if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+            for item in items:
+                yield from _messages_named(item, name)
 
 
 def _scrub_in_place(
@@ -397,6 +548,8 @@ class Recording:
     )
     # The broker's names, as the venue gave them: what scrubbing takes out of free text.
     names: list[str] = field(default_factory=list)
+    # As secret as the balances it hides: kept in the unscrubbed files only, never shown.
+    money_shift: int = field(default_factory=_draw_money_shift, repr=False)
     # Where each entry and name is also written as it is added, if anywhere.
     journal: Journal | None = field(default=None, repr=False, compare=False)
 
@@ -455,6 +608,7 @@ def encode_recording(
     """
     ids = IdMap()
     shift_ms = recording.started_wall_ms - FAKE_EPOCH_MS
+    first_deposit = _first_deposit(recording)
 
     def clean(message: Message) -> Message:
         return scrub_execution(
@@ -463,6 +617,8 @@ def encode_recording(
             login=login,
             ids=ids,
             shift_ms=shift_ms,
+            money_shift=recording.money_shift,
+            first_deposit=first_deposit,
             names=recording.names,
         )
 
@@ -528,6 +684,7 @@ def encode_raw(recording: Recording, *, account_id: int, login: int | None) -> b
         "account_id": account_id,
         "login": login,
         "names": recording.names,
+        "money_shift": recording.money_shift,
         "timeline": [_raw_entry(entry) for entry in recording.timeline],
         "closing": {
             key: [_encode(message, partial=True) for message in items]
@@ -545,7 +702,11 @@ def decode_raw(data: bytes) -> tuple[Recording, int, int | None]:
     """
     raw = json.loads(data)
     # A file written before names were kept has none.
-    recording = Recording(raw["started_wall_ms"], names=list(raw.get("names", [])))
+    recording = Recording(
+        raw["started_wall_ms"],
+        names=list(raw.get("names", [])),
+        money_shift=raw["money_shift"],
+    )
     recording.timeline = [_entry_from_raw(item) for item in raw["timeline"]]
     recording.closing = {
         key: [_decode(item) for item in items] for key, items in raw["closing"].items()
@@ -620,6 +781,7 @@ class Journal:
                 "account_id": self._account_id,
                 "login": self._login,
                 "names": recording.names,
+                "money_shift": recording.money_shift,
             }
             items.insert(0, header)
         self._append(items)
@@ -678,7 +840,11 @@ def read_journal(data: bytes) -> tuple[Recording, int, int | None]:
     header = json.loads(lines[0])
     if header["format"] != FORMAT:
         raise ValueError("a journal of another format")
-    recording = Recording(header["started_wall_ms"], names=list(header["names"]))
+    recording = Recording(
+        header["started_wall_ms"],
+        names=list(header["names"]),
+        money_shift=header["money_shift"],
+    )
     torn = False
     for index, line in enumerate(lines[1:], start=1):
         try:
@@ -715,9 +881,13 @@ def check_clean(
     The broker's names are looked for in every note and every text field instead, the way
     `clean_text()` matches them: in the JSON or the bytes, a short name would turn up by chance
     inside the base64 of a payload.
+
+    Amounts are compared field by field with the recording's own: a balance, or the first
+    deposit's amount, left at its real value is refused. The money shift is looked for as text.
     """
     numbers = [n for n in (account_id, login, *ids.real_ids()) if n is not None]
     text = [str(n).encode() for n in numbers] + [s.encode() for s in secrets if s]
+    text.append(str(recording.money_shift).encode())
     varints = [record_fixtures._varint(n) for n in numbers]
 
     record_fixtures.assert_clean(data, text)
@@ -729,6 +899,7 @@ def check_clean(
         raise record_fixtures.ScrubError("the encoded recording lost a message")
     for message in messages:
         record_fixtures.assert_clean(message.SerializeToString(), text + varints)
+    _check_amounts_hidden(recording, messages)
 
     names = _names_pattern(recording.names)
     if names is None:
@@ -739,6 +910,21 @@ def check_clean(
     # The token itself may read as a name: "<broker>" for a broker called "Broker".
     if any(names.search(t.replace(BROKER_PLACEHOLDER, " ")) for t in texts):
         raise record_fixtures.ScrubError("a broker name was found in recorded fixture data")
+
+
+def _check_amounts_hidden(recording: Recording, scrubbed: list[Message]) -> None:
+    """Raise `ScrubError` if a balance or the first deposit's amount kept its real value."""
+    first_deposit = _first_deposit(recording)
+    for original, kept in zip(recording.messages(), scrubbed, strict=True):
+        for message, target, name, value in _paired_fields(original, kept):
+            if not target.HasField(name) or getattr(target, name) != value:
+                continue
+            if _MONEY_FIELDS.get((message.DESCRIPTOR.name, name)) == LEVEL:
+                raise record_fixtures.ScrubError("a balance was found unshifted in the fixture")
+            if _is_first_deposit(message, name, first_deposit):
+                raise record_fixtures.ScrubError(
+                    "the first deposit's amount was found unshifted in the fixture",
+                )
 
 
 def _strings(message: Message) -> Iterable[str]:

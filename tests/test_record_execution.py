@@ -17,6 +17,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -108,13 +109,24 @@ def execution_event(
     return event
 
 
-def scrubbed(message, ids: r.IdMap | None = None, shift_ms: int = 0):
+MONEY_SHIFT = 432_198_765
+
+
+def scrubbed(
+    message,
+    ids: r.IdMap | None = None,
+    shift_ms: int = 0,
+    *,
+    first_deposit: int | None = None,
+):
     return r.scrub_execution(
         message,
         account_id=ACCOUNT_ID,
         login=LOGIN,
         ids=ids if ids is not None else r.IdMap(),
         shift_ms=shift_ms,
+        money_shift=MONEY_SHIFT,
+        first_deposit=first_deposit,
     )
 
 
@@ -213,14 +225,16 @@ def test_timestamps_shift_by_one_constant() -> None:
     assert event.position.tradeData.openTimestamp == 1_790_000_000_000 - shift
 
 
-def test_a_deposit_is_cleared_and_a_balance_zeroed() -> None:
+def test_a_deposit_is_kept_and_every_balance_shifted() -> None:
     event = execution_event()
     event.depositWithdraw.CopyFrom(
         om.ProtoOADepositWithdraw(
             operationType=om.BALANCE_DEPOSIT,
-            balanceHistoryId=1,
+            balanceHistoryId=880_044_556,
             balance=999_999,
             delta=500_000,
+            equity=999_000,
+            balanceVersion=12,
             changeBalanceTimestamp=1_790_000_000_000,
         ),
     )
@@ -231,16 +245,44 @@ def test_a_deposit_is_cleared_and_a_balance_zeroed() -> None:
             swap=-5,
             commission=-7,
             balance=999_999,
+            pnlConversionFee=-2,
+            balanceVersion=11,
         ),
     )
 
     clean = scrubbed(event)
 
-    assert not clean.HasField("depositWithdraw")
-    assert clean.deal.closePositionDetail.balance == 0
+    deposit, detail = clean.depositWithdraw, clean.deal.closePositionDetail
+    assert (deposit.balance, deposit.equity) == (999_999 + MONEY_SHIFT, 999_000 + MONEY_SHIFT)
+    assert detail.balance == 999_999 + MONEY_SHIFT
+    # Not the first deposit, so its amount is a delta like any other.
+    assert deposit.delta == 500_000
     # Commission, swap and profit stay: they are what the scaling tests need.
-    assert clean.deal.closePositionDetail.commission == -7
-    assert clean.deal.closePositionDetail.grossProfit == 1234
+    assert (detail.grossProfit, detail.swap, detail.commission) == (1234, -5, -7)
+    assert detail.pnlConversionFee == -2
+    # A counter, which orders the balance changes; the base scrubbing would clear it.
+    assert (deposit.balanceVersion, detail.balanceVersion) == (12, 11)
+    # The broker's id of the operation, replaced like a deal's.
+    assert deposit.balanceHistoryId not in (0, 880_044_556)
+
+
+def test_the_first_deposit_s_amount_is_shifted_like_the_balance_it_made() -> None:
+    deposit = om.ProtoOADepositWithdraw(
+        operationType=om.BALANCE_DEPOSIT,
+        balanceHistoryId=880_044_556,
+        balance=10_000_000,
+        delta=10_000_000,
+        changeBalanceTimestamp=1_790_000_000_000,
+    )
+    listed = oa.ProtoOACashFlowHistoryListRes(
+        ctidTraderAccountId=ACCOUNT_ID,
+        depositWithdraw=[deposit],
+    )
+
+    (clean,) = scrubbed(listed, first_deposit=880_044_556).depositWithdraw
+
+    # The balance before it was nothing, and still is.
+    assert clean.balance == clean.delta == 10_000_000 + MONEY_SHIFT
 
 
 def test_a_real_id_in_an_error_description_is_replaced() -> None:
@@ -442,7 +484,7 @@ def test_a_timestamp_below_the_shift_is_left_alone() -> None:
 # Every field of the schema named for a time, and what scrubbing does with it.
 TIME_FIELDS = {
     # Wall times in milliseconds, shifted by the `*Timestamp` rule.
-    "changeBalanceTimestamp": "shifted, though its message is cleared",
+    "changeBalanceTimestamp": "shifted",
     "changeBonusTimestamp": "shifted, though its message is cleared",
     "closeTimestamp": "shifted",
     "createTimestamp": "shifted",
@@ -679,13 +721,13 @@ def test_a_long_number_no_field_identified_is_taken_out_of_a_text() -> None:
     assert not any(char.isdigit() for char in r.NUMBER_PLACEHOLDER)
 
 
-def test_owner_text_and_money_movements_are_gone_from_the_fixture() -> None:
+def test_owner_text_and_bonus_movements_are_gone_from_the_fixture() -> None:
     event = execution_event()
     event.order.clientOrderId = "my-robot-17"
     event.depositWithdraw.CopyFrom(
         om.ProtoOADepositWithdraw(
             operationType=om.BALANCE_DEPOSIT,
-            balanceHistoryId=1,
+            balanceHistoryId=880_044_557,
             balance=999_999,
             delta=500_000,
             changeBalanceTimestamp=1_790_000_000_000,
@@ -708,7 +750,9 @@ def test_owner_text_and_money_movements_are_gone_from_the_fixture() -> None:
 
     clean = decoded["message"]
     assert clean.order.clientOrderId == r.SCRUBBED_TEXT
-    assert not clean.HasField("depositWithdraw")
+    # A deposit is evidence of the balance; only its note is the owner's.
+    assert clean.depositWithdraw.externalNote == r.SCRUBBED_TEXT
+    # A bonus is not, and its message names an introducing broker.
     assert not clean.HasField("bonusDepositWithdraw")
     assert b"savings" not in clean.SerializeToString()
 
@@ -847,6 +891,309 @@ def test_the_owner_s_profile_id_is_zeroed() -> None:
     profile = oa.ProtoOAGetCtidProfileByTokenRes(profile=om.ProtoOACtidProfile(userId=424_242))
 
     assert scrubbed(profile).profile.userId == 0
+
+
+_PROTO_DIR = pathlib.Path(__file__).resolve().parents[1] / "src" / "nautilus_ctrader" / "messages"
+_PROTO_MESSAGE = re.compile(r"^message (\w+) \{(.*?)^\}", re.MULTILINE | re.DOTALL)
+_AFFECTS = re.compile(r"moneyDigits = \d+;.*?Affects ([^\n]+?)\.?\s*$", re.MULTILINE)
+_MONEY_NAME = re.compile(r"balance|equity|bonus|profit|pnl|commission|swap|margin|fee|delta", re.I)
+_INT64_TYPES = (
+    FieldDescriptor.TYPE_INT64,
+    FieldDescriptor.TYPE_UINT64,
+    FieldDescriptor.TYPE_SINT64,
+    FieldDescriptor.TYPE_FIXED64,
+    FieldDescriptor.TYPE_SFIXED64,
+)
+# Wide integer fields whose name reads like money and which are not an amount, and why.
+NOT_MONEY = {
+    "balanceVersion": "a counter of balance changes",
+    "balanceHistoryId": "the id of a balance operation, replaced like a deal's",
+    "bonusHistoryId": "the id of a bonus operation",
+    "changeBalanceTimestamp": "a time",
+    "changeBonusTimestamp": "a time",
+    "lastBalanceUpdateTimestamp": "a time",
+    "deltaOpen": "a bar's price",
+    "deltaHigh": "a bar's price",
+    "deltaClose": "a bar's price",
+    "relativeTakeProfit": "a distance in price",
+    ("ProtoOASymbol", "commission"): "a symbol's trading conditions",
+    ("ProtoOASymbol", "minCommission"): "a symbol's trading conditions",
+    ("ProtoOASymbol", "preciseMinCommission"): "a symbol's trading conditions",
+    ("ProtoOASymbol", "preciseTradingCommissionRate"): "a symbol's trading conditions",
+    ("ProtoOASymbol", "rolloverCommission"): "a symbol's trading conditions",
+}
+
+
+def schema_descriptors() -> dict:
+    """Every message type any payload can hold, by name."""
+    found: dict = {}
+    for payload_type in codec._build_registry().values():
+        for _owner, field in fields_of(payload_type.DESCRIPTOR, set()):
+            if field.type == FieldDescriptor.TYPE_MESSAGE:
+                found[field.message_type.name] = field.message_type
+        found[payload_type.DESCRIPTOR.name] = payload_type.DESCRIPTOR
+    return found
+
+
+def money_by_comment(descriptors: dict) -> set[tuple[str, str]]:
+    """The fields each `moneyDigits` comment of the schema says it affects."""
+    found: set[tuple[str, str]] = set()
+    for proto in sorted(_PROTO_DIR.glob("*.proto")):
+        for name, body in _PROTO_MESSAGE.findall(proto.read_text(encoding="utf-8")):
+            for listed in _AFFECTS.findall(body):
+                for item in listed.split(","):
+                    *path, field_name = item.strip().split(".")
+                    descriptor = descriptors[name]
+                    for step in path:
+                        descriptor = descriptor.fields_by_name[step].message_type
+                    assert field_name in descriptor.fields_by_name, f"{name}: {item}"
+                    found.add((descriptor.name, field_name))
+    return found
+
+
+def test_every_money_field_of_the_schema_is_classified() -> None:
+    """Every amount the schema has is shifted, kept or zeroed by the scrubber's own table.
+
+    An amount is a field a `moneyDigits` comment says it affects, or a wide integer whose name
+    reads like money. A field the schema gains later fails here until someone has decided.
+    """
+    descriptors = schema_descriptors()
+    by_comment = money_by_comment(descriptors)
+    by_name: set[tuple[str, str]] = set()
+    excused: set = set()
+    for owner, descriptor in descriptors.items():
+        for field in descriptor.fields:
+            if field.type not in _INT64_TYPES or not _MONEY_NAME.search(field.name):
+                continue
+            key = (owner, field.name)
+            excuse = next((k for k in (key, field.name) if k in NOT_MONEY), None)
+            if excuse is None:
+                by_name.add(key)
+            else:
+                excused.add(excuse)
+
+    # The schema's own word outranks a name that looks harmless.
+    assert not {key for key in by_comment if key in NOT_MONEY or key[1] in NOT_MONEY}
+    for key in sorted(by_comment | by_name):
+        assert key in r._MONEY_FIELDS, f"unclassified money field {key[0]}.{key[1]}"
+    # Nothing decided here has left the schema: a stale name would hide a renamed field.
+    assert set(r._MONEY_FIELDS) == by_comment | by_name
+    assert excused == NOT_MONEY.keys()
+    assert set(r._MONEY_FIELDS.values()) == {r.LEVEL, r.DELTA, r.ZEROED}
+    # The scrubber pairs single fields only.
+    for owner, name in r._MONEY_FIELDS:
+        assert descriptors[owner].fields_by_name[name].label != FieldDescriptor.LABEL_REPEATED
+
+
+def history_deal(n: int, *, gross: int, swap: int, commission: int, fee: int, balance: int):
+    deal = om.ProtoOADeal(
+        dealId=DEAL_ID + n,
+        orderId=ORDER_ID + n,
+        positionId=POSITION_ID,
+        volume=100_000,
+        filledVolume=100_000,
+        symbolId=1,
+        createTimestamp=1_790_000_000_000 + n * 100_000,
+        executionTimestamp=1_790_000_000_000 + n * 100_000,
+        tradeSide=om.SELL,
+        dealStatus=om.FILLED,
+        commission=commission,
+    )
+    deal.closePositionDetail.CopyFrom(
+        om.ProtoOAClosePositionDetail(
+            entryPrice=1.1,
+            grossProfit=gross,
+            swap=swap,
+            commission=commission,
+            pnlConversionFee=fee,
+            balance=balance,
+            balanceVersion=n + 1,
+        ),
+    )
+    return deal
+
+
+def cash(n: int, *, delta: int, balance: int, at: int) -> om.ProtoOADepositWithdraw:
+    return om.ProtoOADepositWithdraw(
+        operationType=om.BALANCE_DEPOSIT if delta > 0 else om.BALANCE_WITHDRAW,
+        balanceHistoryId=880_000_000 + n,
+        balance=balance,
+        delta=delta,
+        equity=balance,
+        changeBalanceTimestamp=at,
+        moneyDigits=2,
+    )
+
+
+def trader_at(balance: int) -> oa.ProtoOATraderRes:
+    return oa.ProtoOATraderRes(
+        ctidTraderAccountId=ACCOUNT_ID,
+        trader=om.ProtoOATrader(
+            ctidTraderAccountId=ACCOUNT_ID,
+            balance=balance,
+            balanceVersion=4,
+            depositAssetId=1,
+            managerBonus=50_000,
+            moneyDigits=2,
+        ),
+    )
+
+
+def balance_history(*, off_by: int = 0) -> r.Recording:
+    """A deposit, two closing deals and a withdrawal, between two trader snapshots.
+
+    `off_by` breaks the second deal's balance, so the arithmetic no longer holds there.
+    """
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    recording.add("snapshot", "start; trader", trader_at(10_000_000), 0.0)
+    recording.add("snapshot", "after events; trader", trader_at(10_000_000 + off_by), 9.0)
+    recording.closing["account_deals"].append(
+        oa.ProtoOADealListRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            hasMore=False,
+            deal=[
+                history_deal(1, gross=1234, swap=-5, commission=-7, fee=-2, balance=10_001_220),
+                history_deal(
+                    2, gross=-500, swap=0, commission=-7, fee=0, balance=10_000_713 + off_by
+                ),
+            ],
+        ),
+    )
+    # The later operation first: the first deposit is the earliest, not the first listed.
+    recording.closing["cash_flow"].append(
+        oa.ProtoOACashFlowHistoryListRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            depositWithdraw=[
+                cash(2, delta=-713, balance=10_000_000 + off_by, at=1_790_000_900_000),
+                cash(1, delta=10_000_000, balance=10_000_000, at=1_780_000_000_000),
+            ],
+        ),
+    )
+    return recording
+
+
+def residuals(timeline: list, closing: dict) -> list[int]:
+    """How far each balance is from the one before it plus what changed it; 0 where it holds."""
+    traders = [m.trader.balance for m in timeline if isinstance(m, oa.ProtoOATraderRes)]
+    first, withdrawal = sorted(
+        (item for page in closing["cash_flow"] for item in page.depositWithdraw),
+        key=lambda item: item.changeBalanceTimestamp,
+    )
+    one, two = (deal.closePositionDetail for deal in closing["account_deals"][0].deal)
+
+    def closed(before: int, detail) -> int:
+        change = detail.grossProfit + detail.swap + detail.commission + detail.pnlConversionFee
+        return detail.balance - (before + change)
+
+    return [
+        first.balance - (0 + first.delta),
+        traders[0] - first.balance,
+        closed(traders[0], one),
+        closed(one.balance, two),
+        withdrawal.balance - (two.balance + withdrawal.delta),
+        traders[1] - withdrawal.balance,
+    ]
+
+
+def checked_fixture(recording: r.Recording) -> bytes:
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    r.check_clean(data, recording, account_id=ACCOUNT_ID, login=LOGIN, ids=ids, secrets=())
+    return data
+
+
+@pytest.mark.parametrize("off_by", [0, 1], ids=["consistent", "one balance off"])
+def test_the_fixture_hides_the_amounts_and_keeps_their_arithmetic(off_by) -> None:
+    recording = balance_history(off_by=off_by)
+    shift = recording.money_shift
+
+    data = checked_fixture(recording)
+
+    decoded = r.decode_recording(data)
+    timeline = [item["message"] for item in decoded["timeline"]]
+    closing = decoded["closing"]
+    raw_timeline = [entry.message for entry in recording.timeline]
+    # It holds on the fixture exactly where it holds on what was recorded.
+    assert residuals(timeline, closing) == residuals(raw_timeline, recording.closing)
+    assert residuals(timeline, closing) == [0, 0, 0, off_by, 0, 0]
+
+    assert [m.trader.balance for m in timeline] == [10_000_000 + shift, 10_000_000 + off_by + shift]
+    assert {m.trader.managerBonus for m in timeline} == {0}
+    assert {m.trader.balanceVersion for m in timeline} == {4}
+    later, first = closing["cash_flow"][0].depositWithdraw
+    assert (first.balance, first.equity, first.delta) == (10_000_000 + shift,) * 3
+    assert (later.balance, later.delta) == (10_000_000 + off_by + shift, -713)
+    one, two = (deal.closePositionDetail for deal in closing["account_deals"][0].deal)
+    assert (one.balance, one.grossProfit, one.swap, one.commission) == (
+        10_001_220 + shift,
+        1234,
+        -5,
+        -7,
+    )
+    assert (two.pnlConversionFee, two.balanceVersion) == (0, 3)
+
+
+def test_the_shift_is_kept_unscrubbed_and_shown_nowhere() -> None:
+    recording = balance_history()
+    shift = recording.money_shift
+
+    data = checked_fixture(recording)
+    raw = r.encode_raw(recording, account_id=ACCOUNT_ID, login=LOGIN)
+
+    assert json.loads(raw)["money_shift"] == shift
+    assert str(shift).encode() not in data
+    assert str(shift) not in r.describe(data)
+    # The same shift from the raw file: a rebuild gives the same fixture, byte for byte.
+    rebuilt, account_id, login = r.decode_raw(raw)
+    assert r.encode_recording(rebuilt, account_id=account_id, login=login)[0] == data
+
+
+def test_the_shift_is_large_random_and_never_round() -> None:
+    shifts = [r._draw_money_shift() for _ in range(200)]
+
+    # Larger than a real account's balance by far, at two money digits.
+    assert all(10**8 < shift < 10**10 for shift in shifts)
+    assert all(shift % 100 for shift in shifts)
+    assert len(set(shifts)) > 190
+
+
+def tampered(data: bytes, key: str, change) -> bytes:
+    """`data` with the first closing payload under `key` passed through `change`."""
+    loaded = json.loads(data)
+    item = loaded["closing"][key][0]
+    message = r._decode(item)
+    change(message)
+    item.update(r._encode(message))
+    return json.dumps(loaded).encode()
+
+
+def first_deposit_back(message) -> None:
+    message.depositWithdraw[1].delta = 10_000_000
+
+
+def level_back(message) -> None:
+    message.deal[0].closePositionDetail.balance = 10_001_220
+
+
+@pytest.mark.parametrize(
+    ("key", "change"),
+    [("account_deals", level_back), ("cash_flow", first_deposit_back)],
+    ids=["a balance", "the first deposit"],
+)
+def test_check_clean_refuses_an_amount_left_as_it_was(key, change) -> None:
+    recording = balance_history()
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        r.check_clean(
+            tampered(data, key, change),
+            recording,
+            account_id=ACCOUNT_ID,
+            login=LOGIN,
+            ids=ids,
+            secrets=(),
+        )
+
+    assert not any(char.isdigit() for char in str(raised.value))
 
 
 def test_describe_prints_no_real_identifier() -> None:
@@ -1559,7 +1906,9 @@ async def test_every_snapshot_records_the_trader_and_the_start_asks_it_once() ->
         await wait_until(lambda: statuses == [r.STATUS_STARTED])
         asked_at_start = sum(isinstance(m, oa.ProtoOATraderReq) for m in server.received)
         await server.push(execution_event())
-        await wait_until(lambda: len(statuses) >= 2)
+        await wait_until(
+            lambda: sum(isinstance(m, oa.ProtoOAReconcileReq) for m in server.received) >= 4,
+        )
         await server.drop_connections()
         await wait_until(lambda: r.STATUS_RECONNECTED in statuses)
         stop.set()
@@ -2116,6 +2465,18 @@ def test_a_journal_reads_back_as_the_recording_it_was_written_from(tmp_path) -> 
     assert recording.timeline[0].message.position.positionId == POSITION_ID
 
 
+def test_the_journal_keeps_the_money_shift_for_the_finished_fixture(tmp_path) -> None:
+    path = tmp_path / "raw" / "recording.raw.jsonl"
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    recording.journal = r.Journal(path, account_id=ACCOUNT_ID, login=LOGIN, status=_unexpected)
+    recording.add("snapshot", "start; trader", trader_at(10_000_000), 1.0)
+    recording.journal.close()
+
+    journaled, _, _ = r.read_journal(path.read_bytes())
+
+    assert journaled.money_shift == recording.money_shift
+
+
 def test_a_name_learned_after_the_journal_began_is_journalled_too(tmp_path) -> None:
     path = tmp_path / "raw" / "recording.raw.jsonl"
     recording = r.Recording(started_wall_ms=1_790_000_000_000)
@@ -2565,7 +2926,12 @@ async def test_a_raw_recording_is_rescrubbed_into_the_same_fixture(tmp_path, cap
     kinds = [item["kind"] for item in r.decode_recording(again.read_bytes())["timeline"]]
     assert kinds.count("event") == 1 and kinds.count("marker") == 3
     # Rebuilt from the raw file, the summary is the same: which notes were typed is kept there.
-    assert capsys.readouterr().out.splitlines() == [f"Recording written to {again}", *live]
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [f"Recording written to {again}", *live]
+    # The shift that hides the balances is as private as they are.
+    shift = str(json.loads(raw_of(output).read_bytes())["money_shift"])
+    assert shift not in " ".join(statuses) + captured.out + captured.err
+    assert shift.encode() not in again.read_bytes()
 
 
 def test_describe_mode_needs_no_credentials_and_prints_the_timeline(tmp_path, capsys) -> None:
@@ -2615,7 +2981,7 @@ def raw_file(tmp_path, *notes: str) -> pathlib.Path:
 def stripped(raw: bytes, *, typed: bool) -> bytes:
     """A raw recording edited by hand to look like a fixture: the raw-only keys removed."""
     loaded = json.loads(raw)
-    for key in ("started_wall_ms", "account_id", "login", "names"):
+    for key in ("started_wall_ms", "account_id", "login", "names", "money_shift"):
         del loaded[key]
     if not typed:
         for item in loaded["timeline"]:
