@@ -2218,3 +2218,114 @@ def test_a_leg_the_early_protective_order_lacks_still_awaits_protection() -> Non
         AwaitProtection(P),
     ]
     assert b.protection_timed_out(P) == [ProtectionMissing(P, None, target_id(P))]
+
+
+def test_a_leg_is_found_by_its_client_order_id() -> None:
+    b = book()
+    opened(b)
+
+    assert b.leg_position(stop_id(P)) == (P, Level.STOP_LOSS)
+    assert b.leg_position(target_id(P)) == (P, Level.TAKE_PROFIT)
+    assert b.leg_position(entry_id(P)) is None
+    assert b.leg_position("O-unknown") is None
+
+
+def test_the_view_holds_the_quantity_of_each_accepted_live_leg() -> None:
+    b = book()
+    opened(b)
+    assert b.view(P).leg_units == {
+        Level.STOP_LOSS: Decimal("1"),
+        Level.TAKE_PROFIT: Decimal("1"),
+    }
+
+    b.apply(make_event(om.ORDER_REPLACED, protective(25, stop=85000.0)), Amending())
+
+    assert b.view(P).leg_units == {Level.STOP_LOSS: Decimal("1")}
+
+
+def test_a_leg_whose_level_the_broker_lacks_is_cancelled_without_a_request() -> None:
+    b = book()
+    entry_filled_alone(b)
+
+    assert b.cancel_leg(P, Level.STOP_LOSS, 30) == [
+        leg(OrderEventKind.CANCELED, Level.STOP_LOSS, 30)
+    ]
+    assert b.view(P).legs[Level.STOP_LOSS] == (stop_id(P), False)
+    assert b.cancel_leg(P, Level.STOP_LOSS, 31) == []
+
+
+def test_a_leg_whose_level_stands_takes_an_amend_to_cancel() -> None:
+    b = book()
+    opened(b)
+
+    assert b.cancel_leg(P, Level.STOP_LOSS, 30) == []
+    assert b.view(P).legs[Level.STOP_LOSS] == (stop_id(P), True)
+
+
+def test_legs_never_accepted_are_rejected_with_the_brokers_reason() -> None:
+    b = book()
+    entry_filled_alone(b)
+    reason = "TRADING_BAD_STOPS: invalid stops"
+
+    assert b.reject_legs(P, reason, 30) == [
+        leg(OrderEventKind.REJECTED, Level.STOP_LOSS, 30, reason=reason),
+        leg(OrderEventKind.REJECTED, Level.TAKE_PROFIT, 30, reason=reason),
+    ]
+    assert b.protection_timed_out(P) == []
+
+
+def test_accepted_legs_are_never_rejected() -> None:
+    b = book()
+    opened(b)
+
+    assert b.reject_legs(P, "any", 30) == []
+
+
+def test_a_deal_moves_the_volume_once_even_if_its_first_handling_failed() -> None:
+    b = book()
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            our_entry(P, ENTRY, utc=10),
+            position=make_position(P, volume=0, status=om.POSITION_STATUS_CREATED),
+        ),
+        NOTHING,
+    )
+
+    def filled(price: float) -> oa.ProtoOAExecutionEvent:
+        # No position in the event: the deal's own volume moves the position.
+        return make_event(
+            om.ORDER_FILLED,
+            our_entry(P, ENTRY, utc=20),
+            deal=make_deal(9_200_001, ENTRY, P, side=om.BUY, volume=100, price=price, ts=20),
+        )
+
+    with pytest.raises(ValueError):
+        b.apply(filled(float("nan")), NOTHING)
+    b.apply(filled(85250.0), NOTHING)
+
+    assert b.view(P).units == Decimal("1")
+
+
+def test_a_late_event_never_takes_a_position_back_to_an_older_state() -> None:
+    b = book()
+    position = make_position(P)
+    position.utcLastUpdateTimestamp = 20
+    filled = make_event(
+        om.ORDER_FILLED,
+        our_entry(P, ENTRY, utc=20),
+        position=position,
+        deal=make_deal(9_200_001, ENTRY, P, side=om.BUY, volume=100, price=85250.0, ts=20),
+    )
+    # A created position carries no update time: it precedes every other state of it.
+    accepted = make_event(
+        om.ORDER_ACCEPTED,
+        our_entry(P, ENTRY, utc=10),
+        position=make_position(P, volume=0, status=om.POSITION_STATUS_CREATED),
+    )
+
+    b.apply(filled, NOTHING)
+    b.apply(accepted, NOTHING)
+
+    assert b.view(P).open
+    assert b.view(P).units == Decimal("1")
