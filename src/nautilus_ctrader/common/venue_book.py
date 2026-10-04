@@ -83,6 +83,8 @@ class _Position:
     awaiting_protection: bool = False
     protective_order_id: int | None = None
     protective_volume: int = 0
+    # Protective orders replaced by a new id or cancelled: any later event of theirs is stale.
+    retired_protective_ids: set[int] = field(default_factory=set)
     levels: dict[Level, Decimal] = field(default_factory=dict)
 
     @property
@@ -126,6 +128,12 @@ def _levels_of(order: om.ProtoOAOrder, precision: int) -> dict[Level, Decimal]:
     if order.HasField("limitPrice"):
         levels[Level.TAKE_PROFIT] = price_of(order.limitPrice, precision)
     return levels
+
+
+def _remaining(order: om.ProtoOAOrder) -> int:
+    """What is left of a protective order, whether the broker reports its total or its rest."""
+    executed = order.executedVolume if order.HasField("executedVolume") else 0
+    return max(order.tradeData.volume - executed, 0)
 
 
 def _which_level(
@@ -226,10 +234,10 @@ class VenueBook:
                 position = self._positions.get(order.positionId)
                 if position is not None:
                     position.protective_order_id = order.orderId
-                    position.protective_volume = order.tradeData.volume
+                    position.protective_volume = _remaining(order)
                     for leg in position.legs.values():
                         if leg.accepted:
-                            leg.quantity = order.tradeData.volume
+                            leg.quantity = position.protective_volume
             else:
                 # Reconciliation reports every other open order, so Nautilus knows it from then on.
                 self._reported.add(order.orderId)
@@ -346,16 +354,16 @@ class VenueBook:
         if event.HasField("position"):
             position.volume = event.position.tradeData.volume
             position.open = event.position.positionStatus == om.POSITION_STATUS_OPEN
-        elif (
-            event.order.closingOrder
-            and event.executionType in _FILLS
-            and event.HasField("deal")
-            and position.open
-        ):
-            # TODO(verify): whether a closing fill always carries the position; until then the
-            # volumes tell a full close.
-            position.volume = max(position.volume - event.deal.filledVolume, 0)
-            position.open = position.volume > 0
+        elif event.executionType in _FILLS and event.HasField("deal"):
+            # TODO(verify): whether a fill always carries the position; until then the deal's
+            # volume moves the one known.
+            filled = event.deal.filledVolume
+            if not event.order.closingOrder:
+                position.volume += filled
+                position.open = True
+            elif position.open:
+                position.volume = max(position.volume - filled, 0)
+                position.open = position.volume > 0
 
     def _adopt(
         self, position: _Position, entry: om.ProtoOAOrder, *, restored: bool
@@ -597,6 +605,8 @@ class VenueBook:
     ) -> list[Record]:
         order, kind = event.order, event.executionType
         position = self._position_for(event)
+        if order.orderId in position.retired_protective_ids:
+            return []
         if kind in _FILLS:
             return self._triggered(event, position, precision)
         current = position.protective_order_id
@@ -605,11 +615,14 @@ class VenueBook:
             return []
         old_levels = dict(position.levels)
         if kind in (om.ORDER_ACCEPTED, om.ORDER_REPLACED):
+            if current is not None and order.orderId != current:
+                position.retired_protective_ids.add(current)
             position.protective_order_id = order.orderId
-            position.protective_volume = order.tradeData.volume
+            position.protective_volume = _remaining(order)
             position.levels = _levels_of(order, precision)
             position.awaiting_protection = False
         elif kind == om.ORDER_CANCELLED:
+            position.retired_protective_ids.add(order.orderId)
             position.protective_order_id = None
             position.levels = {}
         else:

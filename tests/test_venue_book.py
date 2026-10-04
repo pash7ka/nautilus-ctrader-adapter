@@ -1559,3 +1559,165 @@ def test_an_entry_refused_before_acceptance_takes_whatever_legs_it_has(legs, can
         OrderEvent(OrderEventKind.REJECTED, None, "O-X", 5, reason="MARKET_CLOSED"),
         *(OrderEvent(OrderEventKind.CANCELED, None, leg_id, 5) for leg_id in cancelled),
     ]
+
+
+# Fills that arrive without the position.
+
+
+def entry_filled_alone(b: VenueBook, volume: int = 100, kind=om.ORDER_FILLED) -> None:
+    """The node's entry accepted, then filled by `volume` with no position in the event."""
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            our_entry(P, ENTRY, utc=10),
+            position=make_position(P, volume=0, status=om.POSITION_STATUS_CREATED),
+        ),
+        NOTHING,
+    )
+    b.apply(
+        make_event(
+            kind,
+            our_entry(P, ENTRY, utc=20),
+            deal=make_deal(9_200_001, ENTRY, P, side=om.BUY, volume=volume, price=85250.0, ts=20),
+        ),
+        NOTHING,
+    )
+
+
+def test_an_entry_fill_without_the_position_opens_it() -> None:
+    b = book()
+    entry_filled_alone(b)
+
+    assert b.view(P).open
+    assert b.protection_timed_out(P) == [ProtectionMissing(P, stop_id(P), target_id(P))]
+
+
+def test_a_partial_close_after_an_entry_fill_without_the_position_leaves_the_legs() -> None:
+    b = book()
+    entry_filled_alone(b)
+
+    records = trader_close(b, 9_100_004, 40, None, 41)
+
+    assert records == [
+        external_close(9_100_004, "0.4", 41),
+        manual(Action.PARTIALLY_CLOSED, 41, "0.4"),
+    ]
+    assert b.view(P).legs == {
+        Level.STOP_LOSS: (stop_id(P), True),
+        Level.TAKE_PROFIT: (target_id(P), True),
+    }
+
+
+def test_a_remainder_cancelled_after_a_partial_fill_without_the_position_leaves_the_legs() -> None:
+    b = book()
+    entry_filled_alone(b, 40, om.ORDER_PARTIAL_FILL)
+
+    records = b.apply(make_event(om.ORDER_CANCELLED, our_entry(P, ENTRY, utc=21)), NOTHING)
+
+    assert records == [OrderEvent(OrderEventKind.CANCELED, str(ENTRY), entry_id(P), 21)]
+    assert b.view(P).legs == {
+        Level.STOP_LOSS: (stop_id(P), True),
+        Level.TAKE_PROFIT: (target_id(P), True),
+    }
+
+
+# The protective order's volume is what is left of it.
+
+
+def test_a_protective_order_reporting_its_executed_volume_counts_only_the_remainder() -> None:
+    b = book()
+    opened(b)
+    trigger(
+        b,
+        1,
+        84990.0,
+        30,
+        kind=om.ORDER_PARTIAL_FILL,
+        deal_volume=40,
+        left=60,
+        stop=85000.0,
+        limit=85500.0,
+    )
+    replaced = protective(31, stop=85000.0, limit=85500.0)
+    replaced.executedVolume = 40
+
+    records = b.apply(
+        make_event(om.ORDER_REPLACED, replaced, position=make_position(P, volume=60), server=True),
+        NOTHING,
+    )
+
+    assert records == [
+        leg(OrderEventKind.UPDATED, Level.TAKE_PROFIT, 31, quantity=Decimal("0.6")),
+    ]
+
+
+def test_load_counts_only_the_protective_orders_remainder() -> None:
+    b = book()
+    response = snapshot(stop=85000.0, target=85500.0, volume=60)
+    response.order[0].tradeData.volume = 100
+    response.order[0].executedVolume = 40
+    b.load(response, {P: [our_entry(P, ENTRY)]})
+
+    records = b.apply(
+        make_event(
+            om.ORDER_REPLACED,
+            protective(6, stop=85000.0, limit=85500.0, volume=60),
+            position=make_position(P, volume=60),
+            server=True,
+        ),
+        NOTHING,
+    )
+
+    assert records == []
+
+
+# A retired protective order.
+
+
+def test_every_event_of_a_retired_protective_order_is_ignored() -> None:
+    b = book()
+    opened(b)
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            make_order(
+                9_100_009,
+                P,
+                order_type=om.STOP_LOSS_TAKE_PROFIT,
+                side=om.SELL,
+                closing=True,
+                utc=26,
+                stop=85000.0,
+                limit=85500.0,
+            ),
+            server=True,
+        ),
+        NOTHING,
+    )
+
+    late = b.apply(
+        make_event(om.ORDER_ACCEPTED, protective(27, stop=84000.0, limit=86000.0), server=True),
+        NOTHING,
+    )
+    current = b.apply(
+        make_event(
+            om.ORDER_REPLACED,
+            make_order(
+                9_100_009,
+                P,
+                order_type=om.STOP_LOSS_TAKE_PROFIT,
+                side=om.SELL,
+                closing=True,
+                utc=28,
+                stop=85100.0,
+                limit=85500.0,
+            ),
+        ),
+        Amending(),
+    )
+
+    assert late == []
+    assert b.view(P).protective_order_id == 9_100_009
+    assert current == [
+        leg(OrderEventKind.UPDATED, Level.STOP_LOSS, 28, trigger_price=Decimal("85100.00"))
+    ]
