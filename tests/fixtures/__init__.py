@@ -1,7 +1,10 @@
-"""Loader for the recorded M2 fixtures (`m2_recorded.json`).
+"""Loaders for the recorded fixtures.
 
-The file itself is produced offline by `scripts/record_fixtures.py`, run once against a real,
-read-only broker connection; it is not generated as part of the test suite.
+- `m2_recorded.json`: market data, made by `scripts/record_fixtures.py`;
+- `m3_execution_recorded.json`: a manual trading session, made by `scripts/record_execution.py`.
+
+Both are produced offline against a real broker connection and scrubbed; they are not generated
+as part of the test suite.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ FAKE_ACCOUNT_ID = 1_000_001
 FAKE_TRADER_LOGIN = 2_000_002
 
 _M2 = pathlib.Path(__file__).with_name("m2_recorded.json")
+_M3_EXECUTION = pathlib.Path(__file__).with_name("m3_execution_recorded.json")
 
 
 def load_recorded() -> dict[str, list]:
@@ -38,3 +42,31 @@ def load_recorded() -> dict[str, list]:
             messages.append(message)
         out[key] = messages
     return out
+
+
+def load_execution_recording() -> dict:
+    """The recorded execution session, with every payload parsed into its protobuf message.
+
+    `timeline` keeps the order and spacing in which the venue sent its events; `closing` holds
+    the deal, order and cash-flow lists asked for at the end.
+    """
+
+    def decode(item: dict):
+        message = codec.payload_class(item["type"])()
+        message.ParseFromString(base64.b64decode(item["payload"]))
+        return message
+
+    raw = json.loads(_M3_EXECUTION.read_text(encoding="utf-8"))
+    return {
+        "format": raw["format"],
+        "timeline": [
+            {
+                "t": item["t"],
+                "kind": item["kind"],
+                "note": item["note"],
+                "message": decode(item) if "payload" in item else None,
+            }
+            for item in raw["timeline"]
+        ],
+        "closing": {key: [decode(item) for item in items] for key, items in raw["closing"].items()},
+    }

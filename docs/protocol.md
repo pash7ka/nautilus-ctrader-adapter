@@ -70,9 +70,10 @@ actually arriving. This adapter also treats 90 seconds with no inbound frame —
 server heartbeats at the 30-second tolerance — as a lost connection and reconnects. Silence is
 checked periodically, so the loss is detected within a few seconds after the 90 seconds, not at
 exactly 90 seconds.
-**Unconfirmed**: that the server sends heartbeats when it has nothing else to send; if it stays
-silent on an otherwise idle connection instead, this reconnects an idle session every 90
-seconds.
+The server does send frames on an otherwise idle authenticated connection (confirmed): in a
+recorded session with no market-data subscription, stretches of up to two minutes with no
+other message passed without the 90-second detector firing. Heartbeats themselves were not
+recorded, so this is inferred from the detector staying silent.
 
 ## 4. Authentication
 
@@ -279,3 +280,126 @@ to seconds before the value reaches application code, so callers never have to k
 error type they got. **Unconfirmed**: this is inferred from the two messages' documentation,
 not yet observed together on a live connection; the first real maintenance window will settle
 it.
+
+## 10. Execution events
+
+Everything in this section was observed in one recorded session on a hedging account, in which
+a person traded one symbol priced near 85,000 with 2-decimal prices by hand in the broker's
+terminal while a read-only connection listened; the history lists also hold one earlier trade
+on another symbol. The scrubbed recording is the fixture
+`tests/fixtures/m3_execution_recorded.json`. What it did not exercise is marked **unconfirmed**.
+
+### Delivery
+
+- **Execution events are pushed after account authentication alone** (confirmed). No
+  subscription request exists for them, and none is needed: every order, position and deal
+  change made in the session arrived as a `ProtoOAExecutionEvent`, including changes made by
+  another client such as the broker's own terminal.
+- `isServerEvent` is `false` for an action a client asked for (placing, amending, cancelling)
+  and `true` for what the venue did on its own (creating the protective order, a level
+  triggering, a protective order following a partial close) (confirmed).
+- **Prices in execution messages are doubles in price units** (`executionPrice`, `stopLoss`,
+  `stopPrice`, `limitPrice`, position `price`), unlike the integer spot and trendbar prices of
+  §7. The relative distances on a new order are integers in 1/100000 of a price unit, like spot
+  prices: a distance of `90.01` travels as `9001000` (confirmed, on a 2-decimal symbol).
+- **Volumes are in cents of a unit here too** (confirmed by the arithmetic): closing volume `1`
+  of a position opened at `85287.21` and closed at `85219.06` realised a gross profit of
+  `-0.68`, which is `(85219.06 - 85287.21) * 0.01`.
+
+### A market order with a stop-loss and a take-profit
+
+The terminal sends a `MARKET` order with `timeInForce = IMMEDIATE_OR_CANCEL` and the levels as
+`relativeStopLoss` / `relativeTakeProfit`. The events then arrive in this order (confirmed):
+
+1. `ORDER_ACCEPTED` — the order, with its relative levels, and a new position in
+   `POSITION_STATUS_CREATED` with zero volume;
+2. `ORDER_FILLED` — the order filled, the deal, and the position now open. **The fill event does
+   not yet carry the position's levels**;
+3. `ORDER_ACCEPTED`, a server event — a **separate order of type `STOP_LOSS_TAKE_PROFIT`** with
+   its own `orderId`, `closingOrder = true`, `GOOD_TILL_CANCEL`, the stop-loss in `stopPrice` and
+   the take-profit in `limitPrice`; the position now carries `stopLoss` and `takeProfit` too.
+
+**The relative levels are applied to the fill price** (`executionPrice`), not to the
+position's `marginRate` (confirmed): a fill at `85287.21` with distances `90.01` and `100.01`
+gave a stop-loss of `85197.20` and a take-profit of `85387.22`, and the second position
+matched the same way. **Unconfirmed**: how far the quote at the moment of sending was from the
+fill; the recording holds no quote.
+
+So the two protective levels of a position are **one** venue order, not two, and that order has
+a real `orderId` from the moment the position opens.
+
+### Changing the levels
+
+Moving a level, removing one and adding one back are all `ORDER_REPLACED` events on that same
+protective order, with the position's own `stopLoss` / `takeProfit` updated alongside
+(confirmed). A removed level is simply absent: after the take-profit was removed, the order
+carried `stopPrice` and no `limitPrice`, and the position no `takeProfit`. Adding it back made
+both fields reappear on the same `orderId`.
+
+**Unconfirmed**: what happens when both levels are removed — whether the protective order is
+cancelled or stays with neither field.
+
+### A level triggering
+
+A triggered level fills the protective order: an `ORDER_FILLED` server event carrying that
+order, a closing deal, and the position in `POSITION_STATUS_CLOSED` (confirmed, for a stop-loss
+and for a take-profit). The order still holds both levels as they stood; the deal's
+`executionPrice` is the fill, which can differ from the level: a stop-loss at `85206.20`
+filled at `85205.58`.
+
+**Unconfirmed**: a field that says which of the two levels triggered. None in this adapter's
+bindings does; telling them apart from the fill price against `stopPrice` and `limitPrice` is
+ambiguous in principle. The venue's schema is newer than the bindings used for the recording
+(see below), so a newer field may answer this.
+
+### Closing part of a position
+
+A partial close from the terminal is a `MARKET` order with `closingOrder = true`,
+`IMMEDIATE_OR_CANCEL` and the `positionId` it closes: `ORDER_ACCEPTED`, then `ORDER_FILLED` with
+a deal whose `closePositionDetail` carries the realised result (confirmed). A server
+`ORDER_REPLACED` on the protective order follows, its volume reduced to the position's new
+volume. The position's `price` stays the original entry price.
+
+`closingOrder` is `true` on a partial close and on the protective order (confirmed).
+**Unconfirmed**: a full manual close of a position from the terminal, and a stop-out; neither
+happened in the session.
+
+### A pending order
+
+A `LIMIT` order placed from the terminal arrives as `ORDER_ACCEPTED` with `GOOD_TILL_CANCEL`
+and **already names a new `positionId`**, in `POSITION_STATUS_CREATED` with zero volume
+(confirmed). Cancelling it is `ORDER_CANCELLED`, and that position is reported
+`POSITION_STATUS_CLOSED` without ever having opened.
+
+### Balance
+
+- **Opening a position does not change the balance** (confirmed). The position shows its
+  commission at once, but the account's `balance` and `balanceVersion` are unchanged until a
+  deal closes volume.
+- **A closing deal changes the balance by exactly its realised amounts** (confirmed, on every
+  closing deal recorded): `balance after = balance before + grossProfit + swap + commission +
+  pnlConversionFee`, with the commission covering both the opening and the closing side of the
+  closed volume. `closePositionDetail.balance` is the balance after the deal, and
+  `balanceVersion` increases by one for each change.
+- **Swap is realised when the position closes** (confirmed, on a position held a few hours and
+  closed some days before the session): its `closePositionDetail.swap` was part of the change
+  above.
+  **Unconfirmed**: when swap accrues on an open position, and how that is reported.
+- **The cash-flow history reaches the account's first deposit** (confirmed), which has
+  `balance == delta`. The deal list answered for a window starting at the account's
+  registration; **unconfirmed** that it would have returned deals older than its window allows.
+  Together the two lists rebuild the balance at any past moment the deal history covers.
+- **Unconfirmed**: the sign of `delta` for a withdrawal; the session had none.
+
+### Messages not seen
+
+No margin-change, trader-update, margin-call or order-error event arrived in the session; their
+shapes are **unconfirmed**.
+
+### The venue's schema is newer than these bindings
+
+Fields unknown to the bindings arrived in `ProtoOAExecutionEvent`, `ProtoOATraderRes`,
+`ProtoOADealListRes` and `ProtoOADealListByPositionIdRes` (confirmed). Protobuf keeps unknown
+fields when it parses a message, so nothing fails, but they cannot be read until the bindings
+are regenerated from the current schema.
+
