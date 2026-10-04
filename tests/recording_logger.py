@@ -11,16 +11,17 @@ class RecordingLogger:
     def __init__(self) -> None:
         self.lines: list[tuple[str, str]] = []
 
-    def debug(self, message: str) -> None:
+    # `color` mirrors the Nautilus `Logger` signature; it is ignored.
+    def debug(self, message: str, color=None) -> None:
         self.lines.append(("debug", message))
 
-    def info(self, message: str) -> None:
+    def info(self, message: str, color=None) -> None:
         self.lines.append(("info", message))
 
-    def warning(self, message: str) -> None:
+    def warning(self, message: str, color=None) -> None:
         self.lines.append(("warning", message))
 
-    def error(self, message: str) -> None:
+    def error(self, message: str, color=None) -> None:
         self.lines.append(("error", message))
 
     def exception(self, message: str, ex: BaseException) -> None:
@@ -28,3 +29,6 @@ class RecordingLogger:
 
     def errors(self) -> list[str]:
         return [message for level, message in self.lines if level == "error"]
+
+    def warnings(self) -> list[str]:
+        return [message for level, message in self.lines if level == "warning"]
