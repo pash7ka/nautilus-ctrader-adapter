@@ -57,6 +57,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 from google.protobuf import text_format
 from google.protobuf.descriptor import FieldDescriptor
@@ -74,6 +75,7 @@ from nautilus_ctrader.constants import (
     PROTOBUF_PORT,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _OUTPUT_PATH = _REPO_ROOT / "tests" / "fixtures" / "m3_execution_recorded.json"
@@ -244,6 +246,28 @@ _OPERATION_AMOUNT = ("ProtoOADepositWithdraw", "delta")
 # A level the venue may send as 0 for "not given". Kept 0: shifted, it would be the shift.
 # TODO(verify): whether an operation listed in the cash-flow history carries its equity at all.
 _ZERO_IS_NOT_GIVEN = frozenset({("ProtoOADepositWithdraw", "equity")})
+# The operation types that bring money into the balance: every deposit type but a bonus, kept
+# apart from the balance; a transfer from a subaccount, whose schema comment and name give
+# opposite directions; and the reset of a negative balance to zero.
+_MONEY_ARRIVING = frozenset(
+    om.ProtoOAChangeBalanceType.Value(name)
+    for name in (
+        "BALANCE_DEPOSIT",
+        "BALANCE_DEPOSIT_STRATEGY_COMMISSION_INNER",
+        "BALANCE_DEPOSIT_IB_COMMISSIONS",
+        "BALANCE_DEPOSIT_IB_SHARED_PERCENTAGE_FROM_SUB_IB",
+        "BALANCE_DEPOSIT_IB_SHARED_PERCENTAGE_FROM_BROKER",
+        "BALANCE_DEPOSIT_REBATE",
+        "BALANCE_DEPOSIT_STRATEGY_COMMISSION_OUTER",
+        "BALANCE_DEPOSIT_DIVIDENDS",
+        "BALANCE_DEPOSIT_SWAP",
+        "BALANCE_DEPOSIT_MANAGEMENT_FEE",
+        "BALANCE_DEPOSIT_PERFORMANCE_FEE",
+        "BALANCE_DEPOSIT_TO_SUBACCOUNT",
+        "BALANCE_DEPOSIT_TRANSFER",
+        "BALANCE_DEPOSIT_CONVERTED_BONUS",
+    )
+)
 # Lists of account ids. They name the owner's other accounts, whose ids no check knows.
 _ACCOUNT_ID_LISTS = frozenset({"ctidTraderAccountIds"})
 # The owner's id at the identity provider. Zeroed, not cleared: the field is `required`.
@@ -331,13 +355,39 @@ def _names_pattern(names: Iterable[str]) -> re.Pattern[str] | None:
     return re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.IGNORECASE)
 
 
+# What may group the thousands of an amount in text, the usual way and the European way.
+_GROUPS = r"[,'\u2019 \u00a0\u202f]"
+_EUROPEAN_GROUPS = r"[.'\u2019 \u00a0\u202f]"
+
+
 def _amounts_pattern(amounts: Iterable[str]) -> re.Pattern[str] | None:
-    """What matches any of `amounts` as a whole number; `None` if there is none."""
+    """What matches any of `amounts` as a whole number; `None` if there is none.
+
+    Each written as plain digits with a decimal point, as given, or with its thousands grouped
+    by a comma, a space, a no-break space or an apostrophe; or the European way, grouped by a
+    point or a space with a decimal comma.
+    """
     ordered = sorted(set(amounts), key=len, reverse=True)
     if not ordered:
         return None
-    alternatives = "|".join(re.escape(amount) for amount in ordered)
-    return re.compile(rf"(?<![\d.])(?:{alternatives})(?!\d|\.\d)")
+    alternatives = []
+    for amount in ordered:
+        whole, _, fraction = amount.partition(".")
+        if fraction:
+            alternatives.append(_grouped(whole, _GROUPS) + r"\." + fraction)
+            alternatives.append(_grouped(whole, _EUROPEAN_GROUPS) + "," + fraction)
+        else:
+            alternatives.append(_grouped(whole, _GROUPS))
+    joined = "|".join(alternatives)
+    # Not part of a longer number, nor its fraction.
+    return re.compile(rf"(?<!\d)(?<!\d[.,])(?:{joined})(?!\d)(?![.,]\d)")
+
+
+def _grouped(digits: str, separator: str) -> str:
+    """`digits` as a pattern that allows `separator` between its groups of three."""
+    head = len(digits) % 3 or 3
+    groups = [digits[:head], *(digits[i : i + 3] for i in range(head, len(digits), 3))]
+    return f"{separator}?".join(groups)
 
 
 def clean_text(
@@ -452,8 +502,12 @@ def _made_from_zero(message: Message, name: str) -> bool:
     Only there is the shifted amount still what the shifted balance grew by. Anywhere else,
     the shifted amount less that growth would be the shift.
     """
+    # TODO(verify): whether a withdrawal's `delta` is signed or a magnitude; the type is what
+    # says money arrived either way.
     is_amount = (message.DESCRIPTOR.name, name) == _OPERATION_AMOUNT
-    return is_amount and message.balance == message.delta
+    return (
+        is_amount and message.operationType in _MONEY_ARRIVING and message.balance == message.delta
+    )
 
 
 def _shift_money(original: Message, scrubbed: Message, money_shift: int) -> None:
@@ -486,16 +540,22 @@ def _real_amounts(recording: Recording) -> set[str]:
 
 
 def _written_forms(value: int, digits: int | None) -> set[str]:
-    """`value`, in raw money units, as a whole number and as a decimal.
+    """`value`, in raw money units at `digits` (2 if not given), as text may write it.
 
-    In decimals by `digits` and by 2, the usual number, each with and without its trailing
-    zeros: 1001230 gives "1001230", "10012.30" and "10012.3".
+    The raw integer; the amount with all its decimals, with two, rounded or cut, and with
+    none; each also without trailing zeros. 1001230 at two digits gives "1001230", "10012.30",
+    "10012.3" and "10012".
     """
-    forms = {str(value)}
-    for places in {2, digits or 0} - {0}:
-        whole, part = divmod(value, 10**places)
-        decimal = f"{whole}.{part:0{places}d}"
-        forms |= {decimal, decimal.rstrip("0").rstrip(".")}
+    amount = Decimal(value).scaleb(-(2 if digits is None else digits))
+    forms = {str(value), str(int(amount))}
+    cent = Decimal("0.01")
+    for written in (
+        amount,
+        amount.quantize(cent, ROUND_HALF_UP),
+        amount.quantize(cent, ROUND_DOWN),
+    ):
+        text = f"{written:f}"
+        forms |= {text, text.rstrip("0").rstrip(".") if "." in text else text}
     return forms
 
 

@@ -1031,9 +1031,19 @@ def history_deal(n: int, *, gross: int, swap: int, commission: int, fee: int, ba
     return deal
 
 
-def cash(n: int, *, delta: int, balance: int, at: int) -> om.ProtoOADepositWithdraw:
+def cash(
+    n: int,
+    *,
+    delta: int,
+    balance: int,
+    at: int,
+    kind: int | None = None,
+) -> om.ProtoOADepositWithdraw:
+    """A balance operation; a deposit or a withdrawal by the sign of `delta` unless `kind` says."""
+    if kind is None:
+        kind = om.BALANCE_DEPOSIT if delta > 0 else om.BALANCE_WITHDRAW
     return om.ProtoOADepositWithdraw(
-        operationType=om.BALANCE_DEPOSIT if delta > 0 else om.BALANCE_WITHDRAW,
+        operationType=kind,
         balanceHistoryId=880_000_000 + n,
         balance=balance,
         delta=delta,
@@ -1317,6 +1327,136 @@ def test_a_real_balance_in_a_text_is_replaced_in_any_of_its_forms() -> None:
     assert error["message"].description == f"Not enough money: balance {token}"
     assert marker["note"] == f"closed at 1.1050: balance {token}, then {token}, raw {token}; 3 lots"
     assert not any(char.isdigit() for char in token)
+
+
+def halved(withdrawn: int) -> r.Recording:
+    """A deposit of 4 000 000, then a withdrawal that leaves half of it, between two traders."""
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    recording.add("snapshot", "start; trader", trader_at(4_000_000), 0.0)
+    recording.add("snapshot", "after events; trader", trader_at(2_000_000), 9.0)
+    recording.closing["cash_flow"].append(
+        oa.ProtoOACashFlowHistoryListRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            depositWithdraw=[
+                cash(1, delta=4_000_000, balance=4_000_000, at=1_780_000_000_000),
+                cash(
+                    2,
+                    delta=withdrawn,
+                    balance=2_000_000,
+                    at=1_790_000_060_000,
+                    kind=om.BALANCE_WITHDRAW,
+                ),
+            ],
+        ),
+    )
+    return recording
+
+
+@pytest.mark.parametrize("withdrawn", [2_000_000, -2_000_000], ids=["magnitude", "signed"])
+def test_a_withdrawal_that_leaves_its_own_amount_is_not_shifted(withdrawn) -> None:
+    """A withdrawal is not made on a balance of zero, whatever sign its amount is given."""
+    recording = halved(withdrawn)
+
+    start, _, listed = fixture_messages(checked_fixture(recording))
+
+    deposit, withdrawal = listed.depositWithdraw
+    assert deposit.delta == 4_000_000 + recording.money_shift
+    assert withdrawal.delta == withdrawn
+    # What a reader would take for the shift: the amount, less what the balance fell by.
+    before = start.trader.balance
+    assert abs(withdrawal.delta) - (before - withdrawal.balance) == 0
+
+
+def test_check_clean_refuses_a_shifted_withdrawal() -> None:
+    recording = halved(2_000_000)
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    loaded = json.loads(data)
+    item = loaded["closing"]["cash_flow"][0]
+    message = r._decode(item)
+    message.depositWithdraw[1].delta += recording.money_shift
+    item.update(r._encode(message))
+
+    with pytest.raises(r.record_fixtures.ScrubError, match="shifted"):
+        r.check_clean(
+            json.dumps(loaded).encode(),
+            recording,
+            account_id=ACCOUNT_ID,
+            login=LOGIN,
+            ids=ids,
+            secrets=(),
+        )
+
+
+# The deposit types the script does not take for money arriving in the balance, and why.
+NOT_ARRIVING = {
+    "BALANCE_DEPOSIT_NONWITHDRAWABLE_BONUS": "a bonus, kept apart from the balance",
+    "BALANCE_DEPOSIT_FROM_SUBACCOUNT": "its schema comment and its name give opposite directions",
+    "BALANCE_DEPOSIT_NEGATIVE_BALANCE_PROTECTION": "brings a negative balance back to zero",
+}
+
+
+def test_every_balance_operation_type_is_decided() -> None:
+    """Only money arriving is ever shifted; a type the schema gains fails here until decided."""
+    names = om.ProtoOAChangeBalanceType.keys()
+    deposits = {name for name in names if name.startswith("BALANCE_DEPOSIT")}
+
+    assert {om.ProtoOAChangeBalanceType.Name(v) for v in r._MONEY_ARRIVING} == (
+        deposits - NOT_ARRIVING.keys()
+    )
+    assert NOT_ARRIVING.keys() <= deposits
+    assert all(name.startswith(("BALANCE_DEPOSIT", "BALANCE_WITHDRAW")) for name in names)
+
+
+def test_check_clean_refuses_an_equity_not_given_that_was_shifted() -> None:
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    listed = operations((10_000_000, 10_000_000))
+    listed.depositWithdraw[0].equity = 0
+    recording.closing["cash_flow"].append(listed)
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    loaded = json.loads(data)
+    item = loaded["closing"]["cash_flow"][0]
+    message = r._decode(item)
+    message.depositWithdraw[0].equity = recording.money_shift
+    item.update(r._encode(message))
+
+    with pytest.raises(r.record_fixtures.ScrubError, match="not given"):
+        r.check_clean(
+            json.dumps(loaded).encode(),
+            recording,
+            account_id=ACCOUNT_ID,
+            login=LOGIN,
+            ids=ids,
+            secrets=(),
+        )
+
+
+@pytest.mark.parametrize(
+    "written",
+    ["100,012.20", "100 012.20", "100\u00a0012.20", "100'012.20", "100.012,20", "100012"],
+    ids=["comma", "space", "no-break space", "apostrophe", "european", "whole part"],
+)
+def test_a_real_balance_is_found_however_its_digits_are_grouped(written) -> None:
+    recording = balance_history()
+    recording.add("marker", f"balance {written} now; 1.1050, 100012.5 and 3 lots", None, 11.0)
+
+    *_, marker = r.decode_recording(checked_fixture(recording))["timeline"]
+
+    token = r.AMOUNT_PLACEHOLDER
+    # A price, another number and a volume that are no real balance stay as typed.
+    assert marker["note"] == f"balance {token} now; 1.1050, 100012.5 and 3 lots"
+
+
+def test_a_real_balance_is_written_with_two_decimals_at_its_own_money_digits() -> None:
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    trader = trader_at(1_000_123_456)
+    trader.trader.moneyDigits = 4
+    recording.add("snapshot", "start; trader", trader, 0.0)
+    recording.add("marker", "balance 100012.35, exactly 100012.3456", None, 1.0)
+
+    _, marker = r.decode_recording(checked_fixture(recording))["timeline"]
+
+    token = r.AMOUNT_PLACEHOLDER
+    assert marker["note"] == f"balance {token}, exactly {token}"
 
 
 def test_check_clean_refuses_a_real_balance_left_in_a_note() -> None:
