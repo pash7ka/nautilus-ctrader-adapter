@@ -347,10 +347,11 @@ and for a take-profit). The order still holds both levels as they stood; the dea
 `executionPrice` is the fill, which can differ from the level: a stop-loss at `85206.20`
 filled at `85205.58`.
 
-**Unconfirmed**: a field that says which of the two levels triggered. None in this adapter's
-bindings does; telling them apart from the fill price against `stopPrice` and `limitPrice` is
-ambiguous in principle. The venue's schema is newer than the bindings used for the recording
-(see below), so a newer field may answer this.
+No field says which of the two levels triggered — neither in the published schema nor among
+the fields the venue sends beyond it (see below). What tells them apart is the fill price: a
+stop-loss and a take-profit always sit on opposite sides of the market, so the triggered one is
+the level the fill is nearer to. **Unconfirmed**: slippage large enough to carry a fill past the
+midpoint between the two levels; none occurred.
 
 ### Closing part of a position
 
@@ -396,10 +397,14 @@ and **already names a new `positionId`**, in `POSITION_STATUS_CREATED` with zero
 No margin-change, trader-update, margin-call or order-error event arrived in the session; their
 shapes are **unconfirmed**.
 
-### The venue's schema is newer than these bindings
+### Fields beyond the published schema
 
-Fields unknown to the bindings arrived in `ProtoOAExecutionEvent`, `ProtoOATraderRes`,
-`ProtoOADealListRes` and `ProtoOADealListByPositionIdRes` (confirmed). Protobuf keeps unknown
-fields when it parses a message, so nothing fails, but they cannot be read until the bindings
-are regenerated from the current schema.
+The venue sends two fields that the published schema does not define (confirmed; the bindings
+were generated from the latest published schema, so regenerating them does not help):
+
+- field 19 on every `ProtoOADeal`, length-delimited and empty in every deal recorded;
+- field 23 on `ProtoOATrader`, a small integer with the same value in every response.
+
+Protobuf keeps unknown fields when it parses a message, so nothing fails. Neither field carries
+anything this adapter needs; their meaning is **unconfirmed**.
 
