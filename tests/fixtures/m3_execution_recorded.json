@@ -1,0 +1,611 @@
+{
+  "format": 1,
+  "timeline": [
+    {
+      "t": 0.356,
+      "kind": "snapshot",
+      "note": "start; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDBvMaKExgDOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 0.434,
+      "kind": "snapshot",
+      "note": "start; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPQ=="
+    },
+    {
+      "t": 0.509,
+      "kind": "snapshot",
+      "note": "start; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPQ=="
+    },
+    {
+      "t": 124.674,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgCIkgIwZaxAhIeCMQCEAAYATAAOghzY3J1YmJlZEIJQ29udHJhY3RzGAMgACkAAAAAAAAAAEgAUQAAAAAAAAAAWABgAGgAeAKAAQAqXgiBm+4CEiUIxAIQZBgBINrNwbvILjAAOghzY3J1YmJlZEIJQ29udHJhY3RzGAEgAUAASNrNwbvILmAAigEIc2NydWJiZWSQAQOYAcGWsQKgAaiwpQSoAei04gS4AQBQAA=="
+    },
+    {
+      "t": 124.804,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgDImIIwZaxAhIlCMQCEGQYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EBA5M7Bu8guSKzq/////////wFRUrgehXPS9EBYAGAAaJqpnAF4AoABACpuCIGb7gISLAjEAhBkGAEg2s3Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHNI5M7Bu8guGAEgAjnD9Shcc9L0QEBkSOTOwbvILmAAigEIc2NydWJiZWSQAQOYAcGWsQKgAaiwpQSoAei04gS4AQAyWAjBn6sDEIGb7gIYwZaxAiBkKGQwxAI42s3Bu8guQOTOwbvILkjkzsG7yC5Rw/UoXHPS9EBYAWACaVK4HoVz0vRAcKzq/////////wF5UrgehXPS9ECIAQJQAA=="
+    },
+    {
+      "t": 124.822,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgCInYIwZaxAhIlCMQCEGQYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EAxMzMzM9PM9EA5UrgehbPY9EBA587Bu8guSKzq/////////wFRUrgehXPS9EBYAGAAaJqpnAFwAXgCgAEAKmcIgpvuAhIlCMQCEGQYAiDnzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEjnzsG7yC5gAWlSuB6Fs9j0QHEzMzMz08z0QIoBCHNjcnViYmVkkAECmAHBlrECuAEAwAEBUAE="
+    },
+    {
+      "t": 127.064,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDBvMaKExgDOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 127.124,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMGWsQISJQjEAhBkGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzPTzPRAOVK4HoWz2PRAQOfOwbvILkis6v////////8BUVK4HoVz0vRAWABgAGiaqZwBcAF4AoABAA=="
+    },
+    {
+      "t": 127.187,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMGWsQISJQjEAhBkGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzPTzPRAOVK4HoWz2PRAQOfOwbvILkis6v////////8BUVK4HoVz0vRAWABgAGiaqZwBcAF4AoABACJnCIKb7gISJQjEAhBkGAIg587Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABI587Bu8guYAFpUrgehbPY9EBxMzMzM9PM9ECKAQhzY3J1YmJlZJABApgBwZaxArgBAMABAQ=="
+    },
+    {
+      "t": 131.901,
+      "kind": "marker",
+      "note": "1"
+    },
+    {
+      "t": 168.22,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwZaxAhIlCMQCEGQYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EAxMzMzMwPN9EA5UrgehbPY9EBA+KHEu8guSKzq/////////wFRUrgehXPS9EBYAGAAaJqpnAFwAXgCgAEAKmcIgpvuAhIlCMQCEGQYAiDnzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEj4ocS7yC5gAWlSuB6Fs9j0QHEzMzMzA830QIoBCHNjcnViYmVkkAECmAHBlrECuAEAwAEBUAA="
+    },
+    {
+      "t": 170.32,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDBvMaKExgDOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 170.383,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMGWsQISJQjEAhBkGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzMDzfRAOVK4HoWz2PRAQPihxLvILkis6v////////8BUVK4HoVz0vRAWABgAGiaqZwBcAF4AoABAA=="
+    },
+    {
+      "t": 170.441,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMGWsQISJQjEAhBkGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzMDzfRAOVK4HoWz2PRAQPihxLvILkis6v////////8BUVK4HoVz0vRAWABgAGiaqZwBcAF4AoABACJnCIKb7gISJQjEAhBkGAIg587Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABI+KHEu8guYAFpUrgehbPY9EBxMzMzMwPN9ECKAQhzY3J1YmJlZJABApgBwZaxArgBAMABAQ=="
+    },
+    {
+      "t": 203.702,
+      "kind": "marker",
+      "note": "2"
+    },
+    {
+      "t": 226.451,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEIm0IwZaxAhIlCMQCEGQYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EAxMzMzMwPN9EBA5ujHu8guSKzq/////////wFRUrgehXPS9EBYAGAAaJqpnAFwAXgCgAEAKl4IgpvuAhIlCMQCEGQYAiDnzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEjm6Me7yC5gAXEzMzMzA830QIoBCHNjcnViYmVkkAECmAHBlrECuAEAwAEBUAA="
+    },
+    {
+      "t": 228.671,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDBvMaKExgDOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 228.731,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRptCMGWsQISJQjEAhBkGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzMDzfRAQObox7vILkis6v////////8BUVK4HoVz0vRAWABgAGiaqZwBcAF4AoABAA=="
+    },
+    {
+      "t": 228.787,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRptCMGWsQISJQjEAhBkGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzMDzfRAQObox7vILkis6v////////8BUVK4HoVz0vRAWABgAGiaqZwBcAF4AoABACJeCIKb7gISJQjEAhBkGAIg587Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABI5ujHu8guYAFxMzMzMwPN9ECKAQhzY3J1YmJlZJABApgBwZaxArgBAMABAQ=="
+    },
+    {
+      "t": 254.344,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwZaxAhIlCMQCEGQYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EAxMzMzMwPN9EA5hetRuJbW9EBA6MLJu8guSKzq/////////wFRUrgehXPS9EBYAGAAaJqpnAFwAXgCgAEAKmcIgpvuAhIlCMQCEGQYAiDnzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEjowsm7yC5gAWmF61G4ltb0QHEzMzMzA830QIoBCHNjcnViYmVkkAECmAHBlrECuAEAwAEBUAA="
+    },
+    {
+      "t": 256.413,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDBvMaKExgDOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 256.485,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMGWsQISJQjEAhBkGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzMDzfRAOYXrUbiW1vRAQOjCybvILkis6v////////8BUVK4HoVz0vRAWABgAGiaqZwBcAF4AoABAA=="
+    },
+    {
+      "t": 256.539,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMGWsQISJQjEAhBkGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzMDzfRAOYXrUbiW1vRAQOjCybvILkis6v////////8BUVK4HoVz0vRAWABgAGiaqZwBcAF4AoABACJnCIKb7gISJQjEAhBkGAIg587Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABI6MLJu8guYAFphetRuJbW9EBxMzMzMwPN9ECKAQhzY3J1YmJlZJABApgBwZaxArgBAMABAQ=="
+    },
+    {
+      "t": 263.906,
+      "kind": "marker",
+      "note": "3"
+    },
+    {
+      "t": 355.435,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgCInYIwZaxAhIlCMQCEGQYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EAxMzMzMwPN9EA5hetRuJbW9EBA6MLJu8guSKzq/////////wFRUrgehXPS9EBYAGAAaJqpnAFwAXgCgAEAKk8Ig5vuAhIlCMQCEAEYAiDT2M+7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAFAAEjT2M+7yC5gAYoBCHNjcnViYmVkkAEDmAHBlrECUAA="
+    },
+    {
+      "t": 355.58,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgDInYIwZaxAhIlCMQCEGMYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EAxMzMzMwPN9EA5hetRuJbW9EBA29nPu8guSMjq/////////wFRUrgehXPS9EBYAGAAaI7hmgFwAXgCgAEAKl8Ig5vuAhIsCMQCEAEYAiDT2M+7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0c0jb2c+7yC4YASACOVyPwvUwzvRAQAFI29nPu8guYAGKAQhzY3J1YmJlZJABA5gBwZaxAjKTAQjCn6sDEIOb7gIYwZaxAiABKAEwxAI409jPu8guQNvZz7vILkjb2c+7yC5RXI/C9TDO9EBYAmACaVyPwvUwzvRAcOT//////////wF5XI/C9TDO9ECCATgJw/UoXHPS9EAQvP//////////ARgAIMj//////////wEoxbvGihMxAAAAAAAA8D84AUAESAJQAIgBAlAA"
+    },
+    {
+      "t": 355.599,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwZaxAhIlCMQCEGMYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EAxMzMzMwPN9EA5hetRuJbW9EBA4dnPu8guSMjq/////////wFRUrgehXPS9EBYAGAAaI7hmgFwAXgCgAEAKmcIgpvuAhIlCMQCEGMYAiDnzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEjh2c+7yC5gAWmF61G4ltb0QHEzMzMzA830QIoBCHNjcnViYmVkkAECmAHBlrECuAEAwAEBUAE="
+    },
+    {
+      "t": 357.847,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDFu8aKExgEOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 357.907,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMGWsQISJQjEAhBjGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzMDzfRAOYXrUbiW1vRAQOHZz7vILkjI6v////////8BUVK4HoVz0vRAWABgAGiO4ZoBcAF4AoABAA=="
+    },
+    {
+      "t": 357.969,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMGWsQISJQjEAhBjGAEg5M7Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKcP1KFxz0vRAMTMzMzMDzfRAOYXrUbiW1vRAQOHZz7vILkjI6v////////8BUVK4HoVz0vRAWABgAGiO4ZoBcAF4AoABACJnCIKb7gISJQjEAhBjGAIg587Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABI4dnPu8guYAFphetRuJbW9EBxMzMzMwPN9ECKAQhzY3J1YmJlZJABApgBwZaxArgBAMABAQ=="
+    },
+    {
+      "t": 365.563,
+      "kind": "marker",
+      "note": "4"
+    },
+    {
+      "t": 405.35,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwZaxAhIlCMQCEGMYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApw/UoXHPS9EAxMzMzM2PN9EA5hetRuJbW9EBAxt7Su8guSMjq/////////wFRUrgehXPS9EBYAGAAaI7hmgFwAXgCgAEAKmcIgpvuAhIlCMQCEGMYAiDnzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEjG3tK7yC5gAWmF61G4ltb0QHEzMzMzY830QIoBCHNjcnViYmVkkAECmAHBlrECuAEAwAEBUAA="
+    },
+    {
+      "t": 406.555,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgDIl0IwZaxAhIsCMQCEAAYASDkzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0c0ju59K7yC4YAiAAKQAAAAAAAAAAQO7n0rvILkgAUQAAAAAAAAAAWABgAGgAeAKAAQAqdwiCm+4CEiwIxAIQYxgCIOfOwbvILjAAOghzY3J1YmJlZEIJQ29udHJhY3RzSO7n0rvILhgEIAI5exSuR1nN9EBAY0ju59K7yC5gAWmF61G4ltb0QHEzMzMzY830QIoBCHNjcnViYmVkkAECmAHBlrECuAEAwAEBMpMBCMOfqwMQgpvuAhjBlrECIGMoYzDEAjjX5tK7yC5A7ufSu8guSO7n0rvILlF7FK5HWc30QFgCYAJpexSuR1nN9EBwy+r/////////AXl7FK5HWc30QIIBOAnD9Shcc9L0QBDvwP////////8BGAAgk9X/////////ASjH0cWKEzEAAAAAAADwPzhjQAVIAlAAiAECUAE="
+    },
+    {
+      "t": 408.688,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDH0cWKExgFOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 408.75,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPQ=="
+    },
+    {
+      "t": 408.813,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPQ=="
+    },
+    {
+      "t": 422.65,
+      "kind": "marker",
+      "note": "5"
+    },
+    {
+      "t": 442.859,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgCIkgIwpaxAhIeCMQCEAAYATAAOghzY3J1YmJlZEIJQ29udHJhY3RzGAMgACkAAAAAAAAAAEgAUQAAAAAAAAAAWABgAGgAeAKAAQAqXgiEm+4CEiUIxAIQZBgBIM+D1bvILjAAOghzY3J1YmJlZEIJQ29udHJhY3RzGAEgAUAASM+D1bvILmAAigEIc2NydWJiZWSQAQOYAcKWsQKgAaiwpQSoAei04gS4AQBQAA=="
+    },
+    {
+      "t": 442.992,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgDImIIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EBA1oTVu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAF4AoABACpuCISb7gISLAjEAhBkGAEgz4PVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHNI1oTVu8guGAEgAjmamZmZkc30QEBkSNaE1bvILmAAigEIc2NydWJiZWSQAQOYAcKWsQKgAaiwpQSoAei04gS4AQAyWAjEn6sDEISb7gIYwpaxAiBkKGQwxAI4z4PVu8guQNaE1bvILkjWhNW7yC5RmpmZmZHN9EBYAWACaZqZmZmRzfRAcK/q/////////wF5mpmZmZHN9ECIAQJQAA=="
+    },
+    {
+      "t": 443.011,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgCInYIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EAxCtejcPHH9EA5KVyPwtHT9EBA2YTVu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAFwAXgCgAEAKmcIhZvuAhIlCMQCEGQYAiDZhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEjZhNW7yC5gAWkpXI/C0dP0QHEK16Nw8cf0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBUAE="
+    },
+    {
+      "t": 445.115,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDH0cWKExgFOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 445.171,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMQrXo3Dxx/RAOSlcj8LR0/RAQNmE1bvILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABAA=="
+    },
+    {
+      "t": 445.224,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMQrXo3Dxx/RAOSlcj8LR0/RAQNmE1bvILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABACJnCIWb7gISJQjEAhBkGAIg2YTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABI2YTVu8guYAFpKVyPwtHT9EBxCtejcPHH9ECKAQhzY3J1YmJlZJABApgBwpaxArgBAMABAQ=="
+    },
+    {
+      "t": 480.308,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EAxCtejcBHG9EA5KVyPwtHT9EBAmKjXu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAFwAXgCgAEAKmcIhZvuAhIlCMQCEGQYAiDZhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEiYqNe7yC5gAWkpXI/C0dP0QHEK16NwEcb0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBUAA="
+    },
+    {
+      "t": 482.554,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDH0cWKExgFOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 482.621,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMQrXo3ARxvRAOSlcj8LR0/RAQJio17vILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABAA=="
+    },
+    {
+      "t": 482.68,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMQrXo3ARxvRAOSlcj8LR0/RAQJio17vILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABACJnCIWb7gISJQjEAhBkGAIg2YTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABImKjXu8guYAFpKVyPwtHT9EBxCtejcBHG9ECKAQhzY3J1YmJlZJABApgBwpaxArgBAMABAQ=="
+    },
+    {
+      "t": 486.182,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EAx16NwPXLC9EA5KVyPwtHT9EBAi9bXu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAFwAXgCgAEAKmcIhZvuAhIlCMQCEGQYAiDZhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEiL1te7yC5gAWkpXI/C0dP0QHHXo3A9csL0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBUAA="
+    },
+    {
+      "t": 488.437,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDH0cWKExgFOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 488.514,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMdejcD1ywvRAOSlcj8LR0/RAQIvW17vILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABAA=="
+    },
+    {
+      "t": 488.574,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMdejcD1ywvRAOSlcj8LR0/RAQIvW17vILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABACJnCIWb7gISJQjEAhBkGAIg2YTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABIi9bXu8guYAFpKVyPwtHT9EBx16NwPXLC9ECKAQhzY3J1YmJlZJABApgBwpaxArgBAMABAQ=="
+    },
+    {
+      "t": 502.15,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EAx16NwPXLC9EA5H4XrUYjO9EBA7NLYu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAFwAXgCgAEAKmcIhZvuAhIlCMQCEGQYAiDZhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEjs0ti7yC5gAWkfhetRiM70QHHXo3A9csL0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBUAA="
+    },
+    {
+      "t": 504.327,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDH0cWKExgFOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 504.382,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMdejcD1ywvRAOR+F61GIzvRAQOzS2LvILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABAA=="
+    },
+    {
+      "t": 504.446,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMdejcD1ywvRAOR+F61GIzvRAQOzS2LvILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABACJnCIWb7gISJQjEAhBkGAIg2YTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABI7NLYu8guYAFpH4XrUYjO9EBx16NwPXLC9ECKAQhzY3J1YmJlZJABApgBwpaxArgBAMABAQ=="
+    },
+    {
+      "t": 516.935,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EAx16NwPXLC9EA5H4XrUUjO9EBArsbZu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAFwAXgCgAEAKmcIhZvuAhIlCMQCEGQYAiDZhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEiuxtm7yC5gAWkfhetRSM70QHHXo3A9csL0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBUAA="
+    },
+    {
+      "t": 519.2,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDH0cWKExgFOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 519.26,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMdejcD1ywvRAOR+F61FIzvRAQK7G2bvILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABAA=="
+    },
+    {
+      "t": 519.32,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMdejcD1ywvRAOR+F61FIzvRAQK7G2bvILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABACJnCIWb7gISJQjEAhBkGAIg2YTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABIrsbZu8guYAFpH4XrUUjO9EBx16NwPXLC9ECKAQhzY3J1YmJlZJABApgBwpaxArgBAMABAQ=="
+    },
+    {
+      "t": 620.701,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EAx16NwPXLC9EA5ZmZmZgbL9EBAgfHfu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAFwAXgCgAEAKmcIhZvuAhIlCMQCEGQYAiDZhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEiB8d+7yC5gAWlmZmZmBsv0QHHXo3A9csL0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBUAA="
+    },
+    {
+      "t": 622.636,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EAx16NwPXLC9EA5H4XrUWjN9EBAiYDgu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAFwAXgCgAEAKmcIhZvuAhIlCMQCEGQYAiDZhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEiJgOC7yC5gAWkfhetRaM30QHHXo3A9csL0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBUAA="
+    },
+    {
+      "t": 624.776,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDH0cWKExgFOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 624.862,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMdejcD1ywvRAOR+F61FozfRAQImA4LvILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABAA=="
+    },
+    {
+      "t": 624.918,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPRp2CMKWsQISJQjEAhBkGAEg1oTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYASAAKZqZmZmRzfRAMdejcD1ywvRAOR+F61FozfRAQImA4LvILkiv6v////////8BUZqZmZmRzfRAWABgAGjwlpwBcAF4AoABACJnCIWb7gISJQjEAhBkGAIg2YTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYBCABQABIiYDgu8guYAFpH4XrUWjN9EBx16NwPXLC9ECKAQhzY3J1YmJlZJABApgBwpaxArgBAMABAQ=="
+    },
+    {
+      "t": 657.504,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgEInYIwpaxAhIlCMQCEGQYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgBIAApmpmZmZHN9EAx16NwPXLC9EA5zczMzLTL9EBAxJDiu8guSK/q/////////wFRmpmZmZHN9EBYAGAAaPCWnAFwAXgCgAEAKmcIhZvuAhIlCMQCEGQYAiDZhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0cxgEIAFAAEjEkOK7yC5gAWnNzMzMtMv0QHHXo3A9csL0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBUAA="
+    },
+    {
+      "t": 658.078,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgDIl0IwpaxAhIsCMQCEAAYASDWhNW7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0c0iIleK7yC4YAiAAKQAAAAAAAAAAQIiV4rvILkgAUQAAAAAAAAAAWABgAGgAeAKAAQAqdwiFm+4CEiwIxAIQZBgCINmE1bvILjAAOghzY3J1YmJlZEIJQ29udHJhY3RzSIiV4rvILhgEIAI516NwPT7M9EBAZEiIleK7yC5gAWnNzMzMtMv0QHHXo3A9csL0QIoBCHNjcnViYmVkkAECmAHClrECuAEAwAEBMpMBCMWfqwMQhZvuAhjClrECIGQoZDDEAjj5k+K7yC5AiJXiu8guSIiV4rvILlHXo3A9Psz0QFgCYAJp16NwPT7M9EBwr+r/////////AXnXo3A9Psz0QIIBOAmamZmZkc30QBC37/////////8BGAAg3tT/////////ASjclcWKEzEAAAAAAADwPzhkQAZIAlAAiAECUAE="
+    },
+    {
+      "t": 660.169,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDclcWKExgGOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 660.23,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPQ=="
+    },
+    {
+      "t": 660.292,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPQ=="
+    },
+    {
+      "t": 668.852,
+      "kind": "marker",
+      "note": "6"
+    },
+    {
+      "t": 695.013,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgCIkUIw5axAhIeCMQCEAAYATAAOghzY3J1YmJlZEIJQ29udHJhY3RzGAMgACkAAAAAAAAAAEgAUQAAAAAAAAAAWABgAGgAeAIqWAiGm+4CEiUIxAIQZBgBIMq15LvILjAAOghzY3J1YmJlZEIJQ29udHJhY3RzGAIgAUAASMq15LvILmAAaQAAAADAxvRAigEIc2NydWJiZWSQAQKYAcOWsQJQAA=="
+    },
+    {
+      "t": 697.196,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDclcWKExgGOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 697.255,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPSJYCIab7gISJQjEAhBkGAEgyrXku8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYAiABQABIyrXku8guYABpAAAAAMDG9ECKAQhzY3J1YmJlZJABApgBw5axAg=="
+    },
+    {
+      "t": 697.313,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPSJYCIab7gISJQjEAhBkGAEgyrXku8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYAiABQABIyrXku8guYABpAAAAAMDG9ECKAQhzY3J1YmJlZJABApgBw5axAg=="
+    },
+    {
+      "t": 760.29,
+      "kind": "event",
+      "note": "",
+      "type": 2126,
+      "payload": "EMGEPRgFIlMIw5axAhIlCMQCEAAYATAAOghzY3J1YmJlZEIJQ29udHJhY3RzSM2z6LvILhgCIAApAAAAAAAAAABAzbPou8guSABRAAAAAAAAAABYAGAAaAB4AipYCIab7gISJQjEAhBkGAEgyrXku8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYAiAFQABIzbPou8guYABpAAAAAMDG9ECKAQhzY3J1YmJlZJABApgBw5axAlAA"
+    },
+    {
+      "t": 762.514,
+      "kind": "snapshot",
+      "note": "after events; trader",
+      "type": 2122,
+      "payload": "EMGEPRokCMGEPRDclcWKExgGOABAD0gAUJBOWAFgkE5oAHgAkAEAoAEC"
+    },
+    {
+      "t": 762.573,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=false",
+      "type": 2125,
+      "payload": "EMGEPQ=="
+    },
+    {
+      "t": 762.632,
+      "kind": "snapshot",
+      "note": "after events; returnProtectionOrders=true",
+      "type": 2125,
+      "payload": "EMGEPQ=="
+    },
+    {
+      "t": 774.88,
+      "kind": "marker",
+      "note": "7"
+    },
+    {
+      "t": 774.88,
+      "kind": "marker",
+      "note": "unknown fields dropped from: ProtoOADealListByPositionIdRes, ProtoOADealListRes, ProtoOAExecutionEvent, ProtoOATraderRes"
+    }
+  ],
+  "closing": {
+    "deals": [
+      {
+        "type": 2134,
+        "payload": "EMGEPRqTAQjFn6sDEIWb7gIYwpaxAiBkKGQwxAI4+ZPiu8guQIiV4rvILkj5k+K7yC5R16NwPT7M9EBYAmACadejcD0+zPRAcK/q/////////wF516NwPT7M9ECCATgJmpmZmZHN9EAQt+//////////ARgAIN7U/////////wEo3JXFihMxAAAAAAAA8D84ZEAGSAJQAIgBAhpYCMSfqwMQhJvuAhjClrECIGQoZDDEAjjPg9W7yC5A1oTVu8guSM+D1bvILlGamZmZkc30QFgBYAJpmpmZmZHN9EBwr+r/////////AXmamZmZkc30QIgBAhqTAQjDn6sDEIKb7gIYwZaxAiBjKGMwxAI41+bSu8guQO7n0rvILkjX5tK7yC5RexSuR1nN9EBYAmACaXsUrkdZzfRAcMvq/////////wF5exSuR1nN9ECCATgJw/UoXHPS9EAQ78D/////////ARgAIJPV/////////wEox9HFihMxAAAAAAAA8D84Y0AFSAJQAIgBAhqTAQjCn6sDEIOb7gIYwZaxAiABKAEwxAI409jPu8guQNvZz7vILkjT2M+7yC5RXI/C9TDO9EBYAmACaVyPwvUwzvRAcOT//////////wF5XI/C9TDO9ECCATgJw/UoXHPS9EAQvP//////////ARgAIMj//////////wEoxbvGihMxAAAAAAAA8D84AUAESAJQAIgBAhpYCMGfqwMQgZvuAhjBlrECIGQoZDDEAjjazcG7yC5A5M7Bu8guSNrNwbvILlHD9Shcc9L0QFgBYAJpUrgehXPS9EBwrOr/////////AXlSuB6Fc9L0QIgBAiAA"
+      }
+    ],
+    "orders": [
+      {
+        "type": 2176,
+        "payload": "EMGEPRpYCIab7gISJQjEAhBkGAEgyrXku8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYAiAFQABIzbPou8guYABpAAAAAMDG9ECKAQhzY3J1YmJlZJABApgBw5axAhp3CIWb7gISLAjEAhBkGAIg2YTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHNIiJXiu8guGAQgAjnXo3A9Psz0QEBkSIiV4rvILmABac3MzMy0y/RAcdejcD1ywvRAigEIc2NydWJiZWSQAQKYAcKWsQK4AQDAAQEabgiEm+4CEiwIxAIQZBgBIM+D1bvILjAAOghzY3J1YmJlZEIJQ29udHJhY3RzSNaE1bvILhgBIAI5mpmZmZHN9EBAZEjWhNW7yC5gAIoBCHNjcnViYmVkkAEDmAHClrECoAGosKUEqAHotOIEuAEAGncIgpvuAhIsCMQCEGMYAiDnzsG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0c0ju59K7yC4YBCACOXsUrkdZzfRAQGNI7ufSu8guYAFphetRuJbW9EBxMzMzM2PN9ECKAQhzY3J1YmJlZJABApgBwZaxArgBAMABARpyCIOb7gISLAjEAhABGAIg09jPu8guMAA6CHNjcnViYmVkQglDb250cmFjdHNI29nPu8guGAEgAjlcj8L1MM70QEABSNvZz7vILmABeTMzMzMDzfRAgQGF61G4ltb0QIoBCHNjcnViYmVkkAEDmAHBlrECGm4IgZvuAhIsCMQCEGQYASDazcG7yC4wADoIc2NydWJiZWRCCUNvbnRyYWN0c0jkzsG7yC4YASACOcP1KFxz0vRAQGRI5M7Bu8guYACKAQhzY3J1YmJlZJABA5gBwZaxAqABqLClBKgB6LTiBLgBACAA"
+      }
+    ],
+    "position_orders": [
+      {
+        "type": 2184,
+        "payload": "EMGEPRp3CIKb7gISLAjEAhBjGAIg587Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHNI7ufSu8guGAQgAjl7FK5HWc30QEBjSO7n0rvILmABaYXrUbiW1vRAcTMzMzNjzfRAigEIc2NydWJiZWSQAQKYAcGWsQK4AQDAAQEacgiDm+4CEiwIxAIQARgCINPYz7vILjAAOghzY3J1YmJlZEIJQ29udHJhY3RzSNvZz7vILhgBIAI5XI/C9TDO9EBAAUjb2c+7yC5gAXkzMzMzA830QIEBhetRuJbW9ECKAQhzY3J1YmJlZJABA5gBwZaxAhpuCIGb7gISLAjEAhBkGAEg2s3Bu8guMAA6CHNjcnViYmVkQglDb250cmFjdHNI5M7Bu8guGAEgAjnD9Shcc9L0QEBkSOTOwbvILmAAigEIc2NydWJiZWSQAQOYAcGWsQKgAaiwpQSoAei04gS4AQAgAA=="
+      },
+      {
+        "type": 2184,
+        "payload": "EMGEPRp3CIWb7gISLAjEAhBkGAIg2YTVu8guMAA6CHNjcnViYmVkQglDb250cmFjdHNIiJXiu8guGAQgAjnXo3A9Psz0QEBkSIiV4rvILmABac3MzMy0y/RAcdejcD1ywvRAigEIc2NydWJiZWSQAQKYAcKWsQK4AQDAAQEabgiEm+4CEiwIxAIQZBgBIM+D1bvILjAAOghzY3J1YmJlZEIJQ29udHJhY3RzSNaE1bvILhgBIAI5mpmZmZHN9EBAZEjWhNW7yC5gAIoBCHNjcnViYmVkkAEDmAHClrECoAGosKUEqAHotOIEuAEAIAA="
+      },
+      {
+        "type": 2184,
+        "payload": "EMGEPRpYCIab7gISJQjEAhBkGAEgyrXku8guMAA6CHNjcnViYmVkQglDb250cmFjdHMYAiAFQABIzbPou8guYABpAAAAAMDG9ECKAQhzY3J1YmJlZJABApgBw5axAiAA"
+      }
+    ],
+    "position_deals": [
+      {
+        "type": 2180,
+        "payload": "EMGEPRqTAQjDn6sDEIKb7gIYwZaxAiBjKGMwxAI41+bSu8guQO7n0rvILkjX5tK7yC5RexSuR1nN9EBYAmACaXsUrkdZzfRAcMvq/////////wF5exSuR1nN9ECCATgJw/UoXHPS9EAQ78D/////////ARgAIJPV/////////wEox9HFihMxAAAAAAAA8D84Y0AFSAJQAIgBAhqTAQjCn6sDEIOb7gIYwZaxAiABKAEwxAI409jPu8guQNvZz7vILkjT2M+7yC5RXI/C9TDO9EBYAmACaVyPwvUwzvRAcOT//////////wF5XI/C9TDO9ECCATgJw/UoXHPS9EAQvP//////////ARgAIMj//////////wEoxbvGihMxAAAAAAAA8D84AUAESAJQAIgBAhpYCMGfqwMQgZvuAhjBlrECIGQoZDDEAjjazcG7yC5A5M7Bu8guSNrNwbvILlHD9Shcc9L0QFgBYAJpUrgehXPS9EBwrOr/////////AXlSuB6Fc9L0QIgBAiAA"
+      },
+      {
+        "type": 2180,
+        "payload": "EMGEPRqTAQjFn6sDEIWb7gIYwpaxAiBkKGQwxAI4+ZPiu8guQIiV4rvILkj5k+K7yC5R16NwPT7M9EBYAmACadejcD0+zPRAcK/q/////////wF516NwPT7M9ECCATgJmpmZmZHN9EAQt+//////////ARgAIN7U/////////wEo3JXFihMxAAAAAAAA8D84ZEAGSAJQAIgBAhpYCMSfqwMQhJvuAhjClrECIGQoZDDEAjjPg9W7yC5A1oTVu8guSM+D1bvILlGamZmZkc30QFgBYAJpmpmZmZHN9EBwr+r/////////AXmamZmZkc30QIgBAiAA"
+      },
+      {
+        "type": 2180,
+        "payload": "EMGEPSAA"
+      }
+    ],
+    "account_deals": [
+      {
+        "type": 2134,
+        "payload": "EMGEPRqTAQjFn6sDEIWb7gIYwpaxAiBkKGQwxAI4+ZPiu8guQIiV4rvILkj5k+K7yC5R16NwPT7M9EBYAmACadejcD0+zPRAcK/q/////////wF516NwPT7M9ECCATgJmpmZmZHN9EAQt+//////////ARgAIN7U/////////wEo3JXFihMxAAAAAAAA8D84ZEAGSAJQAIgBAhpYCMSfqwMQhJvuAhjClrECIGQoZDDEAjjPg9W7yC5A1oTVu8guSM+D1bvILlGamZmZkc30QFgBYAJpmpmZmZHN9EBwr+r/////////AXmamZmZkc30QIgBAhqTAQjDn6sDEIKb7gIYwZaxAiBjKGMwxAI41+bSu8guQO7n0rvILkjX5tK7yC5RexSuR1nN9EBYAmACaXsUrkdZzfRAcMvq/////////wF5exSuR1nN9ECCATgJw/UoXHPS9EAQ78D/////////ARgAIJPV/////////wEox9HFihMxAAAAAAAA8D84Y0AFSAJQAIgBAhqTAQjCn6sDEIOb7gIYwZaxAiABKAEwxAI409jPu8guQNvZz7vILkjT2M+7yC5RXI/C9TDO9EBYAmACaVyPwvUwzvRAcOT//////////wF5XI/C9TDO9ECCATgJw/UoXHPS9EAQvP//////////ARgAIMj//////////wEoxbvGihMxAAAAAAAA8D84AUAESAJQAIgBAhpYCMGfqwMQgZvuAhjBlrECIGQoZDDEAjjazcG7yC5A5M7Bu8guSNrNwbvILlHD9Shcc9L0QFgBYAJpUrgehXPS9EBwrOr/////////AXlSuB6Fc9L0QIgBAhqTAQjGn6sDEIeb7gIYxJaxAiBkKGQwlwI40vLt28YuQOPz7dvGLkjS8u3bxi5Rw/UoXM/f2EBYAmACae/nFOSvRdxAcAB57+cU5K9F3ECCAUEJMzMzM5Pl2EAQw+v/////////ARj9+/////////8BIAAowbzGihMx5L1qZcIv8j84ZEADSAJQ7f//////////AYgBAhpPCMefqwMQiJvuAhjElrECIGQoZDCXAjiLqqbVxi5AkKum1cYuSIuqptXGLlEzMzMzk+XYQFgBYAJpghjo2uFO3EBwAHmCGOja4U7cQIgBAiAA"
+      }
+    ],
+    "cash_flow": [
+      {
+        "type": 2144,
+        "payload": "EMGEPQ=="
+      },
+      {
+        "type": 2144,
+        "payload": "EMGEPRouCAAQgaToAxiU1caKEyCU1caKEyiluo2jxS4yCHNjcnViYmVkOAJAlNXGihNIAg=="
+      },
+      {
+        "type": 2144,
+        "payload": "EMGEPQ=="
+      }
+    ]
+  }
+}
