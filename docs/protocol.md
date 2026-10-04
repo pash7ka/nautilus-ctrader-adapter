@@ -348,10 +348,13 @@ and for a take-profit). The order still holds both levels as they stood; the dea
 filled at `85205.58`.
 
 No field says which of the two levels triggered — neither in the published schema nor among
-the fields the venue sends beyond it (see below). What tells them apart is the fill price: a
-stop-loss and a take-profit always sit on opposite sides of the market, so the triggered one is
-the level the fill is nearer to. **Unconfirmed**: slippage large enough to carry a fill past the
-midpoint between the two levels; none occurred.
+the fields the venue sends beyond it (see below). The protective order's own semantics tell them
+apart: for a long position (the protective order sells) it is the take-profit if the fill is at
+or above `limitPrice`, otherwise the stop-loss; for a short (it buys), the take-profit if the fill
+is at or below `limitPrice`, otherwise the stop-loss; with one level present, that level. Both
+recorded triggers agree, including a take-profit moved through the market, which the venue
+accepted and filled at once: the two levels need not sit on opposite sides of the market.
+**Unconfirmed**: that a take-profit never fills worse than its price.
 
 ### Closing part of a position
 
