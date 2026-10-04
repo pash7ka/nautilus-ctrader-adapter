@@ -112,13 +112,7 @@ def execution_event(
 MONEY_SHIFT = 432_198_765
 
 
-def scrubbed(
-    message,
-    ids: r.IdMap | None = None,
-    shift_ms: int = 0,
-    *,
-    first_deposit: int | None = None,
-):
+def scrubbed(message, ids: r.IdMap | None = None, shift_ms: int = 0):
     return r.scrub_execution(
         message,
         account_id=ACCOUNT_ID,
@@ -126,7 +120,6 @@ def scrubbed(
         ids=ids if ids is not None else r.IdMap(),
         shift_ms=shift_ms,
         money_shift=MONEY_SHIFT,
-        first_deposit=first_deposit,
     )
 
 
@@ -255,7 +248,7 @@ def test_a_deposit_is_kept_and_every_balance_shifted() -> None:
     deposit, detail = clean.depositWithdraw, clean.deal.closePositionDetail
     assert (deposit.balance, deposit.equity) == (999_999 + MONEY_SHIFT, 999_000 + MONEY_SHIFT)
     assert detail.balance == 999_999 + MONEY_SHIFT
-    # Not the first deposit, so its amount is a delta like any other.
+    # The balance before it was not zero, so its amount is a delta like any other.
     assert deposit.delta == 500_000
     # Commission, swap and profit stay: they are what the scaling tests need.
     assert (detail.grossProfit, detail.swap, detail.commission) == (1234, -5, -7)
@@ -266,23 +259,48 @@ def test_a_deposit_is_kept_and_every_balance_shifted() -> None:
     assert deposit.balanceHistoryId not in (0, 880_044_556)
 
 
-def test_the_first_deposit_s_amount_is_shifted_like_the_balance_it_made() -> None:
-    deposit = om.ProtoOADepositWithdraw(
-        operationType=om.BALANCE_DEPOSIT,
-        balanceHistoryId=880_044_556,
-        balance=10_000_000,
-        delta=10_000_000,
-        changeBalanceTimestamp=1_790_000_000_000,
-    )
-    listed = oa.ProtoOACashFlowHistoryListRes(
+def operations(*items: tuple[int, int]) -> oa.ProtoOACashFlowHistoryListRes:
+    """A cash-flow answer of deposits, each `(balance after, amount)`, a minute apart."""
+    return oa.ProtoOACashFlowHistoryListRes(
         ctidTraderAccountId=ACCOUNT_ID,
-        depositWithdraw=[deposit],
+        depositWithdraw=[
+            om.ProtoOADepositWithdraw(
+                operationType=om.BALANCE_DEPOSIT,
+                balanceHistoryId=880_044_556 + n,
+                balance=balance,
+                delta=delta,
+                changeBalanceTimestamp=1_790_000_000_000 + n * 60_000,
+            )
+            for n, (balance, delta) in enumerate(items)
+        ],
     )
 
-    (clean,) = scrubbed(listed, first_deposit=880_044_556).depositWithdraw
+
+def test_an_operation_from_a_balance_of_zero_has_its_amount_shifted() -> None:
+    (clean,) = scrubbed(operations((10_000_000, 10_000_000))).depositWithdraw
 
     # The balance before it was nothing, and still is.
     assert clean.balance == clean.delta == 10_000_000 + MONEY_SHIFT
+
+
+def test_the_earliest_operation_keeps_its_amount_unless_it_started_from_zero() -> None:
+    """A history without the initial deposit: shifting the earliest amount would give K away."""
+    (top_up, later) = scrubbed(
+        operations((15_000_000, 5_000_000), (15_500_000, 500_000)),
+    ).depositWithdraw
+
+    assert (top_up.delta, later.delta) == (5_000_000, 500_000)
+    assert top_up.balance == 15_000_000 + MONEY_SHIFT
+
+
+def test_an_equity_of_zero_is_taken_as_not_given() -> None:
+    listed = operations((10_000_000, 10_000_000))
+    listed.depositWithdraw[0].equity = 0
+
+    (clean,) = scrubbed(listed).depositWithdraw
+
+    # Shifted, it would be K itself.
+    assert clean.equity == 0
 
 
 def test_a_real_id_in_an_error_description_is_replaced() -> None:
@@ -1132,6 +1150,25 @@ def test_the_fixture_hides_the_amounts_and_keeps_their_arithmetic(off_by) -> Non
     assert (two.pnlConversionFee, two.balanceVersion) == (0, 3)
 
 
+def integers(message) -> list[int]:
+    """Every integer `message` holds, at any depth."""
+    found: list[int] = []
+    for descriptor, value in message.ListFields():
+        items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+        if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            for item in items:
+                found.extend(integers(item))
+        elif all(isinstance(item, int) and not isinstance(item, bool) for item in items):
+            found.extend(items)
+    return found
+
+
+def fixture_messages(data: bytes) -> list:
+    decoded = r.decode_recording(data)
+    messages = [item["message"] for item in decoded["timeline"] if item["message"] is not None]
+    return messages + [m for items in decoded["closing"].values() for m in items]
+
+
 def test_the_shift_is_kept_unscrubbed_and_shown_nowhere() -> None:
     recording = balance_history()
     shift = recording.money_shift
@@ -1139,8 +1176,10 @@ def test_the_shift_is_kept_unscrubbed_and_shown_nowhere() -> None:
     data = checked_fixture(recording)
     raw = r.encode_raw(recording, account_id=ACCOUNT_ID, login=LOGIN)
 
-    assert json.loads(raw)["money_shift"] == shift
-    assert str(shift).encode() not in data
+    assert json.loads(raw)["money_shift_draw"] == recording.money_shift_draw
+    for message in fixture_messages(data):
+        assert shift not in integers(message)
+        assert r.record_fixtures._varint(shift) not in message.SerializeToString()
     assert str(shift) not in r.describe(data)
     # The same shift from the raw file: a rebuild gives the same fixture, byte for byte.
     rebuilt, account_id, login = r.decode_raw(raw)
@@ -1156,36 +1195,140 @@ def test_the_shift_is_large_random_and_never_round() -> None:
     assert len(set(shifts)) > 190
 
 
-def tampered(data: bytes, key: str, change) -> bytes:
-    """`data` with the first closing payload under `key` passed through `change`."""
-    loaded = json.loads(data)
-    item = loaded["closing"][key][0]
-    message = r._decode(item)
-    change(message)
-    item.update(r._encode(message))
-    return json.dumps(loaded).encode()
+@pytest.mark.parametrize(
+    ("digits", "scale"),
+    [(None, 1), (0, 1), (2, 1), (4, 100), (8, 1_000_000)],
+    ids=["not given", "none", "two", "four", "eight"],
+)
+def test_the_shift_hides_the_same_amount_of_currency_at_any_money_digits(digits, scale) -> None:
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    trader = trader_at(10_000_000)
+    trader.trader.ClearField("moneyDigits")
+    if digits is not None:
+        trader.trader.moneyDigits = digits
+    recording.add("snapshot", "start; trader", trader, 0.0)
+
+    (clean,) = fixture_messages(checked_fixture(recording))
+
+    assert recording.money_shift == recording.money_shift_draw * scale
+    assert clean.trader.balance == 10_000_000 + recording.money_shift
 
 
-def first_deposit_back(message) -> None:
-    message.depositWithdraw[1].delta = 10_000_000
+def first_deposit_back(message, shift: int) -> None:
+    message.depositWithdraw[1].delta -= shift
 
 
-def level_back(message) -> None:
-    message.deal[0].closePositionDetail.balance = 10_001_220
+def later_amount_shifted(message, shift: int) -> None:
+    message.depositWithdraw[0].delta += shift
+
+
+def level_back(message, shift: int) -> None:
+    message.deal[0].closePositionDetail.balance -= shift
+
+
+def shift_as_a_volume(message, shift: int) -> None:
+    message.deal[0].closePositionDetail.closedVolume = shift
 
 
 @pytest.mark.parametrize(
     ("key", "change"),
-    [("account_deals", level_back), ("cash_flow", first_deposit_back)],
-    ids=["a balance", "the first deposit"],
+    [
+        ("account_deals", level_back),
+        ("cash_flow", first_deposit_back),
+        ("cash_flow", later_amount_shifted),
+        ("account_deals", shift_as_a_volume),
+    ],
+    ids=["a balance", "the first deposit", "a later amount", "the shift itself"],
 )
-def test_check_clean_refuses_an_amount_left_as_it_was(key, change) -> None:
+def test_check_clean_refuses_an_amount_not_hidden_as_it_should_be(key, change) -> None:
     recording = balance_history()
     data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    loaded = json.loads(data)
+    item = loaded["closing"][key][0]
+    message = r._decode(item)
+    change(message, recording.money_shift)
+    item.update(r._encode(message))
 
     with pytest.raises(r.record_fixtures.ScrubError) as raised:
         r.check_clean(
-            tampered(data, key, change),
+            json.dumps(loaded).encode(),
+            recording,
+            account_id=ACCOUNT_ID,
+            login=LOGIN,
+            ids=ids,
+            secrets=(),
+        )
+
+    # At most the length of what was found: never an amount, nor the shift.
+    assert not re.search(r"\d{2}", str(raised.value))
+
+
+def test_a_history_without_its_initial_deposit_shifts_no_amount() -> None:
+    """Shifted, the earliest top-up would give the shift away against the balance before it."""
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    recording.add("snapshot", "start; trader", trader_at(15_500_000), 0.0)
+    recording.closing["cash_flow"].append(
+        oa.ProtoOACashFlowHistoryListRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            depositWithdraw=[
+                cash(1, delta=5_000_000, balance=15_000_000, at=1_780_000_000_000),
+                cash(2, delta=500_000, balance=15_500_000, at=1_780_000_060_000),
+            ],
+        ),
+    )
+
+    (_, listed) = fixture_messages(checked_fixture(recording))
+
+    assert [item.delta for item in listed.depositWithdraw] == [5_000_000, 500_000]
+
+
+def test_check_clean_refuses_a_balance_of_zero() -> None:
+    """Shifted, it would be the shift itself, under any choice of shift."""
+    recording = balance_history()
+    recording.add("snapshot", "after events; trader", trader_at(0), 10.0)
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        r.check_clean(data, recording, account_id=ACCOUNT_ID, login=LOGIN, ids=ids, secrets=())
+
+    assert "zero" in str(raised.value)
+    assert not any(char.isdigit() for char in str(raised.value))
+
+
+def test_a_real_balance_in_a_text_is_replaced_in_any_of_its_forms() -> None:
+    recording = balance_history()
+    recording.add(
+        "event",
+        "",
+        oa.ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=ACCOUNT_ID,
+            errorCode="NOT_ENOUGH_MONEY",
+            description="Not enough money: balance 100012.20",
+        ),
+        10.0,
+    )
+    note = "closed at 1.1050: balance 100012.2, then 100007.13, raw 10001220; 3 lots"
+    recording.add("marker", note, None, 11.0, typed=True)
+
+    data = checked_fixture(recording)
+
+    *_, error, marker = r.decode_recording(data)["timeline"]
+    token = r.AMOUNT_PLACEHOLDER
+    assert error["message"].description == f"Not enough money: balance {token}"
+    assert marker["note"] == f"closed at 1.1050: balance {token}, then {token}, raw {token}; 3 lots"
+    assert not any(char.isdigit() for char in token)
+
+
+def test_check_clean_refuses_a_real_balance_left_in_a_note() -> None:
+    recording = balance_history()
+    recording.add("marker", "moved the stop", None, 11.0, typed=True)
+    data, ids = r.encode_recording(recording, account_id=ACCOUNT_ID, login=LOGIN)
+    loaded = json.loads(data)
+    loaded["timeline"][-1]["note"] = "balance 100012.20"
+
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        r.check_clean(
+            json.dumps(loaded).encode(),
             recording,
             account_id=ACCOUNT_ID,
             login=LOGIN,
@@ -1367,6 +1510,27 @@ async def test_a_run_records_events_snapshots_and_markers_in_order() -> None:
     assert len(recording.closing["deals"]) == 1
     # Nothing sent to the venue changes the account.
     assert {type(m) for m in server.received} <= r.READ_ONLY_REQUESTS
+
+
+async def test_the_trader_is_timed_by_its_own_answer() -> None:
+    server = venue()
+    # Every answer comes this late, so each request of the snapshot takes about as long.
+    server.reply_delay_secs = 0.2
+    await server.start()
+    stop, markers = asyncio.Event(), asyncio.Queue()
+    recording = r.Recording(started_wall_ms=1_790_000_000_000)
+    task = asyncio.create_task(run(server, stop, markers, recording=recording))
+    try:
+        await wait_until(lambda: len(recording.timeline) >= 2, timeout_secs=10)
+        stop.set()
+        await asyncio.wait_for(task, 20)
+    finally:
+        task.cancel()
+        await server.stop()
+
+    trader, positions = recording.timeline[:2]
+    assert trader.note == "start; trader"
+    assert positions.t - trader.t >= 0.15
 
 
 async def test_a_snapshot_is_named_by_the_flag_it_was_asked_with() -> None:
@@ -1988,12 +2152,13 @@ async def test_the_account_s_history_is_asked_from_its_registration() -> None:
     windows = [
         (q.fromTimestamp, q.toTimestamp) for q in asked(server, oa.ProtoOACashFlowHistoryListReq)
     ]
-    # Consecutive windows of at most a week, from the registration to the time the deals end.
-    assert len(windows) == 3
-    assert windows[0][0] == registered and windows[-1][1] == history.toTimestamp
+    # Consecutive windows of at most a week, from a week before the registration, so an
+    # operation at the registration itself is inside whether or not a window's start is.
+    assert len(windows) == 4
+    assert windows[0][0] == registered - WEEK_MS and windows[-1][1] == history.toTimestamp
     assert all(to - start <= WEEK_MS for start, to in windows)
     assert all(windows[i][1] == windows[i + 1][0] for i in range(len(windows) - 1))
-    assert (len(recording.closing["account_deals"]), len(recording.closing["cash_flow"])) == (1, 3)
+    assert (len(recording.closing["account_deals"]), len(recording.closing["cash_flow"])) == (1, 4)
     assert marker_notes(recording) == []
 
 
@@ -2067,8 +2232,9 @@ async def test_the_cash_flow_stops_at_the_window_limit_and_says_so(monkeypatch) 
     recording = await closing_run(server)
 
     windows = asked(server, oa.ProtoOACashFlowHistoryListReq)
-    # From the registration on: the first deposit is what the rest of the history builds on.
-    assert [q.fromTimestamp for q in windows] == [registered, registered + WEEK_MS]
+    # The first window, for the initial deposit, and the latest ones, nearest the session.
+    start = registered - WEEK_MS
+    assert [q.fromTimestamp for q in windows] == [start, start + 3 * WEEK_MS]
     assert marker_notes(recording) == ["closing list truncated: cash_flow"]
 
 
@@ -2156,7 +2322,8 @@ async def test_a_recording_is_written_even_when_the_run_fails(tmp_path) -> None:
         "closing list refused: account_deals INVALID_REQUEST",
     ]
     assert decoded["closing"]["deals"] == []
-    assert len(decoded["closing"]["cash_flow"]) == 2
+    # Ten days, from a week before the registration.
+    assert len(decoded["closing"]["cash_flow"]) == 3
     assert len(decoded["closing"]["orders"]) == 1
     assert len(decoded["closing"]["position_orders"]) == 1
 
@@ -2474,7 +2641,7 @@ def test_the_journal_keeps_the_money_shift_for_the_finished_fixture(tmp_path) ->
 
     journaled, _, _ = r.read_journal(path.read_bytes())
 
-    assert journaled.money_shift == recording.money_shift
+    assert journaled.money_shift_draw == recording.money_shift_draw
 
 
 def test_a_name_learned_after_the_journal_began_is_journalled_too(tmp_path) -> None:
@@ -2929,7 +3096,7 @@ async def test_a_raw_recording_is_rescrubbed_into_the_same_fixture(tmp_path, cap
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [f"Recording written to {again}", *live]
     # The shift that hides the balances is as private as they are.
-    shift = str(json.loads(raw_of(output).read_bytes())["money_shift"])
+    shift = str(r.decode_raw(raw_of(output).read_bytes())[0].money_shift)
     assert shift not in " ".join(statuses) + captured.out + captured.err
     assert shift.encode() not in again.read_bytes()
 
@@ -2981,7 +3148,7 @@ def raw_file(tmp_path, *notes: str) -> pathlib.Path:
 def stripped(raw: bytes, *, typed: bool) -> bytes:
     """A raw recording edited by hand to look like a fixture: the raw-only keys removed."""
     loaded = json.loads(raw)
-    for key in ("started_wall_ms", "account_id", "login", "names", "money_shift"):
+    for key in ("started_wall_ms", "account_id", "login", "names", "money_shift_draw"):
         del loaded[key]
     if not typed:
         for item in loaded["timeline"]:
@@ -3245,10 +3412,13 @@ def test_the_checklist_states_when_the_recording_ends() -> None:
 
     assert "2026-01-02 17:05" in text
     assert "--minutes 480)" in text
-    # The one step that needs more time than the default gives says so.
-    (step,) = [line for line in text.splitlines() if "rollover" in line]
-    assert "--minutes" in step
-    assert "no names and no account numbers" in text
+    words = " ".join(text.split())
+    # The one step that needs more time than the default gives says so, and ends inside the
+    # recording, so the swap the closing realises is in it.
+    step = words.split(" 8. ")[1].split(" A line ")[0]
+    assert "rollover" in step and "--minutes" in step
+    assert "close it while still recording" in step
+    assert "no names, no account numbers and no amounts" in words
 
 
 def test_a_recording_lasts_eight_hours_unless_told_otherwise(tmp_path, monkeypatch) -> None:
@@ -3595,6 +3765,41 @@ def test_rescrub_checks_the_fixture_against_the_secrets_in_the_env_file(tmp_path
         "1 events, 0 snapshots, 1 notes",
     ]
     assert "access-token" not in captured.out + captured.err
+
+
+def test_a_raw_file_without_its_money_shift_is_refused_in_words(tmp_path, capsys) -> None:
+    raw = raw_file(tmp_path)
+    loaded = json.loads(raw.read_bytes())
+    del loaded["money_shift_draw"]
+    raw.write_bytes(json.dumps(loaded).encode())
+
+    assert r.main(rescrub_args(tmp_path, raw)) == 1
+
+    assert not (tmp_path / "rebuilt.json").exists()
+    assert capsys.readouterr().err == f"error: {r.NO_MONEY_SHIFT}\n"
+
+
+def test_a_journal_without_its_money_shift_is_refused_in_words(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    journal = journal_file(tmp_path)
+    header, rest = journal.read_bytes().split(b"\n", 1)
+    loaded = json.loads(header)
+    del loaded["money_shift_draw"]
+    journal.write_bytes(json.dumps(loaded).encode() + b"\n" + rest)
+    before = journal.read_bytes()
+
+    async def never(*_args) -> None:
+        raise AssertionError("a journal without its shift is not finished")
+
+    assert journal_run(tmp_path, monkeypatch, never) == 1
+
+    assert journal.read_bytes() == before
+    captured = capsys.readouterr()
+    assert captured.err == f"error: {r.NO_MONEY_SHIFT}\n"
+    assert captured.out.splitlines() == [f"{r.JOURNAL_UNREADABLE_KEPT}: {journal}"]
 
 
 def test_rescrub_needs_the_same_env_keys_as_a_recording(tmp_path, capsys) -> None:

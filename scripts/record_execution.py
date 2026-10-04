@@ -15,9 +15,10 @@ The fixture never holds the account id, the trader login, a token, the broker's 
 broker's own order, position, deal and balance-operation ids: those are replaced consistently,
 so a position still lines up with its orders and deals. A wall time in milliseconds or seconds
 is shifted by one constant, which keeps every interval; a bar's time in minutes keeps its value.
-Every balance, and the first deposit that made the first one, is raised by one secret random
-amount, kept only in the unscrubbed files: what each deal or operation changed stays exact, and
-the real balance cannot be read back.
+Every balance, and the amount of an operation made on a balance of zero, is raised by one
+secret random amount, kept only in the unscrubbed files: what each deal or operation changed
+stays exact, and the real balance cannot be read back. A real balance quoted in text is taken
+out of it.
 
 A session is kept however it ends. What was seen is first written unscrubbed to
 `tests/recordings/`, which git ignores, and only then scrubbed, checked and written as the
@@ -117,6 +118,8 @@ SCRUBBED_TEXT = "scrubbed"
 NUMBER_PLACEHOLDER = "<number>"
 # Stands in for the broker's name in free text.
 BROKER_PLACEHOLDER = "<broker>"
+# Stands in for a real balance in free text.
+AMOUNT_PLACEHOLDER = "<amount>"
 _MIN_NAME_CHARS = 3
 # An arbitrary fixed instant: every timestamp is moved so the recording starts here.
 FAKE_EPOCH_MS = 1_600_000_000_000
@@ -176,6 +179,10 @@ NOT_A_FIXTURE = (
     "not a scrubbed fixture, so nothing of it is printed; "
     "an unscrubbed recording becomes a fixture with --rescrub"
 )
+NO_MONEY_SHIFT = (
+    "the recording was written by an earlier version of this script, without the shift that "
+    "hides its balances, so no fixture can be built from it"
+)
 
 _ID_KINDS = {
     "positionId": "position",
@@ -199,8 +206,8 @@ _CLEARED_MESSAGES = frozenset({"bonusDepositWithdraw"})
 # What scrubbing does with each amount of the schema, by message and field:
 # - `LEVEL`, a balance or equity, is raised by the recording's money shift;
 # - `DELTA`, what one deal, position or operation changed or holds, is kept: it does not tell
-#   how much the account has. The first deposit's amount is the exception, raised like the
-#   balance it made, which would otherwise be that balance;
+#   how much the account has. An operation made on a balance of zero is the exception: its
+#   amount is the balance it made, and is raised like it;
 # - `ZEROED` is a sum of the account's with no part in the balance arithmetic.
 LEVEL = "level"
 DELTA = "delta"
@@ -233,7 +240,10 @@ _MONEY_FIELDS: dict[tuple[str, str], str] = {
     ("ProtoOAPositionUnrealizedPnL", "grossUnrealizedPnL"): DELTA,
     ("ProtoOAPositionUnrealizedPnL", "netUnrealizedPnL"): DELTA,
 }
-_FIRST_DEPOSIT = ("ProtoOADepositWithdraw", "delta")
+_OPERATION_AMOUNT = ("ProtoOADepositWithdraw", "delta")
+# A level the venue may send as 0 for "not given". Kept 0: shifted, it would be the shift.
+# TODO(verify): whether an operation listed in the cash-flow history carries its equity at all.
+_ZERO_IS_NOT_GIVEN = frozenset({("ProtoOADepositWithdraw", "equity")})
 # Lists of account ids. They name the owner's other accounts, whose ids no check knows.
 _ACCOUNT_ID_LISTS = frozenset({"ctidTraderAccountIds"})
 # The owner's id at the identity provider. Zeroed, not cleared: the field is `required`.
@@ -248,12 +258,12 @@ _LONG_NUMBER_DIGITS = 7
 
 
 def _draw_money_shift() -> int:
-    """One recording's money shift, in the account's raw money units.
+    """One recording's money shift as it is at two money digits; `Recording.money_shift` scales it.
 
-    At two money digits, 1 to 100 million of the deposit currency: far above a real balance, so
-    none shifted can be negative or read back. Its last two digits are never 00, so the shifted
-    first deposit does not look like a round amount. Below 10**10, so a shifted balance is still
-    an ordinary amount for the platform's money type.
+    1 to 100 million of the deposit currency: far above a real balance, so none shifted can be
+    negative or read back. Its last two digits are never 00, so the shifted first deposit does
+    not look like a round amount. Below 10**8 of the currency, so a shifted balance is still an
+    ordinary amount for the platform's money type.
     """
     units = 10**6 + secrets.randbelow(10**8 - 10**6)
     return units * 100 + 1 + secrets.randbelow(99)
@@ -321,6 +331,15 @@ def _names_pattern(names: Iterable[str]) -> re.Pattern[str] | None:
     return re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.IGNORECASE)
 
 
+def _amounts_pattern(amounts: Iterable[str]) -> re.Pattern[str] | None:
+    """What matches any of `amounts` as a whole number; `None` if there is none."""
+    ordered = sorted(set(amounts), key=len, reverse=True)
+    if not ordered:
+        return None
+    alternatives = "|".join(re.escape(amount) for amount in ordered)
+    return re.compile(rf"(?<![\d.])(?:{alternatives})(?!\d|\.\d)")
+
+
 def clean_text(
     text: str,
     *,
@@ -328,6 +347,7 @@ def clean_text(
     login: int | None,
     ids: IdMap,
     names: Iterable[str] = (),
+    amounts: Iterable[str] = (),
 ) -> str:
     """Free text with the names and numbers that could identify the account taken out.
 
@@ -335,6 +355,8 @@ def clean_text(
     not that id.
 
     - each of `names`, the broker's, becomes `BROKER_PLACEHOLDER`, as a whole word in any case;
+    - each of `amounts`, a real balance as `_real_amounts()` writes it, becomes
+      `AMOUNT_PLACEHOLDER`, as a whole number: not the end of a longer number or of a fraction;
     - a known order, position or deal id becomes its fake id;
     - the account id and the trader login become the fake values their own fields get;
     - any other run of `_LONG_NUMBER_DIGITS` digits or more becomes `NUMBER_PLACEHOLDER`: an id
@@ -344,6 +366,9 @@ def clean_text(
     pattern = _names_pattern(names)
     if pattern is not None:
         text = pattern.sub(BROKER_PLACEHOLDER, text)
+    pattern = _amounts_pattern(amounts)
+    if pattern is not None:
+        text = pattern.sub(AMOUNT_PLACEHOLDER, text)
     fakes = ids.text_fakes()
     fakes.setdefault(str(account_id), str(record_fixtures.FAKE_ACCOUNT_ID))
     if login is not None:
@@ -369,24 +394,30 @@ def scrub_execution(
     ids: IdMap,
     shift_ms: int,
     money_shift: int,
-    first_deposit: int | None = None,
     names: Iterable[str] = (),
+    amounts: Iterable[str] = (),
 ) -> Message:
     """`record_fixtures.scrub()`, then what execution messages add to it.
 
-    Amounts follow `_MONEY_FIELDS`, with `money_shift` as the shift. `first_deposit` is the
-    real `balanceHistoryId` of the account's earliest balance operation, whose amount is
-    shifted too.
+    Amounts follow `_MONEY_FIELDS`, with `money_shift` as the shift. `amounts` are the real
+    balances as text may write them, which venue text loses as `clean_text()` says.
     """
     result = record_fixtures.scrub(message, account_id, login)
     # A field newer than these bindings is scrubbed by nothing here, and may hold anything.
     result.DiscardUnknownFields()
 
     def clean(text: str) -> str:
-        return clean_text(text, account_id=account_id, login=login, ids=ids, names=names)
+        return clean_text(
+            text,
+            account_id=account_id,
+            login=login,
+            ids=ids,
+            names=names,
+            amounts=amounts,
+        )
 
     # From the original: the base scrubbing has cleared or zeroed the balances by then.
-    _shift_money(message, result, money_shift, first_deposit)
+    _shift_money(message, result, money_shift)
     _scrub_in_place(result, ids, shift_ms, clean)
     return result
 
@@ -415,23 +446,24 @@ def _paired_fields(
             yield from _paired_fields(value, getattr(scrubbed, name))
 
 
-def _is_first_deposit(message: Message, name: str, first_deposit: int | None) -> bool:
-    return (
-        (message.DESCRIPTOR.name, name) == _FIRST_DEPOSIT
-        and first_deposit is not None
-        and message.balanceHistoryId == first_deposit
-    )
+def _made_from_zero(message: Message, name: str) -> bool:
+    """Whether `name` is the amount of an operation made on a balance of zero.
+
+    Only there is the shifted amount still what the shifted balance grew by. Anywhere else,
+    the shifted amount less that growth would be the shift.
+    """
+    is_amount = (message.DESCRIPTOR.name, name) == _OPERATION_AMOUNT
+    return is_amount and message.balance == message.delta
 
 
-def _shift_money(
-    original: Message,
-    scrubbed: Message,
-    money_shift: int,
-    first_deposit: int | None,
-) -> None:
+def _shift_money(original: Message, scrubbed: Message, money_shift: int) -> None:
     for message, target, name, value in _paired_fields(original, scrubbed):
-        role = _MONEY_FIELDS.get((message.DESCRIPTOR.name, name))
-        if role == LEVEL or _is_first_deposit(message, name, first_deposit):
+        key = (message.DESCRIPTOR.name, name)
+        role = _MONEY_FIELDS.get(key)
+        if role == LEVEL:
+            if value or key not in _ZERO_IS_NOT_GIVEN:
+                setattr(target, name, value + money_shift)
+        elif _made_from_zero(message, name):
             setattr(target, name, value + money_shift)
         elif role == ZEROED:
             if target.HasField(name):
@@ -442,30 +474,29 @@ def _shift_money(
             setattr(target, name, value)
 
 
-def _first_deposit(recording: Recording) -> int | None:
-    """The real id of the earliest balance operation in `recording`; `None` if it has none."""
-    operations = [
-        found
-        for message in recording.messages()
-        for found in _messages_named(message, "ProtoOADepositWithdraw")
-    ]
-    if not operations:
-        return None
-    # TODO(verify): that the earliest operation listed is the account's initial deposit, which
-    # holds only if the cash-flow history reaches back to the registration.
-    first = min(operations, key=lambda o: (o.changeBalanceTimestamp, o.balanceHistoryId))
-    return first.balanceHistoryId
+def _real_amounts(recording: Recording) -> set[str]:
+    """Every real balance of `recording` as text may write it; zero is never one."""
+    forms: set[str] = set()
+    for message in recording.messages():
+        for holder, _, name, value in _paired_fields(message, message):
+            if value and _MONEY_FIELDS.get((holder.DESCRIPTOR.name, name)) == LEVEL:
+                digits = holder.moneyDigits if holder.HasField("moneyDigits") else None
+                forms |= _written_forms(abs(value), digits)
+    return forms
 
 
-def _messages_named(message: Message, name: str) -> Iterable[Message]:
-    """`message` and every message in it, at any depth, whose type is called `name`."""
-    if message.DESCRIPTOR.name == name:
-        yield message
-    for descriptor, value in message.ListFields():
-        if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
-            items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
-            for item in items:
-                yield from _messages_named(item, name)
+def _written_forms(value: int, digits: int | None) -> set[str]:
+    """`value`, in raw money units, as a whole number and as a decimal.
+
+    In decimals by `digits` and by 2, the usual number, each with and without its trailing
+    zeros: 1001230 gives "1001230", "10012.30" and "10012.3".
+    """
+    forms = {str(value)}
+    for places in {2, digits or 0} - {0}:
+        whole, part = divmod(value, 10**places)
+        decimal = f"{whole}.{part:0{places}d}"
+        forms |= {decimal, decimal.rstrip("0").rstrip(".")}
+    return forms
 
 
 def _scrub_in_place(
@@ -548,8 +579,9 @@ class Recording:
     )
     # The broker's names, as the venue gave them: what scrubbing takes out of free text.
     names: list[str] = field(default_factory=list)
-    # As secret as the balances it hides: kept in the unscrubbed files only, never shown.
-    money_shift: int = field(default_factory=_draw_money_shift, repr=False)
+    # What `money_shift` is made from. As secret as the balances it hides: kept in the
+    # unscrubbed files only, never shown.
+    money_shift_draw: int = field(default_factory=_draw_money_shift, repr=False)
     # Where each entry and name is also written as it is added, if anywhere.
     journal: Journal | None = field(default=None, repr=False, compare=False)
 
@@ -582,6 +614,24 @@ class Recording:
         for items in self.closing.values():
             yield from items
 
+    @property
+    def money_shift(self) -> int:
+        """What every balance is raised by, in raw money units.
+
+        The draw scaled by the money digits of the first trader recorded, so it hides as much
+        of the currency at any digits; two digits if no trader gives them.
+        """
+        digits = next(
+            (
+                message.trader.moneyDigits
+                for message in self.messages()
+                if isinstance(message, oa.ProtoOATraderRes)
+                and message.trader.HasField("moneyDigits")
+            ),
+            2,
+        )
+        return self.money_shift_draw * 10 ** max(digits - 2, 0)
+
 
 def _encode(message: Message, *, partial: bool = False) -> dict:
     # `partial` skips the check for unset required fields, so an odd message still goes out.
@@ -608,7 +658,7 @@ def encode_recording(
     """
     ids = IdMap()
     shift_ms = recording.started_wall_ms - FAKE_EPOCH_MS
-    first_deposit = _first_deposit(recording)
+    amounts = _real_amounts(recording)
 
     def clean(message: Message) -> Message:
         return scrub_execution(
@@ -618,8 +668,8 @@ def encode_recording(
             ids=ids,
             shift_ms=shift_ms,
             money_shift=recording.money_shift,
-            first_deposit=first_deposit,
             names=recording.names,
+            amounts=amounts,
         )
 
     # A first pass only to fill the id map, so a text quoting an id is fixed even where the id
@@ -635,6 +685,7 @@ def encode_recording(
             login=login,
             ids=ids,
             names=recording.names,
+            amounts=amounts,
         )
         item: dict = {"t": entry.t, "kind": entry.kind, "note": note}
         if entry.message is not None:
@@ -684,7 +735,7 @@ def encode_raw(recording: Recording, *, account_id: int, login: int | None) -> b
         "account_id": account_id,
         "login": login,
         "names": recording.names,
-        "money_shift": recording.money_shift,
+        "money_shift_draw": recording.money_shift_draw,
         "timeline": [_raw_entry(entry) for entry in recording.timeline],
         "closing": {
             key: [_encode(message, partial=True) for message in items]
@@ -692,6 +743,13 @@ def encode_raw(recording: Recording, *, account_id: int, login: int | None) -> b
         },
     }
     return json.dumps(output, indent=2).encode("utf-8")
+
+
+def _stored_shift(stored: dict) -> int:
+    """The money shift's draw a raw file or journal header holds; `Refused` if it holds none."""
+    if "money_shift_draw" not in stored:
+        raise Refused(NO_MONEY_SHIFT)
+    return stored["money_shift_draw"]
 
 
 def decode_raw(data: bytes) -> tuple[Recording, int, int | None]:
@@ -705,7 +763,7 @@ def decode_raw(data: bytes) -> tuple[Recording, int, int | None]:
     recording = Recording(
         raw["started_wall_ms"],
         names=list(raw.get("names", [])),
-        money_shift=raw["money_shift"],
+        money_shift_draw=_stored_shift(raw),
     )
     recording.timeline = [_entry_from_raw(item) for item in raw["timeline"]]
     recording.closing = {
@@ -781,7 +839,7 @@ class Journal:
                 "account_id": self._account_id,
                 "login": self._login,
                 "names": recording.names,
-                "money_shift": recording.money_shift,
+                "money_shift_draw": recording.money_shift_draw,
             }
             items.insert(0, header)
         self._append(items)
@@ -843,7 +901,7 @@ def read_journal(data: bytes) -> tuple[Recording, int, int | None]:
     recording = Recording(
         header["started_wall_ms"],
         names=list(header["names"]),
-        money_shift=header["money_shift"],
+        money_shift_draw=_stored_shift(header),
     )
     torn = False
     for index, line in enumerate(lines[1:], start=1):
@@ -882,13 +940,18 @@ def check_clean(
     `clean_text()` matches them: in the JSON or the bytes, a short name would turn up by chance
     inside the base64 of a payload.
 
-    Amounts are compared field by field with the recording's own: a balance, or the first
-    deposit's amount, left at its real value is refused. The money shift is looked for as text.
+    Amounts are compared field by field with the recording's own, by the rules
+    `_shift_money()` follows; a balance of zero is refused, since shifted it is the shift
+    itself. The shift is looked for as text and as a varint, and every real balance, in the
+    forms `_real_amounts()` gives, in every note and text field.
     """
+    shift = recording.money_shift
     numbers = [n for n in (account_id, login, *ids.real_ids()) if n is not None]
     text = [str(n).encode() for n in numbers] + [s.encode() for s in secrets if s]
-    text.append(str(recording.money_shift).encode())
-    varints = [record_fixtures._varint(n) for n in numbers]
+    # The draw too: with the money digits, which the fixture keeps, it gives the shift.
+    shifts = {shift, recording.money_shift_draw}
+    text.extend(str(n).encode() for n in shifts)
+    varints = [record_fixtures._varint(n) for n in (*numbers, *shifts)]
 
     record_fixtures.assert_clean(data, text)
     decoded = decode_recording(data)
@@ -897,34 +960,46 @@ def check_clean(
         messages.extend(items)
     if len(messages) != sum(1 for _ in recording.messages()):
         raise record_fixtures.ScrubError("the encoded recording lost a message")
+    # First: its refusals say what went wrong, where the search below would only find the shift.
+    _check_amounts_hidden(recording, messages)
     for message in messages:
         record_fixtures.assert_clean(message.SerializeToString(), text + varints)
-    _check_amounts_hidden(recording, messages)
 
-    names = _names_pattern(recording.names)
-    if names is None:
-        return
     texts = [item["note"] for item in decoded["timeline"]]
     for message in messages:
         texts.extend(_strings(message))
+    amounts = _amounts_pattern(_real_amounts(recording))
+    if amounts is not None and any(amounts.search(t) for t in texts):
+        raise record_fixtures.ScrubError("a real balance was found in a text of the fixture")
+    names = _names_pattern(recording.names)
     # The token itself may read as a name: "<broker>" for a broker called "Broker".
-    if any(names.search(t.replace(BROKER_PLACEHOLDER, " ")) for t in texts):
+    if names is not None and any(names.search(t.replace(BROKER_PLACEHOLDER, " ")) for t in texts):
         raise record_fixtures.ScrubError("a broker name was found in recorded fixture data")
 
 
 def _check_amounts_hidden(recording: Recording, scrubbed: list[Message]) -> None:
-    """Raise `ScrubError` if a balance or the first deposit's amount kept its real value."""
-    first_deposit = _first_deposit(recording)
+    """Raise `ScrubError` if an amount is not hidden the way `_shift_money()` hides it."""
+
+    def refuse(text: str) -> None:
+        raise record_fixtures.ScrubError(text)
+
     for original, kept in zip(recording.messages(), scrubbed, strict=True):
         for message, target, name, value in _paired_fields(original, kept):
-            if not target.HasField(name) or getattr(target, name) != value:
-                continue
-            if _MONEY_FIELDS.get((message.DESCRIPTOR.name, name)) == LEVEL:
-                raise record_fixtures.ScrubError("a balance was found unshifted in the fixture")
-            if _is_first_deposit(message, name, first_deposit):
-                raise record_fixtures.ScrubError(
-                    "the first deposit's amount was found unshifted in the fixture",
-                )
+            key = (message.DESCRIPTOR.name, name)
+            published = getattr(target, name) if target.HasField(name) else None
+            if _MONEY_FIELDS.get(key) == LEVEL:
+                if value == 0 and key in _ZERO_IS_NOT_GIVEN:
+                    if published:
+                        refuse("an amount not given was shifted in the fixture")
+                elif value == 0:
+                    refuse("a balance of zero was recorded: shifted, it would be the shift")
+                elif published == value:
+                    refuse("a balance was found unshifted in the fixture")
+            elif key == _OPERATION_AMOUNT:
+                if _made_from_zero(message, name) and published == value:
+                    refuse("an operation made on a balance of zero kept its real amount")
+                elif not _made_from_zero(message, name) and published != value:
+                    refuse("an operation's amount was shifted in the fixture")
 
 
 def _strings(message: Message) -> Iterable[str]:
@@ -1187,25 +1262,43 @@ async def _ask_closing_lists(
     else:
         mark("closing list truncated: account_deals")
 
-    # From the registration on, so the first deposit is always there; the windows overlap at
-    # their edges, so an operation at an edge is listed twice rather than missed.
-    # TODO(verify): whether either end of a cash-flow window is inclusive.
-    start = registered
-    for _ in range(_MAX_CASH_FLOW_WINDOWS):
-        end = min(start + _CASH_FLOW_WINDOW_MS, now_ms)
+    windows, truncated = _cash_flow_windows(registered, now_ms)
+    for window in windows:
         listed = await ask(
             "cash_flow",
             oa.ProtoOACashFlowHistoryListReq(
                 ctidTraderAccountId=account_id,
-                fromTimestamp=start,
-                toTimestamp=end,
+                fromTimestamp=window[0],
+                toTimestamp=window[1],
             ),
         )
-        if listed is None or end >= now_ms:
+        if listed is None:
             break
-        start = end
     else:
-        mark("closing list truncated: cash_flow")
+        if truncated:
+            mark("closing list truncated: cash_flow")
+
+
+def _cash_flow_windows(registered: int, now_ms: int) -> tuple[list[tuple[int, int]], bool]:
+    """The cash-flow windows to ask, oldest first, and whether any was left out.
+
+    A week at most each, at most `_MAX_CASH_FLOW_WINDOWS` of them, from a week before the
+    registration, so an operation at the registration itself is listed whichever end of a
+    window is inclusive. The windows overlap at their edges, so an operation
+    at an edge is listed twice rather than missed. Over the cap, the first window is kept, for
+    the initial deposit, and the latest ones, nearest the session.
+    """
+    # TODO(verify): whether either end of a cash-flow window is inclusive.
+    start = registered - _CASH_FLOW_WINDOW_MS
+    count = max(1, -(-(now_ms - start) // _CASH_FLOW_WINDOW_MS))
+    windows = [
+        (start + i * _CASH_FLOW_WINDOW_MS, min(start + (i + 1) * _CASH_FLOW_WINDOW_MS, now_ms))
+        for i in range(count)
+    ]
+    cap = _MAX_CASH_FLOW_WINDOWS
+    if len(windows) <= cap:
+        return windows, False
+    return windows[:1] + windows[len(windows) - (cap - 1) :], True
 
 
 def _registration_ms(recording: Recording) -> int | None:
@@ -1295,6 +1388,7 @@ async def record(
             connection,
             oa.ProtoOATraderReq(ctidTraderAccountId=account_id),
         )
+        answered = now()
         recording.add_name(trader.trader.brokerName)
         # Asked both ways, and named by the flag alone.
         # TODO(verify): what `returnProtectionOrders` changes in the response; comparing the
@@ -1308,9 +1402,10 @@ async def record(
                 ),
             )
             if trader is not None:
-                # Recorded only once the venue answers the next request too: a snapshot it
-                # refuses at the start leaves nothing recorded, so nothing is written.
-                recording.add("snapshot", f"{note}; trader", trader, now())
+                # Recorded only once the venue answers the next request too, so a snapshot it
+                # refuses at the start leaves nothing recorded and nothing is written; timed by
+                # its own answer all the same.
+                recording.add("snapshot", f"{note}; trader", trader, answered)
                 trader = None
             shape = f"returnProtectionOrders={str(flag).lower()}"
             recording.add("snapshot", f"{note}; {shape}", response, now())
@@ -1772,7 +1867,7 @@ _CHECKLIST = """\
 Recording until {ends} local time (--minutes {minutes}), when it stops by itself.
 Trade by hand in the cTrader terminal, at the smallest volume, and after each step type what
 you did and press Enter.
-Notes are published with the fixture: write no names and no account numbers.
+Notes are published with the fixture: write no names, no account numbers and no amounts.
   1. a market buy with a stop-loss and a take-profit
   2. move the stop-loss
   3. remove the take-profit, then add it back
@@ -1780,8 +1875,8 @@ Notes are published with the fixture: write no names and no account numbers.
   5. let the stop-loss trigger, or close the position by hand
   6. a second position, closed by its take-profit
   7. place a pending limit order, then cancel it
-  8. (optional, long) keep a position open across the daily rollover: needs a --minutes
-     that reaches past it
+  8. (optional, long) keep a position open across the daily rollover, then close it while
+     still recording: needs a --minutes that reaches past it
 A line "events: ..." follows each step the venue reported; if none appears, nothing is being
 recorded. Type q and press Enter to stop."""
 
@@ -1938,6 +2033,9 @@ def _read_journal_file(
     """`read_journal()` of `journal`; `Refused`, which quotes nothing of it, if it cannot be."""
     try:
         return read_journal(journal.read_bytes())
+    except Refused:
+        outcome.journal_readable = False
+        raise
     except Exception:
         # Empty, a partly written header, a damaged line: whatever it says could quote the file.
         outcome.journal_readable = False
