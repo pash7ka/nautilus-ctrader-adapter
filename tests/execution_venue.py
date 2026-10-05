@@ -60,6 +60,8 @@ STRATEGY_ID = StrategyId("S-001")
 
 
 def _orders(message: Message) -> list[om.ProtoOAOrder]:
+    if isinstance(message, om.ProtoOAOrder):
+        return [message]
     if isinstance(message, oa.ProtoOAExecutionEvent):
         return [message.order] if message.HasField("order") else []
     return list(message.order) if hasattr(message, "order") else []
@@ -72,7 +74,7 @@ def _positions(message: Message) -> list[om.ProtoOAPosition]:
 
 
 def on_us100(messages: Iterable[Message]) -> list[Message]:
-    """Copies of recorded execution messages, on `US100.cash` and the fake account."""
+    """Copies of recorded messages, orders and deals, on `US100.cash` and the fake account."""
     moved = []
     for message in messages:
         copy = type(message)()
@@ -85,6 +87,8 @@ def on_us100(messages: Iterable[Message]) -> list[Message]:
             position.tradeData.symbolId = US100_SYMBOL_ID
         if isinstance(copy, oa.ProtoOAExecutionEvent) and copy.HasField("deal"):
             copy.deal.symbolId = US100_SYMBOL_ID
+        if isinstance(copy, om.ProtoOADeal):
+            copy.symbolId = US100_SYMBOL_ID
         moved.append(copy)
     return moved
 
@@ -187,8 +191,11 @@ async def harness(
     execution_venue: ExecutionVenue | None = None,
     config: CTraderExecClientConfig | None = None,
     connect: bool = True,
+    cache: Cache | None = None,
 ) -> AsyncIterator[Harness]:
     """The client against the fake venue, inside a live execution engine and a portfolio.
+
+    A given `cache` stands for one a restarted node reloads from a persistent backend.
 
     What the client sends Nautilus is recorded on the way in: order events, execution reports,
     account states, and the account activity published on the message bus.
@@ -207,7 +214,7 @@ async def harness(
     )
     clock = LiveClock()
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
-    cache = Cache()
+    cache = Cache() if cache is None else cache
     portfolio = Portfolio(msgbus, cache, clock)
     engine = LiveExecutionEngine(
         loop=asyncio.get_running_loop(),

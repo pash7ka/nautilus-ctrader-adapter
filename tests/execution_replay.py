@@ -130,6 +130,17 @@ def history(position_id: int, *, until_ms: int | None = None) -> PositionHistory
     return PositionHistory(tuple(orders), tuple(deals))
 
 
+def window_deals(*position_ids: int, until_ms: int | None = None) -> tuple[om.ProtoOADeal, ...]:
+    """The account's recorded deals of the given positions, as they stood at `until_ms`."""
+    return tuple(
+        deal
+        for response in RECORDING["closing"]["account_deals"]
+        for deal in response.deal
+        if deal.positionId in position_ids
+        and (until_ms is None or deal.executionTimestamp <= until_ms)
+    )
+
+
 def snapshot_at(t: float) -> oa.ProtoOAReconcileRes:
     """The snapshot of the last pair taken at or before timeline time `t` that lists orders.
 
