@@ -13,7 +13,7 @@ does no I/O and holds no Nautilus object. What it relies on, from a recorded ses
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
 from nautilus_ctrader.common import order_record
@@ -23,6 +23,7 @@ from nautilus_ctrader.common.venue_records import (
     Activity,
     ActivityKind,
     AwaitProtection,
+    Exposure,
     ExternalOrder,
     ExternalType,
     Fill,
@@ -42,7 +43,7 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
 _SIDE = {om.BUY: "BUY", om.SELL: "SELL"}
-_EXTERNAL_TYPE = {
+EXTERNAL_TYPE = {
     om.MARKET: ExternalType.MARKET,
     om.MARKET_RANGE: ExternalType.MARKET,
     om.LIMIT: ExternalType.LIMIT,
@@ -116,7 +117,8 @@ class PositionView:
     leg_units: dict[Level, Decimal]
 
 
-def _entry_of(orders: Sequence[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
+def entry_of(orders: Sequence[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
+    """The entry among a position's orders."""
     # The protective order and closing orders carry the entry's client order id too.
     for order in orders:
         if not order.closingOrder and order.orderType != om.STOP_LOSS_TAKE_PROFIT:
@@ -128,7 +130,8 @@ def _opposite(side: int) -> int:
     return om.SELL if side == om.BUY else om.BUY
 
 
-def _levels_of(order: om.ProtoOAOrder, precision: int) -> dict[Level, Decimal]:
+def levels_of(order: om.ProtoOAOrder, precision: int) -> dict[Level, Decimal]:
+    """The levels a protective order holds: its stop price and its limit price."""
     levels: dict[Level, Decimal] = {}
     if order.HasField("stopPrice"):
         levels[Level.STOP_LOSS] = price_of(order.stopPrice, precision)
@@ -145,7 +148,7 @@ def _remaining(order: om.ProtoOAOrder) -> int:
     return max(order.tradeData.volume - executed, 0)
 
 
-def _which_level(
+def which_level(
     side: str,
     levels: dict[Level, Decimal],
     fill_price: Decimal,
@@ -185,6 +188,10 @@ class VenueBook:
         # external orders reported once.
         self._closes: dict[int, str] = {}
         self._closes_accepted: set[int] = set()
+        # The position each matched close belongs to, by broker order id.
+        self._close_positions: dict[int, int] = {}
+        # Pending orders on symbols the node has not loaded, by broker order id.
+        self._unloaded_orders: dict[int, Exposure] = {}
         # Never-opened entries that ended, dropped from `_positions`.
         self._ended_entries: set[int] = set()
         self._reported: set[int] = set()
@@ -214,6 +221,26 @@ class VenueBook:
             },
         )
 
+    def exposure(self) -> tuple[Exposure, ...]:
+        """What stands on symbols the node has not loaded, sorted."""
+        positions = (
+            Exposure(position.symbol_id, "position", position.side, units_of(position.volume))
+            for position in self._positions.values()
+            if position.open and self._precision(position.symbol_id) is None
+        )
+        return tuple(sorted((*positions, *self._unloaded_orders.values())))
+
+    def known_closes(self) -> dict[int, str]:
+        """The node's closes the model has matched: broker order id to the node's close id."""
+        return dict(self._closes)
+
+    def close_order(self, client_order_id: str) -> tuple[int, int] | None:
+        """The broker order id and position id of the node's matched close `client_order_id`."""
+        for order_id, close_id in self._closes.items():
+            if close_id == client_order_id:
+                return order_id, self._close_positions[order_id]
+        return None
+
     def load(
         self,
         snapshot: oa.ProtoOAReconcileRes,
@@ -225,6 +252,7 @@ class VenueBook:
         to Nautilus is reconciliation's job; this returns only notices.
         """
         self._positions = {}
+        self._unloaded_orders = {}
         self._reported = set()
         notices: list[Record] = []
         for venue_position in snapshot.position:
@@ -244,7 +272,7 @@ class VenueBook:
                     position.levels[Level.TAKE_PROFIT] = price_of(
                         venue_position.takeProfit, precision
                     )
-            entry = _entry_of(position_orders.get(position.position_id, ()))
+            entry = entry_of(position_orders.get(position.position_id, ()))
             if entry is not None:
                 notices += self._adopt(position, entry, restored=True)
         for order in snapshot.order:
@@ -259,6 +287,8 @@ class VenueBook:
             else:
                 # Reconciliation reports every other open order, so Nautilus knows it from then on.
                 self._reported.add(order.orderId)
+                if self._precision(order.tradeData.symbolId) is None:
+                    self._unloaded_orders[order.orderId] = self._pending(order)
         return notices
 
     def apply(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
@@ -563,11 +593,11 @@ class VenueBook:
         """`order` as an external order; `levels` stands in for its own prices if given.
 
         A stop price is read from `STOP_LOSS` and a limit price from `TAKE_PROFIT`, as
-        `_levels_of` reads `stopPrice` and `limitPrice`. Building the record marks nothing: the
+        `levels_of` reads `stopPrice` and `limitPrice`. Building the record marks nothing: the
         caller that reports it adds the id to `_reported`.
         """
-        kind = order_type or _EXTERNAL_TYPE.get(order.orderType, ExternalType.MARKET)
-        prices = _levels_of(order, precision) if levels is None else levels
+        kind = order_type or EXTERNAL_TYPE.get(order.orderType, ExternalType.MARKET)
+        prices = levels_of(order, precision) if levels is None else levels
         priced = kind in (ExternalType.LIMIT, ExternalType.STOP_LIMIT)
         triggered = kind in (ExternalType.STOP_MARKET, ExternalType.STOP_LIMIT)
         data = order.tradeData
@@ -700,12 +730,13 @@ class VenueBook:
             position.entry_accepted = True
             return [OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, entry_id, ts)]
         if kind in _FILLS:
+            # Built first: a fill that raises must leave the acceptance to be told next time.
+            fill = self._fill(event.deal, precision)
             records: list[Record] = []
             if not position.entry_accepted:
                 # The acceptance can be applied after the fill, or never come: it is told here.
                 position.entry_accepted = True
                 records.append(OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, entry_id, ts))
-            fill = self._fill(event.deal, precision)
             records.append(
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, entry_id, fill.ts_ms, fill=fill),
             )
@@ -768,7 +799,7 @@ class VenueBook:
                 position.retired_protective_ids.add(current)
             position.protective_order_id = order.orderId
             position.protective_volume = _remaining(order)
-            position.levels = _levels_of(order, precision)
+            position.levels = levels_of(order, precision)
             position.awaiting_protection = False
         elif kind == om.ORDER_CANCELLED:
             position.retired_protective_ids.add(order.orderId)
@@ -867,9 +898,9 @@ class VenueBook:
         order, deal = event.order, event.deal
         fill = self._fill(deal, precision)
         level: Level | None = None
-        levels = _levels_of(order, precision) or dict(position.levels)
+        levels = levels_of(order, precision) or dict(position.levels)
         if levels:
-            level, records = _which_level(position.side, levels, fill.price)
+            level, records = which_level(position.side, levels, fill.price)
         else:
             records = [
                 Notice(
@@ -935,6 +966,7 @@ class VenueBook:
             # One close id names one broker order; a second match is somebody else's close.
             if candidate is not None and candidate not in self._closes.values():
                 close_id = self._closes[order.orderId] = candidate
+                self._close_positions[order.orderId] = position.position_id
         records: list[Record] = []
         if kind in _FILLS and event.isServerEvent and not order.isStopOut:
             records.append(self._unnamed_close(position, event.deal))
@@ -962,12 +994,12 @@ class VenueBook:
             self._closes_accepted.add(order.orderId)
             return [OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, close_id, ts)]
         if kind in _FILLS:
+            fill = self._fill(event.deal, precision)
             records: list[Record] = []
             if order.orderId not in self._closes_accepted:
                 # As for an entry: the acceptance can be applied after the fill.
                 self._closes_accepted.add(order.orderId)
                 records.append(OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, close_id, ts))
-            fill = self._fill(event.deal, precision)
             records.append(
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, close_id, fill.ts_ms, fill=fill)
             )
@@ -1004,6 +1036,7 @@ class VenueBook:
 
     def _unloaded(self, event: oa.ProtoOAExecutionEvent) -> list[Record]:
         """Anything on a symbol the node has not loaded: activity, never an order."""
+        self._track_unloaded(event)
         order, kind = event.order, event.executionType
         data = order.tradeData
         has_position = event.HasField("position")
@@ -1043,3 +1076,32 @@ class VenueBook:
             ActivityKind.STOP_OUT if order.isStopOut else ActivityKind.UNLOADED_SYMBOL
         )
         return [Activity(kind_of_activity, data.symbolId, subject, side, units, action, ts)]
+
+    @staticmethod
+    def _pending(order: om.ProtoOAOrder) -> Exposure:
+        return Exposure(
+            order.tradeData.symbolId,
+            "order",
+            _SIDE[order.tradeData.tradeSide],
+            units_of(_remaining(order)),
+        )
+
+    def _track_unloaded(self, event: oa.ProtoOAExecutionEvent) -> None:
+        """Keep the position and the pending orders `exposure()` reports current."""
+        order, kind = event.order, event.executionType
+        if event.HasField("position") or kind in _FILLS:
+            self._sync(self._position_for(event), event)
+        if order.orderType == om.STOP_LOSS_TAKE_PROFIT:
+            return
+        order_id = order.orderId
+        if kind in (om.ORDER_ACCEPTED, om.ORDER_REPLACED):
+            self._unloaded_orders[order_id] = self._pending(order)
+        elif kind == om.ORDER_PARTIAL_FILL and order_id in self._unloaded_orders:
+            held = self._unloaded_orders[order_id]
+            left = held.units - units_of(event.deal.filledVolume)
+            if left > 0:
+                self._unloaded_orders[order_id] = replace(held, units=left)
+            else:
+                del self._unloaded_orders[order_id]
+        elif kind == om.ORDER_FILLED or kind in _ENDED:
+            self._unloaded_orders.pop(order_id, None)

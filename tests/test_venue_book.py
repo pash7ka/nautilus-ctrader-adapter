@@ -17,6 +17,7 @@ from nautilus_ctrader.common.venue_records import (
     Activity,
     ActivityKind,
     AwaitProtection,
+    Exposure,
     ExternalOrder,
     ExternalType,
     Fill,
@@ -25,6 +26,7 @@ from nautilus_ctrader.common.venue_records import (
     OrderEvent,
     OrderEventKind,
     ProtectionMissing,
+    units_of,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -2382,3 +2384,143 @@ def test_a_late_event_never_takes_a_position_back_to_an_older_state() -> None:
 
     assert b.view(P).open
     assert b.view(P).units == Decimal("1")
+
+
+# Exposure on symbols the node has not loaded, and the closes the model has matched.
+
+
+def test_exposure_lists_unloaded_positions_and_orders_sorted() -> None:
+    far, near = UNLOADED + 1, UNLOADED
+    response = oa.ProtoOAReconcileRes(ctidTraderAccountId=1_000_001)
+    response.position.append(make_position(8, volume=250, symbol=far, side=om.SELL))
+    response.position.append(make_position(P))
+    response.order.append(
+        make_order(71, 0, order_type=om.LIMIT, limit=1.0, volume=40, symbol=near, side=om.BUY)
+    )
+    response.order.append(
+        make_order(72, 8, order_type=om.STOP_LOSS_TAKE_PROFIT, stop=1.0, side=om.BUY, symbol=far)
+    )
+    b = book()
+
+    b.load(response, {})
+
+    assert b.exposure() == (
+        Exposure(near, "order", "BUY", units_of(40)),
+        Exposure(far, "position", "SELL", units_of(250)),
+    )
+
+
+def test_exposure_follows_unloaded_events() -> None:
+    b = book()
+    b.load(oa.ProtoOAReconcileRes(ctidTraderAccountId=1_000_001), {})
+
+    def pending(utc):
+        return make_order(71, 0, order_type=om.LIMIT, utc=utc, limit=1.0, symbol=UNLOADED)
+
+    def apply(event):
+        b.apply(event, NOTHING)
+        return b.exposure()
+
+    after_accept = apply(make_event(om.ORDER_ACCEPTED, pending(51)))
+    after_cancel = apply(make_event(om.ORDER_CANCELLED, pending(52)))
+    after_entry = apply(
+        make_event(
+            om.ORDER_FILLED,
+            make_order(72, 8, utc=53, symbol=UNLOADED),
+            position=make_position(8, symbol=UNLOADED),
+            deal=make_deal(9, 72, 8, side=om.BUY, volume=100, price=1.0, ts=53),
+        )
+    )
+    after_close = apply(
+        make_event(
+            om.ORDER_FILLED,
+            make_order(73, 8, side=om.SELL, closing=True, utc=54, symbol=UNLOADED),
+            position=closed(8, symbol=UNLOADED),
+            deal=make_deal(10, 73, 8, side=om.SELL, volume=100, price=1.0, ts=54),
+        )
+    )
+
+    assert after_accept == (Exposure(UNLOADED, "order", "BUY", Decimal("1")),)
+    assert after_cancel == ()
+    assert after_entry == (Exposure(UNLOADED, "position", "BUY", Decimal("1")),)
+    assert after_close == ()
+
+
+def test_close_order_is_known_once_matched() -> None:
+    b = book()
+    opened(b)
+    close = make_order(9_100_003, P, side=om.SELL, closing=True, utc=40)
+    assert b.close_order("O-C-1") is None
+
+    b.apply(make_event(om.ORDER_ACCEPTED, close, position=make_position(P)), Closing("O-C-1"))
+
+    assert b.close_order("O-C-1") == (9_100_003, P)
+    assert b.close_order("O-C-2") is None
+    assert b.known_closes() == {9_100_003: "O-C-1"}
+    b.known_closes().clear()
+    assert b.known_closes() == {9_100_003: "O-C-1"}
+
+
+def test_a_fill_that_cannot_be_built_does_not_consume_the_acceptance() -> None:
+    b = book()
+
+    def filled(price: float, deal_id: int) -> oa.ProtoOAExecutionEvent:
+        return make_event(
+            om.ORDER_FILLED,
+            our_entry(P, ENTRY, utc=20),
+            position=make_position(P),
+            deal=make_deal(deal_id, ENTRY, P, side=om.BUY, volume=100, price=price, ts=20),
+        )
+
+    with pytest.raises(ValueError):
+        b.apply(filled(float("nan"), 9_200_001), NOTHING)
+    records = b.apply(filled(85250.0, 9_200_002), NOTHING)
+
+    assert records[0] == OrderEvent(OrderEventKind.ACCEPTED, str(ENTRY), entry_id(P), 20)
+
+
+def test_a_fill_of_the_nodes_close_that_cannot_be_built_does_not_consume_the_acceptance() -> None:
+    b = book()
+    opened(b)
+    close = make_order(9_100_003, P, side=om.SELL, closing=True, utc=40)
+
+    def filled(price: float, deal_id: int) -> oa.ProtoOAExecutionEvent:
+        return make_event(
+            om.ORDER_FILLED,
+            close,
+            position=make_position(P, volume=0, status=om.POSITION_STATUS_CLOSED),
+            deal=make_deal(deal_id, 9_100_003, P, side=om.SELL, volume=100, price=price, ts=41),
+        )
+
+    with pytest.raises(ValueError):
+        b.apply(filled(float("nan"), 9_200_003), Closing("O-C"))
+    records = b.apply(filled(85300.0, 9_200_004), Closing("O-C"))
+
+    assert records[0] == OrderEvent(OrderEventKind.ACCEPTED, "9100003", "O-C", 40)
+
+
+def test_a_replaced_pending_order_changes_its_units_and_a_partial_fill_takes_what_filled() -> None:
+    b = book()
+    b.load(oa.ProtoOAReconcileRes(ctidTraderAccountId=1_000_001), {})
+
+    def pending(utc, volume):
+        return make_order(
+            71, 0, order_type=om.LIMIT, utc=utc, limit=1.0, volume=volume, symbol=UNLOADED
+        )
+
+    b.apply(make_event(om.ORDER_ACCEPTED, pending(51, 100)), NOTHING)
+    b.apply(make_event(om.ORDER_REPLACED, pending(52, 300)), NOTHING)
+    b.apply(
+        make_event(
+            om.ORDER_PARTIAL_FILL,
+            pending(53, 300),
+            position=make_position(8, volume=100, symbol=UNLOADED),
+            deal=make_deal(9, 71, 8, side=om.BUY, volume=100, price=1.0, ts=53),
+        ),
+        NOTHING,
+    )
+
+    assert b.exposure() == (
+        Exposure(UNLOADED, "order", "BUY", Decimal("2")),
+        Exposure(UNLOADED, "position", "BUY", Decimal("1")),
+    )

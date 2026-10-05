@@ -187,6 +187,19 @@ class Activity:
     ts_ms: int
 
 
+@dataclass(frozen=True, order=True)
+class Exposure:
+    """An open position or pending order on a symbol the node has not loaded.
+
+    `subject` is `"position"` or `"order"`.
+    """
+
+    symbol_id: int
+    subject: str
+    side: str
+    units: Decimal
+
+
 @dataclass(frozen=True)
 class AwaitProtection:
     """The node's entry filled with legs, and the broker's protective order should follow."""
