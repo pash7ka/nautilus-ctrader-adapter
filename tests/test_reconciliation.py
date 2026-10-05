@@ -5,9 +5,12 @@ from __future__ import annotations
 import copy
 from decimal import Decimal
 
+from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.reconciliation import (
     PositionHistory,
     Reconciliation,
+    entry_named,
+    one_position,
     reconcile,
     unfilled_order,
 )
@@ -387,3 +390,47 @@ def test_unfilled_orders_carry_the_node_id_when_they_are_the_node_s() -> None:
     assert reports["6000132"].reduce_only
     assert reports["6000133"].client_order_id is None
     assert result.notices == ()
+
+
+def test_one_position_is_reported_from_its_own_lists_alone() -> None:
+    # Another open position, with no lists given: left out, not reported with a notice.
+    snapshot = as_ours([snapshot_at(OPEN_AT)], [FIRST])[0]
+    snapshot.position.append(make_position(SECOND))
+    found = ours(history(FIRST), FIRST)
+
+    result = one_position(snapshot, FIRST, found, precision, {}, NOTHING)
+
+    assert result.notices == ()
+    assert {r.venue_position_id for r in result.orders} == {str(FIRST)}
+    assert [p.venue_position_id for p in result.positions] == [str(FIRST)]
+
+
+def test_one_position_takes_a_closed_position_with_no_window() -> None:
+    found = ours(history(FIRST), FIRST)
+
+    result = one_position(snapshot_at(CLOSED_AT), FIRST, found, precision, {}, NOTHING)
+
+    assert [r.venue_order_id for r in result.orders] == [
+        r.venue_order_id for r in closed_first(mine=True).orders
+    ]
+
+
+def test_the_entry_is_never_a_protective_or_closing_order_carrying_its_ids() -> None:
+    label = order_record.encode_label(entry_id(FIRST))
+    protective = make_order(
+        6_000_150,
+        FIRST,
+        order_type=om.STOP_LOSS_TAKE_PROFIT,
+        label=label,
+        client_order_id=entry_id(FIRST),
+    )
+    close = make_order(
+        6_000_151, FIRST, side=om.SELL, closing=True, label=label, client_order_id=entry_id(FIRST)
+    )
+    # The id without the node's record is somebody else's order.
+    unlabelled = make_order(6_000_152, FIRST, client_order_id=entry_id(FIRST))
+    orders = [protective, close, unlabelled, our_entry(FIRST, 6_000_153)]
+
+    assert entry_named(orders, entry_id(FIRST)).orderId == 6_000_153
+    assert entry_named(orders[:3], entry_id(FIRST)) is None
+    assert entry_named(orders, entry_id(SECOND)) is None

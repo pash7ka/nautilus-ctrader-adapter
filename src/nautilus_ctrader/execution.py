@@ -18,6 +18,7 @@ import contextlib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import partial
 
 from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
@@ -33,6 +34,7 @@ from nautilus_trader.execution.messages import (
     GeneratePositionStatusReports,
     ModifyOrder,
     QueryAccount,
+    QueryOrder,
     SubmitOrder,
     SubmitOrderList,
 )
@@ -79,7 +81,14 @@ from nautilus_ctrader.common.operations import OperationsInFlight, PendingBracke
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.order_translation import Unsupported
 from nautilus_ctrader.common.parsing import PRICE_SCALE
-from nautilus_ctrader.common.reconciliation import PositionHistory, reconcile
+from nautilus_ctrader.common.reconciliation import (
+    PositionHistory,
+    Reconciliation,
+    entry_named,
+    one_position,
+    reconcile,
+    unfilled_order,
+)
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.common.venue_book import PositionView, VenueBook
 from nautilus_ctrader.common.venue_records import (
@@ -93,6 +102,7 @@ from nautilus_ctrader.common.venue_records import (
     OrderEventKind,
     ProtectionMissing,
     Record,
+    ReportedOrder,
     money_of,
 )
 from nautilus_ctrader.config import CTraderExecClientConfig
@@ -442,14 +452,130 @@ class CTraderExecutionClient(LiveExecutionClient):
         )
         return status
 
-    # Answering a query for one order is not built yet; Nautilus resolves orders in flight
-    # through its own in-flight check.
-
     async def generate_order_status_report(
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        return None
+        """The broker's report of one order; one with fills has reached Nautilus already."""
+        report, _ = await self._answer(command.client_order_id, command.venue_order_id)
+        return report
+
+    async def _query_order(self, command: QueryOrder) -> None:
+        report, sent = await self._answer(command.client_order_id, command.venue_order_id)
+        if report is not None and not sent:
+            self._send_order_status_report(report)
+
+    async def _answer(
+        self,
+        client_order_id: ClientOrderId | None,
+        venue_order_id: VenueOrderId | None,
+    ) -> tuple[OrderStatusReport | None, bool]:
+        """The broker's report of one of the node's orders, and whether it was sent already.
+
+        The order is looked up by what it is:
+
+        - a leg: its position in the venue model;
+        - a close: its broker order, once the model has matched it;
+        - an entry or a market order: the broker's pending orders, then its order list over
+          the fill window.
+
+        The report is built from that position's own lists. One with fills is sent at once as
+        a one-order mass status carrying them: a bare filled report would make Nautilus infer a
+        fill of its own. Nothing is answered while the connection is down, while a leg's entry
+        is still in flight, or when nothing matches; a DEBUG line says which.
+        """
+        if client_order_id is None and venue_order_id is not None:
+            client_order_id = self._cache.client_order_id(venue_order_id)
+        order = None if client_order_id is None else self._cache.order(client_order_id)
+
+        def unanswered(reason: str) -> tuple[None, bool]:
+            self._log.debug(f"Query of {client_order_id or venue_order_id} not answered: {reason}")
+            return None, False
+
+        if not self._connected():
+            return unanswered(_NOT_CONNECTED)
+        if order is None:
+            return unanswered("not found in Nautilus")
+        if self._instrument_provider.find(order.instrument_id) is None:
+            return unanswered(f"{order.instrument_id} is not loaded")
+        order_id = order.client_order_id.value
+        leg = self._book.leg_position(order_id)
+        if leg is None and self._brackets.by_leg(order_id) is not None:
+            return unanswered("its entry is still in flight")
+        close = self._book.close_order(order_id)
+        listed: om.ProtoOAOrder | None = None
+        record: ReportedOrder | None = None
+        try:
+            if leg is not None or close is not None:
+                position_id = leg[0] if leg is not None else close[1]
+            elif order.is_reduce_only:
+                return unanswered("not found at the venue")
+            else:
+                pending = await self._request(
+                    oa.ProtoOAReconcileReq(ctidTraderAccountId=self._account.account_id),
+                )
+                listed = entry_named(pending.order, order_id)
+                position_id = None
+                if listed is None:
+                    windows = history.weekly_windows(
+                        self._since_ms(self._lookback_mins), self._clock.timestamp_ms()
+                    )
+                    # TODO(verify): that the order list holds an order the broker rejected;
+                    # none was recorded.
+                    for start, end in reversed(windows):
+                        found = await history.orders_between(
+                            partial(self._request, bucket=BUCKET_HISTORICAL),
+                            self._account.account_id,
+                            start,
+                            end,
+                        )
+                        listed = entry_named(found, order_id)
+                        if listed is not None:
+                            break
+                    if listed is None:
+                        return unanswered("not found at the venue")
+                    if listed.HasField("positionId"):
+                        position_id = listed.positionId
+            if position_id is not None:
+                state = await self._read_broker(since_ms=None, positions=[position_id])
+                found = state.histories.get(position_id)
+                if found is not None:
+                    built = one_position(
+                        state.snapshot,
+                        position_id,
+                        found,
+                        self._price_precision,
+                        self._book.known_closes(),
+                        self._operations,
+                    )
+                    record = next((r for r in built.orders if r.client_order_id == order_id), None)
+        except CTraderError as e:
+            return unanswered(str(e))
+        unfilled = listed is not None and listed.orderStatus != om.ORDER_STATUS_FILLED
+        if record is None and unfilled and not listed.executedVolume:
+            # Not in its position's reports. One that filled is answered only with its fills.
+            digits = self._price_precision(listed.tradeData.symbolId)
+            if digits is not None:
+                record = unfilled_order(listed, digits, order_id)
+        if record is None:
+            return unanswered("not found at the venue")
+        status, _ = reports.mass_status(
+            self.id,
+            self.account_id,
+            self.venue,
+            Reconciliation((record,), (), ()),
+            self._instrument_provider.instrument_for_symbol_id,
+            self._currency,
+            self._clock.timestamp_ns(),
+            held_price=self._held_price,
+        )
+        if not status.order_reports:
+            return unanswered("no price or instrument to report it at")
+        (report,) = status.order_reports.values()
+        if not record.fills:
+            return report, False
+        self._send_mass_status_report(status)
+        return report, True
 
     async def generate_order_status_reports(
         self,

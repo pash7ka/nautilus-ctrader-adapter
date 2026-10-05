@@ -42,18 +42,18 @@ from tests.account_venue import ACCOUNT_ID, HeldReplies
 from tests.execution_replay import (
     FIRST,
     NoOperations,
-    as_ours,
     history,
     make_deal,
     make_event,
     make_order,
     make_position,
     snapshot_at,
-    window_deals,
 )
 from tests.execution_venue import (
+    CLOSE,
     ENTRY,
     FIRST_EVENTS,
+    OURS,
     STOP,
     STRATEGY_ID,
     TARGET,
@@ -62,10 +62,16 @@ from tests.execution_venue import (
     US100_SYMBOL_ID,
     ExecutionVenue,
     Harness,
+    broker_lists,
+    close_sent,
     exec_config,
     harness,
+    node_close_events,
     on_us100,
+    our_market_position,
     push,
+    serve,
+    started,
     status,
     submitted,
 )
@@ -79,22 +85,6 @@ UUID_SHAPED = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 
 def precision(symbol_id: int) -> int | None:
     return 2 if symbol_id == US100_SYMBOL_ID else None
-
-
-def broker_lists(
-    at: float, *, mine: bool = True
-) -> tuple[oa.ProtoOAReconcileRes, dict[int, PositionHistory], tuple[om.ProtoOADeal, ...]]:
-    """What the broker lists for the first position at timeline time `at`, on US100.cash."""
-    snapshot = snapshot_at(at)
-    until = snapshot.position[0].utcLastUpdateTimestamp if snapshot.position else None
-    found = history(FIRST, until_ms=until)
-    orders = list(found.orders)
-    if mine:
-        snapshot = as_ours([snapshot], [FIRST])[0]
-        orders = as_ours(orders, [FIRST])
-    moved = PositionHistory(tuple(on_us100(orders)), tuple(on_us100(found.deals)))
-    deals = tuple(on_us100(window_deals(FIRST, until_ms=until)))
-    return on_us100([snapshot])[0], {FIRST: moved}, deals
 
 
 def records(snapshot, histories, deals) -> Reconciliation:
@@ -443,15 +433,6 @@ EURUSD_SYMBOL_ID = 1  # not loaded by the harness
 MINUTE_MS = 60_000
 
 
-def serve(venue: ExecutionVenue, at: float) -> None:
-    """Make the venue's snapshot and lists the node's first position at timeline time `at`."""
-    snapshot, histories, deals = broker_lists(at)
-    venue.snapshot = snapshot
-    venue.position_orders = {pid: list(found.orders) for pid, found in histories.items()}
-    venue.position_deals = {pid: list(found.deals) for pid, found in histories.items()}
-    venue.deals = list(deals)
-
-
 def serving(at: float = OPEN_AT) -> ExecutionVenue:
     """A venue whose snapshot and lists are the node's first position at timeline time `at`."""
     venue = ExecutionVenue()
@@ -702,15 +683,6 @@ async def test_reports_outside_a_mass_status_never_carry_a_filled_order() -> Non
 # -- Reconnect ---------------------------------------------------------------------------------
 
 TP_BACK_AT = 256.5  # FIRST open, its take-profit set again by hand
-OURS = 5_300_001
-CLOSE = "O-C-5300001"
-
-
-async def started(h: Harness) -> ExecutionMassStatus:
-    """The start's reconciliation, reconciled by the engine as a node would."""
-    built = await h.client.generate_mass_status()
-    h.engine.reconcile_execution_mass_status(built)
-    return built
 
 
 async def test_reconnect_sends_a_mass_status_not_events() -> None:
@@ -761,45 +733,6 @@ async def test_a_reconnect_during_the_start_wait_releases_after_its_own_mass_sta
         assert h.client._buffer is None
         await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
         assert not any("No Nautilus order" in line for line in h.logger.warnings())
-
-
-def our_market_position(venue: ExecutionVenue, *, opened: int, closed: int | None = None) -> None:
-    """The node's market order on `US100.cash`, filled at `opened`; closed at `closed` if given."""
-    entry_id = "O-M-5300001"
-    entry = make_order(
-        6_300_001,
-        OURS,
-        utc=opened,
-        label=order_record.encode_label(entry_id),
-        comment=order_record.encode_comment(LegIds(None, None)),
-        client_order_id=entry_id,
-        symbol=US100_SYMBOL_ID,
-    )
-    entry.orderStatus = om.ORDER_STATUS_FILLED
-    orders = [entry]
-    deals = [
-        make_deal(7_300_001, 6_300_001, OURS, side=om.BUY, volume=100, price=85000.0, ts=opened)
-    ]
-    venue.snapshot = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
-    if closed is None:
-        position = make_position(OURS, symbol=US100_SYMBOL_ID)
-        position.price = 85000.0
-        position.utcLastUpdateTimestamp = opened
-        venue.snapshot.position.append(position)
-    else:
-        close = make_order(
-            6_300_002, OURS, side=om.SELL, closing=True, utc=closed, symbol=US100_SYMBOL_ID
-        )
-        close.orderStatus = om.ORDER_STATUS_FILLED
-        orders.append(close)
-        deals.append(
-            make_deal(
-                7_300_002, 6_300_002, OURS, side=om.SELL, volume=100, price=85100.0, ts=closed
-            ),
-        )
-    venue.position_orders = {OURS: orders}
-    venue.position_deals = {OURS: on_us100(deals)}
-    venue.deals = on_us100(deals)
 
 
 async def test_a_close_in_flight_across_a_reconnect_keeps_the_node_id() -> None:
@@ -933,33 +866,6 @@ async def test_a_failed_reconnect_pass_releases_the_buffer() -> None:
 # -- The node's close around a rebuild -------------------------------------------------------
 
 
-async def close_sent(h: Harness) -> asyncio.Task:
-    """The node's close of `OURS`, sent; returns the task awaiting its answer."""
-    position_id = PositionId(str(OURS))
-    order = h.factory.market(
-        US100_ID,
-        OrderSide.SELL,
-        Quantity.from_str("1.00"),
-        reduce_only=True,
-        client_order_id=ClientOrderId(CLOSE),
-    )
-    h.cache.add_order(order, position_id=position_id)
-    closing = asyncio.create_task(
-        h.client._submit_order(
-            SubmitOrder(
-                trader_id=TRADER_ID,
-                strategy_id=STRATEGY_ID,
-                order=order,
-                command_id=UUID4(),
-                ts_init=0,
-                position_id=position_id,
-            ),
-        ),
-    )
-    await wait_until(lambda: len(h.received(oa.ProtoOAClosePositionReq)) == 1)
-    return closing
-
-
 def in_flight(h: Harness) -> str | None:
     return h.client._operations.closing(OURS, 100)
 
@@ -1016,46 +922,6 @@ async def test_a_close_that_times_out_on_a_live_connection_is_no_longer_in_fligh
         assert h.account.session.is_ready
         assert in_flight(h) is None
         assert h.client._lost_closes == set()
-
-
-def node_close_events(*, closed: int) -> list[oa.ProtoOAExecutionEvent]:
-    """The node's close of `OURS` accepted, then filled at `closed` (hand-built)."""
-
-    def order(utc: int) -> om.ProtoOAOrder:
-        return make_order(
-            6_300_002, OURS, side=om.SELL, closing=True, utc=utc, symbol=US100_SYMBOL_ID
-        )
-
-    def position(utc: int, status: int = om.POSITION_STATUS_OPEN) -> om.ProtoOAPosition:
-        found = make_position(
-            OURS, volume=0 if status == om.POSITION_STATUS_CLOSED else 100, status=status
-        )
-        found.utcLastUpdateTimestamp = utc
-        return found
-
-    deal = make_deal(7_300_002, 6_300_002, OURS, side=om.SELL, volume=100, price=85100.0, ts=closed)
-    deal.closePositionDetail.CopyFrom(
-        om.ProtoOAClosePositionDetail(
-            entryPrice=85000.0,
-            grossProfit=10_000,
-            swap=0,
-            commission=0,
-            balance=1_000_000,
-            balanceVersion=100,
-            moneyDigits=2,
-        ),
-    )
-    return on_us100(
-        [
-            make_event(om.ORDER_ACCEPTED, order(closed - 1), position=position(closed - 1)),
-            make_event(
-                om.ORDER_FILLED,
-                order(closed),
-                position=position(closed, om.POSITION_STATUS_CLOSED),
-                deal=deal,
-            ),
-        ],
-    )
 
 
 async def test_a_close_answered_during_a_rebuild_is_still_the_nodes() -> None:

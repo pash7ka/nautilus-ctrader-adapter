@@ -7,7 +7,7 @@ given, so the same input always gives the same records.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_EVEN, Decimal
 
@@ -194,6 +194,40 @@ def reconcile(
         positions=tuple(positions),
         notices=tuple(notices),
     )
+
+
+def one_position(
+    snapshot: oa.ProtoOAReconcileRes,
+    position_id: int,
+    found: PositionHistory,
+    precision: Callable[[int], int | None],
+    known_closes: Mapping[int, str],
+    operations: Operations,
+) -> Reconciliation:
+    """`reconcile` of position `position_id` alone, open or closed, from its own lists `found`.
+
+    Each of its deals counts as in the window, so a closed position is taken too.
+    """
+    alone = oa.ProtoOAReconcileRes(
+        ctidTraderAccountId=snapshot.ctidTraderAccountId,
+        position=[p for p in snapshot.position if p.positionId == position_id],
+        order=[o for o in snapshot.order if o.positionId == position_id],
+    )
+    return reconcile(alone, {position_id: found}, found.deals, precision, known_closes, operations)
+
+
+def entry_named(orders: Iterable[om.ProtoOAOrder], client_order_id: str) -> om.ProtoOAOrder | None:
+    """The broker order that the node's entry or market order `client_order_id` became.
+
+    Told by the node's record in its `label`. A protective or closing order is never taken,
+    though either may carry the entry's ids.
+    """
+    for order in orders:
+        if order.closingOrder or order.orderType == om.STOP_LOSS_TAKE_PROFIT:
+            continue
+        if order_record.parse_label(order.tradeData.label) == client_order_id:
+            return order
+    return None
 
 
 def unfilled_order(
