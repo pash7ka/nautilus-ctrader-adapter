@@ -174,6 +174,13 @@ class BrokerState:
     requests: int
 
 
+class _Buffered:
+    """An execution event held while the venue model is rebuilt; it is applied later."""
+
+
+_BUFFERED = _Buffered()
+
+
 @dataclass(frozen=True)
 class _Refused:
     """A request the broker refused, or one that never left."""
@@ -274,6 +281,11 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._protection_timers: set[asyncio.TimerHandle] = set()
         # Execution events held while the model is rebuilt, or `None` when it stands.
         self._buffer: list[oa.ProtoOAExecutionEvent] | None = None
+        # Set whenever no buffer is held, so an amend whose answer was held can wait for it.
+        self._model_standing = asyncio.Event()
+        self._model_standing.set()
+        # Closes whose answer the connection lost: in flight until the next reconnect pass.
+        self._lost_closes: set[str] = set()
         # The start's mass status the held events wait on, and how long they wait at most.
         self._awaited_report: UUID4 | None = None
         self._release_timer: asyncio.TimerHandle | None = None
@@ -296,19 +308,20 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._instrument_provider.initialize()
             session = self._account.session
             assert session is not None  # `connect()` returned, so the session is up
-            trader = await self._trader()
-            check_account(trader)
-            self._currency = Currency.from_str(self._account.deposit_asset.name)
             self._balance_version = -1
-            self._take_trader(trader)
-            # Attached only once the account is known, and before the rebuild, whose buffer
-            # holds the execution events that come meanwhile.
+            # Attached before the account is read, so an account event right behind that read
+            # is applied; execution events wait in the buffer until the model stands.
+            self._hold_buffer()
             self._session = session
             self._msgbus.subscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
             session.add_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
             session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
             session.add_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
             session.add_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
+            trader = await self._trader()
+            check_account(trader)
+            self._currency = Currency.from_str(self._account.deposit_asset.name)
+            self._take_trader(trader)
             await self._load()
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
@@ -334,6 +347,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._stop_awaiting()
         # Whatever it held is dropped: its next connect rebuilds anew.
         self._buffer = None
+        self._model_standing.set()
+        self._end_lost_closes()
         session, self._session = self._session, None
         if session is None:
             return
@@ -345,12 +360,36 @@ class CTraderExecutionClient(LiveExecutionClient):
         session.remove_restore(self._restore_key)
 
     async def _reload(self) -> None:
-        """Rebuild the model on a reconnect: the broker may have changed meanwhile."""
+        """Reconcile again on a reconnect: the broker may have changed meanwhile.
+
+        The pass is the start's, over the start's fill window. Nautilus reconciles its mass
+        status at once and turns what changed into events; the execution events held meanwhile
+        are applied after that.
+        """
         self._log.warning("Rebuilding the venue model after a reconnect")
-        trader = await self._trader()
-        self._take_trader(trader)
-        await self._load()
+        # This pass's own mass status supersedes a start's still awaited; one release serves both.
+        self._stop_awaiting()
+        self._hold_buffer()
+        try:
+            self._take_trader(await self._trader())
+            status = await self._reconcile_pass(self._since_ms(self._lookback_mins))
+            # Reported under the node's id if it reached the broker; never in flight past this.
+            self._end_lost_closes()
+            self._send_mass_status_report(status)
+        except BaseException:
+            self._release_buffer()
+            raise
+        self._refresh_checkpoint()
+        self._release_buffer()
         self._emit_account_state(self._clock.timestamp_ns())
+
+    def _refresh_checkpoint(self) -> None:
+        """Rewrite the balance checkpoint; not kept yet."""
+
+    def _end_lost_closes(self) -> None:
+        for client_order_id in self._lost_closes:
+            self._operations.end_close(client_order_id)
+        self._lost_closes.clear()
 
     # -- Reconciliation -------------------------------------------------------------------------
 
@@ -368,13 +407,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         Returns `None`, with a WARNING, when a request of the read fails.
         """
         self._lookback_mins = lookback_mins
-        self._hold_buffer()
+        margins = dict(self._margins)
         try:
-            state = await self._read_broker(since_ms=self._since_ms(lookback_mins))
-            margins = dict(self._margins)
-            self._stand(state)
-            status = self._mass_status(state)
-            self._write_exposure()
+            status = await self._reconcile_pass(self._since_ms(lookback_mins))
         except CTraderError as e:
             self._release_buffer()
             self._log.warning(f"Reconciliation failed, so nothing is reported: {e}")
@@ -384,13 +419,26 @@ class CTraderExecutionClient(LiveExecutionClient):
             raise
         if self._margins != margins:
             self._emit_account_state(self._clock.timestamp_ns())
+        self._await_reconciliation(status.id)
+        return status
+
+    async def _reconcile_pass(self, since_ms: int) -> ExecutionMassStatus:
+        """Read the broker once, rebuild the venue model and write the unloaded exposure.
+
+        Leaves the buffer held: the caller releases it once Nautilus has the returned mass
+        status, or when this raises.
+        """
+        self._hold_buffer()
+        state = await self._read_broker(since_ms=since_ms)
+        self._stand(state)
+        status = self._mass_status(state)
+        self._write_exposure()
         fills = sum(len(found) for found in status.fill_reports.values())
         positions = sum(len(found) for found in status.position_reports.values())
         self._log.info(
             f"Reconciliation read the broker in {state.requests} requests: "
             f"{len(status.order_reports)} orders, {fills} fills, {positions} positions",
         )
-        self._await_reconciliation(status.id)
         return status
 
     # Answering a query for one order is not built yet; Nautilus resolves orders in flight
@@ -522,6 +570,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         # A rebuild that starts while another holds the buffer joins it.
         if self._buffer is None:
             self._buffer = []
+        self._model_standing.clear()
 
     def _await_reconciliation(self, report_id: UUID4) -> None:
         self._stop_awaiting()
@@ -553,13 +602,16 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Apply the execution events held meanwhile, in order; a second call does nothing."""
         self._stop_awaiting()
         held, self._buffer = self._buffer, None
-        # A client detached meanwhile must start nothing; its next connect rebuilds anew.
-        if held is None or self._session is None:
-            return
-        for event in held:
-            self._on_execution_event(event)
-        # A protective order that came during an outage arrives with the rebuild, no event.
-        self._settle_brackets()
+        try:
+            # A client detached meanwhile must start nothing; its next connect rebuilds anew.
+            if held is None or self._session is None:
+                return
+            for event in held:
+                self._on_execution_event(event)
+            # A protective order that came during an outage arrives with the rebuild, no event.
+            self._settle_brackets()
+        finally:
+            self._model_standing.set()
 
     def _write_exposure(self) -> None:
         """Write what stands on unloaded symbols to the cache, whole.
@@ -794,6 +846,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._emit_account_state(self._clock.timestamp_ns())
 
     def _emit_account_state(self, ts_event: int) -> None:
+        if self._currency is None:
+            # An account event before the account was read; `_connect` states it once it is.
+            return
         margins: dict[InstrumentId | None, Decimal] = {}
         for symbol_id, margin in self._margins.values():
             instrument = self._instrument_provider.instrument_for_symbol_id(symbol_id)
@@ -812,14 +867,15 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     # -- Execution events -----------------------------------------------------------------------
 
-    def _on_execution_event(self, event: oa.ProtoOAExecutionEvent) -> list[Record]:
+    def _on_execution_event(self, event: oa.ProtoOAExecutionEvent) -> list[Record] | _Buffered:
         """The one way an execution event reaches the model, pushed or as a request's response.
 
-        Returns the records it produced, so a command can tell what its response meant.
+        Returns the records it produced, so a command can tell what its response meant, or
+        `_BUFFERED` while a rebuild holds it.
         """
         if self._buffer is not None:
             self._buffer.append(event)
-            return []
+            return _BUFFERED
         try:
             records = self._book.apply(event, self._operations)
         except Exception as e:
@@ -1070,6 +1126,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._clock.timestamp_ns(),
         )
         self._log.info(f"Close {client_order_id} of position {position_id} sent")
+        outcome: Message | _Refused | None = None
         try:
             outcome = await self._send(request)
             if isinstance(outcome, _Refused):
@@ -1089,7 +1146,11 @@ class CTraderExecutionClient(LiveExecutionClient):
             else:
                 self._on_execution_event(outcome)
         finally:
-            self._operations.end_close(client_order_id)
+            if outcome is None and not self._connected():
+                # The answer went with the connection: the reconnect pass may find the close.
+                self._lost_closes.add(client_order_id)
+            else:
+                self._operations.end_close(client_order_id)
 
     def _position_to_close(self, command: SubmitOrder) -> tuple[int, PositionSide]:
         if command.position_id is None:
@@ -1412,10 +1473,26 @@ class CTraderExecutionClient(LiveExecutionClient):
                 if isinstance(outcome, _Refused):
                     return outcome
                 if isinstance(outcome, oa.ProtoOAExecutionEvent):
-                    return self._on_execution_event(outcome)
+                    records = self._on_execution_event(outcome)
+                    if isinstance(records, _Buffered):
+                        # Still in flight while it waits, so the answer is read as the node's.
+                        await self._wait_for_model()
+                        return []
+                    return records
                 return []
             finally:
                 self._operations.end_amend(position_id)
+
+    async def _wait_for_model(self) -> None:
+        """Wait for the rebuilt model, with the events it held applied."""
+        wait_secs = self._config.connect_timeout_secs
+        try:
+            await asyncio.wait_for(self._model_standing.wait(), wait_secs)
+        except TimeoutError:
+            self._log.warning(
+                f"The venue model was not rebuilt within {wait_secs:g}s; an amend's answer is "
+                "read from the model as it stands",
+            )
 
     def _drop_amend_locks(self) -> None:
         """Forget the lock of each position no longer open; an amend there is refused anyway."""

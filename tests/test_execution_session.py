@@ -17,6 +17,7 @@ from nautilus_trader.model.objects import Money, Price
 
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+from tests.account_venue import ACCOUNT_ID
 from tests.execution_replay import FIRST, PENDING, SECOND, as_ours, events
 from tests.execution_venue import (
     ENTRY,
@@ -33,6 +34,7 @@ from tests.execution_venue import (
     submit_bracket,
     submitted,
     sync,
+    trader,
 )
 from tests.polling import wait_until
 
@@ -130,4 +132,21 @@ async def test_a_bracket_the_node_sends_and_a_trader_then_handles_ends_as_record
         assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
         assert h.cache.position(PositionId(str(FIRST))).is_closed
         assert len(h.client._brackets) == 0
+        assert h.logger.errors() == []
+
+
+async def test_an_account_event_right_behind_the_trader_read_is_applied() -> None:
+    execution_venue = ExecutionVenue()
+    execution_venue.trader = trader(balance=100_000, balanceVersion=10)
+    pushed = trader(balance=123_456, balanceVersion=11).trader
+    execution_venue.server.on(
+        om.PROTO_OA_TRADER_REQ,
+        lambda _r: [
+            execution_venue.trader,
+            oa.ProtoOATraderUpdatedEvent(ctidTraderAccountId=ACCOUNT_ID, trader=pushed),
+        ],
+    )
+    async with harness(execution_venue=execution_venue) as h:
+        assert h.states[-1].balances[0].total == Money(Decimal("1234.56"), USD)
+        assert all(state.base_currency == USD for state in h.states)
         assert h.logger.errors() == []

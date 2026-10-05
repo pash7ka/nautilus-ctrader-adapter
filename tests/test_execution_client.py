@@ -581,7 +581,9 @@ async def test_a_query_answered_with_an_older_balance_never_takes_it_back() -> N
         assert balance_of(h.states[-1]) == Decimal("10000.00")
 
 
-async def test_an_account_event_before_the_account_is_read_is_left_to_that_read() -> None:
+async def test_an_account_event_during_the_account_read_is_stated_once_the_account_is_known() -> (
+    None
+):
     async with harness(connect=False) as h:
         # Another user of the account brings it up, so the client's own trader read is the
         # first one held.
@@ -597,7 +599,8 @@ async def test_an_account_event_before_the_account_is_read_is_left_to_that_read(
             await connecting
 
             assert h.logger.errors() == []
-            assert len(h.states) == 1
+            assert all(state.base_currency == USD for state in h.states)
+            assert balance_of(h.states[-1]) == Decimal("10000.00")
         finally:
             await h.account.disconnect()
 

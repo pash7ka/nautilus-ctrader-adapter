@@ -18,13 +18,17 @@ from decimal import Decimal
 import pytest
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import GenerateOrderStatusReports
+from nautilus_trader.execution.messages import (
+    GenerateOrderStatusReports,
+    ModifyOrder,
+    SubmitOrder,
+)
 from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import ContingencyType, OrderStatus, OrderType
+from nautilus_trader.model.enums import ContingencyType, OrderSide, OrderStatus, OrderType
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import ClientOrderId, PositionId, TradeId, VenueOrderId
-from nautilus_trader.model.objects import Money, Price
+from nautilus_trader.model.objects import Money, Price, Quantity
 
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.execution_reports import mass_status
@@ -51,11 +55,14 @@ from tests.execution_venue import (
     ENTRY,
     FIRST_EVENTS,
     STOP,
+    STRATEGY_ID,
     TARGET,
+    TRADER_ID,
     US100_ID,
     US100_SYMBOL_ID,
     ExecutionVenue,
     Harness,
+    exec_config,
     harness,
     on_us100,
     push,
@@ -436,15 +443,19 @@ EURUSD_SYMBOL_ID = 1  # not loaded by the harness
 MINUTE_MS = 60_000
 
 
+def serve(venue: ExecutionVenue, at: float) -> None:
+    """Make the venue's snapshot and lists the node's first position at timeline time `at`."""
+    snapshot, histories, deals = broker_lists(at)
+    venue.snapshot = snapshot
+    venue.position_orders = {pid: list(found.orders) for pid, found in histories.items()}
+    venue.position_deals = {pid: list(found.deals) for pid, found in histories.items()}
+    venue.deals = list(deals)
+
+
 def serving(at: float = OPEN_AT) -> ExecutionVenue:
     """A venue whose snapshot and lists are the node's first position at timeline time `at`."""
     venue = ExecutionVenue()
-    snapshot, histories, deals = broker_lists(at)
-    venue.snapshot = snapshot
-    for position_id, found in histories.items():
-        venue.position_orders[position_id] = list(found.orders)
-        venue.position_deals[position_id] = list(found.deals)
-    venue.deals = list(deals)
+    serve(venue, at)
     return venue
 
 
@@ -686,3 +697,234 @@ async def test_reports_outside_a_mass_status_never_carry_a_filled_order() -> Non
             ClientOrderId(STOP),
             ClientOrderId(TARGET),
         }
+
+
+# -- Reconnect ---------------------------------------------------------------------------------
+
+TP_BACK_AT = 256.5  # FIRST open, its take-profit set again by hand
+OURS = 5_300_001
+CLOSE = "O-C-5300001"
+
+
+async def started(h: Harness) -> ExecutionMassStatus:
+    """The start's reconciliation, reconciled by the engine as a node would."""
+    built = await h.client.generate_mass_status()
+    h.engine.reconcile_execution_mass_status(built)
+    return built
+
+
+async def test_reconnect_sends_a_mass_status_not_events() -> None:
+    venue = serving(TP_BACK_AT)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        assert status(h, TARGET) == OrderStatus.ACCEPTED
+
+        # What the broker holds once the session is back.
+        serve(venue, REMOVED_AT)
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        # The cancel came from the engine's reconciliation, not from the client.
+        assert "OrderCanceled" not in h.kinds_of(TARGET)
+        assert any("Rebuilding the venue model" in line for line in h.logger.warnings())
+
+
+async def test_a_reconnect_during_the_start_wait_releases_after_its_own_mass_status() -> None:
+    venue = serving()
+    async with harness(execution_venue=venue) as h:
+        h.client._reconciled_wait_secs = 60.0
+        assert await h.client.generate_mass_status() is not None
+        # Nautilus has not reconciled the start's mass status yet.
+        await push(h, *FIRST_EVENTS[-2:])
+        held_when_reconciled: list[int] = []
+        h.client._msgbus.subscribe(
+            topic=f"reports.execution.{CTRADER_VENUE}",
+            handler=lambda _status: held_when_reconciled.append(len(h.client._buffer or [])),
+        )
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+
+        # The start's wait is over once the reconnect pass runs; its timer can release nothing.
+        assert h.client._awaited_report is None
+        assert h.client._release_timer is None
+        assert len(h.client._buffer) == 2
+        await held.stop_holding()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        assert held_when_reconciled == [2]
+        assert h.client._buffer is None
+        await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
+        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+
+
+def our_market_position(venue: ExecutionVenue, *, opened: int, closed: int | None = None) -> None:
+    """The node's market order on `US100.cash`, filled at `opened`; closed at `closed` if given."""
+    entry_id = "O-M-5300001"
+    entry = make_order(
+        6_300_001,
+        OURS,
+        utc=opened,
+        label=order_record.encode_label(entry_id),
+        comment=order_record.encode_comment(LegIds(None, None)),
+        client_order_id=entry_id,
+        symbol=US100_SYMBOL_ID,
+    )
+    entry.orderStatus = om.ORDER_STATUS_FILLED
+    orders = [entry]
+    deals = [
+        make_deal(7_300_001, 6_300_001, OURS, side=om.BUY, volume=100, price=85000.0, ts=opened)
+    ]
+    venue.snapshot = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
+    if closed is None:
+        position = make_position(OURS, symbol=US100_SYMBOL_ID)
+        position.price = 85000.0
+        position.utcLastUpdateTimestamp = opened
+        venue.snapshot.position.append(position)
+    else:
+        close = make_order(
+            6_300_002, OURS, side=om.SELL, closing=True, utc=closed, symbol=US100_SYMBOL_ID
+        )
+        close.orderStatus = om.ORDER_STATUS_FILLED
+        orders.append(close)
+        deals.append(
+            make_deal(
+                7_300_002, 6_300_002, OURS, side=om.SELL, volume=100, price=85100.0, ts=closed
+            ),
+        )
+    venue.position_orders = {OURS: orders}
+    venue.position_deals = {OURS: on_us100(deals)}
+    venue.deals = on_us100(deals)
+
+
+async def test_a_close_in_flight_across_a_reconnect_keeps_the_node_id() -> None:
+    # Hand-built: the recording holds no close of the node's.
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        position_id = PositionId(str(OURS))
+        assert h.cache.position(position_id).is_open
+        order = h.factory.market(
+            US100_ID,
+            OrderSide.SELL,
+            Quantity.from_str("1.00"),
+            reduce_only=True,
+            client_order_id=ClientOrderId(CLOSE),
+        )
+        h.cache.add_order(order, position_id=position_id)
+        # The venue never answers the close.
+        closing = asyncio.create_task(
+            h.client._submit_order(
+                SubmitOrder(
+                    trader_id=TRADER_ID,
+                    strategy_id=STRATEGY_ID,
+                    order=order,
+                    command_id=UUID4(),
+                    ts_init=0,
+                    position_id=position_id,
+                ),
+            ),
+        )
+        await wait_until(lambda: len(h.received(oa.ProtoOAClosePositionReq)) == 1)
+
+        our_market_position(venue, opened=now - 120_000, closed=now - 60_000)
+        await h.server.drop_connections()
+        await asyncio.wait_for(closing, timeout=10)
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+
+        (built,) = h.mass_statuses
+        assert built.order_reports[VenueOrderId("6300002")].client_order_id == ClientOrderId(CLOSE)
+        assert not any(UUID_SHAPED.match(o.client_order_id.value) for o in h.cache.orders())
+        assert status(h, CLOSE) == OrderStatus.FILLED
+        assert h.cache.position(position_id).is_closed
+        assert h.client._operations.closing(OURS, 100) is None
+
+
+def target_moved_to(price: float) -> oa.ProtoOAExecutionEvent:
+    """The broker's answer to an amend moving the take-profit of the position at `OPEN_AT`."""
+    at = snapshot_at(OPEN_AT).position[0].utcLastUpdateTimestamp
+    (last,) = [
+        e
+        for e in FIRST_EVENTS
+        if e.executionType == om.ORDER_REPLACED and e.order.utcLastUpdateTimestamp == at
+    ]
+    event = type(last)()
+    event.CopyFrom(last)
+    event.isServerEvent = False
+    event.order.limitPrice = price
+    event.order.utcLastUpdateTimestamp = at + 1_000
+    event.position.takeProfit = price
+    event.position.utcLastUpdateTimestamp = at + 1_000
+    return event
+
+
+async def test_an_amend_answered_during_a_rebuild_reads_the_rebuilt_view() -> None:
+    venue = serving()
+    venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: target_moved_to(85400.0))
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+        rebuilding = asyncio.create_task(h.client._reload())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        modifying = asyncio.create_task(
+            h.client._modify_order(
+                ModifyOrder(
+                    trader_id=TRADER_ID,
+                    strategy_id=STRATEGY_ID,
+                    instrument_id=US100_ID,
+                    client_order_id=ClientOrderId(TARGET),
+                    venue_order_id=None,
+                    quantity=None,
+                    price=Price.from_str("85400.00"),
+                    trigger_price=None,
+                    command_id=UUID4(),
+                    ts_init=0,
+                ),
+            ),
+        )
+        await wait_until(lambda: len(h.client._buffer or []) == 1)
+
+        await held.stop_holding()
+        await asyncio.wait_for(rebuilding, timeout=10)
+        await asyncio.wait_for(modifying, timeout=10)
+
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
+        )
+        assert "OrderModifyRejected" not in h.kinds_of(TARGET)
+        assert h.kinds_of(TARGET)[-1] == "OrderUpdated"
+        assert h.logger.errors() == []
+
+
+async def test_an_amend_waits_for_the_model_no_longer_than_the_connect_timeout() -> None:
+    async with harness(config=exec_config(connect_timeout_secs=0.1)) as h:
+        h.client._hold_buffer()
+
+        await asyncio.wait_for(h.client._wait_for_model(), timeout=5)
+
+        assert any("not rebuilt within 0.1s" in line for line in h.logger.warnings())
+
+
+async def test_a_failed_reconnect_pass_releases_the_buffer() -> None:
+    venue = serving()
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
+
+        await h.server.drop_connections()
+        await wait_until(lambda: any("Restore" in line for line in h.logger.errors()))
+
+        assert h.client._buffer is None
+        assert h.client._model_standing.is_set()
+        assert h.mass_statuses == []

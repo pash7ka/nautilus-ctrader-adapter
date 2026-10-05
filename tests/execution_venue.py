@@ -240,6 +240,7 @@ class Harness:
     states: list
     activity: list
     logger: RecordingLogger
+    mass_statuses: list
 
     @property
     def server(self) -> FakeCTraderServer:
@@ -268,7 +269,7 @@ async def harness(
     A given `cache` stands for one a restarted node reloads from a persistent backend.
 
     What the client sends Nautilus is recorded on the way in: order events, execution reports,
-    account states, and the account activity published on the message bus.
+    mass statuses, account states, and the account activity published on the message bus.
     """
     execution_venue = execution_venue or ExecutionVenue()
     server = execution_venue.server
@@ -297,6 +298,7 @@ async def harness(
     reports: list = []
     states: list = []
     activity: list = []
+    mass_statuses: list = []
 
     def recorded(store: list, handler):
         def handle(message) -> object:
@@ -308,6 +310,11 @@ async def harness(
     for endpoint, store, handler in (
         ("ExecEngine.process", events, engine.process),
         ("ExecEngine.reconcile_execution_report", reports, engine.reconcile_execution_report),
+        (
+            "ExecEngine.reconcile_execution_mass_status",
+            mass_statuses,
+            engine.reconcile_execution_mass_status,
+        ),
         ("Portfolio.update_account", states, portfolio.update_account),
     ):
         msgbus.deregister(endpoint=endpoint, handler=handler)
@@ -338,6 +345,7 @@ async def harness(
         states,
         activity,
         logger,
+        mass_statuses,
     )
     try:
         if connect:
