@@ -122,12 +122,7 @@ async def test_a_bracket_the_node_sends_and_a_trader_then_handles_ends_as_record
         await push(h, *FIRST_EVENTS[3:])
         await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
 
-        # The venue answers with the acceptance and pushes the fill right behind it; the fill can
-        # be applied first, and the late acceptance then has nothing new to report.
-        assert h.kinds_of(ENTRY) in (
-            ["OrderSubmitted", "OrderFilled"],
-            ["OrderSubmitted", "OrderAccepted", "OrderFilled"],
-        )
+        assert h.kinds_of(ENTRY) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
         assert h.kinds_of(TARGET) == ["OrderSubmitted", "OrderAccepted", "OrderCanceled"]
         stop = h.cache.order(h.cache.client_order_id(VenueOrderId("6000001-SL")))
         assert stop.client_order_id.value == STOP

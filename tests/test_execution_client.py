@@ -353,7 +353,7 @@ async def test_a_response_applied_after_a_later_event_reports_each_step_once() -
         h.client._on_execution_event(filled)
         await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
 
-        assert h.kinds_of(ENTRY) == ["OrderSubmitted", "OrderFilled"]
+        assert h.kinds_of(ENTRY) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
         assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderAccepted"]
 
 

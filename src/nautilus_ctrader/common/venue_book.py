@@ -697,11 +697,15 @@ class VenueBook:
             position.entry_accepted = True
             return [OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, entry_id, ts)]
         if kind in _FILLS:
-            position.entry_accepted = True
+            records: list[Record] = []
+            if not position.entry_accepted:
+                # The acceptance can be applied after the fill, or never come: it is told here.
+                position.entry_accepted = True
+                records.append(OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, entry_id, ts))
             fill = self._fill(event.deal, precision)
-            records: list[Record] = [
+            records.append(
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, entry_id, fill.ts_ms, fill=fill),
-            ]
+            )
             if position.protective_order_id is not None:
                 # The protective order came first: its levels accept the legs now, at the deal's
                 # time so that they never predate the fill.
@@ -955,11 +959,16 @@ class VenueBook:
             self._closes_accepted.add(order.orderId)
             return [OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, close_id, ts)]
         if kind in _FILLS:
-            self._closes_accepted.add(order.orderId)
+            records: list[Record] = []
+            if order.orderId not in self._closes_accepted:
+                # As for an entry: the acceptance can be applied after the fill.
+                self._closes_accepted.add(order.orderId)
+                records.append(OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, close_id, ts))
             fill = self._fill(event.deal, precision)
-            return [
+            records.append(
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, close_id, fill.ts_ms, fill=fill)
-            ]
+            )
+            return records
         if kind in _ENDED:
             return [
                 OrderEvent(
