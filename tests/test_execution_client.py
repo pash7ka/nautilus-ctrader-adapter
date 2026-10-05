@@ -90,6 +90,7 @@ def test_the_config_carries_no_instrument_settings() -> None:
         {"environment": "staging"},
         {"reference_price_max_age_secs": 0.0},
         {"protective_order_timeout_secs": -1.0},
+        {"order_request_timeout_secs": 0.0},
     ],
 )
 def test_the_config_refuses_bad_values(overrides) -> None:
@@ -102,6 +103,7 @@ def test_the_config_defaults() -> None:
 
     assert config.reference_price_max_age_secs == 10.0
     assert config.protective_order_timeout_secs == 2.0
+    assert config.order_request_timeout_secs == 30.0
     assert config.environment == "auto"
 
 
@@ -810,6 +812,19 @@ async def test_an_order_without_an_answer_is_never_sent_again() -> None:
         await sync(h)
 
         assert len(h.received(oa.ProtoOANewOrderReq)) == 1
+        assert status(h, MARKET_ID) == OrderStatus.SUBMITTED
+        assert any("not resent" in line for line in h.logger.warnings())
+
+
+async def test_an_order_waits_for_its_answer_as_long_as_configured() -> None:
+    # The venue never answers a new order.
+    async with harness(config=exec_config(order_request_timeout_secs=0.3)) as h:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await submit(h, market(h))
+        waited = loop.time() - started
+
+        assert 0.3 <= waited < 2.0
         assert status(h, MARKET_ID) == OrderStatus.SUBMITTED
         assert any("not resent" in line for line in h.logger.warnings())
 

@@ -836,7 +836,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         if session is None or not session.is_ready:
             return _Refused(_NOT_CONNECTED, retryable=True)
         try:
-            response = await session.request(request)
+            response = await session.request(
+                request, timeout_secs=self._config.order_request_timeout_secs
+            )
         except CTraderRequestError as e:
             return _Refused(
                 _reason(e.error_code, e.description),

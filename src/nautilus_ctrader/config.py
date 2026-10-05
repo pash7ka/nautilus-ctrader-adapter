@@ -163,6 +163,9 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     protective_order_timeout_secs : float, default 2.0
         How long after a bracket's fill to wait for the broker's protective order before
         setting the levels by an amend.
+    order_request_timeout_secs : float, default 30.0
+        Response timeout for an order, a close or a level amend. An order or a close with no
+        answer by then is never resent, so a slow answer must not be taken for a lost one.
 
     Raises
     ------
@@ -188,6 +191,7 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     restore_retry_interval_secs: float = 30.0
     reference_price_max_age_secs: float = 10.0
     protective_order_timeout_secs: float = 2.0
+    order_request_timeout_secs: float = 30.0
 
     def __post_init__(self) -> None:
         if self.instrument_provider != InstrumentProviderConfig():
@@ -200,7 +204,11 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
             raise ValueError(
                 f"environment must be one of {ENVIRONMENTS}, got {self.environment!r}",
             )
-        for name in ("reference_price_max_age_secs", "protective_order_timeout_secs"):
+        for name in (
+            "reference_price_max_age_secs",
+            "protective_order_timeout_secs",
+            "order_request_timeout_secs",
+        ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
 
