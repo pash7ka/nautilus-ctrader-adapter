@@ -927,10 +927,15 @@ class CTraderExecutionClient(LiveExecutionClient):
             for client_order_id in legs.values():
                 self._cancel_rejected(client_order_id, outcome.reason)
             return
+        # Answered from what the broker holds now, not from what was asked.
+        view = self._book.view(position_id)
         ts_ms = self._clock.timestamp_ms()
-        for level in legs:
-            # A level the broker did not hold was not in its answer: nothing cancelled the leg.
-            self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
+        for level, client_order_id in legs.items():
+            if view is not None and level in view.levels:
+                self._cancel_rejected(client_order_id, "the broker kept the level")
+            else:
+                # A level the broker did not hold was not in its answer: nothing cancelled the leg.
+                self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
 
     async def _modify_order(self, command: ModifyOrder) -> None:
         client_order_id = command.client_order_id
@@ -974,6 +979,16 @@ class CTraderExecutionClient(LiveExecutionClient):
         outcome = await self._amend(found[0], lambda view: {**view.levels, level: wanted})
         if isinstance(outcome, _Refused):
             self._modify_rejected(client_order_id, outcome.reason)
+            return
+        view = self._book.view(found[0])
+        held_price = None if view is None else view.levels.get(level)
+        if held_price != wanted:
+            reason = (
+                "the broker holds no such level"
+                if held_price is None
+                else f"the broker kept the level at {held_price}"
+            )
+            self._modify_rejected(client_order_id, reason)
             return
         updated = any(
             isinstance(r, OrderEvent)

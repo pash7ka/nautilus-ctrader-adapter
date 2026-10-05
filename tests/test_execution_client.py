@@ -1202,6 +1202,46 @@ async def test_a_cancel_the_broker_refuses_is_rejected_and_the_level_stays() -> 
         assert Level.STOP_LOSS in h.client._book.view(FIRST).levels
 
 
+def keep_levels(execution_venue: ExecutionVenue) -> list:
+    """The broker answers every amend by replacing the protective order, its levels unchanged."""
+    amends: list = []
+
+    def answer(request):
+        amends.append(request)
+        return protective(85197.2, 85387.22, utc=AMEND_FROM + len(amends))
+
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, answer)
+    return amends
+
+
+async def test_a_cancel_whose_level_the_broker_keeps_is_rejected() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = keep_levels(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._cancel_order(cancel(STOP))
+        await wait_until(lambda: last_kind(h, STOP) == "OrderCancelRejected")
+
+        assert len(amends) == 1
+        assert "OrderCanceled" not in h.kinds_of(STOP)
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+
+
+async def test_a_modify_whose_level_the_broker_keeps_is_rejected() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = keep_levels(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderModifyRejected")
+
+        assert len(amends) == 1
+        (event,) = [e for e in h.events_of(TARGET) if type(e).__name__ == "OrderModifyRejected"]
+        assert "85387.22" in event.reason
+        assert "OrderUpdated" not in h.kinds_of(TARGET)
+        assert h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85387.22")
+
+
 async def test_cancel_all_removes_a_positions_levels_in_one_amend() -> None:
     execution_venue = answered(FIRST_EVENTS[:3])
     amends = echo_amends(execution_venue)
