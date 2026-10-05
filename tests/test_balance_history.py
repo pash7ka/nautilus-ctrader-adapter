@@ -19,6 +19,7 @@ from nautilus_ctrader.common.balance_history import (
     OFF,
     BalanceChange,
     CheckpointValue,
+    MissingField,
     Reason,
     balance_at,
     change_of_cash_flow,
@@ -28,6 +29,7 @@ from nautilus_ctrader.common.balance_history import (
     next_checkpoint,
     value_json,
 )
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.execution_replay import RECORDING
 
 TRADER_BALANCE = 5_122_378_460
@@ -41,14 +43,17 @@ def deals():
     return [deal for page in RECORDING["closing"]["account_deals"] for deal in page.deal]
 
 
-def recorded_changes() -> list[BalanceChange]:
-    closing = [change for change in map(change_of_deal, deals()) if change is not None]
-    cash_flow = [
-        change_of_cash_flow(operation)
+def operations():
+    return [
+        operation
         for page in RECORDING["closing"]["cash_flow"]
         for operation in page.depositWithdraw
     ]
-    return closing + cash_flow
+
+
+def recorded_changes() -> list[BalanceChange]:
+    closing = [change for change in map(change_of_deal, deals()) if change is not None]
+    return closing + [change_of_cash_flow(operation) for operation in operations()]
 
 
 def value(t_ms: int, changes=None, **overrides):
@@ -210,6 +215,7 @@ def test_a_cash_flow_chains_with_either_sign():
         delta=1000,
         money_digits=2,
         cash_flow=True,
+        deposit=False,
     )
     trader = {"trader_version": 7, "trader_balance": TRADER_BALANCE - 1000}
 
@@ -237,6 +243,12 @@ def test_the_trader_balance_must_match_its_version():
     checkpoint = value(1_600_000_400_000, trader_balance=TRADER_BALANCE + 1)
 
     assert checkpoint.reason == Reason.NO_CHAIN
+
+
+def test_the_trader_balance_must_match_an_anchor_at_its_version():
+    # After the last change, so that change is the anchor itself.
+    assert value(1_600_000_700_000).balance == TRADER_BALANCE
+    assert value(1_600_000_700_000, trader_balance=TRADER_BALANCE + 1).reason == Reason.NO_CHAIN
 
 
 def test_no_change_in_the_week_needs_earlier():
@@ -273,11 +285,47 @@ def test_mixed_money_scales():
 
     assert value(1_600_000_400_000, changes).reason == Reason.MIXED_SCALES
     assert value(1_600_000_400_000, trader_money_digits=3).reason == Reason.MIXED_SCALES
+    # No single scale to state it in.
+    assert value(1_600_000_400_000, changes).first_deposit is None
 
 
 def test_first_deposit():
     assert first_deposit(recorded_changes()).balance == DEPOSIT
     assert first_deposit([change for change in recorded_changes() if not change.cash_flow]) is None
+
+
+def test_the_first_deposit_is_told_by_the_operation_type():
+    (operation,) = operations()
+    assert operation.operationType == om.BALANCE_DEPOSIT
+    assert change_of_cash_flow(operation).deposit is True
+    assert {change_of_deal(deal).deposit for deal in deals() if change_of_deal(deal)} == {None}
+
+    other = om.ProtoOADepositWithdraw()
+    other.CopyFrom(operation)
+    other.operationType = om.BALANCE_DEPOSIT_TRANSFER
+    changes = [change_of_cash_flow(other) if c.cash_flow else c for c in recorded_changes()]
+
+    # Its balance equals its delta, yet it is not a deposit.
+    assert change_of_cash_flow(other).deposit is False
+    assert first_deposit(changes) is None
+    t_ms, registration = 1_599_100_000_000, 1_599_000_000_000
+    assert value(t_ms, changes, registration_ms=registration).reason == Reason.NO_CHAIN
+
+
+@pytest.mark.parametrize("field", ["balanceVersion", "moneyDigits"])
+def test_an_item_without_a_version_or_scale_is_refused_by_name(field):
+    deal = om.ProtoOADeal()
+    deal.CopyFrom(next(deal for deal in deals() if deal.HasField("closePositionDetail")))
+    deal.closePositionDetail.ClearField(field)
+    operation = om.ProtoOADepositWithdraw()
+    operation.CopyFrom(operations()[0])
+    operation.ClearField(field)
+
+    for convert, item in ((change_of_deal, deal), (change_of_cash_flow, operation)):
+        with pytest.raises(MissingField) as refused:
+            convert(item)
+        assert refused.value.field == field
+        assert isinstance(refused.value, ValueError)
 
 
 def test_checkpoint_hour_in_utc():

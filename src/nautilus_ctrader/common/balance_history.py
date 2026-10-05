@@ -20,6 +20,8 @@ here judges the value.
   registration. An account registered after `T` did not exist at `T`. One registered at or before
   `T` held zero, provided the chain from zero holds through every change, the first being a
   deposit on a zero balance.
+- **The first deposit** is the earliest cash flow that is a deposit by its operation type and
+  made on a zero balance (its balance equals its amount).
 
 Pure: no I/O and no clock; every function takes the moment it needs.
 """
@@ -49,6 +51,7 @@ class BalanceChange:
     - `balance`: the balance after the change.
     - `delta`: a closing deal's `grossProfit + swap + commission + pnlConversionFee`; a cash
       flow's own `delta`, whose sign the chain decides.
+    - `deposit`: whether a cash flow is a deposit by its operation type; `None` for a deal.
     """
 
     ts_ms: int
@@ -57,12 +60,21 @@ class BalanceChange:
     delta: int | None
     money_digits: int
     cash_flow: bool
+    deposit: bool | None
+
+
+class MissingField(ValueError):
+    """A history item lacks a field the balance cannot be rebuilt without; `field` names it."""
+
+    def __init__(self, message_type: str, field: str) -> None:
+        super().__init__(f"{message_type} without {field}")
+        self.field = field
 
 
 def change_of_deal(deal: om.ProtoOADeal) -> BalanceChange | None:
     """The change a closing deal made, or `None` for a deal that closed nothing.
 
-    Raises `ValueError` if the closing detail lacks `balanceVersion` or `moneyDigits`.
+    Raises `MissingField` if the closing detail lacks `balanceVersion` or `moneyDigits`.
     """
     if not deal.HasField("closePositionDetail"):
         return None
@@ -74,13 +86,14 @@ def change_of_deal(deal: om.ProtoOADeal) -> BalanceChange | None:
         delta=detail.grossProfit + detail.swap + detail.commission + detail.pnlConversionFee,
         money_digits=_required(detail, "moneyDigits"),
         cash_flow=False,
+        deposit=None,
     )
 
 
 def change_of_cash_flow(operation: om.ProtoOADepositWithdraw) -> BalanceChange:
     """The change a cash-flow operation made.
 
-    Raises `ValueError` if the operation lacks `balanceVersion` or `moneyDigits`.
+    Raises `MissingField` if the operation lacks `balanceVersion` or `moneyDigits`.
     """
     return BalanceChange(
         ts_ms=operation.changeBalanceTimestamp,
@@ -89,12 +102,13 @@ def change_of_cash_flow(operation: om.ProtoOADepositWithdraw) -> BalanceChange:
         delta=operation.delta,
         money_digits=_required(operation, "moneyDigits"),
         cash_flow=True,
+        deposit=operation.operationType == om.BALANCE_DEPOSIT,
     )
 
 
 def _required(message, field: str) -> int:
     if not message.HasField(field):
-        raise ValueError(f"{type(message).__name__} without {field}")
+        raise MissingField(type(message).__name__, field)
     return getattr(message, field)
 
 
@@ -204,7 +218,7 @@ def balance_at(
     - `reached_cap`: the history cannot be read further back than `covered_from_ms`.
 
     `first_deposit` is filled whenever a deposit on a zero balance is among `changes`, whatever
-    the status.
+    the status, except with mixed scales: there is no single scale to state it in.
     """
     digits = trader_money_digits
     if any(change.money_digits != digits for change in changes):
@@ -242,13 +256,13 @@ def balance_at(
 
 
 def first_deposit(changes: Sequence[BalanceChange]) -> BalanceChange | None:
-    """The earliest cash flow made on a zero balance, if `changes` hold one."""
+    """The earliest deposit made on a zero balance, if `changes` hold one."""
     deposits = [change for change in changes if _on_zero(change)]
     return min(deposits, key=lambda change: change.version, default=None)
 
 
 def _on_zero(change: BalanceChange) -> bool:
-    return change.cash_flow and change.delta is not None and change.balance == change.delta
+    return bool(change.deposit) and change.delta is not None and change.balance == change.delta
 
 
 def _by_version(changes: Sequence[BalanceChange]) -> list[BalanceChange] | None:
@@ -271,6 +285,8 @@ def _chain(
 
     `version` is `None` for the chain from zero, whose first change has no predecessor.
     """
+    if version == trader_version and balance != trader_balance:
+        return Reason.NO_CHAIN
     for change in after:
         if version is not None and change.version != version + 1:
             return Reason.NO_CHAIN

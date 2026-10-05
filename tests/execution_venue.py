@@ -72,6 +72,7 @@ from tests.recording_logger import RecordingLogger
 
 US100_ID = InstrumentId(Symbol("US100.cash"), CTRADER_VENUE)
 US100_SYMBOL_ID = 275
+WEEK_MS = 604_800_000
 TRADER_ID = TraderId("TESTER-001")
 STRATEGY_ID = StrategyId("S-001")
 
@@ -136,6 +137,7 @@ class ExecutionVenue:
     """The fake venue's account, read at each request so a test can change it between requests.
 
     The history lists answer oldest first, `page_size` items a page, and set `hasMore` past it.
+    The cash-flow list has no pages and refuses a window over a week, as the schema states.
     A request whose payload type is in `fail` is answered with an error. `replies` holds each
     served payload type's answer, for a test that holds it back.
 
@@ -150,6 +152,7 @@ class ExecutionVenue:
         self.position_deals: dict[int, list[om.ProtoOADeal]] = {}
         self.deals: list[om.ProtoOADeal] = []
         self.orders: list[om.ProtoOAOrder] = []
+        self.cash_flow: list[om.ProtoOADepositWithdraw] = []
         self.page_size = 100
         self.fail: set[int] = set()
         self.replies: dict[int, Callable[[Message], Message]] = {}
@@ -181,6 +184,7 @@ class ExecutionVenue:
                 oa.ProtoOAOrderListRes, "order", _between(self.orders, r, _last_update)
             ),
         )
+        self._serve(om.PROTO_OA_CASH_FLOW_HISTORY_LIST_REQ, self._cash_flow)
         self.server.on(
             om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
             lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
@@ -203,6 +207,18 @@ class ExecutionVenue:
         self.replies[payload_type] = handle
         self.server.on(payload_type, handle)
 
+    def _cash_flow(self, request: oa.ProtoOACashFlowHistoryListReq) -> Message:
+        if request.toTimestamp - request.fromTimestamp > WEEK_MS:
+            return oa.ProtoOAErrorRes(
+                ctidTraderAccountId=ACCOUNT_ID,
+                errorCode="INVALID_REQUEST",
+                description="the window is over a week",
+            )
+        return oa.ProtoOACashFlowHistoryListRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            depositWithdraw=_between(self.cash_flow, request, _changed),
+        )
+
     def _page(self, response: type[Message], field: str, items: list) -> Message:
         return response(
             ctidTraderAccountId=ACCOUNT_ID,
@@ -217,6 +233,10 @@ def _executed(deal: om.ProtoOADeal) -> int:
 
 def _last_update(order: om.ProtoOAOrder) -> int:
     return order.utcLastUpdateTimestamp
+
+
+def _changed(operation: om.ProtoOADepositWithdraw) -> int:
+    return operation.changeBalanceTimestamp
 
 
 def exec_config(**overrides) -> CTraderExecClientConfig:

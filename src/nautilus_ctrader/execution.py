@@ -70,6 +70,7 @@ from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
 from nautilus_ctrader.common import execution_reports as reports
 from nautilus_ctrader.common import history, order_translation
 from nautilus_ctrader.common.account import CTraderAccountClient
+from nautilus_ctrader.common.balance_checkpoint import BalanceCheckpoint
 from nautilus_ctrader.common.errors import (
     CTraderAccountError,
     CTraderConnectionError,
@@ -107,6 +108,7 @@ from nautilus_ctrader.common.venue_records import (
 )
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
+    BALANCE_CHECKPOINT_KEY,
     BUCKET_HISTORICAL,
     CTRADER,
     CTRADER_VENUE,
@@ -306,6 +308,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         # The account counts its users without knowing who releases, and Nautilus calls
         # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
         self._holds_account = False
+        self._checkpoint: BalanceCheckpoint | None = None
 
     @property
     def instrument_provider(self) -> CTraderInstrumentProvider:
@@ -335,6 +338,20 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._load()
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
+            self._checkpoint = BalanceCheckpoint(
+                request=partial(self._request, bucket=BUCKET_HISTORICAL),
+                account_id=self._account.account_id,
+                hour=self._config.balance_checkpoint_hour,
+                zone=self._config.checkpoint_zone(),
+                currency=self._account.deposit_asset.name,
+                write=partial(self._cache.add, BALANCE_CHECKPOINT_KEY),
+                loop=self._loop,
+                now_ms=self._clock.timestamp_ms,
+                log=self._log,
+            )
+            # Written before the node reconciles and its trader starts.
+            await self._checkpoint.refresh(trader, at_start=True)
+            self._checkpoint.schedule()
             # The first bring-up has run its restores already; this one serves every later one.
             session.add_restore(self._restore_key, self._reload)
         except BaseException:
@@ -359,6 +376,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._buffer = None
         self._model_standing.set()
         self._end_lost_closes()
+        if self._checkpoint is not None:
+            self._checkpoint.stop()
+            self._checkpoint = None
         session, self._session = self._session, None
         if session is None:
             return
@@ -374,14 +394,15 @@ class CTraderExecutionClient(LiveExecutionClient):
 
         The pass is the start's, over the start's fill window. Nautilus reconciles its mass
         status at once and turns what changed into events; the execution events held meanwhile
-        are applied after that.
+        are applied after that, and after the balance checkpoint is written again.
         """
         self._log.warning("Rebuilding the venue model after a reconnect")
         # This pass's own mass status supersedes a start's still awaited; one release serves both.
         self._stop_awaiting()
         self._hold_buffer()
         try:
-            self._take_trader(await self._trader())
+            trader = await self._trader()
+            self._take_trader(trader)
             status = await self._reconcile_pass(self._since_ms(self._lookback_mins))
             # Reported under the node's id if it reached the broker; never in flight past this.
             self._end_lost_closes()
@@ -390,12 +411,16 @@ class CTraderExecutionClient(LiveExecutionClient):
             # Lost closes stay in flight: the retried pass may still find them.
             self._release_buffer()
             raise
-        self._refresh_checkpoint()
-        self._release_buffer()
+        try:
+            await self._refresh_checkpoint(trader)
+        finally:
+            self._release_buffer()
         self._emit_account_state(self._clock.timestamp_ns())
 
-    def _refresh_checkpoint(self) -> None:
-        """Rewrite the balance checkpoint; not kept yet."""
+    async def _refresh_checkpoint(self, trader: om.ProtoOATrader) -> None:
+        # With no hour, the off value written at connect stands.
+        if self._checkpoint is not None and self._config.balance_checkpoint_hour is not None:
+            await self._checkpoint.refresh(trader, at_start=False)
 
     def _end_lost_closes(self) -> None:
         for client_order_id in self._lost_closes:
