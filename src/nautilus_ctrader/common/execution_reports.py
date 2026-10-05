@@ -10,7 +10,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import (
@@ -303,23 +303,32 @@ def mass_status(
 
     A leg whose level the broker no longer lists has no price of its own. It is reported at
     the held price: no price change was seen, and Nautilus would otherwise emit an update
-    without a price. A leg Nautilus does not hold either is left out, with its fills.
+    without a price. Failing that, a leg with fills is reported at their average price; one
+    without is left out. What is left out is unlinked from the orders kept, since Nautilus
+    fails on a linked order it cannot find.
 
     Returns the mass status and the records left out for want of a price.
     """
     status = ExecutionMassStatus(client_id, account_id, venue, UUID4(), ts_init)
-    order_reports: list[OrderStatusReport] = []
-    fill_reports: list[FillReport] = []
+    kept: list[tuple[ReportedOrder, Instrument]] = []
     left_out: list[ReportedOrder] = []
     for record in reconciliation.orders:
         instrument = instrument_for(record.symbol_id)
         if instrument is None:
             continue
-        priced = _priced(record, held_price)
+        priced = _priced(record, held_price, instrument.price_precision)
         if priced is None:
             left_out.append(record)
-            continue
-        report, fills = reported_order(priced, instrument, account_id, currency, ts_init)
+        else:
+            kept.append((priced, instrument))
+    gone = {record.client_order_id for record in left_out}
+    order_reports: list[OrderStatusReport] = []
+    fill_reports: list[FillReport] = []
+    for record, instrument in kept:
+        if gone.intersection(record.linked_order_ids):
+            linked = tuple(i for i in record.linked_order_ids if i not in gone)
+            record = replace(record, linked_order_ids=linked)
+        report, fills = reported_order(record, instrument, account_id, currency, ts_init)
         order_reports.append(report)
         fill_reports += fills
     position_reports = [
@@ -334,9 +343,9 @@ def mass_status(
 
 
 def _priced(
-    record: ReportedOrder, held_price: Callable[[str], Decimal | None]
+    record: ReportedOrder, held_price: Callable[[str], Decimal | None], precision: int
 ) -> ReportedOrder | None:
-    """`record` with every price its type needs, or `None` if one is missing and not held."""
+    """`record` with every price its type needs, or `None` if one is missing and unknown."""
     if record.order_type == ExternalType.LIMIT and record.price is None:
         field = "price"
     elif record.order_type == ExternalType.STOP_MARKET and record.trigger_price is None:
@@ -349,6 +358,10 @@ def _priced(
     else:
         return record
     held = None if record.client_order_id is None else held_price(record.client_order_id)
+    if held is None and record.fills:
+        units = sum((fill.units for fill in record.fills), Decimal(0))
+        total = sum((fill.price * fill.units for fill in record.fills), Decimal(0))
+        held = (total / units).quantize(Decimal(1).scaleb(-precision), rounding=ROUND_HALF_EVEN)
     return None if held is None else replace(record, **{field: held})
 
 

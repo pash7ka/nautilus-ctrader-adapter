@@ -473,6 +473,7 @@ def test_a_priceless_leg_takes_the_price_nautilus_holds_or_is_left_out() -> None
     held = {STOP: Decimal("85197.20"), TARGET: Decimal("85387.22")}
 
     priced, none_left = build(records, held.get)
+    stop_only, target_left = build(records, {STOP: Decimal("85197.20")}.get)
     unpriced, left_out = build(records)
 
     assert none_left == ()
@@ -480,8 +481,45 @@ def test_a_priceless_leg_takes_the_price_nautilus_holds_or_is_left_out() -> None
     assert by_venue_id[VenueOrderId("6000001-SL")].trigger_price == Price.from_str("85197.20")
     assert by_venue_id[VenueOrderId("6000001-SL")].order_status == OrderStatus.CANCELED
     assert by_venue_id[VenueOrderId("6000001-TP")].price == Price.from_str("85387.22")
+    # What is left out is linked from nowhere: Nautilus fails on a link it cannot find.
+    assert target_left == (target,)
+    kept = stop_only.order_reports
+    assert kept[VenueOrderId("6000001")].linked_order_ids == [ClientOrderId(STOP)]
+    assert kept[VenueOrderId("6000001")].contingency_type == ContingencyType.OTO
+    assert kept[VenueOrderId("6000001-SL")].linked_order_ids is None
+    assert kept[VenueOrderId("6000001-SL")].contingency_type == ContingencyType.NO_CONTINGENCY
+    assert kept[VenueOrderId("6000001-SL")].parent_order_id == ClientOrderId(ENTRY)
     assert left_out == (stop, target)
-    assert list(unpriced.order_reports) == [VenueOrderId("6000001")]
+    (alone,) = unpriced.order_reports.values()
+    assert alone.venue_order_id == VenueOrderId("6000001")
+    assert alone.linked_order_ids is None
+    assert alone.contingency_type == ContingencyType.NO_CONTINGENCY
+
+
+def test_a_priceless_leg_with_fills_is_priced_at_their_average() -> None:
+    fills = (
+        fill(trade_id="7000010", units=Decimal("0.10"), price=Decimal("85353.41")),
+        fill(trade_id="7000011", units=Decimal("0.30"), price=Decimal("85353.42")),
+    )
+    target = target_leg(
+        status=ReportStatus.CANCELED,
+        price=None,
+        filled_units=Decimal("0.40"),
+        avg_price=Decimal("85353.42"),
+        fills=fills,
+    )
+
+    status, left_out = build(Reconciliation((entry(), leg(), target), (), ()))
+
+    assert left_out == ()
+    report = status.order_reports[VenueOrderId("6000001-TP")]
+    # 85353.4175 at the instrument's two decimals.
+    assert report.price == Price.from_str("85353.42")
+    assert report.filled_qty == Quantity.from_str("0.40")
+    assert [f.trade_id for f in status.fill_reports[VenueOrderId("6000001-TP")]] == [
+        TradeId("7000010"),
+        TradeId("7000011"),
+    ]
 
 
 def test_exposure_json_is_sorted_and_plain() -> None:

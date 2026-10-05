@@ -8,21 +8,23 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 from nautilus_trader.cache.cache import Cache
+from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import ContingencyType, OrderStatus, OrderType
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import ClientOrderId, PositionId, TradeId, VenueOrderId
-from nautilus_trader.model.objects import Money
+from nautilus_trader.model.objects import Money, Price
 
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.execution_reports import mass_status
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.reconciliation import PositionHistory, Reconciliation, reconcile
-from nautilus_ctrader.common.venue_records import ReportedOrder, money_of
+from nautilus_ctrader.common.venue_records import Fill, ReportedOrder, money_of
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -103,9 +105,10 @@ def held_price(h: Harness) -> Callable[[str], Decimal | None]:
     return held
 
 
-def into_nautilus(h: Harness, reconciliation: Reconciliation) -> tuple[ReportedOrder, ...]:
-    """Reconcile `reconciliation` in the harness's engine; returns what was left out."""
-    built, left_out = mass_status(
+def convert(
+    h: Harness, reconciliation: Reconciliation
+) -> tuple[ExecutionMassStatus, tuple[ReportedOrder, ...]]:
+    return mass_status(
         h.client.id,
         h.client.account_id,
         CTRADER_VENUE,
@@ -115,8 +118,24 @@ def into_nautilus(h: Harness, reconciliation: Reconciliation) -> tuple[ReportedO
         ts_init=0,
         held_price=held_price(h),
     )
+
+
+def into_nautilus(h: Harness, reconciliation: Reconciliation) -> tuple[ReportedOrder, ...]:
+    """Reconcile `reconciliation` in the harness's engine; returns what was left out."""
+    built, left_out = convert(h, reconciliation)
     h.engine.reconcile_execution_mass_status(built)
     return left_out
+
+
+def records_with_legs(at: float, legs: LegIds) -> Reconciliation:
+    """The node's records at `at`, its entry's record naming only `legs`."""
+    snapshot, histories, deals = broker_lists(at)
+    orders = list(histories[FIRST].orders)
+    for order in orders:
+        if order.orderId == 6000001:
+            order.tradeData.comment = order_record.encode_comment(legs)
+    found = PositionHistory(tuple(orders), histories[FIRST].deals)
+    return records(snapshot, {FIRST: found}, deals)
 
 
 def kinds(h: Harness, client_order_id: str) -> list[str]:
@@ -213,11 +232,65 @@ async def test_a_priceless_leg_nautilus_does_not_hold_is_left_out() -> None:
     assert removed.price is None
 
     async with harness() as h:
-        assert into_nautilus(h, reconciliation) == (removed,)
+        built, left_out = convert(h, reconciliation)
+        assert left_out == (removed,)
+        reports = built.order_reports
+        assert reports[VenueOrderId("6000001")].linked_order_ids == [ClientOrderId(STOP)]
+        assert reports[VenueOrderId("6000001-SL")].linked_order_ids is None
+
+        h.engine.reconcile_execution_mass_status(built)
 
         assert h.cache.order(ClientOrderId(TARGET)) is None
         assert status(h, STOP) == OrderStatus.ACCEPTED
         assert h.cache.position(PositionId("5000001")).is_open
+        linked = {i for order in h.cache.orders() for i in order.linked_order_ids or []}
+        assert linked == {ClientOrderId(STOP)}
+        assert all(h.cache.order(i) is not None for i in linked)
+
+
+async def test_a_priceless_leg_with_a_fill_reaches_nautilus_at_its_fill_price() -> None:
+    # Hand-built: the recording holds no leg partly filled before its level was removed.
+    reconciliation = records_at(REMOVED_AT)
+    (removed,) = (r for r in reconciliation.orders if r.client_order_id == TARGET)
+    fills = (
+        Fill(
+            "7000010",
+            "5000001",
+            "SELL",
+            Decimal("0.10"),
+            Decimal("85353.41"),
+            Decimal("-0.30"),
+            removed.ts_ms - 2,
+        ),
+        Fill(
+            "7000011",
+            "5000001",
+            "SELL",
+            Decimal("0.30"),
+            Decimal("85353.42"),
+            Decimal("-0.93"),
+            removed.ts_ms - 1,
+        ),
+    )
+    partly = replace(
+        removed, filled_units=Decimal("0.40"), avg_price=Decimal("85353.42"), fills=fills
+    )
+    orders = tuple(partly if r is removed else r for r in reconciliation.orders)
+    # Without a position report: the broker's position would not match these fills.
+    hand_built = Reconciliation(orders, (), ())
+
+    async with harness() as h:
+        assert into_nautilus(h, hand_built) == ()
+
+        target = h.cache.order(ClientOrderId(TARGET))
+        assert target.status == OrderStatus.CANCELED
+        assert target.price == Price.from_str("85353.42")
+        assert str(target.filled_qty) == "0.40"
+        filled = [e for e in target.events if isinstance(e, OrderFilled)]
+        assert [(e.trade_id, e.commission) for e in filled] == [
+            (TradeId("7000010"), Money(Decimal("0.30"), USD)),
+            (TradeId("7000011"), Money(Decimal("0.93"), USD)),
+        ]
 
 
 async def test_restart_with_cache_fills_a_triggered_leg() -> None:
@@ -249,15 +322,8 @@ async def test_restart_with_cache_changes_nothing_known() -> None:
 
 
 async def test_a_one_leg_bracket_is_taken_by_nautilus() -> None:
-    snapshot, histories, deals = broker_lists(OPEN_AT)
-    orders = list(histories[FIRST].orders)
-    for order in orders:
-        if order.orderId == 6000001:
-            order.tradeData.comment = order_record.encode_comment(LegIds(STOP, None))
-    one_leg = {FIRST: PositionHistory(tuple(orders), histories[FIRST].deals)}
-
     async with harness() as h:
-        into_nautilus(h, records(snapshot, one_leg, deals))
+        into_nautilus(h, records_with_legs(OPEN_AT, LegIds(STOP, None)))
 
         stop = h.cache.order(ClientOrderId(STOP))
         assert stop.status == OrderStatus.ACCEPTED
@@ -313,7 +379,12 @@ def stop_out() -> tuple[Reconciliation, str, str]:
 
 CLOSES = {
     "manual close": lambda: (records_at(CLOSED_AT), "6000003", "5000001"),
-    "no-leg level trigger": lambda: (records_at(CLOSED_AT, mine=False), "6000002", "5000001"),
+    # The node's own position with no stop leg, closed by its stop-loss.
+    "no-leg level trigger": lambda: (
+        records_with_legs(CLOSED_AT, LegIds(None, TARGET)),
+        "6000002",
+        "5000001",
+    ),
     "stop-out": stop_out,
     "foreign close": lambda: (records_at(CLOSED_AT, mine=False), "6000003", "5000001"),
 }
