@@ -747,7 +747,24 @@ async def test_an_order_is_refused_unsent_while_the_connection_is_down() -> None
         await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.REJECTED)
 
         assert rejection(h, MARKET_ID) == "not connected to the venue"
+        assert h.kinds_of(MARKET_ID) == ["OrderRejected"]
         assert h.received(oa.ProtoOANewOrderReq) == []
+
+
+async def test_a_bracket_is_refused_unsent_while_the_connection_is_down() -> None:
+    async with harness() as h:
+        await push_spot(h, BID, ASK)
+        await h.server.drop_connections()
+        await wait_until(lambda: not h.account.session.is_ready)
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+
+        assert rejection(h, ENTRY) == "not connected to the venue"
+        assert h.kinds_of(ENTRY) == ["OrderRejected"]
+        assert h.kinds_of(STOP) == ["OrderCanceled"]
+        assert h.kinds_of(TARGET) == ["OrderCanceled"]
+        assert h.received(oa.ProtoOANewOrderReq) == []
+        assert len(h.client._brackets) == 0
 
 
 @pytest.mark.parametrize(
@@ -841,6 +858,20 @@ async def test_a_close_of_a_position_not_open_at_the_venue_is_refused() -> None:
 
         assert "not open at the venue" in rejection(h, CLOSE_ID)
         assert h.received(oa.ProtoOAClosePositionReq) == []
+
+
+async def test_a_close_is_refused_unsent_while_the_connection_is_down() -> None:
+    async with harness(execution_venue=closing_venue()) as h:
+        await opened_market_position(h)
+        await h.server.drop_connections()
+        await wait_until(lambda: not h.account.session.is_ready)
+        await submit(h, close_order(h), position_id=PositionId(str(MARKET_POSITION)))
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
+
+        assert rejection(h, CLOSE_ID) == "not connected to the venue"
+        assert h.kinds_of(CLOSE_ID) == ["OrderRejected"]
+        assert h.received(oa.ProtoOAClosePositionReq) == []
+        assert h.client._operations.closing(MARKET_POSITION, 100) is None
 
 
 async def test_a_close_that_would_add_to_the_position_is_refused() -> None:

@@ -82,6 +82,7 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider
 
 _REFERENCE_CONSUMER = "reference"
+_NOT_CONNECTED = "not connected to the venue"
 # The most pages of one position's order list read; the venue lists newest first.
 _MAX_ORDER_PAGES = 20
 
@@ -668,6 +669,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         except Unsupported as e:
             self._refuse(orders, str(e))
             return
+        if not self._connected():
+            self._refuse(orders, _NOT_CONNECTED)
+            return
         entry_id = entry.client_order_id.value
         legs: dict[Level, str] = {}
         if bracket:
@@ -710,6 +714,9 @@ class CTraderExecutionClient(LiveExecutionClient):
             )
         except Unsupported as e:
             self._refuse([order], str(e))
+            return
+        if not self._connected():
+            self._refuse([order], _NOT_CONNECTED)
             return
         client_order_id = order.client_order_id.value
         # In flight before it leaves, so the broker's events of the close are matched to it.
@@ -796,11 +803,16 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Forget a bracket whose levels will never be corrected."""
         self._brackets.remove(entry_id)
 
+    def _connected(self) -> bool:
+        session = self._account.session
+        return session is not None and session.is_ready
+
     async def _send(self, request: Message) -> Message | _Refused | None:
         """`request`'s response, a refusal, or `None` when its outcome is unknown."""
         session = self._account.session
+        # Checked again here: the session can drop after a command was checked and submitted.
         if session is None or not session.is_ready:
-            return _Refused("not connected to the venue", retryable=True)
+            return _Refused(_NOT_CONNECTED, retryable=True)
         try:
             response = await session.request(request)
         except CTraderRequestError as e:
