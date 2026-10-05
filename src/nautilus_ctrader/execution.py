@@ -14,7 +14,8 @@ An order or a close whose outcome is unknown is never resent: the lost answer ma
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+import contextlib
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -22,10 +23,14 @@ from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.execution.messages import (
+    BatchCancelOrders,
+    CancelAllOrders,
+    CancelOrder,
     GenerateFillReports,
     GenerateOrderStatusReport,
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
+    ModifyOrder,
     QueryAccount,
     SubmitOrder,
     SubmitOrderList,
@@ -43,7 +48,7 @@ from nautilus_trader.model.identifiers import (
     VenueOrderId,
 )
 from nautilus_trader.model.instruments import Instrument
-from nautilus_trader.model.objects import Currency
+from nautilus_trader.model.objects import Currency, Price, Quantity
 from nautilus_trader.model.orders import Order
 
 from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
@@ -61,7 +66,7 @@ from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.order_translation import Unsupported
 from nautilus_ctrader.common.parsing import PRICE_SCALE
 from nautilus_ctrader.common.session import CTraderSession
-from nautilus_ctrader.common.venue_book import VenueBook
+from nautilus_ctrader.common.venue_book import PositionView, VenueBook
 from nautilus_ctrader.common.venue_records import (
     Activity,
     ActivityKind,
@@ -85,6 +90,11 @@ _REFERENCE_CONSUMER = "reference"
 _NOT_CONNECTED = "not connected to the venue"
 # The most pages of one position's order list read; the venue lists newest first.
 _MAX_ORDER_PAGES = 20
+# Sends of one level amend that got no answer or never left; it sets the whole state, so a
+# repeat is safe.
+_AMEND_ATTEMPTS = 3
+# Correcting amends of one bracket before its levels are left where the broker holds them.
+_CORRECTION_ROUNDS = 3
 
 
 @dataclass
@@ -213,6 +223,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._spot_symbols: set[int] = set()
         self._operations = OperationsInFlight()
         self._brackets = PendingBrackets()
+        # One amend of a position at a time, so each computes from what the last one left.
+        self._amend_locks: dict[int, asyncio.Lock] = {}
+        self._protection_timers: set[asyncio.TimerHandle] = set()
         # Execution events held while the model is rebuilt, or `None` when it stands.
         self._buffer: list[oa.ProtoOAExecutionEvent] | None = None
         self._restore_key = ("execution", self._owner)
@@ -259,6 +272,9 @@ class CTraderExecutionClient(LiveExecutionClient):
                 await self._account.disconnect()
 
     def _detach(self) -> None:
+        for timer in self._protection_timers:
+            timer.cancel()
+        self._protection_timers.clear()
         session, self._session = self._session, None
         if session is None:
             return
@@ -499,6 +515,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             records = []
         self._handle_records(records)
         self._update_account(event)
+        self._settle_brackets()
         return records
 
     def _on_order_error_event(self, event: oa.ProtoOAOrderErrorEvent) -> None:
@@ -523,9 +540,6 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self._on_protection(record)
             except Exception as e:
                 self._log.exception(f"{type(record).__name__} could not be reported", e)
-
-    def _on_protection(self, record: AwaitProtection | ProtectionMissing) -> None:
-        self._log.debug(f"{type(record).__name__} for position {record.position_id}")
 
     def _nautilus_order(self, record: OrderEvent) -> Order | None:
         """The order a record is about: the node's by its own id, an external one by venue id."""
@@ -595,6 +609,16 @@ class CTraderExecutionClient(LiveExecutionClient):
             self.generate_order_rejected(*ids, record.reason or "rejected by the venue", ts)
         elif kind == OrderEventKind.EXPIRED:
             self.generate_order_expired(*ids, venue_order_id, ts)
+        if kind in (OrderEventKind.REJECTED, OrderEventKind.CANCELED, OrderEventKind.EXPIRED):
+            bracket = (
+                None
+                if record.client_order_id is None
+                else self._brackets.by_entry(record.client_order_id)
+            )
+            if bracket is not None and not any(
+                self._leg_alive(leg_id) for leg_id in bracket.legs.values()
+            ):
+                self._end_bracket(bracket.entry_id, record.reason or f"the entry {kind.value}")
 
     def _external_order(self, record: ExternalOrder) -> None:
         """An order Nautilus does not know yet: its report, then a report of each fill."""
@@ -799,10 +823,6 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._book.reject_entry(entry_id, legs, reason, self._clock.timestamp_ms()),
         )
 
-    def _end_bracket(self, entry_id: str, reason: str) -> None:
-        """Forget a bracket whose levels will never be corrected."""
-        self._brackets.remove(entry_id)
-
     def _connected(self) -> bool:
         session = self._account.session
         return session is not None and session.is_ready
@@ -826,6 +846,393 @@ class CTraderExecutionClient(LiveExecutionClient):
             # Not an error response to the transport: it arrives as the request's answer.
             return _Refused(_reason(response.errorCode, response.description or None))
         return response
+
+    def _on_protection(self, record: AwaitProtection | ProtectionMissing) -> None:
+        if isinstance(record, AwaitProtection):
+            timer = self._loop.call_later(
+                self._config.protective_order_timeout_secs,
+                self._protection_waited,
+                record.position_id,
+            )
+            self._protection_timers.add(timer)
+        else:
+            self.create_task(
+                self._set_missing_levels(record),
+                log_msg=f"set the levels of position {record.position_id}",
+            )
+
+    def _protection_waited(self, position_id: int) -> None:
+        self._protection_timers = {t for t in self._protection_timers if not t.cancelled()}
+        self._handle_records(self._book.protection_timed_out(position_id))
+
+    def _end_bracket(self, entry_id: str, reason: str) -> None:
+        """Forget a bracket whose levels will never be corrected; a modify waiting on it fails."""
+        bracket = self._brackets.by_entry(entry_id)
+        if bracket is None:
+            return
+        self._brackets.remove(entry_id)
+        for level in sorted(bracket.modified - bracket.cancels, key=lambda lv: lv.value):
+            self._modify_rejected(ClientOrderId(bracket.legs[level]), reason)
+
+    # -- Legs -------------------------------------------------------------------------------------
+
+    async def _cancel_order(self, command: CancelOrder) -> None:
+        await self._cancel([command.client_order_id])
+
+    async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
+        selection = {
+            "instrument_id": command.instrument_id,
+            "strategy_id": command.strategy_id,
+            "side": command.order_side,
+        }
+        orders = self._cache.orders_open(**selection) + self._cache.orders_inflight(**selection)
+        await self._cancel([order.client_order_id for order in orders])
+
+    async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
+        await self._cancel([cancel.client_order_id for cancel in command.cancels])
+
+    async def _cancel(self, client_order_ids: list[ClientOrderId]) -> None:
+        """Cancel legs, one amend per position; anything else is refused."""
+        by_position: dict[int, dict[Level, ClientOrderId]] = {}
+        for client_order_id in client_order_ids:
+            pending = self._brackets.by_leg(client_order_id.value)
+            if pending is not None:
+                bracket, level = pending
+                # Carried by the bracket's correcting amend.
+                bracket.cancels.add(level)
+                continue
+            found = self._book.leg_position(client_order_id.value)
+            if found is None:
+                self._cancel_rejected(
+                    client_order_id,
+                    "only a protective leg can be cancelled; a market order fills at once",
+                )
+            elif not self._leg_alive(client_order_id.value):
+                self._cancel_rejected(client_order_id, "the leg is already closed")
+            else:
+                position_id, level = found
+                by_position.setdefault(position_id, {})[level] = client_order_id
+        await asyncio.gather(
+            *(self._remove_levels(position_id, legs) for position_id, legs in by_position.items()),
+        )
+
+    async def _remove_levels(self, position_id: int, legs: dict[Level, ClientOrderId]) -> None:
+        outcome = await self._amend(
+            position_id,
+            lambda view: {lv: p for lv, p in view.levels.items() if lv not in legs},
+        )
+        if isinstance(outcome, _Refused):
+            for client_order_id in legs.values():
+                self._cancel_rejected(client_order_id, outcome.reason)
+            return
+        ts_ms = self._clock.timestamp_ms()
+        for level in legs:
+            # A level the broker did not hold was not in its answer: nothing cancelled the leg.
+            self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
+
+    async def _modify_order(self, command: ModifyOrder) -> None:
+        client_order_id = command.client_order_id
+        order = self._cache.order(client_order_id)
+        pending = self._brackets.by_leg(client_order_id.value)
+        found = self._book.leg_position(client_order_id.value)
+        if order is None or (pending is None and found is None):
+            self._modify_rejected(client_order_id, "only a protective leg can be modified")
+            return
+        level = pending[1] if pending is not None else found[1]
+        if pending is None and not self._leg_alive(client_order_id.value):
+            self._modify_rejected(client_order_id, "the leg is already closed")
+            return
+        held = self._leg_quantity(order, found)
+        if command.quantity is not None and command.quantity != held:
+            self._modify_rejected(
+                client_order_id,
+                f"a protective leg's quantity follows its position ({held}) and cannot be set",
+            )
+            return
+        price = command.trigger_price if level == Level.STOP_LOSS else command.price
+        if price is None:
+            # Only the quantity the leg already has: nothing to send.
+            self.generate_order_updated(
+                order.strategy_id,
+                order.instrument_id,
+                client_order_id,
+                order.venue_order_id,
+                held,
+                None,
+                None,
+                self._clock.timestamp_ns(),
+            )
+            return
+        if pending is not None:
+            bracket = pending[0]
+            bracket.requested[level] = price.as_decimal()
+            bracket.modified.add(level)
+            return
+        wanted = price.as_decimal()
+        outcome = await self._amend(found[0], lambda view: {**view.levels, level: wanted})
+        if isinstance(outcome, _Refused):
+            self._modify_rejected(client_order_id, outcome.reason)
+            return
+        updated = any(
+            isinstance(r, OrderEvent)
+            and r.kind == OrderEventKind.UPDATED
+            and r.client_order_id == client_order_id.value
+            for r in outcome
+        )
+        if not updated:
+            # The level stood there already, so no event says so; the modify still needs one.
+            self._leg_updated(client_order_id, level, wanted)
+
+    def _leg_alive(self, leg_id: str) -> bool:
+        found = self._book.leg_position(leg_id)
+        if found is None:
+            return False
+        view = self._book.view(found[0])
+        return view is not None and view.legs.get(found[1], (leg_id, False))[1]
+
+    def _leg_quantity(self, order: Order, found: tuple[int, Level] | None) -> Quantity:
+        """What the leg holds: the protective order's volume once accepted, else its own."""
+        if found is not None:
+            view = self._book.view(found[0])
+            units = None if view is None else view.leg_units.get(found[1])
+            if units is not None:
+                instrument = self._instrument_provider.find(order.instrument_id)
+                return reports.quantity(units, instrument)
+        return order.quantity
+
+    def _leg_updated(self, client_order_id: ClientOrderId, level: Level, value: Decimal) -> None:
+        order = self._cache.order(client_order_id)
+        instrument = self._instrument_provider.find(order.instrument_id)
+        price = reports.price(value, instrument)
+        stop = level == Level.STOP_LOSS
+        self.generate_order_updated(
+            order.strategy_id,
+            order.instrument_id,
+            client_order_id,
+            order.venue_order_id,
+            order.quantity,
+            None if stop else price,
+            price if stop else None,
+            self._clock.timestamp_ns(),
+        )
+
+    def _cancel_rejected(self, client_order_id: ClientOrderId, reason: str) -> None:
+        order = self._cache.order(client_order_id)
+        if order is None:
+            self._log.warning(f"Cancel of {client_order_id} refused ({reason}); no such order")
+            return
+        self.generate_order_cancel_rejected(
+            order.strategy_id,
+            order.instrument_id,
+            client_order_id,
+            order.venue_order_id,
+            reason,
+            self._clock.timestamp_ns(),
+        )
+
+    def _modify_rejected(self, client_order_id: ClientOrderId, reason: str) -> None:
+        order = self._cache.order(client_order_id)
+        if order is None:
+            self._log.warning(f"Modify of {client_order_id} refused ({reason}); no such order")
+            return
+        self.generate_order_modify_rejected(
+            order.strategy_id,
+            order.instrument_id,
+            client_order_id,
+            order.venue_order_id,
+            reason,
+            self._clock.timestamp_ns(),
+        )
+
+    # -- Amends -----------------------------------------------------------------------------------
+
+    async def _amend(
+        self,
+        position_id: int,
+        levels_of: Callable[[PositionView], dict[Level, Decimal]],
+    ) -> list[Record] | _Refused:
+        """Set the position's levels to `levels_of(view)`; returns the records of the answer.
+
+        `levels_of` runs once the amends of the position before it are answered, so it sees
+        the levels they left and never undoes them.
+        """
+        async with self._amend_locks.setdefault(position_id, asyncio.Lock()):
+            view = self._book.view(position_id)
+            if view is None or not view.open:
+                return _Refused(f"position {position_id} is not open at the venue")
+            levels = levels_of(view)
+            if levels == view.levels:
+                return []
+            instrument = self._instrument_provider.instrument_for_symbol_id(view.symbol_id)
+            request = order_translation.amend_levels(
+                self._account.account_id,
+                position_id,
+                stop_loss=self._level_price(levels, Level.STOP_LOSS, instrument),
+                take_profit=self._level_price(levels, Level.TAKE_PROFIT, instrument),
+            )
+            self._operations.begin_amend(position_id)
+            try:
+                outcome = await self._send_amend(request)
+                if isinstance(outcome, _Refused):
+                    return outcome
+                if isinstance(outcome, oa.ProtoOAExecutionEvent):
+                    return self._on_execution_event(outcome)
+                return []
+            finally:
+                self._operations.end_amend(position_id)
+
+    @staticmethod
+    def _level_price(
+        levels: dict[Level, Decimal],
+        level: Level,
+        instrument: Instrument | None,
+    ) -> Price | None:
+        value = levels.get(level)
+        return None if value is None else reports.price(value, instrument)
+
+    async def _send_amend(self, request: oa.ProtoOAAmendPositionSLTPReq) -> Message | _Refused:
+        # TODO(verify): whether an accepted amend sends an execution event besides its answer; a
+        # later one would be read as a trader's change once the amend is no longer in flight.
+        outcome: Message | _Refused | None = None
+        for _ in range(_AMEND_ATTEMPTS):
+            outcome = await self._send(request)
+            if outcome is not None and not (isinstance(outcome, _Refused) and outcome.retryable):
+                return outcome
+            await self._wait_ready()
+        return outcome if isinstance(outcome, _Refused) else _Refused("the amend got no answer")
+
+    async def _wait_ready(self) -> None:
+        session = self._account.session
+        if session is None:
+            return
+        with contextlib.suppress(TimeoutError):
+            await session.wait_ready(timeout_secs=self._config.connect_timeout_secs)
+
+    # -- Bracket levels ---------------------------------------------------------------------------
+
+    def _settle_brackets(self) -> None:
+        """Start the correcting amend of each bracket whose protective order has come."""
+        for bracket in self._brackets:
+            if bracket.correcting:
+                continue
+            view = self._bracket_position(bracket)
+            if view is None or view.protective_order_id is None:
+                continue
+            if self._wanted_levels(bracket, view) == view.levels:
+                self._bracket_done(bracket, view)
+            elif bracket.rounds >= _CORRECTION_ROUNDS:
+                self._bracket_refused(
+                    bracket, view.position_id, "the broker kept other levels than asked"
+                )
+            else:
+                bracket.correcting = True
+                bracket.rounds += 1
+                self.create_task(
+                    self._correct(bracket, view.position_id),
+                    log_msg=f"set the levels of {bracket.entry_id}",
+                )
+
+    def _bracket_position(self, bracket: PendingBracket) -> PositionView | None:
+        for leg_id in bracket.legs.values():
+            found = self._book.leg_position(leg_id)
+            if found is not None:
+                return self._book.view(found[0])
+        return None
+
+    @staticmethod
+    def _wanted_levels(bracket: PendingBracket, view: PositionView) -> dict[Level, Decimal]:
+        """The broker's levels, with each live leg's at its asked price and a cancelled one gone."""
+        levels = dict(view.levels)
+        for level, leg_id in bracket.legs.items():
+            alive = view.legs.get(level, (leg_id, False))[1]
+            if alive and level not in bracket.cancels:
+                levels[level] = bracket.requested[level]
+            else:
+                levels.pop(level, None)
+        return levels
+
+    async def _correct(self, bracket: PendingBracket, position_id: int) -> None:
+        try:
+            outcome = await self._amend(
+                position_id, lambda view: self._wanted_levels(bracket, view)
+            )
+        finally:
+            bracket.correcting = False
+        if isinstance(outcome, _Refused):
+            self._bracket_refused(bracket, position_id, outcome.reason)
+            return
+        # Checked again: a cancel or modify may have come while the amend was out.
+        self._settle_brackets()
+
+    def _bracket_done(self, bracket: PendingBracket, view: PositionView) -> None:
+        """The broker holds the levels asked for: what waited on that is answered."""
+        self._brackets.remove(bracket.entry_id)
+        ts_ms = self._clock.timestamp_ms()
+        for level in bracket.cancels:
+            self._handle_records(self._book.cancel_leg(view.position_id, level, ts_ms))
+        for level in bracket.modified - bracket.cancels:
+            if level in view.levels:
+                self._leg_updated(ClientOrderId(bracket.legs[level]), level, view.levels[level])
+
+    def _bracket_refused(self, bracket: PendingBracket, position_id: int, reason: str) -> None:
+        """The levels stay where the broker set them, and every leg says where that is."""
+        self._log.warning(
+            f"Levels of position {position_id} stay where the broker set them: {reason}",
+        )
+        self._brackets.remove(bracket.entry_id)
+        view = self._book.view(position_id)
+        for level, leg_id in bracket.legs.items():
+            client_order_id = ClientOrderId(leg_id)
+            if level in bracket.cancels:
+                self._cancel_rejected(client_order_id, reason)
+            elif level in bracket.modified:
+                self._modify_rejected(client_order_id, reason)
+            if (
+                view is not None
+                and view.legs.get(level, (leg_id, False))[1]
+                and level in view.levels
+            ):
+                self._leg_updated(client_order_id, level, view.levels[level])
+
+    async def _set_missing_levels(self, record: ProtectionMissing) -> None:
+        """No protective order followed the fill: set the levels the legs asked for."""
+        position_id = record.position_id
+        self._log.warning(
+            f"No protective order followed the fill of position {position_id} within "
+            f"{self._config.protective_order_timeout_secs:g}s; setting its levels by an amend",
+        )
+        missing = {
+            level: leg_id
+            for level, leg_id in (
+                (Level.STOP_LOSS, record.stop_loss_id),
+                (Level.TAKE_PROFIT, record.take_profit_id),
+            )
+            if leg_id is not None
+        }
+        pending = self._brackets.by_leg(next(iter(missing.values())))
+        if pending is None:
+            self._levels_refused(position_id, "the levels asked for are no longer known")
+            return
+        bracket = pending[0]
+        ts_ms = self._clock.timestamp_ms()
+        for level in bracket.cancels:
+            self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
+        wanted = {
+            level: bracket.requested[level] for level in missing if level not in bracket.cancels
+        }
+        if not wanted:
+            self._brackets.remove(bracket.entry_id)
+            return
+        outcome = await self._amend(position_id, lambda view: {**view.levels, **wanted})
+        if isinstance(outcome, _Refused):
+            self._end_bracket(bracket.entry_id, outcome.reason)
+            self._levels_refused(position_id, outcome.reason)
+
+    def _levels_refused(self, position_id: int, reason: str) -> None:
+        self._log.error(f"Position {position_id} stands without its levels: {reason}")
+        self._handle_records(
+            self._book.reject_legs(position_id, reason, self._clock.timestamp_ms()),
+        )
 
     # -- Reference prices -----------------------------------------------------------------------
 

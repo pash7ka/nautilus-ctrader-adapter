@@ -10,7 +10,14 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import QueryAccount, SubmitOrder
+from nautilus_trader.execution.messages import (
+    BatchCancelOrders,
+    CancelAllOrders,
+    CancelOrder,
+    ModifyOrder,
+    QueryAccount,
+    SubmitOrder,
+)
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.events import OrderFilled, OrderRejected
@@ -28,6 +35,7 @@ from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.account import account_client_from_config
 from nautilus_ctrader.common.errors import CTraderAccountError
 from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.venue_records import Level
 from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -900,3 +908,414 @@ async def test_a_close_the_broker_refuses_is_rejected_and_no_longer_in_flight() 
 
         assert rejection(h, CLOSE_ID) == "POSITION_NOT_FOUND: gone"
         assert h.client._operations.closing(MARKET_POSITION, 100) is None
+
+
+AMEND_FROM = 1_600_000_200_000
+REFUSED_STOPS = oa.ProtoOAOrderErrorEvent(
+    ctidTraderAccountId=ACCOUNT_ID, errorCode="TRADING_BAD_STOPS", description="Invalid stops"
+)
+
+
+def protective(
+    stop: float | None,
+    limit: float | None,
+    *,
+    utc: int,
+    kind: int = om.ORDER_REPLACED,
+) -> oa.ProtoOAExecutionEvent:
+    """The first position's protective order as the broker answers an amend (hand-built)."""
+    event = type(FIRST_EVENTS[2])()
+    event.CopyFrom(FIRST_EVENTS[2])
+    event.executionType = kind
+    event.isServerEvent = False
+    event.order.ClearField("stopPrice")
+    event.order.ClearField("limitPrice")
+    if stop is not None:
+        event.order.stopPrice = stop
+    if limit is not None:
+        event.order.limitPrice = limit
+    event.order.utcLastUpdateTimestamp = utc
+    event.position.utcLastUpdateTimestamp = utc
+    return event
+
+
+def echo_amends(execution_venue: ExecutionVenue, *, kind: int = om.ORDER_REPLACED) -> list:
+    """The broker sets whatever levels an amend asks for; returns the amends it received."""
+    amends: list = []
+
+    def answer(request):
+        amends.append(request)
+        stop = request.stopLoss if request.HasField("stopLoss") else None
+        limit = request.takeProfit if request.HasField("takeProfit") else None
+        utc = AMEND_FROM + len(amends)
+        if stop is None and limit is None:
+            return protective(None, None, utc=utc, kind=om.ORDER_CANCELLED)
+        return protective(stop, limit, utc=utc, kind=kind)
+
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, answer)
+    return amends
+
+
+def cancel(client_order_id: str) -> CancelOrder:
+    return CancelOrder(
+        trader_id=TRADER_ID,
+        strategy_id=STRATEGY_ID,
+        instrument_id=US100_ID,
+        client_order_id=ClientOrderId(client_order_id),
+        venue_order_id=None,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def modify(
+    client_order_id: str,
+    *,
+    price: str | None = None,
+    trigger_price: str | None = None,
+    quantity: str | None = None,
+) -> ModifyOrder:
+    return ModifyOrder(
+        trader_id=TRADER_ID,
+        strategy_id=STRATEGY_ID,
+        instrument_id=US100_ID,
+        client_order_id=ClientOrderId(client_order_id),
+        venue_order_id=None,
+        quantity=None if quantity is None else Quantity.from_str(quantity),
+        price=None if price is None else Price.from_str(price),
+        trigger_price=None if trigger_price is None else Price.from_str(trigger_price),
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def last_kind(h, client_order_id: str) -> str | None:
+    kinds = h.kinds_of(client_order_id)
+    return kinds[-1] if kinds else None
+
+
+async def opened_bracket(h, **levels) -> None:
+    await push_spot(h, BID, ASK)
+    await submit_bracket(h, bracket(h, **levels))
+    await wait_until(
+        lambda: (
+            status(h, STOP) == OrderStatus.ACCEPTED and status(h, TARGET) == OrderStatus.ACCEPTED
+        ),
+    )
+    await sync(h)
+
+
+async def test_the_levels_are_set_exactly_once_the_protective_order_has_come() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h, stop_price="85190.00", target_price="85400.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated")
+
+        (amend,) = amends
+        assert amend.positionId == FIRST
+        assert amend.stopLoss == 85190.0
+        assert amend.takeProfit == 85400.0
+        assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderAccepted", "OrderUpdated"]
+        assert h.client._book.view(FIRST).levels == {
+            Level.STOP_LOSS: Decimal("85190.00"),
+            Level.TAKE_PROFIT: Decimal("85400.00"),
+        }
+        assert len(h.client._brackets) == 0
+        # The node's own amend is no trader's change.
+        assert h.activity == []
+
+
+async def test_no_amend_when_the_broker_set_the_levels_asked_for() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+
+        assert amends == []
+        assert len(h.client._brackets) == 0
+
+
+async def test_a_refused_correction_leaves_each_leg_where_the_broker_holds_it() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+    async with harness(execution_venue=execution_venue) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h, stop_price="85190.00", target_price="85400.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated")
+
+        # The engine applies the events it is given from a queue, after they are recorded.
+        await wait_until(
+            lambda: (
+                h.cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85197.20")
+                and h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85387.22")
+            ),
+        )
+        assert any("stay where the broker set them" in line for line in h.logger.warnings())
+
+
+async def in_flight(h, execution_venue_held: HeldReplies) -> asyncio.Task:
+    """A bracket sent and still unanswered."""
+    await push_spot(h, BID, ASK)
+    task = asyncio.create_task(submit_bracket(h, bracket(h)))
+    await asyncio.wait_for(execution_venue_held.arrived.wait(), timeout=5)
+    return task
+
+
+async def test_a_leg_cancelled_while_its_entry_is_in_flight_goes_with_the_correction() -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        sending = await in_flight(h, held)
+        await h.client._cancel_order(cancel(TARGET))
+        assert amends == []
+
+        await held.release()
+        await sending
+        await push(h, *FIRST_EVENTS[1:3])
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+
+        (amend,) = amends
+        assert amend.stopLoss == 85197.2
+        assert not amend.HasField("takeProfit")
+        assert h.kinds_of(TARGET) == ["OrderSubmitted", "OrderAccepted", "OrderCanceled"]
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+
+
+async def test_a_leg_modified_while_its_entry_is_in_flight_goes_with_the_correction() -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        sending = await in_flight(h, held)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+
+        await held.release()
+        await sending
+        await push(h, *FIRST_EVENTS[1:3])
+        await wait_until(lambda: last_kind(h, STOP) == "OrderUpdated")
+
+        (amend,) = amends
+        assert amend.stopLoss == 85150.0
+        assert amend.takeProfit == 85387.22
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85150.00"),
+        )
+
+
+async def test_a_modify_waiting_on_a_rejected_entry_is_rejected_before_the_leg_is_cancelled() -> (
+    None
+):
+    execution_venue = ExecutionVenue()
+    refusal = oa.ProtoOAOrderErrorEvent(
+        ctidTraderAccountId=ACCOUNT_ID, errorCode="NOT_ENOUGH_MONEY", description="Not enough"
+    )
+    held = HeldReplies(execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: refusal)
+    async with harness(execution_venue=execution_venue) as h:
+        sending = await in_flight(h, held)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+
+        await held.release()
+        await sending
+        await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
+
+        assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderModifyRejected", "OrderCanceled"]
+
+
+async def test_a_leg_is_cancelled_by_removing_its_level_alone() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._cancel_order(cancel(STOP))
+        await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
+
+        (amend,) = amends
+        assert not amend.HasField("stopLoss")
+        assert amend.takeProfit == 85387.22
+        assert status(h, TARGET) == OrderStatus.ACCEPTED
+
+        await h.client._cancel_order(cancel(STOP))
+        await wait_until(lambda: last_kind(h, STOP) == "OrderCancelRejected")
+        assert len(amends) == 1
+
+
+async def test_a_leg_is_moved_by_an_amend_keeping_the_other_level() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated")
+
+        (amend,) = amends
+        assert amend.stopLoss == 85197.2
+        assert amend.takeProfit == 85400.0
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
+        )
+
+
+async def test_a_legs_quantity_follows_its_position_and_cannot_be_set() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._modify_order(modify(TARGET, quantity="1.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated")
+        await h.client._modify_order(modify(TARGET, quantity="0.50"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderModifyRejected")
+
+        assert amends == []
+
+
+async def test_a_market_entry_cannot_be_cancelled() -> None:
+    async with harness(execution_venue=answered(FIRST_EVENTS[:3])) as h:
+        await opened_bracket(h)
+        await h.client._cancel_order(cancel(ENTRY))
+        await wait_until(lambda: last_kind(h, ENTRY) == "OrderCancelRejected")
+
+        (event,) = [e for e in h.events_of(ENTRY) if type(e).__name__ == "OrderCancelRejected"]
+        assert "market order" in event.reason
+
+
+async def test_a_cancel_the_broker_refuses_is_rejected_and_the_level_stays() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._cancel_order(cancel(STOP))
+        await wait_until(lambda: last_kind(h, STOP) == "OrderCancelRejected")
+
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+        assert Level.STOP_LOSS in h.client._book.view(FIRST).levels
+
+
+async def test_cancel_all_removes_a_positions_levels_in_one_amend() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._cancel_all_orders(
+            CancelAllOrders(
+                trader_id=TRADER_ID,
+                strategy_id=STRATEGY_ID,
+                instrument_id=US100_ID,
+                order_side=OrderSide.NO_ORDER_SIDE,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.CANCELED
+                and status(h, TARGET) == OrderStatus.CANCELED
+            ),
+        )
+
+        (amend,) = amends
+        assert not amend.HasField("stopLoss")
+        assert not amend.HasField("takeProfit")
+
+
+async def test_a_batch_cancel_removes_a_positions_levels_in_one_amend() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._batch_cancel_orders(
+            BatchCancelOrders(
+                trader_id=TRADER_ID,
+                strategy_id=STRATEGY_ID,
+                instrument_id=US100_ID,
+                cancels=[cancel(STOP), cancel(TARGET)],
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.CANCELED
+                and status(h, TARGET) == OrderStatus.CANCELED
+            ),
+        )
+
+        assert len(amends) == 1
+
+
+async def test_two_amends_of_one_position_never_undo_each_other() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await asyncio.gather(
+            h.client._cancel_order(cancel(STOP)),
+            h.client._modify_order(modify(TARGET, price="85400.00")),
+        )
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.CANCELED and last_kind(h, TARGET) == "OrderUpdated"
+            ),
+        )
+
+        assert len(amends) == 2
+        assert not amends[-1].HasField("stopLoss")
+        assert amends[-1].takeProfit == 85400.0
+
+
+async def test_missing_protection_is_set_by_an_amend_once_the_wait_ends() -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])  # no protective order follows the fill
+    amends = echo_amends(execution_venue, kind=om.ORDER_ACCEPTED)
+    config = exec_config(protective_order_timeout_secs=0.05)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h))
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.ACCEPTED
+                and status(h, TARGET) == OrderStatus.ACCEPTED
+            ),
+        )
+
+        (amend,) = amends
+        assert amend.stopLoss == 85197.2
+        assert amend.takeProfit == 85387.22
+        assert any("No protective order followed" in line for line in h.logger.warnings())
+
+
+async def test_levels_the_broker_refuses_after_the_wait_reject_the_legs_with_an_error() -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+    config = exec_config(protective_order_timeout_secs=0.05)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h))
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.REJECTED
+                and status(h, TARGET) == OrderStatus.REJECTED
+            ),
+        )
+
+        assert any("stands without its levels" in line for line in h.logger.errors())
+
+
+async def test_an_amend_without_an_answer_is_sent_again_once_reconnected() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        # What the broker holds after the reconnect, for the model's rebuild.
+        our_open_position(execution_venue)
+        h.server.close_after_next_request = True
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated", timeout_secs=10)
+
+        assert len(h.received(oa.ProtoOAAmendPositionSLTPReq)) == 2
+        assert len(amends) == 1
