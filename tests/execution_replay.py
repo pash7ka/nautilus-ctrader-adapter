@@ -131,18 +131,22 @@ def history(position_id: int, *, until_ms: int | None = None) -> PositionHistory
 
 
 def snapshot_at(t: float) -> oa.ProtoOAReconcileRes:
-    """The last snapshot taken at or before timeline time `t`.
+    """The snapshot of the last pair taken at or before timeline time `t` that lists orders.
 
-    Snapshots come in pairs, the second asked with protection orders; once both are taken, the
-    second is the one returned.
+    Snapshots come in pairs, the second asked with protection orders. When neither of the pair
+    taken by `t` lists an order, the last of them is returned.
     """
-    found = None
-    for item in RECORDING["timeline"]:
-        if item["t"] <= t and isinstance(item["message"], oa.ProtoOAReconcileRes):
-            found = item["message"]
-    if found is None:
+    taken = [
+        item
+        for item in RECORDING["timeline"]
+        if item["t"] <= t and isinstance(item["message"], oa.ProtoOAReconcileRes)
+    ]
+    if not taken:
         raise LookupError(f"no snapshot at or before {t}")
-    return found
+    second = "returnProtectionOrders=true" in taken[-1]["note"]
+    pair = taken[-2:] if second else taken[-1:]
+    listing = [item for item in pair if item["message"].order]
+    return (listing or pair)[-1]["message"]
 
 
 # Hand-built messages, for what the recording did not hold.

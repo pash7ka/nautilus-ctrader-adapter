@@ -92,8 +92,9 @@ def reconcile(
       the report carries that id, contingency `OTO` and the legs named in `comment`. A foreign
       entry carries neither.
     - Each closing order with a deal, as a reduce-only `MARKET`. Its client order id is the
-      matched close from `known_closes`, else the node's close of the same volume on that
-      position still in flight (`operations.closing`), never claiming one id twice, else none.
+      matched close from `known_closes`, else, for a close with a deal in `window_deals`, the
+      node's close of the same volume on that position still in flight (`operations.closing`),
+      never claiming one id twice, else none.
     - For the node's position, each leg named in `comment`, under `leg_venue_order_id`, with the
       entry as parent, contingency `OUO` and the other leg linked. A stop leg is a
       `STOP_MARKET` with `trigger_price`; a take-profit leg is a `LIMIT` with `price`.
@@ -105,11 +106,13 @@ def reconcile(
     - A protective order's deal no leg takes (a foreign position, or no leg of that level): an
       external reduce-only order under the protective order's own id, typed by `which_level`
       (`STOP_MARKET` or `LIMIT`), or `MARKET` with no level known.
-    - An open position's `ReportedPosition`.
+    - An open position's `ReportedPosition`, even when its lists show no entry fill (with a
+      `Notice`): the position stands at the broker whatever its lists say.
 
     Never reported: an open protective order (it is its position's levels) and a closing order
-    with no deal. Every other order in `snapshot` on a loaded symbol is reported as it stands,
-    with no client order id: the node sends no pending orders.
+    with no deal. Every other order in `snapshot` on a loaded symbol not reported above is
+    reported as it stands, with the node's id when it is the node's: for an entry, the one in its
+    `label`; for a closing order, the matched or in-flight close, as above but with no deal.
 
     `orders` is sorted by the first fill's time, or `ts_ms` for a report with no fill, so a
     cancelled leg of a closed position sorts at the closing deal. Ties put a non-closing order
@@ -126,10 +129,10 @@ def reconcile(
         if order.orderType == om.STOP_LOSS_TAKE_PROFIT
     }
     claimed = set(known_closes.values())
+    in_window = {str(deal.dealId) for deal in window_deals}
     keyed: list[tuple[tuple[int, bool, str], ReportedOrder]] = []
     positions: list[ReportedPosition] = []
     notices: list[Notice] = []
-    entries: set[int] = set()
     for position_id in sorted(symbols):
         digits = precision(symbols[position_id])
         if digits is None:
@@ -149,28 +152,42 @@ def reconcile(
         venue_position = open_positions.get(position_id)
         built = _Position(position_id, entry, found, digits)
         if not built.entry_fills:
-            # Created and never filled: nothing to tell Nautilus.
+            # Created and never filled: nothing to tell Nautilus, unless the broker holds it open.
+            if venue_position is not None:
+                notices.append(
+                    Notice(
+                        f"open position {position_id} lists no entry fill; only the position is "
+                        "reported",
+                    )
+                )
+                positions.append(_position_report(venue_position, digits))
             continue
-        entries.add(entry.orderId)
         reports, said = built.reports(
             venue_position,
             live_protective.get(position_id),
             known_closes,
             operations,
             claimed,
+            in_window,
         )
         notices += said
         entry_ts = _sort_key(reports[0])[0]
         keyed += [(_sort_key(report, not_before=entry_ts), report) for report in reports]
         if venue_position is not None:
             positions.append(_position_report(venue_position, digits))
+    reported = {report.venue_order_id for _, report in keyed}
     for order in snapshot.order:
-        if order.orderType == om.STOP_LOSS_TAKE_PROFIT or order.orderId in entries:
+        if order.orderType == om.STOP_LOSS_TAKE_PROFIT or str(order.orderId) in reported:
             continue
         digits = precision(order.tradeData.symbolId)
-        if digits is not None:
-            report = unfilled_order(order, digits, None)
-            keyed.append((_sort_key(report), report))
+        if digits is None:
+            continue
+        if order.closingOrder:
+            client_order_id = _close_id(order, known_closes, operations, claimed, ask=True)
+        else:
+            client_order_id = order_record.parse_label(order.tradeData.label)
+        report = unfilled_order(order, digits, client_order_id)
+        keyed.append((_sort_key(report), report))
     keyed.sort(key=lambda item: item[0])
     return Reconciliation(
         orders=tuple(report for _, report in keyed),
@@ -186,6 +203,25 @@ def unfilled_order(
     return _order_report(
         order, precision, (), client_order_id=client_order_id, reduce_only=order.closingOrder
     )
+
+
+def _close_id(
+    order: om.ProtoOAOrder,
+    known_closes: Mapping[int, str],
+    operations: Operations,
+    claimed: set[str],
+    *,
+    ask: bool,
+) -> str | None:
+    """The node's id for a closing order, if it is the node's; `ask` offers it to `operations`."""
+    close_id = known_closes.get(order.orderId)
+    # A stop-out is the broker's own close, never the node's.
+    if close_id is None and ask and not order.isStopOut:
+        candidate = operations.closing(order.positionId, order.tradeData.volume)
+        if candidate is not None and candidate not in claimed:
+            claimed.add(candidate)
+            close_id = candidate
+    return close_id
 
 
 def _sort_key(report: ReportedOrder, not_before: int = 0) -> tuple[int, bool, str]:
@@ -222,6 +258,7 @@ class _Position:
         known_closes: Mapping[int, str],
         operations: Operations,
         claimed: set[str],
+        in_window: set[str],
     ) -> tuple[list[ReportedOrder], list[Notice]]:
         """The entry's report first, then the rest in no particular order."""
         notices: list[Notice] = []
@@ -250,7 +287,7 @@ class _Position:
             entry = replace(
                 entry, linked_order_ids=tuple(leg_ids.values()), contingency=Contingency.OTO
             )
-        reports = [entry, *self._closes(known_closes, operations, claimed)]
+        reports = [entry, *self._closes(known_closes, operations, claimed, in_window)]
         leg_fills, external, said = self._triggers(leg_ids)
         notices += said
         for level, leg_id in leg_ids.items():
@@ -274,6 +311,7 @@ class _Position:
         known_closes: Mapping[int, str],
         operations: Operations,
         claimed: set[str],
+        in_window: set[str],
     ) -> list[ReportedOrder]:
         closes = [
             order
@@ -286,13 +324,9 @@ class _Position:
         closes.sort(key=lambda order: (order.utcLastUpdateTimestamp, order.orderId), reverse=True)
         reports = []
         for order in closes:
-            close_id = known_closes.get(order.orderId)
-            # A stop-out is the broker's own close, never the node's.
-            if close_id is None and not order.isStopOut:
-                candidate = operations.closing(self.position_id, order.tradeData.volume)
-                if candidate is not None and candidate not in claimed:
-                    claimed.add(candidate)
-                    close_id = candidate
+            # Only a recent close can be the answer to a close still in flight.
+            recent = any(fill.trade_id in in_window for fill in self.fills[order.orderId])
+            close_id = _close_id(order, known_closes, operations, claimed, ask=recent)
             reports.append(
                 _order_report(
                     order,

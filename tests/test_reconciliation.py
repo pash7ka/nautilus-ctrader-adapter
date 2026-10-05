@@ -20,6 +20,7 @@ from nautilus_ctrader.common.venue_records import (
     ReportStatus,
     units_of,
 )
+from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.execution_replay import (
     FIRST,
@@ -29,6 +30,10 @@ from tests.execution_replay import (
     as_ours,
     entry_id,
     history,
+    make_deal,
+    make_order,
+    make_position,
+    our_entry,
     precision,
     snapshot_at,
     stop_id,
@@ -158,6 +163,7 @@ def test_a_removed_level_cancels_its_leg() -> None:
 
     reports = by_id(run(snapshot, histories, deals))
 
+    assert any(o.orderType == om.STOP_LOSS_TAKE_PROFIT for o in snapshot.order)
     assert reports["6000001-TP"].status == ReportStatus.CANCELED
     assert reports["6000001-SL"].status == ReportStatus.ACCEPTED
 
@@ -181,19 +187,17 @@ def test_reports_are_chronological_across_positions() -> None:
 
 
 class OneClose:
-    """The node's close of `FIRST`'s manual-close volume is in flight; the id is given once."""
+    """The node's close of `volume` on one position is in flight; every ask names it again."""
 
-    def __init__(self, close_id: str = "O-C-1") -> None:
-        self._close_id: str | None = close_id
+    def __init__(self, position_id: int = FIRST, volume: int = 1, close_id: str = "O-C-1") -> None:
+        self._close = (position_id, volume)
+        self._close_id = close_id
 
     def amending(self, position_id: int) -> bool:
         return False
 
     def closing(self, position_id: int, volume: int) -> str | None:
-        if (position_id, volume) != (FIRST, 1):
-            return None
-        close_id, self._close_id = self._close_id, None
-        return close_id
+        return self._close_id if (position_id, volume) == self._close else None
 
 
 def test_a_close_in_flight_is_named_by_the_operation() -> None:
@@ -295,3 +299,91 @@ def test_reconcile_changes_nothing_given() -> None:
     run(snapshot, histories, deals, known_closes=known_closes)
 
     assert (snapshot, histories, deals, known_closes) == before
+
+
+# Hand-built lists, for what the recording did not hold.
+
+
+def reconcile_res(positions=(), orders=()) -> oa.ProtoOAReconcileRes:
+    snapshot = oa.ProtoOAReconcileRes(ctidTraderAccountId=1_000_001)
+    snapshot.position.extend(positions)
+    snapshot.order.extend(orders)
+    return snapshot
+
+
+def filled(order: om.ProtoOAOrder, deal_id: int, volume: int, ts: int) -> om.ProtoOADeal:
+    side = order.tradeData.tradeSide
+    return make_deal(
+        deal_id, order.orderId, order.positionId, side=side, volume=volume, price=85000.0, ts=ts
+    )
+
+
+def test_an_open_position_without_an_entry_fill_is_reported_with_a_notice() -> None:
+    pid = 5_000_101
+    snapshot = reconcile_res([make_position(pid)])
+    found = PositionHistory((our_entry(pid, 6_000_101),), ())
+
+    result = run(snapshot, {pid: found}, ())
+
+    assert result.orders == ()
+    assert [p.venue_position_id for p in result.positions] == [str(pid)]
+    assert len(result.notices) == 1
+
+
+def test_only_a_close_in_the_window_can_take_the_close_in_flight() -> None:
+    pid = 5_000_102
+    entry = our_entry(pid, 6_000_110, volume=300)
+    old = make_order(6_000_111, pid, side=om.SELL, volume=100, closing=True, utc=2000)
+    new = make_order(6_000_112, pid, side=om.SELL, volume=100, closing=True, utc=3000)
+    entry_deal = filled(entry, 7_000_110, 300, 1000)
+    old_deal, new_deal = filled(old, 7_000_111, 100, 2000), filled(new, 7_000_112, 100, 3000)
+    snapshot = reconcile_res([make_position(pid, volume=100)])
+    both = PositionHistory((entry, old, new), (entry_deal, old_deal, new_deal))
+    only_old = PositionHistory((entry, old), (entry_deal, old_deal))
+    in_flight = OneClose(pid, 100)
+
+    reports = by_id(run(snapshot, {pid: both}, (new_deal,), operations=in_flight))
+    alone = by_id(run(snapshot, {pid: only_old}, (), operations=in_flight))
+    matched = by_id(run(snapshot, {pid: only_old}, (), known_closes={6_000_111: "O-C-2"}))
+
+    assert reports["6000112"].client_order_id == "O-C-1"
+    assert reports["6000111"].client_order_id is None
+    assert alone["6000111"].client_order_id is None
+    assert matched["6000111"].client_order_id == "O-C-2"
+
+
+def test_a_partly_filled_close_still_listed_is_reported_once() -> None:
+    pid = 5_000_103
+    entry = our_entry(pid, 6_000_120, volume=200)
+    close = make_order(6_000_121, pid, side=om.SELL, volume=200, closing=True, utc=2000)
+    close_deal = filled(close, 7_000_121, 100, 2000)
+    snapshot = reconcile_res([make_position(pid, volume=100)], [close])
+    found = PositionHistory((entry, close), (filled(entry, 7_000_120, 200, 1000), close_deal))
+
+    result = run(snapshot, {pid: found}, (close_deal,))
+
+    (report,) = (r for r in result.orders if r.venue_order_id == "6000121")
+    assert report.status == ReportStatus.PARTIALLY_FILLED
+    assert trade_ids(report) == ("7000121",)
+
+
+def test_unfilled_orders_carry_the_node_id_when_they_are_the_node_s() -> None:
+    # An entry of ours not filled yet, a close of ours not filled yet on an open position of
+    # ours, and someone else's pending order.
+    pending_entry = our_entry(5_000_104, 6_000_130)
+    pid = 5_000_105
+    entry = our_entry(pid, 6_000_131)
+    close = make_order(6_000_132, pid, side=om.SELL, volume=100, closing=True, utc=2000)
+    foreign = make_order(6_000_133, 5_000_106, order_type=om.LIMIT, limit=85000.0)
+    snapshot = reconcile_res([make_position(pid)], [pending_entry, close, foreign])
+    found = PositionHistory((entry, close), (filled(entry, 7_000_130, 100, 1000),))
+
+    result = run(snapshot, {pid: found}, (), operations=OneClose(pid, 100))
+
+    reports = by_id(result)
+    assert reports["6000130"].client_order_id == entry_id(5_000_104)
+    assert reports["6000130"].status == ReportStatus.ACCEPTED
+    assert reports["6000132"].client_order_id == "O-C-1"
+    assert reports["6000132"].reduce_only
+    assert reports["6000133"].client_order_id is None
+    assert result.notices == ()
