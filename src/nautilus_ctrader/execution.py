@@ -377,6 +377,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._end_lost_closes()
             self._send_mass_status_report(status)
         except BaseException:
+            # Lost closes stay in flight: the retried pass may still find them.
             self._release_buffer()
             raise
         self._refresh_checkpoint()
@@ -1143,10 +1144,11 @@ class CTraderExecutionClient(LiveExecutionClient):
                     f"Close {client_order_id}: no answer, so its outcome is unknown; "
                     "it is not resent",
                 )
-            else:
-                self._on_execution_event(outcome)
+            elif isinstance(self._on_execution_event(outcome), _Buffered):
+                # In flight until the held answer is applied, or it reads as a trader's close.
+                await self._wait_for_model()
         finally:
-            if outcome is None and not self._connected():
+            if outcome is None and self._session is not None and not self._connected():
                 # The answer went with the connection: the reconnect pass may find the close.
                 self._lost_closes.add(client_order_id)
             else:
@@ -1490,7 +1492,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             await asyncio.wait_for(self._model_standing.wait(), wait_secs)
         except TimeoutError:
             self._log.warning(
-                f"The venue model was not rebuilt within {wait_secs:g}s; an amend's answer is "
+                f"The venue model was not rebuilt within {wait_secs:g}s; a request's answer is "
                 "read from the model as it stands",
             )
 

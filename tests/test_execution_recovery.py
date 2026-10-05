@@ -928,3 +928,161 @@ async def test_a_failed_reconnect_pass_releases_the_buffer() -> None:
         assert h.client._buffer is None
         assert h.client._model_standing.is_set()
         assert h.mass_statuses == []
+
+
+# -- The node's close around a rebuild -------------------------------------------------------
+
+
+async def close_sent(h: Harness) -> asyncio.Task:
+    """The node's close of `OURS`, sent; returns the task awaiting its answer."""
+    position_id = PositionId(str(OURS))
+    order = h.factory.market(
+        US100_ID,
+        OrderSide.SELL,
+        Quantity.from_str("1.00"),
+        reduce_only=True,
+        client_order_id=ClientOrderId(CLOSE),
+    )
+    h.cache.add_order(order, position_id=position_id)
+    closing = asyncio.create_task(
+        h.client._submit_order(
+            SubmitOrder(
+                trader_id=TRADER_ID,
+                strategy_id=STRATEGY_ID,
+                order=order,
+                command_id=UUID4(),
+                ts_init=0,
+                position_id=position_id,
+            ),
+        ),
+    )
+    await wait_until(lambda: len(h.received(oa.ProtoOAClosePositionReq)) == 1)
+    return closing
+
+
+def in_flight(h: Harness) -> str | None:
+    return h.client._operations.closing(OURS, 100)
+
+
+async def test_a_lost_close_stays_in_flight_until_a_reconnect_pass_succeeds() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        closing = await close_sent(h)
+        our_market_position(venue, opened=now - 120_000, closed=now - 60_000)
+        venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
+
+        await h.server.drop_connections()
+        await asyncio.wait_for(closing, timeout=10)
+        await wait_until(lambda: any("Restore" in line for line in h.logger.errors()))
+        assert h.mass_statuses == []
+        assert in_flight(h) == CLOSE
+
+        venue.fail = set()
+        await h.account.session.retry_failed_restores()
+
+        (built,) = h.mass_statuses
+        assert built.order_reports[VenueOrderId("6300002")].client_order_id == ClientOrderId(CLOSE)
+        assert in_flight(h) is None
+        assert h.client._lost_closes == set()
+
+
+async def test_a_close_pending_at_disconnect_is_not_left_in_flight() -> None:
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=int(time.time() * 1000) - 120_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        closing = await close_sent(h)
+
+        await h.client._disconnect()
+        await asyncio.wait_for(closing, timeout=10)
+
+        assert in_flight(h) is None
+        assert h.client._lost_closes == set()
+
+
+async def test_a_close_that_times_out_on_a_live_connection_is_no_longer_in_flight() -> None:
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=int(time.time() * 1000) - 120_000)
+    config = exec_config(order_request_timeout_secs=0.2)
+    async with harness(execution_venue=venue, config=config) as h:
+        await started(h)
+        closing = await close_sent(h)
+
+        await asyncio.wait_for(closing, timeout=10)
+
+        assert h.account.session.is_ready
+        assert in_flight(h) is None
+        assert h.client._lost_closes == set()
+
+
+def node_close_events(*, closed: int) -> list[oa.ProtoOAExecutionEvent]:
+    """The node's close of `OURS` accepted, then filled at `closed` (hand-built)."""
+
+    def order(utc: int) -> om.ProtoOAOrder:
+        return make_order(
+            6_300_002, OURS, side=om.SELL, closing=True, utc=utc, symbol=US100_SYMBOL_ID
+        )
+
+    def position(utc: int, status: int = om.POSITION_STATUS_OPEN) -> om.ProtoOAPosition:
+        found = make_position(
+            OURS, volume=0 if status == om.POSITION_STATUS_CLOSED else 100, status=status
+        )
+        found.utcLastUpdateTimestamp = utc
+        return found
+
+    deal = make_deal(7_300_002, 6_300_002, OURS, side=om.SELL, volume=100, price=85100.0, ts=closed)
+    deal.closePositionDetail.CopyFrom(
+        om.ProtoOAClosePositionDetail(
+            entryPrice=85000.0,
+            grossProfit=10_000,
+            swap=0,
+            commission=0,
+            balance=1_000_000,
+            balanceVersion=100,
+            moneyDigits=2,
+        ),
+    )
+    return on_us100(
+        [
+            make_event(om.ORDER_ACCEPTED, order(closed - 1), position=position(closed - 1)),
+            make_event(
+                om.ORDER_FILLED,
+                order(closed),
+                position=position(closed, om.POSITION_STATUS_CLOSED),
+                deal=deal,
+            ),
+        ],
+    )
+
+
+async def test_a_close_answered_during_a_rebuild_is_still_the_nodes() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    accepted, filled = node_close_events(closed=now - 60_000)
+    venue.server.on(om.PROTO_OA_CLOSE_POSITION_REQ, lambda _r: accepted)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+        rebuilding = asyncio.create_task(h.client._reload())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        closing = await close_sent(h)
+        await push(h, filled)
+        assert len(h.client._buffer) == 2
+
+        await held.stop_holding()
+        await asyncio.wait_for(rebuilding, timeout=10)
+        await asyncio.wait_for(closing, timeout=10)
+
+        await wait_until(lambda: status(h, CLOSE) == OrderStatus.FILLED)
+        assert h.kinds_of(CLOSE) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+        assert not any(r.venue_order_id == VenueOrderId("6300002") for r in h.reports)
+        assert not any(a.kind == "manual_change" for a in h.activity)
+        assert in_flight(h) is None
