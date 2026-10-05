@@ -319,6 +319,7 @@ def test_a_model_loaded_mid_session_continues_like_one_that_saw_it_all() -> None
         protective_order_id=6000002,
         levels={Level.STOP_LOSS: d("85197.20"), Level.TAKE_PROFIT: d("85387.22")},
         legs={Level.STOP_LOSS: (stop_id(FIRST), True), Level.TAKE_PROFIT: (target_id(FIRST), True)},
+        leg_units={Level.STOP_LOSS: d("1"), Level.TAKE_PROFIT: d("1")},
     )
 
     later = [

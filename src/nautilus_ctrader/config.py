@@ -9,7 +9,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from nautilus_trader.config import LiveDataClientConfig
+from nautilus_trader.config import (
+    InstrumentProviderConfig,
+    LiveDataClientConfig,
+    LiveExecClientConfig,
+)
 from nautilus_trader.model.enums import AssetClass
 
 from nautilus_ctrader.common.account import ENVIRONMENTS, AccountCredentials, Environment
@@ -117,6 +121,96 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
             raise ValueError(
                 f"environment must be one of {ENVIRONMENTS}, got {self.environment!r}",
             )
+
+    def credentials(self) -> AccountCredentials:
+        return AccountCredentials(
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            access_token=self.access_token,
+            refresh_token=self.refresh_token,
+            token_expires_at=self.token_expires_at,
+        )
+
+
+class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
+    """
+    Configuration for `CTraderExecutionClient` instances.
+
+    It carries no instrument settings: the execution client trades the instruments of the
+    account's provider, which the data client's configuration builds.
+
+    Parameters
+    ----------
+    client_id, client_secret : str
+        The registered application's credentials.
+    access_token : str
+        An access token granting this application the account.
+    trader_login : int
+        The account number the broker gave you, as for `CTraderDataClientConfig`.
+    refresh_token : str, optional
+        Used to renew `access_token`.
+    token_expires_at : float, optional
+        Unix seconds the access token expires at.
+    environment : str, default "auto"
+        `"auto"` reads the account's own live flag and picks the host; `"demo"`/`"live"` force it.
+    connect_timeout_secs : float, default 60.0
+        Bound on the whole account bring-up.
+    restore_retry_interval_secs : float, default 30.0
+        How often to retry what a reconnect failed to restore.
+    reference_price_max_age_secs : float, default 10.0
+        The oldest spot a bracket's levels may be measured from. The venue takes a market
+        order's levels only as distances, which it applies to the fill.
+    protective_order_timeout_secs : float, default 2.0
+        How long after a bracket's fill to wait for the broker's protective order before
+        setting the levels by an amend.
+    order_request_timeout_secs : float, default 30.0
+        Response timeout for an order, a close or a level amend. An order or a close with no
+        answer by then is never resent, so a slow answer must not be taken for a lost one.
+
+    Raises
+    ------
+    ValueError
+        If `instrument_provider` is set, `environment` is not one of "auto", "demo", "live", or
+        a duration is not positive.
+
+    Notes
+    -----
+    Every client of one account shares one connection: the connection settings of the first
+    config built for the account win.
+
+    """
+
+    client_id: str
+    client_secret: str
+    access_token: str
+    trader_login: int
+    refresh_token: str | None = None
+    token_expires_at: float | None = None
+    environment: Environment = "auto"
+    connect_timeout_secs: float = 60.0
+    restore_retry_interval_secs: float = 30.0
+    reference_price_max_age_secs: float = 10.0
+    protective_order_timeout_secs: float = 2.0
+    order_request_timeout_secs: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.instrument_provider != InstrumentProviderConfig():
+            raise ValueError(
+                "instrument_provider is set on the execution config; the execution client "
+                "trades the instruments of the account's provider, which the data client's "
+                "config builds",
+            )
+        if self.environment not in ENVIRONMENTS:
+            raise ValueError(
+                f"environment must be one of {ENVIRONMENTS}, got {self.environment!r}",
+            )
+        for name in (
+            "reference_price_max_age_secs",
+            "protective_order_timeout_secs",
+            "order_request_timeout_secs",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
 
     def credentials(self) -> AccountCredentials:
         return AccountCredentials(

@@ -86,6 +86,9 @@ class _Position:
     # Protective orders replaced by a new id or cancelled: any later event of theirs is stale.
     retired_protective_ids: set[int] = field(default_factory=set)
     levels: dict[Level, Decimal] = field(default_factory=dict)
+    # The `utcLastUpdateTimestamp` of the position state last applied; a created position has
+    # none and counts as 0.
+    updated_ms: int = -1
 
     @property
     def ours(self) -> bool:
@@ -94,7 +97,10 @@ class _Position:
 
 @dataclass(frozen=True)
 class PositionView:
-    """A read-only copy of what the model holds for one position."""
+    """A read-only copy of what the model holds for one position.
+
+    `leg_units` holds the quantity Nautilus has for each accepted live leg.
+    """
 
     position_id: int
     symbol_id: int
@@ -107,6 +113,7 @@ class PositionView:
     protective_order_id: int | None
     levels: dict[Level, Decimal]
     legs: dict[Level, tuple[str, bool]]
+    leg_units: dict[Level, Decimal]
 
 
 def _entry_of(orders: Sequence[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
@@ -182,6 +189,7 @@ class VenueBook:
         self._ended_entries: set[int] = set()
         self._reported: set[int] = set()
         self._seen: set[tuple] = set()
+        self._synced_deals: set[int] = set()
 
     def view(self, position_id: int) -> PositionView | None:
         position = self._positions.get(position_id)
@@ -199,6 +207,11 @@ class VenueBook:
             protective_order_id=position.protective_order_id,
             levels=dict(position.levels),
             legs={level: (leg.client_order_id, leg.alive) for level, leg in position.legs.items()},
+            leg_units={
+                level: units_of(leg.quantity)
+                for level, leg in position.legs.items()
+                if leg.alive and leg.accepted
+            },
         )
 
     def load(
@@ -222,6 +235,7 @@ class VenueBook:
             )
             position.open = True
             position.volume = venue_position.tradeData.volume
+            position.updated_ms = venue_position.utcLastUpdateTimestamp
             precision = self._precision(position.symbol_id)
             if precision is not None:
                 if venue_position.HasField("stopLoss"):
@@ -332,6 +346,46 @@ class VenueBook:
             ),
         ]
 
+    def leg_position(self, client_order_id: str) -> tuple[int, Level] | None:
+        """The position and level of the node's leg `client_order_id`, alive or not."""
+        for position in self._positions.values():
+            for level, leg in position.legs.items():
+                if leg.client_order_id == client_order_id:
+                    return position.position_id, level
+        return None
+
+    def cancel_leg(self, position_id: int, level: Level, ts_ms: int) -> list[Record]:
+        """The node cancels a live leg whose level the broker does not hold: no request is needed.
+
+        Says nothing for a leg already ended, or one whose level stands: that takes an amend.
+        """
+        position = self._positions.get(position_id)
+        leg = None if position is None else position.legs.get(level)
+        if leg is None or not leg.alive or level in position.levels:
+            return []
+        leg.alive = False
+        return [self._leg_event(OrderEventKind.CANCELED, position, level, ts_ms)]
+
+    def reject_legs(self, position_id: int, reason: str, ts_ms: int) -> list[Record]:
+        """The broker refused the levels of the live legs it never accepted; they are rejected."""
+        position = self._positions.get(position_id)
+        if position is None:
+            return []
+        records: list[Record] = []
+        for level, leg in position.legs.items():
+            if leg.alive and not leg.accepted:
+                leg.alive = False
+                records.append(
+                    OrderEvent(
+                        OrderEventKind.REJECTED,
+                        self._leg_id(position, level),
+                        leg.client_order_id,
+                        ts_ms,
+                        reason=reason,
+                    ),
+                )
+        return records
+
     # Positions
 
     def _new_position(self, position_id: int, symbol_id: int, side: int) -> _Position:
@@ -360,12 +414,25 @@ class VenueBook:
             return self._new_position(order.positionId, symbol_id, side)
         return _Position(order.positionId, symbol_id, _SIDE[side])
 
-    @staticmethod
-    def _sync(position: _Position, event: oa.ProtoOAExecutionEvent) -> None:
+    def _sync(self, position: _Position, event: oa.ProtoOAExecutionEvent) -> None:
         if event.HasField("position"):
+            updated = event.position.utcLastUpdateTimestamp
+            # A response can be applied after a later event of its order: its older position
+            # state must not undo the newer one.
+            # TODO(verify): that a position's `utcLastUpdateTimestamp` grows in event order and
+            # is set on every state but a created one; a recording of a reconnect, or of events
+            # racing each other, would confirm both.
+            if updated < position.updated_ms:
+                return
+            position.updated_ms = updated
             position.volume = event.position.tradeData.volume
             position.open = event.position.positionStatus == om.POSITION_STATUS_OPEN
         elif event.executionType in _FILLS and event.HasField("deal"):
+            # An event whose handling raised is not marked seen and may come again; its deal must
+            # not move the volume twice.
+            if event.deal.dealId in self._synced_deals:
+                return
+            self._synced_deals.add(event.deal.dealId)
             # TODO(verify): whether a fill always carries the position; until then the deal's
             # volume moves the one known.
             filled = event.deal.filledVolume
@@ -633,11 +700,15 @@ class VenueBook:
             position.entry_accepted = True
             return [OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, entry_id, ts)]
         if kind in _FILLS:
-            position.entry_accepted = True
+            records: list[Record] = []
+            if not position.entry_accepted:
+                # The acceptance can be applied after the fill, or never come: it is told here.
+                position.entry_accepted = True
+                records.append(OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, entry_id, ts))
             fill = self._fill(event.deal, precision)
-            records: list[Record] = [
+            records.append(
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, entry_id, fill.ts_ms, fill=fill),
-            ]
+            )
             if position.protective_order_id is not None:
                 # The protective order came first: its levels accept the legs now, at the deal's
                 # time so that they never predate the fill.
@@ -891,11 +962,16 @@ class VenueBook:
             self._closes_accepted.add(order.orderId)
             return [OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, close_id, ts)]
         if kind in _FILLS:
-            self._closes_accepted.add(order.orderId)
+            records: list[Record] = []
+            if order.orderId not in self._closes_accepted:
+                # As for an entry: the acceptance can be applied after the fill.
+                self._closes_accepted.add(order.orderId)
+                records.append(OrderEvent(OrderEventKind.ACCEPTED, venue_order_id, close_id, ts))
             fill = self._fill(event.deal, precision)
-            return [
+            records.append(
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, close_id, fill.ts_ms, fill=fill)
-            ]
+            )
+            return records
         if kind in _ENDED:
             return [
                 OrderEvent(

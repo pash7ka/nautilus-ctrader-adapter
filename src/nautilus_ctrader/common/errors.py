@@ -47,3 +47,7 @@ class CTraderRequestError(CTraderError):
         self.description = description
         self.maintenance_end_secs = maintenance_end_secs
         self.retry_after_secs = retry_after_secs
+
+
+class CTraderAccountError(CTraderError):
+    """The account cannot be traded through this adapter: its type or rights do not allow it."""

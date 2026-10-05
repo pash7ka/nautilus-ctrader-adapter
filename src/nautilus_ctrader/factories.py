@@ -16,11 +16,16 @@ import asyncio
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, Logger, MessageBus
-from nautilus_trader.live.factories import LiveDataClientFactory
+from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
 
 from nautilus_ctrader.common.account import account_client_from_config
-from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
+from nautilus_ctrader.config import (
+    CTraderDataClientConfig,
+    CTraderExecClientConfig,
+    parse_asset_class_overrides,
+)
 from nautilus_ctrader.data import CTraderDataClient
+from nautilus_ctrader.execution import CTraderExecutionClient
 
 
 class CTraderLiveDataClientFactory(LiveDataClientFactory):
@@ -86,6 +91,69 @@ class CTraderLiveDataClientFactory(LiveDataClientFactory):
             logger=logger,
         )
         return CTraderDataClient(
+            loop=loop,
+            account=account,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=provider,
+            config=config,
+            name=name,
+        )
+
+
+class CTraderLiveExecClientFactory(LiveExecClientFactory):
+    """
+    Provides a cTrader live execution client factory.
+    """
+
+    @staticmethod
+    def create(  # type: ignore[override]
+        loop: asyncio.AbstractEventLoop,
+        name: str,
+        config: CTraderExecClientConfig,
+        msgbus: MessageBus,
+        cache: Cache,
+        clock: LiveClock,
+    ) -> CTraderExecutionClient:
+        """
+        Create a new cTrader execution client.
+
+        Parameters
+        ----------
+        loop : asyncio.AbstractEventLoop
+            The event loop for the client.
+        name : str
+            The custom client ID.
+        config : CTraderExecClientConfig
+            The client configuration.
+        msgbus : MessageBus
+            The message bus for the client.
+        cache : Cache
+            The cache for the client.
+        clock : LiveClock
+            The clock for the client.
+
+        Returns
+        -------
+        CTraderExecutionClient
+
+        Raises
+        ------
+        ValueError
+            If the account has no instrument provider yet: a cTrader data client for the same
+            account must be configured, and the node builds data clients first.
+
+        """
+        logger = Logger(name)
+        account = account_client_from_config(config, logger)
+        provider = account.instrument_provider
+        if provider is None:
+            raise ValueError(
+                "the account has no instrument provider: configure a cTrader data client for "
+                "the same account, which builds it",
+            )
+        return CTraderExecutionClient(
             loop=loop,
             account=account,
             msgbus=msgbus,
