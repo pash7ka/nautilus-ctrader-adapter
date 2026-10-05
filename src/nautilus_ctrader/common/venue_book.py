@@ -419,6 +419,9 @@ class VenueBook:
             updated = event.position.utcLastUpdateTimestamp
             # A response can be applied after a later event of its order: its older position
             # state must not undo the newer one.
+            # TODO(verify): that a position's `utcLastUpdateTimestamp` grows in event order and
+            # is set on every state but a created one; a recording of a reconnect, or of events
+            # racing each other, would confirm both.
             if updated < position.updated_ms:
                 return
             position.updated_ms = updated

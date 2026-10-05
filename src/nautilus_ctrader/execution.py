@@ -244,15 +244,18 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._instrument_provider.initialize()
             session = self._account.session
             assert session is not None  # `connect()` returned, so the session is up
+            trader = await self._trader()
+            check_account(trader)
+            self._currency = Currency.from_str(self._account.deposit_asset.name)
+            self._balance_version = -1
+            self._take_trader(trader)
+            # Attached only once the account is known, and before the rebuild, whose buffer
+            # holds the execution events that come meanwhile.
             self._session = session
             session.add_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
             session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
             session.add_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
             session.add_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
-            trader = await self._trader()
-            check_account(trader)
-            self._currency = Currency.from_str(self._account.deposit_asset.name)
-            self._take_trader(trader)
             await self._load()
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
@@ -354,10 +357,13 @@ class CTraderExecutionClient(LiveExecutionClient):
                 self._set_margin(position)
         finally:
             held, self._buffer = self._buffer, None
-            for event in held:
-                self._on_execution_event(event)
-            # A protective order that came during an outage arrives with the rebuild, no event.
-            self._settle_brackets()
+            # A client detached meanwhile must start nothing; its next connect rebuilds anew.
+            if self._session is not None:
+                for event in held:
+                    self._on_execution_event(event)
+                # A protective order that came during an outage arrives with the rebuild, no
+                # event.
+                self._settle_brackets()
 
     async def _position_orders(self, position_id: int) -> list[om.ProtoOAOrder]:
         """Every order of one position: its entry tells whose position it is."""
@@ -415,8 +421,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         return True
 
     def _take_trader(self, trader: om.ProtoOATrader) -> None:
-        # A trader read whole is the reference: any version held before is superseded.
-        self._balance_version = -1
+        # A read taken before a newer closing deal or deposit was applied must not undo it.
         self._set_balance(
             trader.balance,
             trader,
@@ -518,6 +523,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._handle_records(records)
         self._update_account(event)
         self._settle_brackets()
+        self._drop_amend_locks()
         return records
 
     def _on_order_error_event(self, event: oa.ProtoOAOrderErrorEvent) -> None:
@@ -853,11 +859,12 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     def _on_protection(self, record: AwaitProtection | ProtectionMissing) -> None:
         if isinstance(record, AwaitProtection):
-            timer = self._loop.call_later(
-                self._config.protective_order_timeout_secs,
-                self._protection_waited,
-                record.position_id,
-            )
+
+            def waited() -> None:
+                self._protection_timers.discard(timer)
+                self._protection_waited(record.position_id)
+
+            timer = self._loop.call_later(self._config.protective_order_timeout_secs, waited)
             self._protection_timers.add(timer)
         else:
             self.create_task(
@@ -866,7 +873,6 @@ class CTraderExecutionClient(LiveExecutionClient):
             )
 
     def _protection_waited(self, position_id: int) -> None:
-        self._protection_timers = {t for t in self._protection_timers if not t.cancelled()}
         self._handle_records(self._book.protection_timed_out(position_id))
 
     def _end_bracket(self, entry_id: str, reason: str) -> None:
@@ -890,7 +896,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             "side": command.order_side,
         }
         orders = self._cache.orders_open(**selection) + self._cache.orders_inflight(**selection)
-        await self._cancel([order.client_order_id for order in orders])
+        # A pending cancel or update is both open and in flight; it is answered once.
+        await self._cancel(list(dict.fromkeys(order.client_order_id for order in orders)))
 
     async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
         await self._cancel([cancel.client_order_id for cancel in command.cancels])
@@ -1099,6 +1106,13 @@ class CTraderExecutionClient(LiveExecutionClient):
                 return []
             finally:
                 self._operations.end_amend(position_id)
+
+    def _drop_amend_locks(self) -> None:
+        """Forget the lock of each position no longer open; an amend there is refused anyway."""
+        for position_id, lock in list(self._amend_locks.items()):
+            view = self._book.view(position_id)
+            if not lock.locked() and (view is None or not view.open):
+                del self._amend_locks[position_id]
 
     @staticmethod
     def _level_price(

@@ -20,7 +20,7 @@ from nautilus_trader.execution.messages import (
 )
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
-from nautilus_trader.model.events import OrderFilled, OrderRejected
+from nautilus_trader.model.events import OrderFilled, OrderPendingCancel, OrderRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientOrderId,
@@ -377,6 +377,23 @@ async def test_events_arriving_while_the_model_is_rebuilt_are_applied_after_it()
         assert any("Rebuilding the venue model" in line for line in h.logger.warnings())
 
 
+async def test_events_held_by_a_rebuild_the_client_left_are_dropped() -> None:
+    async with harness() as h:
+        await submitted(h)
+        held = HeldReplies(h.server, om.PROTO_OA_RECONCILE_REQ, lambda _r: h.venue.snapshot)
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        for message in FIRST_EVENTS[:3]:
+            await h.server.push(message)
+        await wait_until(lambda: len(h.client._buffer or []) == 3)
+
+        await h.client._disconnect()
+        await wait_until(lambda: h.client._buffer is None)
+
+        assert h.kinds_of(ENTRY) == ["OrderSubmitted"]
+        assert status(h, ENTRY) == OrderStatus.SUBMITTED
+
+
 async def test_an_event_the_model_cannot_apply_is_an_error_and_the_client_carries_on() -> None:
     async with harness() as h:
         await submitted(h)
@@ -536,6 +553,43 @@ async def test_a_query_reads_the_account_again() -> None:
         )
 
         assert balance_of(h.states[-1]) == Decimal("7777.00")
+
+
+async def test_a_query_answered_with_an_older_balance_never_takes_it_back() -> None:
+    async with harness() as h:
+        await push(h, deposit(1_000_000, version=10))
+        h.venue.trader = trader(balance=777_700, balanceVersion=9)
+        await h.client._query_account(
+            QueryAccount(
+                trader_id=TRADER_ID,
+                account_id=AccountId("CTRADER-001"),
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+
+        assert balance_of(h.states[-1]) == Decimal("10000.00")
+
+
+async def test_an_account_event_before_the_account_is_read_is_left_to_that_read() -> None:
+    async with harness(connect=False) as h:
+        # Another user of the account brings it up, so the client's own trader read is the
+        # first one held.
+        await h.account.connect()
+        try:
+            await h.client.instrument_provider.initialize()
+            held = HeldReplies(h.server, om.PROTO_OA_TRADER_REQ, lambda _r: h.venue.trader)
+            connecting = asyncio.create_task(h.client._connect())
+            await asyncio.wait_for(held.arrived.wait(), timeout=5)
+            await h.server.push(deposit(1_000_000, version=10))
+            await held.release()
+            await held.stop_holding()
+            await connecting
+
+            assert h.logger.errors() == []
+            assert len(h.states) == 1
+        finally:
+            await h.account.disconnect()
 
 
 # The recorded entry filled at 85287.21: an ask there gives the recorded distances.
@@ -1284,6 +1338,40 @@ async def test_cancel_all_removes_a_positions_levels_in_one_amend() -> None:
         assert not amend.HasField("takeProfit")
 
 
+async def test_cancel_all_answers_an_order_both_open_and_in_flight_once() -> None:
+    async with harness(execution_venue=answered(market_events()[0])) as h:
+        await submit(h, market(h))
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.ACCEPTED)
+        order = h.cache.order(ClientOrderId(MARKET_ID))
+        h.engine.process(
+            OrderPendingCancel(
+                TRADER_ID,
+                STRATEGY_ID,
+                US100_ID,
+                order.client_order_id,
+                order.venue_order_id,
+                ACCOUNT,
+                UUID4(),
+                0,
+                0,
+            ),
+        )
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.PENDING_CANCEL)
+
+        await h.client._cancel_all_orders(
+            CancelAllOrders(
+                trader_id=TRADER_ID,
+                strategy_id=STRATEGY_ID,
+                instrument_id=US100_ID,
+                order_side=OrderSide.NO_ORDER_SIDE,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+
+        assert h.kinds_of(MARKET_ID).count("OrderCancelRejected") == 1
+
+
 async def test_a_batch_cancel_removes_a_positions_levels_in_one_amend() -> None:
     execution_venue = answered(FIRST_EVENTS[:3])
     amends = echo_amends(execution_venue)
@@ -1347,6 +1435,21 @@ async def test_missing_protection_is_set_by_an_amend_once_the_wait_ends() -> Non
         assert amend.stopLoss == 85197.2
         assert amend.takeProfit == 85387.22
         assert any("No protective order followed" in line for line in h.logger.warnings())
+        assert h.client._protection_timers == set()
+
+
+async def test_a_positions_amend_lock_goes_once_the_position_has_closed() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        assert FIRST in h.client._amend_locks
+
+        await push(h, *FIRST_EVENTS[3:])
+
+        assert not h.client._book.view(FIRST).open
+        assert FIRST not in h.client._amend_locks
 
 
 async def test_levels_the_broker_refuses_after_the_wait_reject_the_legs_with_an_error() -> None:
