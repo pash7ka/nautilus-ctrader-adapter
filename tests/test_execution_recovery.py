@@ -1,18 +1,24 @@
 """Restarts through Nautilus's own engine: the broker's lists reconciled as one mass status.
 
-Each test builds the records with `reconcile`, converts them with `mass_status` and hands the
-result to the live execution engine, then reads what Nautilus made of it from the cache.
+The first tests build the records with `reconcile`, convert them with `mass_status` and hand
+the result to the live execution engine, then read what Nautilus made of it from the cache. The
+later ones run the client's own reconciliation pass against the fake venue's lists.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 from nautilus_trader.cache.cache import Cache
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import ContingencyType, OrderStatus, OrderType
@@ -24,18 +30,20 @@ from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.execution_reports import mass_status
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.reconciliation import PositionHistory, Reconciliation, reconcile
-from nautilus_ctrader.common.venue_records import Fill, ReportedOrder, money_of
-from nautilus_ctrader.constants import CTRADER_VENUE
+from nautilus_ctrader.common.venue_records import Fill, Level, ReportedOrder, money_of
+from nautilus_ctrader.constants import CTRADER_VENUE, UNLOADED_EXPOSURE_KEY
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.account_venue import ACCOUNT_ID
+from tests.account_venue import ACCOUNT_ID, HeldReplies
 from tests.execution_replay import (
     FIRST,
     NoOperations,
     as_ours,
     history,
     make_deal,
+    make_event,
     make_order,
+    make_position,
     snapshot_at,
     window_deals,
 )
@@ -46,6 +54,7 @@ from tests.execution_venue import (
     TARGET,
     US100_ID,
     US100_SYMBOL_ID,
+    ExecutionVenue,
     Harness,
     harness,
     on_us100,
@@ -419,3 +428,261 @@ async def test_same_reports_with_and_without_cache() -> None:
 
     assert with_cache == without
     assert restarted_states == fresh_states
+
+
+# -- The client's reconciliation pass --------------------------------------------------------
+
+EURUSD_SYMBOL_ID = 1  # not loaded by the harness
+MINUTE_MS = 60_000
+
+
+def serving(at: float = OPEN_AT) -> ExecutionVenue:
+    """A venue whose snapshot and lists are the node's first position at timeline time `at`."""
+    venue = ExecutionVenue()
+    snapshot, histories, deals = broker_lists(at)
+    venue.snapshot = snapshot
+    for position_id, found in histories.items():
+        venue.position_orders[position_id] = list(found.orders)
+        venue.position_deals[position_id] = list(found.deals)
+    venue.deals = list(deals)
+    return venue
+
+
+def unloaded_position(position_id: int) -> om.ProtoOAPosition:
+    return make_position(position_id, symbol=EURUSD_SYMBOL_ID)
+
+
+def exposure(h: Harness) -> list[dict]:
+    return json.loads(h.cache.get(UNLOADED_EXPOSURE_KEY))
+
+
+def foreign_position(venue: ExecutionVenue, n: int, *, ts: int) -> None:
+    """An open position the node did not open, its entry filled at `ts`, on `US100.cash`."""
+    position_id, order_id = 5_100_000 + n, 6_100_000 + n
+    position = make_position(position_id, symbol=US100_SYMBOL_ID)
+    position.price = 85000.0
+    position.utcLastUpdateTimestamp = ts
+    venue.snapshot.position.append(position)
+    entry = make_order(order_id, position_id, utc=ts, symbol=US100_SYMBOL_ID)
+    entry.orderStatus = om.ORDER_STATUS_FILLED
+    venue.position_orders[position_id] = [entry]
+    deal = make_deal(
+        7_100_000 + n, order_id, position_id, side=om.BUY, volume=100, price=85000.0, ts=ts
+    )
+    venue.position_deals[position_id] = on_us100([deal])
+
+
+def closed_position(
+    venue: ExecutionVenue, n: int, *, opened: int, closed: int
+) -> list[om.ProtoOADeal]:
+    """A foreign position opened at `opened` and closed at `closed`; returns its two deals."""
+    position_id, entry_id, close_id = 5_200_000 + n, 6_200_000 + 2 * n, 6_200_001 + 2 * n
+    entry = make_order(entry_id, position_id, utc=opened, symbol=US100_SYMBOL_ID)
+    close = make_order(
+        close_id, position_id, side=om.SELL, closing=True, utc=closed, symbol=US100_SYMBOL_ID
+    )
+    for order in (entry, close):
+        order.orderStatus = om.ORDER_STATUS_FILLED
+    deals = on_us100(
+        [
+            make_deal(
+                7_200_000 + 2 * n,
+                entry_id,
+                position_id,
+                side=om.BUY,
+                volume=100,
+                price=85000.0,
+                ts=opened,
+            ),
+            make_deal(
+                7_200_001 + 2 * n,
+                close_id,
+                position_id,
+                side=om.SELL,
+                volume=100,
+                price=85100.0,
+                ts=closed,
+            ),
+        ]
+    )
+    venue.position_orders[position_id] = [entry, close]
+    venue.position_deals[position_id] = deals
+    venue.deals += deals
+    return deals
+
+
+async def test_generate_mass_status_reports_the_recorded_state() -> None:
+    async with harness(execution_venue=serving()) as h:
+        built = await h.client.generate_mass_status()
+
+        ids = {report.client_order_id for report in built.order_reports.values()}
+        assert {ClientOrderId(ENTRY), ClientOrderId(STOP), ClientOrderId(TARGET)} <= ids
+        assert len(built.position_reports[US100_ID]) == 1
+        view = h.client._book.view(FIRST)
+        assert view.legs == {Level.STOP_LOSS: (STOP, True), Level.TAKE_PROFIT: (TARGET, True)}
+
+
+async def test_an_event_during_the_start_pass_is_applied_after_reconciliation() -> None:
+    venue = serving()
+    async with harness(execution_venue=venue) as h:
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+        )
+        passing = asyncio.create_task(h.client.generate_mass_status())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        # The stop-loss moved by hand, then the protective order filled at it.
+        await push(h, *FIRST_EVENTS[-2:])
+        await held.stop_holding()
+        built = await asyncio.wait_for(passing, timeout=10)
+
+        h.engine.reconcile_execution_mass_status(built)
+
+        await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
+        assert kinds(h, STOP)[-1] == "OrderFilled"
+        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+
+
+async def test_buffer_is_released_when_reconciliation_never_comes() -> None:
+    async with harness(execution_venue=serving()) as h:
+        h.client._reconciled_wait_secs = 0.2
+        assert await h.client.generate_mass_status() is not None
+
+        await push(h, *FIRST_EVENTS[-2:])
+
+        await wait_until(lambda: not h.client._book.view(FIRST).open)
+        assert any("0.2s" in line for line in h.logger.warnings())
+
+
+async def test_a_failed_list_releases_the_buffer() -> None:
+    venue = serving()
+    venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
+    async with harness(execution_venue=venue) as h:
+        assert await h.client.generate_mass_status() is None
+
+        await push(h, *FIRST_EVENTS[-2:])
+
+        assert not h.client._book.view(FIRST).open
+        assert h.logger.errors() == []
+        assert any("INTERNAL_SERVER_ERROR" in line for line in h.logger.warnings())
+
+
+async def test_the_pass_asks_each_position_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The suite need not wait out the venue's historical rate for 50 lists.
+    monkeypatch.setattr("nautilus_ctrader.common.session.HISTORICAL_RATE_LIMIT_PER_SEC", 1000.0)
+    venue = ExecutionVenue()
+    for n in range(25):
+        foreign_position(venue, n, ts=1_600_000_000_000 + n)
+    async with harness(execution_venue=venue) as h:
+        orders_before = len(h.received(oa.ProtoOAOrderListByPositionIdReq))
+        deals_before = len(h.received(oa.ProtoOADealListByPositionIdReq))
+
+        built = await h.client.generate_mass_status()
+
+        assert len(h.received(oa.ProtoOAOrderListByPositionIdReq)) - orders_before == 25
+        assert len(h.received(oa.ProtoOADealListByPositionIdReq)) - deals_before == 25
+        assert len(built.position_reports[US100_ID]) == 25
+        # The snapshot, the window's deal list, and two lists per position.
+        assert any(level == "info" and "52 requests" in line for level, line in h.logger.lines)
+
+
+async def test_deal_pages_are_followed() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    venue.page_size = 2
+    in_window = closed_position(venue, 1, opened=now - 50_000, closed=now - 40_000)
+    in_window += closed_position(venue, 2, opened=now - 30_000, closed=now - 20_000)
+    # Opened before the window, closed in it.
+    before = now - 2 * 1440 * MINUTE_MS
+    in_window += closed_position(venue, 3, opened=before, closed=now - 10_000)[1:]
+    assert len(in_window) == 5
+    async with harness(execution_venue=venue) as h:
+        built = await h.client.generate_mass_status()
+
+        trade_ids = [f.trade_id.value for fills in built.fill_reports.values() for f in fills]
+        assert len(trade_ids) == len(set(trade_ids))
+        assert {str(deal.dealId) for deal in in_window} <= set(trade_ids)
+        assert len(h.received(oa.ProtoOADealListReq)) > 1
+
+
+async def test_window_uses_the_default_lookback() -> None:
+    async with harness() as h:
+        await h.client.generate_mass_status(lookback_mins=None)
+
+        (asked,) = h.received(oa.ProtoOADealListReq)
+        expected = int(time.time() * 1000) - 1440 * MINUTE_MS
+        assert abs(asked.fromTimestamp - expected) < 5_000
+
+
+async def test_exposure_written_at_connect_and_on_change() -> None:
+    async with harness() as h:
+        assert h.cache.get(UNLOADED_EXPOSURE_KEY) == b"[]"
+
+        order = make_order(6_900_002, 5_900_002, symbol=EURUSD_SYMBOL_ID)
+        order.orderStatus = om.ORDER_STATUS_FILLED
+        deal = make_deal(
+            7_900_002, 6_900_002, 5_900_002, side=om.BUY, volume=100, price=1.1, ts=1_000
+        )
+        deal.symbolId = EURUSD_SYMBOL_ID
+        await push(
+            h,
+            make_event(om.ORDER_FILLED, order, position=unloaded_position(5_900_002), deal=deal),
+        )
+
+        await wait_until(lambda: len(exposure(h)) == 1)
+        (item,) = exposure(h)
+        assert (item["symbol"], item["subject"], item["side"]) == ("EURUSD", "position", "BUY")
+
+    async with harness(connect=False) as h:
+        h.cache.add(UNLOADED_EXPOSURE_KEY, b"stale")
+
+        await h.client._connect()
+
+        assert h.cache.get(UNLOADED_EXPOSURE_KEY) == b"[]"
+
+
+async def test_a_pass_publishes_no_unloaded_activity() -> None:
+    venue = ExecutionVenue()
+    venue.snapshot.position.append(unloaded_position(5_900_003))
+    async with harness(execution_venue=venue) as h:
+        await h.client.generate_mass_status()
+
+        assert h.activity == []
+        assert [item["subject"] for item in exposure(h)] == ["position"]
+
+
+async def test_the_key_is_fresh_when_the_reconciliation_topic_fires() -> None:
+    async with harness() as h:
+        seen: list[bytes] = []
+        h.client._msgbus.subscribe(
+            topic=f"reports.execution.{CTRADER_VENUE}",
+            handler=lambda _status: seen.append(h.cache.get(UNLOADED_EXPOSURE_KEY)),
+        )
+        h.venue.snapshot.position.append(unloaded_position(5_900_004))
+
+        built = await h.client.generate_mass_status()
+        h.engine.reconcile_execution_mass_status(built)
+
+        assert seen
+        assert [item["subject"] for item in json.loads(seen[0])] == ["position"]
+
+
+async def test_reports_outside_a_mass_status_never_carry_a_filled_order() -> None:
+    async with harness(execution_venue=serving()) as h:
+        found = await h.client.generate_order_status_reports(
+            GenerateOrderStatusReports(
+                instrument_id=None,
+                start=None,
+                end=None,
+                open_only=False,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+
+        assert all(report.order_status != OrderStatus.FILLED for report in found)
+        assert {report.client_order_id for report in found} == {
+            ClientOrderId(STOP),
+            ClientOrderId(TARGET),
+        }

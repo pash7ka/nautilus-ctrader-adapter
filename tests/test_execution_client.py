@@ -91,6 +91,7 @@ def test_the_config_carries_no_instrument_settings() -> None:
         {"reference_price_max_age_secs": 0.0},
         {"protective_order_timeout_secs": -1.0},
         {"order_request_timeout_secs": 0.0},
+        {"reconciliation_default_lookback_mins": 0},
     ],
 )
 def test_the_config_refuses_bad_values(overrides) -> None:
@@ -104,6 +105,7 @@ def test_the_config_defaults() -> None:
     assert config.reference_price_max_age_secs == 10.0
     assert config.protective_order_timeout_secs == 2.0
     assert config.order_request_timeout_secs == 30.0
+    assert config.reconciliation_default_lookback_mins == 1440
     assert config.environment == "auto"
 
 
@@ -416,6 +418,14 @@ async def test_an_event_for_an_order_nautilus_does_not_hold_is_a_warning() -> No
 
         assert any("No Nautilus order" in line for line in h.logger.warnings())
         assert h.events == []
+
+
+async def test_a_record_of_an_unknown_type_is_a_warning() -> None:
+    async with harness() as h:
+        h.client._handle_records([object()])
+
+        assert any("object" in line for line in h.logger.warnings())
+        assert h.logger.errors() == []
 
 
 async def test_an_order_error_nobody_waits_for_is_a_warning() -> None:

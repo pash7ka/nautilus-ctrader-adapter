@@ -22,6 +22,7 @@ from decimal import Decimal
 from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     BatchCancelOrders,
     CancelAllOrders,
@@ -35,9 +36,21 @@ from nautilus_trader.execution.messages import (
     SubmitOrder,
     SubmitOrderList,
 )
-from nautilus_trader.execution.reports import FillReport, OrderStatusReport, PositionStatusReport
+from nautilus_trader.execution.reports import (
+    ExecutionMassStatus,
+    FillReport,
+    OrderStatusReport,
+    PositionStatusReport,
+)
 from nautilus_trader.live.execution_client import LiveExecutionClient
-from nautilus_trader.model.enums import AccountType, LiquiditySide, OmsType, PositionSide
+from nautilus_trader.model.enums import (
+    AccountType,
+    LiquiditySide,
+    OmsType,
+    OrderStatus,
+    OrderType,
+    PositionSide,
+)
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -53,11 +66,12 @@ from nautilus_trader.model.orders import Order
 
 from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
 from nautilus_ctrader.common import execution_reports as reports
-from nautilus_ctrader.common import order_translation
+from nautilus_ctrader.common import history, order_translation
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import (
     CTraderAccountError,
     CTraderConnectionError,
+    CTraderError,
     CTraderRequestError,
     CTraderTimeoutError,
 )
@@ -65,6 +79,7 @@ from nautilus_ctrader.common.operations import OperationsInFlight, PendingBracke
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.order_translation import Unsupported
 from nautilus_ctrader.common.parsing import PRICE_SCALE
+from nautilus_ctrader.common.reconciliation import PositionHistory, reconcile
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.common.venue_book import PositionView, VenueBook
 from nautilus_ctrader.common.venue_records import (
@@ -81,7 +96,12 @@ from nautilus_ctrader.common.venue_records import (
     money_of,
 )
 from nautilus_ctrader.config import CTraderExecClientConfig
-from nautilus_ctrader.constants import BUCKET_HISTORICAL, CTRADER, CTRADER_VENUE
+from nautilus_ctrader.constants import (
+    BUCKET_HISTORICAL,
+    CTRADER,
+    CTRADER_VENUE,
+    UNLOADED_EXPOSURE_KEY,
+)
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider
@@ -95,6 +115,13 @@ _MAX_ORDER_PAGES = 20
 _AMEND_ATTEMPTS = 3
 # Correcting amends of one bracket before its levels are left where the broker holds them.
 _CORRECTION_ROUNDS = 3
+# Nautilus publishes each mass status here once it has reconciled it.
+_RECONCILED_TOPIC = f"reports.execution.{CTRADER_VENUE}"
+_MINUTE_MS = 60_000
+_OPEN = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+_ENDED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
+# Activity after which what stands on unloaded symbols may have changed.
+_EXPOSURE_KINDS = (ActivityKind.UNLOADED_SYMBOL, ActivityKind.STOP_OUT)
 
 
 @dataclass
@@ -123,9 +150,28 @@ def check_account(trader: om.ProtoOATrader) -> None:
         )
 
 
+def _ms(moment) -> int:
+    """A datetime as Unix milliseconds."""
+    return int(moment.timestamp() * 1000)
+
+
 def _reason(code: str, description: str | None) -> str:
     # TODO(verify): that the venue's description never carries an account id or login.
     return f"{code}: {description}" if description else code
+
+
+@dataclass(frozen=True)
+class BrokerState:
+    """One read of the broker: what stands now, and the lists of the positions it covers.
+
+    `histories` holds each covered position's lists by position id; `window_deals` the account's
+    deals of the fill window; `requests` how many requests the read took.
+    """
+
+    snapshot: oa.ProtoOAReconcileRes
+    histories: dict[int, PositionHistory]
+    window_deals: tuple[om.ProtoOADeal, ...]
+    requests: int
 
 
 @dataclass(frozen=True)
@@ -228,6 +274,12 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._protection_timers: set[asyncio.TimerHandle] = set()
         # Execution events held while the model is rebuilt, or `None` when it stands.
         self._buffer: list[oa.ProtoOAExecutionEvent] | None = None
+        # The start's mass status the held events wait on, and how long they wait at most.
+        self._awaited_report: UUID4 | None = None
+        self._release_timer: asyncio.TimerHandle | None = None
+        self._reconciled_wait_secs = config.connect_timeout_secs
+        # The fill window Nautilus asked for at start, which a reconnect reuses.
+        self._lookback_mins: int | None = None
         self._restore_key = ("execution", self._owner)
         # The account counts its users without knowing who releases, and Nautilus calls
         # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
@@ -252,6 +304,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             # Attached only once the account is known, and before the rebuild, whose buffer
             # holds the execution events that come meanwhile.
             self._session = session
+            self._msgbus.subscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
             session.add_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
             session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
             session.add_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
@@ -278,9 +331,13 @@ class CTraderExecutionClient(LiveExecutionClient):
         for timer in self._protection_timers:
             timer.cancel()
         self._protection_timers.clear()
+        self._stop_awaiting()
+        # Whatever it held is dropped: its next connect rebuilds anew.
+        self._buffer = None
         session, self._session = self._session, None
         if session is None:
             return
+        self._msgbus.unsubscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
         session.remove_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
         session.remove_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
         session.remove_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
@@ -295,8 +352,49 @@ class CTraderExecutionClient(LiveExecutionClient):
         await self._load()
         self._emit_account_state(self._clock.timestamp_ns())
 
-    # Reconciliation reports are not built yet. Until they are, these report nothing, and
-    # Nautilus resolves orders in flight through its own in-flight check.
+    # -- Reconciliation -------------------------------------------------------------------------
+
+    async def generate_mass_status(
+        self,
+        lookback_mins: int | None = None,
+    ) -> ExecutionMassStatus | None:
+        """The start's reconciliation, built from one read of the broker.
+
+        The read also rebuilds the venue model and writes the unloaded exposure. Execution events
+        that arrive meanwhile are held until Nautilus has reconciled the returned mass status,
+        which it announces on `reports.execution.CTRADER`, or for `connect_timeout_secs` at most:
+        applied earlier, an event could address an order Nautilus does not know yet.
+
+        Returns `None`, with a WARNING, when a request of the read fails.
+        """
+        self._lookback_mins = lookback_mins
+        self._hold_buffer()
+        try:
+            state = await self._read_broker(since_ms=self._since_ms(lookback_mins))
+            margins = dict(self._margins)
+            self._stand(state)
+            status = self._mass_status(state)
+            self._write_exposure()
+        except CTraderError as e:
+            self._release_buffer()
+            self._log.warning(f"Reconciliation failed, so nothing is reported: {e}")
+            return None
+        except BaseException:
+            self._release_buffer()
+            raise
+        if self._margins != margins:
+            self._emit_account_state(self._clock.timestamp_ns())
+        fills = sum(len(found) for found in status.fill_reports.values())
+        positions = sum(len(found) for found in status.position_reports.values())
+        self._log.info(
+            f"Reconciliation read the broker in {state.requests} requests: "
+            f"{len(status.order_reports)} orders, {fills} fills, {positions} positions",
+        )
+        self._await_reconciliation(status.id)
+        return status
+
+    # Answering a query for one order is not built yet; Nautilus resolves orders in flight
+    # through its own in-flight check.
 
     async def generate_order_status_report(
         self,
@@ -308,16 +406,170 @@ class CTraderExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
-        return []
+        """Every open order and live leg; with `open_only` false, also those that ended unfilled.
+
+        A filled order reaches Nautilus only inside a mass status: without its fills Nautilus
+        would infer one with no commission.
+        """
+        since_ms = None if command.open_only else self._command_since_ms(command.start)
+        status = await self._reports(since_ms)
+        if status is None:
+            return []
+        return [
+            report
+            for report in status.order_reports.values()
+            if command.instrument_id in (None, report.instrument_id)
+            and (
+                report.order_status in _OPEN
+                or (
+                    not command.open_only
+                    and report.order_status in _ENDED
+                    and report.filled_qty.as_decimal() == 0
+                )
+            )
+        ]
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
-        return []
+        """The fills of the window, from `command.start` or the reconciliation lookback."""
+        since_ms = self._command_since_ms(command.start)
+        status = await self._reports(since_ms)
+        if status is None:
+            return []
+        until = None if command.end is None else reports.nanos(_ms(command.end))
+        return [
+            fill
+            for venue_order_id, fills in status.fill_reports.items()
+            if command.venue_order_id in (None, venue_order_id)
+            for fill in fills
+            if command.instrument_id in (None, fill.instrument_id)
+            and fill.ts_event >= reports.nanos(since_ms)
+            and (until is None or fill.ts_event <= until)
+        ]
 
     async def generate_position_status_reports(
         self,
         command: GeneratePositionStatusReports,
     ) -> list[PositionStatusReport]:
-        return []
+        """The open positions."""
+        status = await self._reports(None)
+        if status is None:
+            return []
+        return [
+            report
+            for instrument_id, found in status.position_reports.items()
+            if command.instrument_id in (None, instrument_id)
+            for report in found
+        ]
+
+    async def _reports(self, since_ms: int | None) -> ExecutionMassStatus | None:
+        """One read of the broker as a mass status, the venue model and the buffer untouched."""
+        try:
+            state = await self._read_broker(since_ms=since_ms)
+        except CTraderError as e:
+            self._log.warning(f"Reports not generated: {e}")
+            return None
+        return self._mass_status(state)
+
+    def _mass_status(self, state: BrokerState) -> ExecutionMassStatus:
+        found = reconcile(
+            state.snapshot,
+            state.histories,
+            state.window_deals,
+            self._price_precision,
+            self._book.known_closes(),
+            self._operations,
+        )
+        for notice in found.notices:
+            self._log.warning(notice.text)
+        status, left_out = reports.mass_status(
+            self.id,
+            self.account_id,
+            self.venue,
+            found,
+            self._instrument_provider.instrument_for_symbol_id,
+            self._currency,
+            self._clock.timestamp_ns(),
+            held_price=self._held_price,
+        )
+        for record in left_out:
+            # Normal after a restart without a persistent cache.
+            self._log.debug(
+                f"Leg {record.client_order_id} is not reported: its level is gone and Nautilus "
+                "holds no price for it",
+            )
+        return status
+
+    def _held_price(self, client_order_id: str) -> Decimal | None:
+        """The price Nautilus holds for a leg: a stop's trigger price, a limit's price."""
+        order = self._cache.order(ClientOrderId(client_order_id))
+        if order is None:
+            return None
+        if order.order_type == OrderType.STOP_MARKET:
+            return order.trigger_price.as_decimal()
+        if order.order_type == OrderType.LIMIT:
+            return order.price.as_decimal()
+        return None
+
+    def _since_ms(self, lookback_mins: int | None) -> int:
+        if lookback_mins is None:
+            lookback_mins = self._config.reconciliation_default_lookback_mins
+        return self._clock.timestamp_ms() - lookback_mins * _MINUTE_MS
+
+    def _command_since_ms(self, start) -> int:
+        return self._since_ms(self._lookback_mins) if start is None else _ms(start)
+
+    def _hold_buffer(self) -> None:
+        # A rebuild that starts while another holds the buffer joins it.
+        if self._buffer is None:
+            self._buffer = []
+
+    def _await_reconciliation(self, report_id: UUID4) -> None:
+        self._stop_awaiting()
+        self._awaited_report = report_id
+        self._release_timer = self._loop.call_later(
+            self._reconciled_wait_secs, self._reconciliation_waited
+        )
+
+    def _stop_awaiting(self) -> None:
+        if self._release_timer is not None:
+            self._release_timer.cancel()
+            self._release_timer = None
+        self._awaited_report = None
+
+    def _on_reconciled(self, mass_status: ExecutionMassStatus) -> None:
+        # Nautilus publishes a mass status more than once; the first match releases.
+        if self._awaited_report is not None and mass_status.id == self._awaited_report:
+            self._release_buffer()
+
+    def _reconciliation_waited(self) -> None:
+        self._release_timer = None
+        self._log.warning(
+            "Nautilus did not reconcile the mass status within "
+            f"{self._reconciled_wait_secs:g}s; applying the execution events held meanwhile",
+        )
+        self._release_buffer()
+
+    def _release_buffer(self) -> None:
+        """Apply the execution events held meanwhile, in order; a second call does nothing."""
+        self._stop_awaiting()
+        held, self._buffer = self._buffer, None
+        # A client detached meanwhile must start nothing; its next connect rebuilds anew.
+        if held is None or self._session is None:
+            return
+        for event in held:
+            self._on_execution_event(event)
+        # A protective order that came during an outage arrives with the rebuild, no event.
+        self._settle_brackets()
+
+    def _write_exposure(self) -> None:
+        """Write what stands on unloaded symbols to the cache, whole.
+
+        The key is the application's account of it; a rebuild publishes no activity.
+        """
+        self._cache.add(
+            UNLOADED_EXPOSURE_KEY,
+            reports.exposure_json(self._book.exposure(), self._symbol_name),
+        )
 
     # -- Venue data ---------------------------------------------------------------------------
 
@@ -334,53 +586,107 @@ class CTraderExecutionClient(LiveExecutionClient):
         return response.trader
 
     async def _load(self) -> None:
-        """Rebuild the venue model from the broker's open positions and orders.
+        """Rebuild the venue model from the broker's open positions and their order lists.
 
         Execution events that arrive meanwhile are applied once it stands, in order.
         """
-        self._buffer = []
+        self._hold_buffer()
         try:
-            snapshot = await self._request(
-                oa.ProtoOAReconcileReq(
-                    ctidTraderAccountId=self._account.account_id,
-                    returnProtectionOrders=True,
-                ),
-            )
-            position_orders = {
-                position.positionId: await self._position_orders(position.positionId)
-                for position in snapshot.position
-            }
-            self._handle_records(self._book.load(snapshot, position_orders))
-            self._margins = {}
-            self._margin_times = {}
-            for position in snapshot.position:
-                self._set_margin(position)
+            self._stand(await self._read_broker(since_ms=None, deals=False))
         finally:
-            held, self._buffer = self._buffer, None
-            # A client detached meanwhile must start nothing; its next connect rebuilds anew.
-            if self._session is not None:
-                for event in held:
-                    self._on_execution_event(event)
-                # A protective order that came during an outage arrives with the rebuild, no
-                # event.
-                self._settle_brackets()
+            self._release_buffer()
+        self._write_exposure()
 
-    async def _position_orders(self, position_id: int) -> list[om.ProtoOAOrder]:
+    async def _read_broker(
+        self,
+        *,
+        since_ms: int | None,
+        positions: Iterable[int] | None = None,
+        deals: bool = True,
+    ) -> BrokerState:
+        """One read of the broker: the snapshot, then each covered position's lists, once each.
+
+        - `since_ms`: the start of the fill window; the positions its deals name are covered
+          too. `None` reads no window, so only the open positions.
+        - `positions`: exactly these positions are covered instead.
+        - `deals`: `False` reads only the order lists, all the venue model needs.
+
+        A position on a symbol not loaded gets no deal list, as nothing is reported from it, and
+        a closed one no list at all.
+        """
+        requests = 0
+
+        async def historical(payload: Message) -> Message:
+            nonlocal requests
+            requests += 1
+            return await self._request(payload, bucket=BUCKET_HISTORICAL)
+
+        account_id = self._account.account_id
+        snapshot = await self._request(
+            oa.ProtoOAReconcileReq(ctidTraderAccountId=account_id, returnProtectionOrders=True),
+        )
+        requests += 1
+        window: dict[int, om.ProtoOADeal] = {}
+        if since_ms is not None:
+            complete = True
+            for start, end in history.weekly_windows(since_ms, self._clock.timestamp_ms()):
+                found, done = await history.deals_between(historical, account_id, start, end)
+                complete &= done
+                window.update((deal.dealId, deal) for deal in found)
+            if not complete:
+                self._log.warning(
+                    "The deal list of the fill window did not end; a position traded early in "
+                    "the window may be missing from the reports",
+                )
+        symbols = {
+            position.positionId: position.tradeData.symbolId for position in snapshot.position
+        }
+        open_ids = set(symbols)
+        for deal in window.values():
+            symbols.setdefault(deal.positionId, deal.symbolId)
+        covered = sorted(symbols) if positions is None else list(dict.fromkeys(positions))
+        histories: dict[int, PositionHistory] = {}
+        for position_id in covered:
+            symbol_id = symbols.get(position_id)
+            loaded = symbol_id is None or self._price_precision(symbol_id) is not None
+            if not loaded and position_id not in open_ids:
+                continue
+            orders = await self._position_orders(position_id, historical)
+            found = (
+                await history.position_deals(historical, account_id, position_id)
+                if deals and loaded
+                else []
+            )
+            histories[position_id] = PositionHistory(tuple(orders), tuple(found))
+        return BrokerState(snapshot, histories, tuple(window.values()), requests)
+
+    def _stand(self, state: BrokerState) -> None:
+        """Rebuild the venue model and the margins from `state`'s snapshot."""
+        orders = {position_id: found.orders for position_id, found in state.histories.items()}
+        self._handle_records(self._book.load(state.snapshot, orders))
+        self._margins = {}
+        self._margin_times = {}
+        for position in state.snapshot.position:
+            self._set_margin(position)
+
+    async def _position_orders(
+        self, position_id: int, request: history.Request
+    ) -> list[om.ProtoOAOrder]:
         """Every order of one position: its entry tells whose position it is."""
         found: dict[int, om.ProtoOAOrder] = {}
-        request = oa.ProtoOAOrderListByPositionIdReq(
+        payload = oa.ProtoOAOrderListByPositionIdReq(
             ctidTraderAccountId=self._account.account_id,
             positionId=position_id,
         )
         for _ in range(_MAX_ORDER_PAGES):
-            response = await self._request(request, bucket=BUCKET_HISTORICAL)
+            response = await request(payload)
             new = [order for order in response.order if order.orderId not in found]
             found.update((order.orderId, order) for order in new)
             if not response.hasMore or not new:
                 break
             # TODO(verify): paging backwards by `toTimestamp`; no position with more orders than
             # one page was recorded.
-            request.toTimestamp = min(order.utcLastUpdateTimestamp for order in new)
+            payload.toTimestamp = min(order.utcLastUpdateTimestamp for order in new)
         else:
             self._log.warning(
                 f"Position {position_id}: its order list did not end within "
@@ -521,6 +827,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._log.exception("An execution event could not be applied to the venue model", e)
             records = []
         self._handle_records(records)
+        if any(isinstance(r, Activity) and r.kind in _EXPOSURE_KINDS for r in records):
+            self._write_exposure()
         self._update_account(event)
         self._settle_brackets()
         self._drop_amend_locks()
@@ -544,8 +852,10 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self._activity(record)
                 elif isinstance(record, Notice):
                     self._log.warning(record.text)
-                else:
+                elif isinstance(record, (AwaitProtection, ProtectionMissing)):
                     self._on_protection(record)
+                else:
+                    self._log.warning(f"{type(record).__name__} is not a known record; ignored")
             except Exception as e:
                 self._log.exception(f"{type(record).__name__} could not be reported", e)
 

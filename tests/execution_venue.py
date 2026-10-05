@@ -8,7 +8,7 @@ volume precision, and to the fake account; nothing else changes.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -101,8 +101,26 @@ def trader(**overrides) -> oa.ProtoOATraderRes:
     return response
 
 
+def _between(items: Iterable, request: Message, time_of) -> list:
+    """`items` within the request's window, oldest first; a bound it does not carry is open."""
+    low = request.fromTimestamp if request.HasField("fromTimestamp") else None
+    high = request.toTimestamp if request.HasField("toTimestamp") else None
+    return sorted(
+        (
+            item
+            for item in items
+            if (low is None or time_of(item) >= low) and (high is None or time_of(item) <= high)
+        ),
+        key=time_of,
+    )
+
+
 class ExecutionVenue:
     """The fake venue's account, read at each request so a test can change it between requests.
+
+    The history lists answer oldest first, `page_size` items a page, and set `hasMore` past it.
+    A request whose payload type is in `fail` is answered with an error. `replies` holds each
+    served payload type's answer, for a test that holds it back.
 
     Order requests have no handler until a test registers one with `server.on`.
     """
@@ -112,14 +130,38 @@ class ExecutionVenue:
         self.trader = trader()
         self.snapshot = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
         self.position_orders: dict[int, list[om.ProtoOAOrder]] = {}
-        self.server.on(om.PROTO_OA_TRADER_REQ, lambda _r: self.trader)
-        self.server.on(om.PROTO_OA_RECONCILE_REQ, lambda _r: self.snapshot)
-        self.server.on(
+        self.position_deals: dict[int, list[om.ProtoOADeal]] = {}
+        self.deals: list[om.ProtoOADeal] = []
+        self.orders: list[om.ProtoOAOrder] = []
+        self.page_size = 100
+        self.fail: set[int] = set()
+        self.replies: dict[int, Callable[[Message], Message]] = {}
+        self._serve(om.PROTO_OA_TRADER_REQ, lambda _r: self.trader)
+        self._serve(om.PROTO_OA_RECONCILE_REQ, lambda _r: self.snapshot)
+        self._serve(
             om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
             lambda r: oa.ProtoOAOrderListByPositionIdRes(
                 ctidTraderAccountId=ACCOUNT_ID,
                 order=self.position_orders.get(r.positionId, []),
                 hasMore=False,
+            ),
+        )
+        self._serve(
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            lambda r: self._page(
+                oa.ProtoOADealListByPositionIdRes,
+                "deal",
+                _between(self.position_deals.get(r.positionId, []), r, _executed),
+            ),
+        )
+        self._serve(
+            om.PROTO_OA_DEAL_LIST_REQ,
+            lambda r: self._page(oa.ProtoOADealListRes, "deal", _between(self.deals, r, _executed)),
+        )
+        self._serve(
+            om.PROTO_OA_ORDER_LIST_REQ,
+            lambda r: self._page(
+                oa.ProtoOAOrderListRes, "order", _between(self.orders, r, _last_update)
             ),
         )
         self.server.on(
@@ -130,6 +172,34 @@ class ExecutionVenue:
             om.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ,
             lambda r: oa.ProtoOAUnsubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
         )
+
+    def _serve(self, payload_type: int, reply: Callable[[Message], Message]) -> None:
+        def handle(request: Message) -> Message:
+            if payload_type in self.fail:
+                return oa.ProtoOAErrorRes(
+                    ctidTraderAccountId=ACCOUNT_ID,
+                    errorCode="INTERNAL_SERVER_ERROR",
+                    description="the list failed",
+                )
+            return reply(request)
+
+        self.replies[payload_type] = handle
+        self.server.on(payload_type, handle)
+
+    def _page(self, response: type[Message], field: str, items: list) -> Message:
+        return response(
+            ctidTraderAccountId=ACCOUNT_ID,
+            hasMore=len(items) > self.page_size,
+            **{field: items[: self.page_size]},
+        )
+
+
+def _executed(deal: om.ProtoOADeal) -> int:
+    return deal.executionTimestamp
+
+
+def _last_update(order: om.ProtoOAOrder) -> int:
+    return order.utcLastUpdateTimestamp
 
 
 def exec_config(**overrides) -> CTraderExecClientConfig:
