@@ -160,7 +160,8 @@ def make_position(
     status: int = om.POSITION_STATUS_OPEN,
     symbol: int = SYMBOL,
 ) -> om.ProtoOAPosition:
-    position = om.ProtoOAPosition(positionId=position_id, positionStatus=status)
+    # `swap` is required on the wire, so a fake server can send the position.
+    position = om.ProtoOAPosition(positionId=position_id, positionStatus=status, swap=0)
     position.tradeData.symbolId = symbol
     position.tradeData.volume = volume
     position.tradeData.tradeSide = side
@@ -191,6 +192,9 @@ def make_deal(
         executionTimestamp=ts,
         commission=commission,
         moneyDigits=money_digits,
+        # Required on the wire, so a fake server can send the deal.
+        createTimestamp=ts,
+        dealStatus=om.FILLED,
     )
 
 

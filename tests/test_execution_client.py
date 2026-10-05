@@ -10,10 +10,10 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import QueryAccount
+from nautilus_trader.execution.messages import QueryAccount, SubmitOrder
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import OrderStatus
-from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
+from nautilus_trader.model.events import OrderFilled, OrderRejected
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientOrderId,
@@ -24,8 +24,10 @@ from nautilus_trader.model.identifiers import (
 from nautilus_trader.model.objects import Money, Price, Quantity
 
 from nautilus_ctrader.activity import CTraderAccountActivity
+from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.account import account_client_from_config
 from nautilus_ctrader.common.errors import CTraderAccountError
+from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -34,8 +36,10 @@ from tests.account_venue import ACCOUNT_ID, HeldReplies
 from tests.execution_replay import (
     FIRST,
     as_ours,
+    make_deal,
     make_event,
     make_order,
+    make_position,
     position_orders,
     snapshot_with_protection,
 )
@@ -43,17 +47,22 @@ from tests.execution_venue import (
     ENTRY,
     FIRST_EVENTS,
     STOP,
+    STRATEGY_ID,
     TARGET,
     TRADER_ID,
     US100_ID,
     US100_SYMBOL_ID,
     ExecutionVenue,
+    bracket,
     exec_config,
     harness,
     on_us100,
     push,
+    push_spot,
     status,
+    submit_bracket,
     submitted,
+    sync,
     trader,
 )
 from tests.polling import wait_until
@@ -517,3 +526,346 @@ async def test_a_query_reads_the_account_again() -> None:
         )
 
         assert balance_of(h.states[-1]) == Decimal("7777.00")
+
+
+# The recorded entry filled at 85287.21: an ask there gives the recorded distances.
+BID, ASK = 8_528_600_000, 8_528_721_000
+MARKET_ID, CLOSE_ID = "O-M-1", "O-C-1"
+MARKET_POSITION = 5_100_001
+
+
+def at(position: om.ProtoOAPosition, utc: int) -> om.ProtoOAPosition:
+    position.utcLastUpdateTimestamp = utc
+    return position
+
+
+def market_events() -> list:
+    """A plain market order of the node, accepted then filled (hand-built)."""
+
+    def order(utc: int) -> om.ProtoOAOrder:
+        return make_order(
+            6_100_001,
+            MARKET_POSITION,
+            utc=utc,
+            label=order_record.encode_label(MARKET_ID),
+            comment=order_record.encode_comment(LegIds(None, None)),
+            client_order_id=MARKET_ID,
+        )
+
+    return on_us100(
+        [
+            make_event(
+                om.ORDER_ACCEPTED,
+                order(10),
+                position=make_position(
+                    MARKET_POSITION, volume=0, status=om.POSITION_STATUS_CREATED
+                ),
+            ),
+            make_event(
+                om.ORDER_FILLED,
+                order(20),
+                position=at(make_position(MARKET_POSITION), 20),
+                deal=make_deal(
+                    7_100_001,
+                    6_100_001,
+                    MARKET_POSITION,
+                    side=om.BUY,
+                    volume=100,
+                    price=85250.0,
+                    ts=20,
+                    commission=-2770,
+                ),
+            ),
+        ],
+    )
+
+
+def close_events() -> list:
+    """The node's close of that position, accepted then filled (hand-built)."""
+
+    def order(utc: int) -> om.ProtoOAOrder:
+        return make_order(6_100_002, MARKET_POSITION, side=om.SELL, closing=True, utc=utc)
+
+    deal = make_deal(
+        7_100_002,
+        6_100_002,
+        MARKET_POSITION,
+        side=om.SELL,
+        volume=100,
+        price=85260.0,
+        ts=40,
+        commission=-2770,
+    )
+    deal.closePositionDetail.CopyFrom(
+        om.ProtoOAClosePositionDetail(
+            entryPrice=85250.0,
+            grossProfit=1000,
+            swap=0,
+            commission=-5540,
+            balance=1_000_000,
+            balanceVersion=100,
+            moneyDigits=2,
+        ),
+    )
+    return on_us100(
+        [
+            make_event(
+                om.ORDER_ACCEPTED, order(30), position=at(make_position(MARKET_POSITION), 20)
+            ),
+            make_event(
+                om.ORDER_FILLED,
+                order(40),
+                position=at(
+                    make_position(MARKET_POSITION, volume=0, status=om.POSITION_STATUS_CLOSED), 40
+                ),
+                deal=deal,
+            ),
+        ],
+    )
+
+
+def market(
+    h,
+    *,
+    side: OrderSide = OrderSide.BUY,
+    client_order_id: str = MARKET_ID,
+    reduce_only: bool = False,
+    time_in_force: TimeInForce = TimeInForce.GTC,
+):
+    return h.factory.market(
+        US100_ID,
+        side,
+        Quantity.from_str("1.00"),
+        time_in_force=time_in_force,
+        reduce_only=reduce_only,
+        client_order_id=ClientOrderId(client_order_id),
+    )
+
+
+async def submit(h, order, position_id: PositionId | None = None) -> None:
+    h.cache.add_order(order, position_id=position_id)
+    await h.client._submit_order(
+        SubmitOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            order=order,
+            command_id=UUID4(),
+            ts_init=0,
+            position_id=position_id,
+        ),
+    )
+
+
+def rejection(h, client_order_id: str) -> str:
+    (event,) = [e for e in h.events_of(client_order_id) if isinstance(e, OrderRejected)]
+    return event.reason
+
+
+def answered(answer) -> ExecutionVenue:
+    """A venue answering every new order with `answer`."""
+    execution_venue = ExecutionVenue()
+    execution_venue.server.on(om.PROTO_OA_NEW_ORDER_REQ, lambda _r: answer)
+    return execution_venue
+
+
+async def test_a_bracket_goes_out_as_one_market_order_measured_from_the_ask() -> None:
+    async with harness(execution_venue=answered(FIRST_EVENTS[:3])) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+
+        (request,) = h.received(oa.ProtoOANewOrderReq)
+        assert request.orderType == om.MARKET
+        assert request.timeInForce == om.IMMEDIATE_OR_CANCEL
+        assert request.tradeSide == om.BUY
+        assert request.volume == 100
+        assert request.clientOrderId == ENTRY
+        assert request.label == order_record.encode_label(ENTRY)
+        assert request.comment == order_record.encode_comment(LegIds(STOP, TARGET))
+        assert request.relativeStopLoss == 9_001_000
+        assert request.relativeTakeProfit == 10_001_000
+        assert status(h, ENTRY) == OrderStatus.FILLED
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+
+
+async def test_a_market_order_goes_out_without_levels_and_opens_a_position() -> None:
+    async with harness(execution_venue=answered(market_events())) as h:
+        await submit(h, market(h))
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.FILLED)
+
+        (request,) = h.received(oa.ProtoOANewOrderReq)
+        assert not request.HasField("relativeStopLoss")
+        assert not request.HasField("relativeTakeProfit")
+        assert request.timeInForce == om.IMMEDIATE_OR_CANCEL
+        assert h.cache.position(PositionId(str(MARKET_POSITION))).is_open
+
+
+async def test_a_bracket_without_a_fresh_price_is_refused_before_sending() -> None:
+    async with harness() as h:
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+
+        assert "no price" in rejection(h, ENTRY)
+        assert h.kinds_of(ENTRY) == ["OrderRejected"]
+        assert h.kinds_of(STOP) == ["OrderCanceled"]
+        assert h.received(oa.ProtoOANewOrderReq) == []
+
+
+async def test_a_stale_price_measures_nothing() -> None:
+    async with harness(config=exec_config(reference_price_max_age_secs=0.05)) as h:
+        await push_spot(h, BID, ASK)
+        await asyncio.sleep(0.1)
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.REJECTED)
+
+        assert "no price" in rejection(h, ENTRY)
+
+
+async def test_a_level_on_the_wrong_side_of_the_market_is_refused() -> None:
+    async with harness() as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h, stop_price="85300.00"))
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.REJECTED)
+
+        assert "wrong side" in rejection(h, ENTRY)
+        assert h.received(oa.ProtoOANewOrderReq) == []
+
+
+async def test_a_fill_or_kill_market_order_is_refused() -> None:
+    async with harness() as h:
+        await submit(h, market(h, time_in_force=TimeInForce.FOK))
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.REJECTED)
+
+        assert "FOK" in rejection(h, MARKET_ID)
+
+
+async def test_an_order_is_refused_unsent_while_the_connection_is_down() -> None:
+    async with harness() as h:
+        await h.server.drop_connections()
+        await wait_until(lambda: not h.account.session.is_ready)
+        await submit(h, market(h))
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.REJECTED)
+
+        assert rejection(h, MARKET_ID) == "not connected to the venue"
+        assert h.received(oa.ProtoOANewOrderReq) == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        oa.ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=ACCOUNT_ID,
+            errorCode="NOT_ENOUGH_MONEY",
+            description="Not enough money",
+        ),
+        oa.ProtoOAErrorRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            errorCode="NOT_ENOUGH_MONEY",
+            description="Not enough money",
+        ),
+    ],
+)
+async def test_a_bracket_the_broker_refuses_is_one_rejection(answer) -> None:
+    async with harness(execution_venue=answered(answer)) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+
+        assert rejection(h, ENTRY) == "NOT_ENOUGH_MONEY: Not enough money"
+        assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderCanceled"]
+        assert h.kinds_of(TARGET) == ["OrderSubmitted", "OrderCanceled"]
+        assert len(h.client._brackets) == 0
+
+
+async def test_an_order_without_an_answer_is_never_sent_again() -> None:
+    async with harness() as h:
+        h.server.close_after_next_request = True
+        await submit(h, market(h))
+        await wait_until(lambda: h.account.session.is_ready, timeout_secs=10)
+        await sync(h)
+
+        assert len(h.received(oa.ProtoOANewOrderReq)) == 1
+        assert status(h, MARKET_ID) == OrderStatus.SUBMITTED
+        assert any("not resent" in line for line in h.logger.warnings())
+
+
+def closing_venue() -> ExecutionVenue:
+    """A venue that opens the market order, and answers a close with its acceptance only.
+
+    Answered together, the fill can reach the client before the acceptance, which then adds
+    nothing; the test pushes the fill itself to fix the order.
+    """
+    execution_venue = answered(market_events())
+    execution_venue.server.on(om.PROTO_OA_CLOSE_POSITION_REQ, lambda _r: close_events()[0])
+    return execution_venue
+
+
+async def opened_market_position(h) -> None:
+    await submit(h, market(h))
+    await wait_until(lambda: h.cache.position(PositionId(str(MARKET_POSITION))) is not None)
+
+
+def close_order(h, side: OrderSide = OrderSide.SELL):
+    return market(h, side=side, client_order_id=CLOSE_ID, reduce_only=True)
+
+
+async def test_a_close_names_its_position_and_fills_under_its_own_id() -> None:
+    async with harness(execution_venue=closing_venue()) as h:
+        await opened_market_position(h)
+        await submit(h, close_order(h), position_id=PositionId(str(MARKET_POSITION)))
+        await push(h, close_events()[1])
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.FILLED)
+
+        (request,) = h.received(oa.ProtoOAClosePositionReq)
+        assert request.positionId == MARKET_POSITION
+        assert request.volume == 100
+        assert h.kinds_of(CLOSE_ID) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+        assert h.cache.position(PositionId(str(MARKET_POSITION))).is_closed
+        assert h.client._operations.closing(MARKET_POSITION, 100) is None
+        # The node's own close is never reported as somebody else's order.
+        assert h.reports == []
+
+
+async def test_a_close_without_its_position_is_refused() -> None:
+    async with harness() as h:
+        await submit(h, close_order(h))
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
+
+        assert "must name its position" in rejection(h, CLOSE_ID)
+
+
+async def test_a_close_of_a_position_not_open_at_the_venue_is_refused() -> None:
+    async with harness() as h:
+        await submit(h, close_order(h), position_id=PositionId(str(MARKET_POSITION)))
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
+
+        assert "not open at the venue" in rejection(h, CLOSE_ID)
+        assert h.received(oa.ProtoOAClosePositionReq) == []
+
+
+async def test_a_close_that_would_add_to_the_position_is_refused() -> None:
+    async with harness(execution_venue=closing_venue()) as h:
+        await opened_market_position(h)
+        await submit(
+            h, close_order(h, side=OrderSide.BUY), position_id=PositionId(str(MARKET_POSITION))
+        )
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
+
+        assert "would not reduce" in rejection(h, CLOSE_ID)
+
+
+async def test_a_close_the_broker_refuses_is_rejected_and_no_longer_in_flight() -> None:
+    execution_venue = answered(market_events())
+    execution_venue.server.on(
+        om.PROTO_OA_CLOSE_POSITION_REQ,
+        lambda _r: oa.ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=ACCOUNT_ID, errorCode="POSITION_NOT_FOUND", description="gone"
+        ),
+    )
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_market_position(h)
+        await submit(h, close_order(h), position_id=PositionId(str(MARKET_POSITION)))
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
+
+        assert rejection(h, CLOSE_ID) == "POSITION_NOT_FOUND: gone"
+        assert h.client._operations.closing(MARKET_POSITION, 100) is None

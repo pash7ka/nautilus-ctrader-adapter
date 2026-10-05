@@ -27,10 +27,12 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
     QueryAccount,
+    SubmitOrder,
+    SubmitOrderList,
 )
 from nautilus_trader.execution.reports import FillReport, OrderStatusReport, PositionStatusReport
 from nautilus_trader.live.execution_client import LiveExecutionClient
-from nautilus_trader.model.enums import AccountType, LiquiditySide, OmsType
+from nautilus_trader.model.enums import AccountType, LiquiditySide, OmsType, PositionSide
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -40,18 +42,23 @@ from nautilus_trader.model.identifiers import (
     TradeId,
     VenueOrderId,
 )
+from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.orders import Order
 
 from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
 from nautilus_ctrader.common import execution_reports as reports
+from nautilus_ctrader.common import order_translation
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import (
     CTraderAccountError,
     CTraderConnectionError,
     CTraderRequestError,
+    CTraderTimeoutError,
 )
-from nautilus_ctrader.common.operations import OperationsInFlight
+from nautilus_ctrader.common.operations import OperationsInFlight, PendingBracket, PendingBrackets
+from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.order_translation import Unsupported
 from nautilus_ctrader.common.parsing import PRICE_SCALE
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.common.venue_book import VenueBook
@@ -60,6 +67,7 @@ from nautilus_ctrader.common.venue_records import (
     ActivityKind,
     AwaitProtection,
     ExternalOrder,
+    Level,
     Notice,
     OrderEvent,
     OrderEventKind,
@@ -107,6 +115,16 @@ def check_account(trader: om.ProtoOATrader) -> None:
 def _reason(code: str, description: str | None) -> str:
     # TODO(verify): that the venue's description never carries an account id or login.
     return f"{code}: {description}" if description else code
+
+
+@dataclass(frozen=True)
+class _Refused:
+    """A request the broker refused, or one that never left."""
+
+    reason: str
+    # The request never reached the broker, or the broker asked to slow down: a level amend,
+    # which sets the whole state, may be sent again.
+    retryable: bool = False
 
 
 class CTraderExecutionClient(LiveExecutionClient):
@@ -193,6 +211,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._quotes: dict[int, _Quote] = {}
         self._spot_symbols: set[int] = set()
         self._operations = OperationsInFlight()
+        self._brackets = PendingBrackets()
         # Execution events held while the model is rebuilt, or `None` when it stands.
         self._buffer: list[oa.ProtoOAExecutionEvent] | None = None
         self._restore_key = ("execution", self._owner)
@@ -618,6 +637,183 @@ class CTraderExecutionClient(LiveExecutionClient):
             if light.symbolId == symbol_id:
                 return name
         return str(symbol_id)
+
+    # -- Orders -----------------------------------------------------------------------------------
+
+    async def _submit_order(self, command: SubmitOrder) -> None:
+        if command.order.is_reduce_only:
+            await self._close(command)
+        else:
+            await self._open([command.order], bracket=False)
+
+    async def _submit_order_list(self, command: SubmitOrderList) -> None:
+        await self._open(list(command.order_list.orders), bracket=True)
+
+    async def _open(self, orders: list[Order], *, bracket: bool) -> None:
+        entry = orders[0]
+        instrument = self._instrument_provider.find(entry.instrument_id)
+        try:
+            if instrument is None:
+                raise Unsupported(f"instrument {entry.instrument_id} is not loaded")
+            if bracket:
+                bid, ask = self._reference(instrument)
+                built = order_translation.bracket(
+                    self._account.account_id, instrument, orders, bid=bid, ask=ask
+                )
+                request = built.request
+            else:
+                request = order_translation.market_order(
+                    self._account.account_id, instrument, entry
+                )
+        except Unsupported as e:
+            self._refuse(orders, str(e))
+            return
+        entry_id = entry.client_order_id.value
+        legs: dict[Level, str] = {}
+        if bracket:
+            requested: dict[Level, Decimal] = {}
+            for level, leg_id, price in (
+                (Level.STOP_LOSS, built.stop_loss_id, built.stop_loss),
+                (Level.TAKE_PROFIT, built.take_profit_id, built.take_profit),
+            ):
+                if leg_id is not None:
+                    legs[level] = leg_id.value
+                    requested[level] = price.as_decimal()
+            # Before the first await, so a cancel or modify of a leg finds it.
+            self._brackets.add(PendingBracket(entry_id, legs, requested))
+        ts = self._clock.timestamp_ns()
+        for order in orders:
+            self.generate_order_submitted(
+                order.strategy_id, order.instrument_id, order.client_order_id, ts
+            )
+        self._log.info(f"Order {entry_id} sent")
+        outcome = await self._send(request)
+        if isinstance(outcome, _Refused):
+            self._entry_refused(
+                entry_id,
+                LegIds(legs.get(Level.STOP_LOSS), legs.get(Level.TAKE_PROFIT)),
+                outcome.reason,
+            )
+        elif outcome is None:
+            self._log.warning(
+                f"Order {entry_id}: no answer, so its outcome is unknown; it is not resent",
+            )
+        else:
+            self._on_execution_event(outcome)
+
+    async def _close(self, command: SubmitOrder) -> None:
+        order = command.order
+        try:
+            position_id, side = self._position_to_close(command)
+            request = order_translation.close_position(
+                self._account.account_id, position_id, order, position_side=side
+            )
+        except Unsupported as e:
+            self._refuse([order], str(e))
+            return
+        client_order_id = order.client_order_id.value
+        # In flight before it leaves, so the broker's events of the close are matched to it.
+        self._operations.begin_close(client_order_id, position_id, request.volume)
+        self.generate_order_submitted(
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            self._clock.timestamp_ns(),
+        )
+        self._log.info(f"Close {client_order_id} of position {position_id} sent")
+        try:
+            outcome = await self._send(request)
+            if isinstance(outcome, _Refused):
+                self._log.warning(f"Close {client_order_id} refused: {outcome.reason}")
+                self.generate_order_rejected(
+                    order.strategy_id,
+                    order.instrument_id,
+                    order.client_order_id,
+                    outcome.reason,
+                    self._clock.timestamp_ns(),
+                )
+            elif outcome is None:
+                self._log.warning(
+                    f"Close {client_order_id}: no answer, so its outcome is unknown; "
+                    "it is not resent",
+                )
+            else:
+                self._on_execution_event(outcome)
+        finally:
+            self._operations.end_close(client_order_id)
+
+    def _position_to_close(self, command: SubmitOrder) -> tuple[int, PositionSide]:
+        if command.position_id is None:
+            raise Unsupported("on a hedging account a closing order must name its position")
+        try:
+            position_id = int(command.position_id.value)
+        except ValueError:
+            raise Unsupported(f"{command.position_id} is not a venue position") from None
+        view = self._book.view(position_id)
+        if view is None or not view.open:
+            raise Unsupported(f"position {position_id} is not open at the venue")
+        instrument = self._instrument_provider.instrument_for_symbol_id(view.symbol_id)
+        if instrument is None or instrument.id != command.order.instrument_id:
+            raise Unsupported(f"position {position_id} is not on {command.order.instrument_id}")
+        return position_id, PositionSide.LONG if view.side == "BUY" else PositionSide.SHORT
+
+    def _reference(self, instrument: Instrument) -> tuple[Decimal, Decimal]:
+        """The latest bid and ask, when fresh enough to measure a bracket's levels from."""
+        quote = self._quotes.get(instrument.info["symbol_id"])
+        max_age = self._config.reference_price_max_age_secs
+        if (
+            quote is None
+            or quote.bid is None
+            or quote.ask is None
+            or self._loop.time() - quote.at > max_age
+        ):
+            raise Unsupported(
+                f"no price of {instrument.id} newer than {max_age:g}s to measure the levels from",
+            )
+        return quote.bid, quote.ask
+
+    def _refuse(self, orders: list[Order], reason: str) -> None:
+        """Refuse a command before anything is sent: the order rejected, its legs cancelled."""
+        entry, legs = orders[0], orders[1:]
+        self._log.warning(f"Order {entry.client_order_id} refused: {reason}")
+        ts = self._clock.timestamp_ns()
+        self.generate_order_rejected(
+            entry.strategy_id, entry.instrument_id, entry.client_order_id, reason, ts
+        )
+        for leg in legs:
+            self.generate_order_canceled(
+                leg.strategy_id, leg.instrument_id, leg.client_order_id, None, ts
+            )
+
+    def _entry_refused(self, entry_id: str, legs: LegIds, reason: str) -> None:
+        self._log.warning(f"Order {entry_id} refused: {reason}")
+        self._end_bracket(entry_id, reason)
+        self._handle_records(
+            self._book.reject_entry(entry_id, legs, reason, self._clock.timestamp_ms()),
+        )
+
+    def _end_bracket(self, entry_id: str, reason: str) -> None:
+        """Forget a bracket whose levels will never be corrected."""
+        self._brackets.remove(entry_id)
+
+    async def _send(self, request: Message) -> Message | _Refused | None:
+        """`request`'s response, a refusal, or `None` when its outcome is unknown."""
+        session = self._account.session
+        if session is None or not session.is_ready:
+            return _Refused("not connected to the venue", retryable=True)
+        try:
+            response = await session.request(request)
+        except CTraderRequestError as e:
+            return _Refused(
+                _reason(e.error_code, e.description),
+                retryable=e.retry_after_secs is not None,
+            )
+        except (CTraderTimeoutError, CTraderConnectionError):
+            return None
+        if isinstance(response, oa.ProtoOAOrderErrorEvent):
+            # Not an error response to the transport: it arrives as the request's answer.
+            return _Refused(_reason(response.errorCode, response.description or None))
+        return response
 
     # -- Reference prices -----------------------------------------------------------------------
 
