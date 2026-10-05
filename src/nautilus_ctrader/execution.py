@@ -26,6 +26,7 @@ from nautilus_trader.execution.messages import (
     GenerateOrderStatusReport,
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
+    QueryAccount,
 )
 from nautilus_trader.execution.reports import FillReport, OrderStatusReport, PositionStatusReport
 from nautilus_trader.live.execution_client import LiveExecutionClient
@@ -213,11 +214,12 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._session = session
             session.add_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
             session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
+            session.add_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
+            session.add_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
             trader = await self._trader()
             check_account(trader)
             self._currency = Currency.from_str(self._account.deposit_asset.name)
-            self._balance = money_of(trader.balance, trader.moneyDigits)
-            self._balance_version = trader.balanceVersion
+            self._take_trader(trader)
             await self._load()
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
@@ -242,14 +244,15 @@ class CTraderExecutionClient(LiveExecutionClient):
             return
         session.remove_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
         session.remove_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
+        session.remove_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
+        session.remove_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
         session.remove_restore(self._restore_key)
 
     async def _reload(self) -> None:
         """Rebuild the model on a reconnect: the broker may have changed meanwhile."""
         self._log.warning("Rebuilding the venue model after a reconnect")
         trader = await self._trader()
-        self._balance = money_of(trader.balance, trader.moneyDigits)
-        self._balance_version = trader.balanceVersion
+        self._take_trader(trader)
         await self._load()
         self._emit_account_state(self._clock.timestamp_ns())
 
@@ -373,6 +376,74 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._margins[position_id] = entry
         return True
 
+    def _take_trader(self, trader: om.ProtoOATrader) -> None:
+        # A trader read whole is the reference: any version held before is superseded.
+        self._balance_version = -1
+        self._set_balance(
+            trader.balance,
+            trader,
+            trader.balanceVersion if trader.HasField("balanceVersion") else None,
+        )
+
+    def _set_balance(self, amount: int, message: Message, version: int | None) -> bool:
+        """Take a balance the broker reports; returns whether it changed.
+
+        Events can be applied out of order, so a balance older than the one held is ignored.
+        """
+        if version is not None:
+            if version <= self._balance_version:
+                return False
+            self._balance_version = version
+        balance = self._money(amount, message)
+        if balance == self._balance:
+            return False
+        self._balance = balance
+        return True
+
+    def _update_account(self, event: oa.ProtoOAExecutionEvent) -> None:
+        """The account state an execution event carries: a margin, or a balance after a change."""
+        changed = False
+        ts_ms: int | None = None
+        if event.HasField("position"):
+            changed |= self._set_margin(event.position)
+        if event.HasField("deal") and event.deal.HasField("closePositionDetail"):
+            detail = event.deal.closePositionDetail
+            version = detail.balanceVersion if detail.HasField("balanceVersion") else None
+            changed |= self._set_balance(detail.balance, detail, version)
+            ts_ms = event.deal.executionTimestamp
+        if event.HasField("depositWithdraw"):
+            operation = event.depositWithdraw
+            version = operation.balanceVersion if operation.HasField("balanceVersion") else None
+            changed |= self._set_balance(operation.balance, operation, version)
+            ts_ms = operation.changeBalanceTimestamp
+        if changed:
+            self._emit_account_state(
+                self._clock.timestamp_ns() if ts_ms is None else reports.nanos(ts_ms),
+            )
+
+    def _on_trader_updated(self, event: oa.ProtoOATraderUpdatedEvent) -> None:
+        # TODO(verify): no trader update was recorded; its balance is read as the trader's.
+        trader = event.trader
+        version = trader.balanceVersion if trader.HasField("balanceVersion") else None
+        if self._set_balance(trader.balance, trader, version):
+            self._emit_account_state(self._clock.timestamp_ns())
+
+    def _on_margin_changed(self, event: oa.ProtoOAMarginChangedEvent) -> None:
+        # TODO(verify): no margin change was recorded; the positions' own events carry margins.
+        known = self._margins.get(event.positionId)
+        if known is None:
+            # The event names no symbol; a position not yet seen states its margin with its own
+            # next event.
+            return
+        margin = self._money(event.usedMargin, event)
+        if known[1] != margin:
+            self._margins[event.positionId] = (known[0], margin)
+            self._emit_account_state(self._clock.timestamp_ns())
+
+    async def _query_account(self, command: QueryAccount) -> None:
+        self._take_trader(await self._trader())
+        self._emit_account_state(self._clock.timestamp_ns())
+
     def _emit_account_state(self, ts_event: int) -> None:
         margins: dict[InstrumentId | None, Decimal] = {}
         for symbol_id, margin in self._margins.values():
@@ -407,6 +478,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._log.exception("An execution event could not be applied to the venue model", e)
             records = []
         self._handle_records(records)
+        self._update_account(event)
         return records
 
     def _on_order_error_event(self, event: oa.ProtoOAOrderErrorEvent) -> None:

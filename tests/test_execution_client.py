@@ -9,6 +9,8 @@ import pytest
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.events import OrderFilled
@@ -28,7 +30,7 @@ from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.account_venue import HeldReplies
+from tests.account_venue import ACCOUNT_ID, HeldReplies
 from tests.execution_replay import (
     FIRST,
     as_ours,
@@ -411,3 +413,107 @@ async def test_activity_on_an_unloaded_symbol_is_published_with_its_name() -> No
         ]
         assert h.events == []
         assert h.reports == []
+
+
+def balance_of(state) -> Decimal:
+    return state.balances[0].total.as_decimal()
+
+
+def deposit(balance: int, version: int) -> oa.ProtoOAExecutionEvent:
+    return oa.ProtoOAExecutionEvent(
+        ctidTraderAccountId=ACCOUNT_ID,
+        executionType=om.DEPOSIT_WITHDRAW,
+        depositWithdraw=om.ProtoOADepositWithdraw(
+            operationType=om.BALANCE_DEPOSIT,
+            balanceHistoryId=version,
+            balance=balance,
+            delta=100,
+            changeBalanceTimestamp=1_600_000_000_000 + version,
+            balanceVersion=version,
+            moneyDigits=2,
+        ),
+    )
+
+
+async def test_the_account_follows_margins_and_closing_deals() -> None:
+    async with harness() as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS)
+        await wait_until(lambda: h.cache.position(PositionId("5000001")).is_closed)
+
+        opened = FIRST_EVENTS[1].position
+        assert any(
+            s.margins
+            and s.margins[0].initial
+            == Money(Decimal(opened.usedMargin).scaleb(-opened.moneyDigits), USD)
+            for s in h.states
+        )
+        closing = [e.deal for e in FIRST_EVENTS if e.deal.HasField("closePositionDetail")]
+        last = closing[-1].closePositionDetail
+        assert balance_of(h.states[-1]) == Decimal(last.balance).scaleb(-last.moneyDigits)
+        assert h.states[-1].margins == []
+        assert h.states[-1].ts_event == closing[-1].executionTimestamp * 1_000_000
+
+
+async def test_a_balance_older_than_the_one_held_is_ignored() -> None:
+    async with harness() as h:
+        await push(h, deposit(1_000_000, version=10), deposit(900_000, version=9))
+
+        assert [balance_of(s) for s in h.states[1:]] == [Decimal("10000.00")]
+
+
+async def test_the_same_balance_states_nothing_new() -> None:
+    async with harness() as h:
+        await push(h, deposit(1_000_000, version=10), deposit(1_000_000, version=11))
+
+        assert len(h.states) == 2
+
+
+async def test_a_trader_update_states_its_balance() -> None:
+    async with harness() as h:
+        updated = trader(balance=123_456, balanceVersion=50)
+        await push(
+            h,
+            oa.ProtoOATraderUpdatedEvent(ctidTraderAccountId=ACCOUNT_ID, trader=updated.trader),
+        )
+
+        assert balance_of(h.states[-1]) == Decimal("1234.56")
+
+
+async def test_a_margin_change_of_a_known_position_states_it() -> None:
+    execution_venue = ExecutionVenue()
+    our_open_position(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await push(
+            h,
+            oa.ProtoOAMarginChangedEvent(
+                ctidTraderAccountId=ACCOUNT_ID,
+                positionId=FIRST,
+                usedMargin=1_234,
+                moneyDigits=2,
+            ),
+            oa.ProtoOAMarginChangedEvent(
+                ctidTraderAccountId=ACCOUNT_ID,
+                positionId=999,
+                usedMargin=5_000,
+                moneyDigits=2,
+            ),
+        )
+
+        assert len(h.states) == 2
+        assert h.states[-1].margins[0].initial == Money(Decimal("12.34"), USD)
+
+
+async def test_a_query_reads_the_account_again() -> None:
+    async with harness() as h:
+        h.venue.trader = trader(balance=777_700, balanceVersion=99)
+        await h.client._query_account(
+            QueryAccount(
+                trader_id=TRADER_ID,
+                account_id=AccountId("CTRADER-001"),
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+
+        assert balance_of(h.states[-1]) == Decimal("7777.00")
