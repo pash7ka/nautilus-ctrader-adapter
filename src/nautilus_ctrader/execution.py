@@ -356,6 +356,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             held, self._buffer = self._buffer, None
             for event in held:
                 self._on_execution_event(event)
+            # A protective order that came during an outage arrives with the rebuild, no event.
+            self._settle_brackets()
 
     async def _position_orders(self, position_id: int) -> list[om.ProtoOAOrder]:
         """Every order of one position: its entry tells whose position it is."""
@@ -1141,14 +1143,17 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     @staticmethod
     def _wanted_levels(bracket: PendingBracket, view: PositionView) -> dict[Level, Decimal]:
-        """The broker's levels, with each live leg's at its asked price and a cancelled one gone."""
+        """The broker's levels, with each live leg's at its asked price and a cancelled one gone.
+
+        The level of a leg the model holds dead stays as the broker holds it: a rebuild marks a
+        leg dead whose level had not come yet.
+        """
         levels = dict(view.levels)
         for level, leg_id in bracket.legs.items():
-            alive = view.legs.get(level, (leg_id, False))[1]
-            if alive and level not in bracket.cancels:
-                levels[level] = bracket.requested[level]
-            else:
+            if level in bracket.cancels:
                 levels.pop(level, None)
+            elif view.legs.get(level, (leg_id, False))[1]:
+                levels[level] = bracket.requested[level]
         return levels
 
     async def _correct(self, bracket: PendingBracket, position_id: int) -> None:
@@ -1217,16 +1222,23 @@ class CTraderExecutionClient(LiveExecutionClient):
         ts_ms = self._clock.timestamp_ms()
         for level in bracket.cancels:
             self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
-        wanted = {
-            level: bracket.requested[level] for level in missing if level not in bracket.cancels
-        }
-        if not wanted:
-            self._brackets.remove(bracket.entry_id)
+        if all(level in bracket.cancels for level in missing):
+            # Nothing to set; the bracket stays, for its correction to answer what waits on it.
             return
-        outcome = await self._amend(position_id, lambda view: {**view.levels, **wanted})
+
+        def levels_of(view: PositionView) -> dict[Level, Decimal]:
+            # Read under the amend lock, so a modify that came meanwhile is not undone.
+            wanted = {
+                level: bracket.requested[level] for level in missing if level not in bracket.cancels
+            }
+            return {**view.levels, **wanted}
+
+        outcome = await self._amend(position_id, levels_of)
         if isinstance(outcome, _Refused):
             self._end_bracket(bracket.entry_id, outcome.reason)
             self._levels_refused(position_id, outcome.reason)
+            return
+        self._settle_brackets()
 
     def _levels_refused(self, position_id: int, reason: str) -> None:
         self._log.error(f"Position {position_id} stands without its levels: {reason}")

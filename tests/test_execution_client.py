@@ -939,9 +939,8 @@ def protective(
     return event
 
 
-def echo_amends(execution_venue: ExecutionVenue, *, kind: int = om.ORDER_REPLACED) -> list:
-    """The broker sets whatever levels an amend asks for; returns the amends it received."""
-    amends: list = []
+def amend_echo(amends: list, *, kind: int = om.ORDER_REPLACED):
+    """The broker's answer setting whatever levels an amend asks for; keeps each in `amends`."""
 
     def answer(request):
         amends.append(request)
@@ -952,7 +951,13 @@ def echo_amends(execution_venue: ExecutionVenue, *, kind: int = om.ORDER_REPLACE
             return protective(None, None, utc=utc, kind=om.ORDER_CANCELLED)
         return protective(stop, limit, utc=utc, kind=kind)
 
-    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, answer)
+    return answer
+
+
+def echo_amends(execution_venue: ExecutionVenue, *, kind: int = om.ORDER_REPLACED) -> list:
+    """The broker sets whatever levels an amend asks for; returns the amends it received."""
+    amends: list = []
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, amend_echo(amends, kind=kind))
     return amends
 
 
@@ -1319,3 +1324,83 @@ async def test_an_amend_without_an_answer_is_sent_again_once_reconnected() -> No
 
         assert len(h.received(oa.ProtoOAAmendPositionSLTPReq)) == 2
         assert len(amends) == 1
+
+
+async def test_a_bracket_settles_once_the_model_is_rebuilt_with_its_protective_order() -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await push_spot(h, BID, ASK)
+        # The broker took the order and protected the position while the connection was down.
+        our_open_position(execution_venue)
+        h.server.close_after_next_request = True
+        sending = asyncio.create_task(submit_bracket(h, bracket(h)))
+        await wait_until(lambda: len(h.client._brackets) == 1)
+        await h.client._cancel_order(cancel(TARGET))
+        await sending
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED, timeout_secs=10)
+
+        (amend,) = amends
+        assert amend.stopLoss == 85197.2
+        assert not amend.HasField("takeProfit")
+        assert len(h.client._brackets) == 0
+
+
+async def test_a_correction_leaves_the_level_of_a_leg_no_longer_alive() -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])
+    amends = echo_amends(execution_venue)
+    config = exec_config(protective_order_timeout_secs=30.0)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.FILLED)
+        # Rebuilt before the protective order came: the position has no level, so no live leg.
+        our_open_position(execution_venue)
+        snapshot = execution_venue.snapshot
+        snapshot.position[0].ClearField("stopLoss")
+        snapshot.position[0].ClearField("takeProfit")
+        del snapshot.order[:]
+        await h.client._load()
+        assert not any(alive for _, alive in h.client._book.view(FIRST).legs.values())
+
+        await push(h, FIRST_EVENTS[2])
+
+        # Settled on the event itself: no correction was started.
+        assert len(h.client._brackets) == 0
+        assert amends == []
+
+
+async def test_a_wait_ending_with_nothing_to_set_leaves_the_bracket_to_its_correction() -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    amends: list = []
+    held_amends = HeldReplies(
+        execution_venue.server, om.PROTO_OA_AMEND_POSITION_SLTP_REQ, amend_echo(amends)
+    )
+    config = exec_config(protective_order_timeout_secs=30.0)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        sending = await in_flight(h, held)
+        await h.client._cancel_order(cancel(TARGET))
+        await held.release()
+        await sending
+        # The protective order brings the stop-loss alone, away from its asked price.
+        stop_only = protective(85190.0, None, utc=AMEND_FROM, kind=om.ORDER_ACCEPTED)
+        stop_only.isServerEvent = True
+        await push(h, FIRST_EVENTS[1], stop_only)
+        await asyncio.wait_for(held_amends.arrived.wait(), timeout=5)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+
+        # The wait ends while the correction is out; the cancelled leg is the one missing.
+        h.client._protection_waited(FIRST)
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        assert len(h.client._brackets) == 1
+
+        await held_amends.stop_holding()
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85150.00"),
+        )
+        assert amends[-1].stopLoss == 85150.0
+        assert not amends[-1].HasField("takeProfit")
+        assert len(h.client._brackets) == 0
