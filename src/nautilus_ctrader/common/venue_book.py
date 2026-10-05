@@ -140,8 +140,8 @@ def levels_of(order: om.ProtoOAOrder, precision: int) -> dict[Level, Decimal]:
     return levels
 
 
-def _remaining(order: om.ProtoOAOrder) -> int:
-    """What is left of a protective order."""
+def remaining_of(order: om.ProtoOAOrder) -> int:
+    """What is left of an order, as a venue volume."""
     # TODO(verify): whether the broker reports a partly filled protective order's total volume or
     # its rest; none was recorded. A replace after a partial trigger would settle it.
     executed = order.executedVolume if order.HasField("executedVolume") else 0
@@ -280,7 +280,7 @@ class VenueBook:
                 position = self._positions.get(order.positionId)
                 if position is not None:
                     position.protective_order_id = order.orderId
-                    position.protective_volume = _remaining(order)
+                    position.protective_volume = remaining_of(order)
                     for leg in position.legs.values():
                         if leg.accepted:
                             leg.quantity = position.protective_volume
@@ -798,7 +798,7 @@ class VenueBook:
             if current is not None and order.orderId != current:
                 position.retired_protective_ids.add(current)
             position.protective_order_id = order.orderId
-            position.protective_volume = _remaining(order)
+            position.protective_volume = remaining_of(order)
             position.levels = levels_of(order, precision)
             position.awaiting_protection = False
         elif kind == om.ORDER_CANCELLED:
@@ -1083,7 +1083,7 @@ class VenueBook:
             order.tradeData.symbolId,
             "order",
             _SIDE[order.tradeData.tradeSide],
-            units_of(_remaining(order)),
+            units_of(remaining_of(order)),
         )
 
     def _track_unloaded(self, event: oa.ProtoOAExecutionEvent) -> None:
