@@ -781,6 +781,50 @@ async def test_a_cached_position_closed_before_the_window_is_closed_at_start() -
         assert not any(o.tags and "RECONCILIATION" in o.tags for o in h.cache.orders())
 
 
+def unknown_to_the_broker() -> ExecutionVenue:
+    """A venue holding one foreign position, and nothing of the node's first position."""
+    venue = ExecutionVenue()
+    foreign_position(venue, 1, ts=int(time.time() * 1000) - 10_000)
+    return venue
+
+
+async def test_a_cached_position_the_broker_refuses_to_list_fails_no_pass() -> None:
+    cache = await legs_accepted()
+    venue = unknown_to_the_broker()
+    orders_of = venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ]
+
+    def refuse_first(request: oa.ProtoOAOrderListByPositionIdReq) -> Message:
+        if request.positionId == FIRST:
+            return oa.ProtoOAErrorRes(
+                ctidTraderAccountId=ACCOUNT_ID,
+                errorCode="POSITION_NOT_FOUND",
+                description="no such position",
+            )
+        return orders_of(request)
+
+    venue.server.on(om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ, refuse_first)
+    async with harness(execution_venue=venue, cache=cache) as h:
+        built = await h.client.generate_mass_status()
+
+        assert built is not None
+        (report,) = built.position_reports[US100_ID]
+        assert report.venue_position_id == PositionId("5100001")
+        (warning,) = [line for line in h.logger.warnings() if str(FIRST) in line]
+        assert "POSITION_NOT_FOUND" in warning
+
+
+async def test_a_cached_position_the_broker_lists_nothing_of_is_skipped() -> None:
+    cache = await legs_accepted()
+
+    async with harness(execution_venue=unknown_to_the_broker(), cache=cache) as h:
+        built = await h.client.generate_mass_status()
+
+        assert built is not None
+        assert list(built.order_reports) == [VenueOrderId("6100001")]
+        (warning,) = [line for line in h.logger.warnings() if str(FIRST) in line]
+        assert "unknown" in warning
+
+
 def fills_command(**filters) -> GenerateFillReports:
     values = {"instrument_id": None, "venue_order_id": None, "start": None, "end": None}
     values.update(filters)

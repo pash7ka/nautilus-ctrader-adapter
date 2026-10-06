@@ -973,10 +973,14 @@ class CTraderExecutionClient(LiveExecutionClient):
         open_ids = set(symbols)
         for deal in window.values():
             symbols.setdefault(deal.positionId, deal.symbolId)
+        # Known only from Nautilus's cache: possibly another account's, so never fatal.
+        cache_only: set[int] = set()
         if positions is None and deals:
             for position_id in self._cached_open_positions():
-                # Its symbol is known once its lists are read.
-                symbols.setdefault(position_id, None)
+                if position_id not in symbols:
+                    cache_only.add(position_id)
+                    # Its symbol is known once its lists are read.
+                    symbols[position_id] = None
         covered = sorted(symbols) if positions is None else list(dict.fromkeys(positions))
         histories: dict[int, PositionHistory] = {}
         for position_id in covered:
@@ -984,15 +988,34 @@ class CTraderExecutionClient(LiveExecutionClient):
             loaded = symbol_id is None or self._price_precision(symbol_id) is not None
             if not loaded and position_id not in open_ids:
                 continue
-            orders = await self._position_orders(position_id, historical)
             found: list[om.ProtoOADeal] = []
-            if deals and loaded:
-                found, complete = await history.position_deals(historical, account_id, position_id)
-                if not complete:
-                    self._log.warning(
-                        f"Position {position_id}: its deal list did not end; some of its fills "
-                        "may be missing, and whether it is open is read from those found",
+            try:
+                orders = await self._position_orders(position_id, historical)
+                if deals and loaded:
+                    found, complete = await history.position_deals(
+                        historical, account_id, position_id
                     )
+                    if not complete:
+                        self._log.warning(
+                            f"Position {position_id}: its deal list did not end; some of its "
+                            "fills may be missing, and whether it is open is read from those found",
+                        )
+            except (CTraderRequestError, CTraderTimeoutError) as e:
+                if position_id not in cache_only:
+                    raise
+                # TODO(verify): what the venue answers for a position id it does not know; no
+                # such request was recorded.
+                self._log.warning(
+                    f"Position {position_id}, open in Nautilus's cache, could not be read at the "
+                    f"venue, so it is not reconciled: {e}",
+                )
+                continue
+            if position_id in cache_only and not orders and not found:
+                self._log.warning(
+                    f"Position {position_id}, open in Nautilus's cache, is unknown at the venue, "
+                    "so it is not reconciled",
+                )
+                continue
             histories[position_id] = PositionHistory(tuple(orders), tuple(found))
         lacking = {
             position_id

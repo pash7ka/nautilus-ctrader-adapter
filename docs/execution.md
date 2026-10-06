@@ -180,7 +180,12 @@ while the node was down, earlier than the fill window reaches, is named by nothi
 broker lists, and Nautilus does nothing about a cached position the broker reports no position
 for. Read by its own lists, it is reported closed with its real fills, and its legs filled or
 cancelled. The cache only says which positions to ask about; what is reported comes from the
-broker.
+broker. A cached position the broker refuses to list, or lists nothing of, is left out with a
+WARNING; it never fails the pass.
+
+**A persistent cache must not be reused across a change of trading account.** The Nautilus
+account id is the same for every account (`CTRADER-001`), so a cache kept from another account
+holds that account's positions. They are asked about, found unknown and left open in Nautilus.
 
 The broker keeps trading while these are read, so the reads do not describe one moment. Their
 order keeps them consistent:
