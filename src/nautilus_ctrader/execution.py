@@ -563,6 +563,9 @@ class CTraderExecutionClient(LiveExecutionClient):
                         return unanswered("not found at the venue")
                     if listed.HasField("positionId"):
                         position_id = listed.positionId
+                elif listed.executedVolume and listed.HasField("positionId"):
+                    # Partly filled: answered from its position, with its fills.
+                    position_id = listed.positionId
             if position_id is not None:
                 state = await self._read_broker(since_ms=None, positions=[position_id])
                 found = state.histories.get(position_id)
@@ -602,7 +605,31 @@ class CTraderExecutionClient(LiveExecutionClient):
         if not record.fills:
             return report, False
         self._send_mass_status_report(status)
+        bracket = self._brackets.by_entry(order_id)
+        if bracket is not None and self._bracket_position(bracket) is None:
+            await self._learn_position(order_id)
         return report, True
+
+    async def _learn_position(self, entry_id: str) -> None:
+        """Rebuild the model after a query found bracket `entry_id`'s entry filled.
+
+        No event told the model of the position, so its legs would stay "in flight" and its
+        levels uncorrected; the rebuild settles the bracket from the broker's levels.
+
+        - Only for a position the model does not know: a rebuild before the protective order
+          has come would end legs still alive.
+        - Not while a rebuild holds the buffer: releasing it here would apply the held events
+          before Nautilus has reconciled the start.
+        """
+        if self._buffer is not None:
+            self._log.debug(f"Bracket {entry_id}: its entry filled; left to the rebuild under way")
+            return
+        try:
+            await self._load()
+        except CTraderError as e:
+            self._log.warning(
+                f"Bracket {entry_id}: its entry filled, but the venue model was not rebuilt: {e}",
+            )
 
     async def generate_order_status_reports(
         self,

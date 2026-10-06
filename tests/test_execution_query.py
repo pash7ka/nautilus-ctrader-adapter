@@ -31,7 +31,7 @@ from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.execution_replay import FIRST, make_order
+from tests.execution_replay import FIRST, make_deal, make_order, make_position
 from tests.execution_venue import (
     CLOSE,
     ENTRY,
@@ -50,6 +50,7 @@ from tests.execution_venue import (
     exec_config,
     harness,
     node_close_events,
+    on_us100,
     our_market_position,
     push,
     push_spot,
@@ -385,3 +386,51 @@ async def test_a_fill_after_the_in_flight_check_gave_up_still_opens_our_position
         assert position.opening_order_id == ClientOrderId(ENTRY)
         assert position.quantity == Quantity.from_str("1.00")
         assert status(h, ENTRY) == OrderStatus.REJECTED
+
+
+async def test_an_entry_answered_filled_settles_its_bracket() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await push_spot(h, BID, ASK)
+        # At the levels the broker holds at `OPEN_AT`, so no correcting amend is needed.
+        await submit_bracket(h, bracket(h, stop_price="85200.20", target_price="85353.42"))
+        filled_at_the_broker(venue)
+
+        await h.client._query_order(query(h, ENTRY))
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.FILLED)
+        assert len(h.client._brackets) == 0
+
+        await h.client._query_order(query(h, STOP))
+
+        await wait_until(lambda: status(h, STOP) == OrderStatus.ACCEPTED)
+        assert h.cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85200.20")
+        (report,) = h.reports
+        assert report.venue_order_id == VenueOrderId("6000001-SL")
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+
+
+async def test_a_partly_filled_pending_entry_is_answered_with_its_fill() -> None:
+    at = now_ms() - MINUTE_MS
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await market_submitted(h)
+        entry = market_entry(order_status=om.ORDER_STATUS_ACCEPTED, utc=at)
+        entry.executedVolume = 50
+        position = make_position(MARKET_POSITION, volume=50, symbol=US100_SYMBOL_ID)
+        position.price = 85000.0
+        position.utcLastUpdateTimestamp = at
+        deal = make_deal(
+            7_100_001, MARKET_ORDER, MARKET_POSITION, side=om.BUY, volume=50, price=85000.0, ts=at
+        )
+        venue.snapshot.order.append(entry)
+        venue.snapshot.position.append(position)
+        venue.position_orders = {MARKET_POSITION: [entry]}
+        venue.position_deals = {MARKET_POSITION: on_us100([deal])}
+
+        await h.client._query_order(query(h, MARKET_ID))
+
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.PARTIALLY_FILLED)
+        assert trade_ids(h, MARKET_ID) == [TradeId("7100001")]
+        assert h.cache.order(ClientOrderId(MARKET_ID)).filled_qty == Quantity.from_str("0.50")
+        (built,) = h.mass_statuses
+        assert list(built.order_reports) == [VenueOrderId(str(MARKET_ORDER))]
