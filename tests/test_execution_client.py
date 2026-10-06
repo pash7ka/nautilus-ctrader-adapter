@@ -666,9 +666,9 @@ def market_events() -> list:
 def close_events() -> list:
     """The node's close of that position, accepted then filled (hand-built).
 
-    The closing order is created now: one created before the node sent its close is not its.
+    The broker's clock runs a minute behind the node's: its answer is the close's all the same.
     """
-    created = int(time.time() * 1000)
+    created = int(time.time() * 1000) - 60_000
 
     def order(utc: int) -> om.ProtoOAOrder:
         found = make_order(6_100_002, MARKET_POSITION, side=om.SELL, closing=True, utc=utc)

@@ -128,9 +128,8 @@ def entry_of(orders: Sequence[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
 
 def created_of(order: om.ProtoOAOrder) -> int:
     """When the broker created `order`, in ms; its last change if it carries no creation time."""
-    # TODO(verify): that the broker's clock and the node's agree closely enough to compare a
-    # closing order's `openTimestamp` with the time the node sent its close. Every recorded
-    # closing order carries `openTimestamp`.
+    # TODO(verify): that a closing order's `openTimestamp` is on the same clock as the broker's
+    # other timestamps; every recorded closing order carries it.
     if order.tradeData.HasField("openTimestamp"):
         return order.tradeData.openTimestamp
     return order.utcLastUpdateTimestamp
@@ -239,6 +238,11 @@ class VenueBook:
             if position.open and self._precision(position.symbol_id) is None
         )
         return tuple(sorted((*positions, *self._unloaded_orders.values())))
+
+    def updated_ms(self, position_id: int) -> int:
+        """The broker's time of the last position state applied, or -1 for none."""
+        position = self._positions.get(position_id)
+        return -1 if position is None else position.updated_ms
 
     def known_closes(self) -> dict[int, str]:
         """The node's closes the model has matched: broker order id to the node's close id."""
@@ -986,7 +990,7 @@ class VenueBook:
             # TODO(verify): that the broker's closing order carries the volume the node's close
             # asked for; the match rests on it.
             candidate = operations.closing(
-                position.position_id, order.tradeData.volume, created_of(order)
+                position.position_id, order.tradeData.volume, created_of(order), order.orderId
             )
             # One close id names one broker order; a second match is somebody else's close.
             if candidate is not None and candidate not in self._closes.values():

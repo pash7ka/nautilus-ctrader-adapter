@@ -514,11 +514,14 @@ sign flipped to Nautilus's convention (a charge is positive).
 - **A manual change at the same moment as the node's own is taken for the node's.** The adapter
   tells a trader's change from its own by what it has in flight: a level amend of that position,
   or a close of that volume on that position. A trader's change landing while one is in flight is
-  read as the answer to it. For a close, only a closing order the broker created no earlier than
-  the node sent its close can be taken, judged by the broker's creation time against the node's
-  clock. This includes a close whose answer was lost: until the next successful
-  reconnect pass, a trader's close of the same volume on that position during the outage is taken
-  for the node's.
+  read as the answer to it. For a close, the broker's answer to the node's request is always the
+  node's close. Any other closing order of that volume on that position is taken for it if the
+  broker created it after the newest broker time the node had seen when it sent the close. That
+  time comes from the broker's own stamps on execution events and spots, never from the node's
+  clock. So a trader's close created after the last broker stamp the node saw, but before the
+  node's close reached the broker, is taken for the node's. This includes a close whose answer
+  was lost: until the next successful reconnect pass, such a trader's close of the same volume on
+  that position during the outage is taken for the node's.
 - **A level re-added by hand after its leg was cancelled is adopted after a restart.** After a
   restart a leg lives exactly while its level does, so the level a trader put back makes the leg
   alive again under its original id. Before the restart, the same re-added level is only a
@@ -560,7 +563,10 @@ it. The main groups:
   event; a protective order that triggers partially, and whether a partly filled protective order
   reports its total volume or its rest.
 - **Matching the node's close**: whether the broker's closing order carries the volume the node's
-  close asked for. The match of a close to the node's order rests on it.
+  close asked for. The match of a close to the node's order rests on it. Also, that a closing
+  order's creation time, the execution events' times and a spot's `timestamp` are all on the
+  broker's one clock: the bound that keeps a trader's earlier close from being taken for the
+  node's compares them.
 - **Rejected orders**: whether a rejected order carries a position id.
 - **Error text**: whether the broker's description of a refusal can ever contain an account
   identifier. The adapter adds none, but it passes the broker's text through.

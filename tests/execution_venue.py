@@ -414,14 +414,17 @@ async def push(h: Harness, *messages: Message) -> None:
     await sync(h)
 
 
-async def push_spot(h: Harness, bid: int, ask: int) -> None:
-    """A spot of `US100.cash`, in the venue's integer price units (1/100000)."""
-    await push(
-        h,
-        oa.ProtoOASpotEvent(
-            ctidTraderAccountId=ACCOUNT_ID, symbolId=US100_SYMBOL_ID, bid=bid, ask=ask
-        ),
+async def push_spot(h: Harness, bid: int, ask: int, *, timestamp: int | None = None) -> None:
+    """A spot of `US100.cash`, in the venue's integer price units (1/100000).
+
+    `timestamp` is the broker's time of the spot, in ms.
+    """
+    spot = oa.ProtoOASpotEvent(
+        ctidTraderAccountId=ACCOUNT_ID, symbolId=US100_SYMBOL_ID, bid=bid, ask=ask
     )
+    if timestamp is not None:
+        spot.timestamp = timestamp
+    await push(h, spot)
 
 
 def bracket(
@@ -567,15 +570,16 @@ def our_market_position(venue: ExecutionVenue, *, opened: int, closed: int | Non
     venue.deals = on_us100(deals)
 
 
-def answer_closes(venue: ExecutionVenue) -> list[oa.ProtoOAExecutionEvent]:
+def answer_closes(venue: ExecutionVenue, *, behind_ms: int = 0) -> list[oa.ProtoOAExecutionEvent]:
     """Answer the node's close with its acceptance, made when the close arrives.
 
-    Returns the list that then holds the close's events, accepted and filled.
+    The broker stamps it `behind_ms` behind the node's clock. Returns the list that then holds
+    the close's events, accepted and filled.
     """
     made: list[oa.ProtoOAExecutionEvent] = []
 
     def answer(_request: Message) -> Message:
-        made[:] = node_close_events(closed=int(time.time() * 1000))
+        made[:] = node_close_events(closed=int(time.time() * 1000) - behind_ms)
         return made[0]
 
     venue.server.on(om.PROTO_OA_CLOSE_POSITION_REQ, answer)
@@ -612,8 +616,8 @@ async def close_sent(h: Harness) -> asyncio.Task:
 def node_close_events(*, closed: int) -> list[oa.ProtoOAExecutionEvent]:
     """The node's close of `OURS` created and accepted, then filled, at `closed` (hand-built).
 
-    The broker takes a closing order for the node's close only if it was created no earlier
-    than the close was sent, so `closed` must not precede the send.
+    A closing order is taken for the node's close only if it was created after the newest
+    broker time the node had seen when it sent it, so `closed` must be later than that.
     """
 
     def order(utc: int) -> om.ProtoOAOrder:

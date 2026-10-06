@@ -58,7 +58,7 @@ class Closing(NoOperations):
     def __init__(self, client_order_id: str) -> None:
         self.client_order_id = client_order_id
 
-    def closing(self, position_id: int, volume: int, created_ms: int) -> str | None:
+    def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
         return self.client_order_id
 
 
@@ -452,7 +452,8 @@ def test_a_close_created_before_the_node_sent_its_own_is_not_the_nodes() -> None
     b = book()
     opened(b)
     table = OperationsInFlight()
-    table.begin_close("O-C", P, 100, 50)
+    # The node last heard from the broker at 45, broker time, when it sent the close.
+    table.begin_close("O-C", P, 100, 45)
     earlier = make_order(9_100_003, P, side=om.SELL, closing=True, utc=40)
     later = make_order(9_100_004, P, side=om.SELL, closing=True, utc=50)
 

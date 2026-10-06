@@ -73,6 +73,10 @@ MINUTE_MS = 60_000
 LOSING = exec_config(order_request_timeout_secs=0.2)
 
 
+# The broker's clock runs this far behind the node's in the tests that skew them.
+BROKER_BEHIND_MS = 60_000
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -301,13 +305,13 @@ async def test_query_for_a_matched_close_answers_from_its_position() -> None:
     now = now_ms()
     venue = ExecutionVenue()
     our_market_position(venue, opened=now - 2 * MINUTE_MS)
-    answer_closes(venue)
+    answer_closes(venue, behind_ms=BROKER_BEHIND_MS)
     async with harness(execution_venue=venue) as h:
         await started(h)
         await asyncio.wait_for(await close_sent(h), timeout=10)
         assert status(h, CLOSE) == OrderStatus.ACCEPTED
         # The fill's event never came; the broker's lists hold it.
-        our_market_position(venue, opened=now - 2 * MINUTE_MS, closed=now_ms())
+        our_market_position(venue, opened=now - 2 * MINUTE_MS, closed=now_ms() - BROKER_BEHIND_MS)
 
         await h.client._query_order(query(h, CLOSE))
 
@@ -327,8 +331,8 @@ async def test_query_for_a_close_in_flight_answers_under_the_node_id() -> None:
     async with harness(execution_venue=venue, config=config) as h:
         await started(h)
         closing = await close_sent(h)
-        # The broker executed it; its lists hold the fill.
-        closed = now_ms()
+        # The broker executed it, its clock a minute behind the node's; its lists hold the fill.
+        closed = now_ms() - BROKER_BEHIND_MS
         our_market_position(venue, opened=now - 2 * MINUTE_MS, closed=closed)
 
         await h.client._query_order(query(h, CLOSE))
@@ -355,7 +359,7 @@ async def test_a_close_named_by_a_query_keeps_its_late_events_after_the_timeout(
     async with harness(execution_venue=venue, config=config) as h:
         await started(h)
         closing = await close_sent(h)
-        closed = now_ms()
+        closed = now_ms() - BROKER_BEHIND_MS
         our_market_position(venue, opened=now - 2 * MINUTE_MS, closed=closed)
         await h.client._query_order(query(h, CLOSE))
         await wait_until(lambda: status(h, CLOSE) == OrderStatus.FILLED)
@@ -378,8 +382,9 @@ async def test_query_for_a_close_in_flight_never_claims_an_earlier_close() -> No
     config = exec_config(order_request_timeout_secs=2.0)
     async with harness(execution_venue=venue, config=config) as h:
         await started(h)
+        # A trader's close of the same volume, made before a spot the node saw, then the node's.
+        await push_spot(h, BID, ASK, timestamp=now - MINUTE_MS // 2)
         closing = await close_sent(h)
-        # A trader's close of the same volume, made before the node's was sent.
         our_market_position(venue, opened=now - 2 * MINUTE_MS, closed=now - MINUTE_MS)
 
         await h.client._query_order(query(h, CLOSE))

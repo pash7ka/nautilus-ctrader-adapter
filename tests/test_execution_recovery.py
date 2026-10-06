@@ -975,7 +975,8 @@ async def test_a_close_in_flight_across_a_reconnect_keeps_the_node_id() -> None:
         )
         await wait_until(lambda: len(h.received(oa.ProtoOAClosePositionReq)) == 1)
 
-        our_market_position(venue, opened=now - 120_000, closed=int(time.time() * 1000))
+        # The broker's clock runs a minute behind the node's.
+        our_market_position(venue, opened=now - 120_000, closed=int(time.time() * 1000) - 60_000)
         await h.server.drop_connections()
         await asyncio.wait_for(closing, timeout=10)
         await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
@@ -1086,7 +1087,8 @@ async def test_a_lost_close_stays_in_flight_until_a_reconnect_pass_succeeds() ->
     async with harness(execution_venue=venue) as h:
         await started(h)
         closing = await close_sent(h)
-        our_market_position(venue, opened=now - 120_000, closed=int(time.time() * 1000))
+        # The broker's clock runs a minute behind the node's.
+        our_market_position(venue, opened=now - 120_000, closed=int(time.time() * 1000) - 60_000)
         venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
 
         await h.server.drop_connections()
@@ -1110,8 +1112,9 @@ async def test_the_pass_never_names_an_earlier_close_by_the_close_in_flight() ->
     our_market_position(venue, opened=now - 120_000)
     async with harness(execution_venue=venue) as h:
         await started(h)
+        # A trader's close of the same volume, made before a spot the node saw, then the node's.
+        await push_spot(h, 8_528_600_000, 8_528_721_000, timestamp=now - 30_000)
         closing = await close_sent(h)
-        # A trader's close of the same volume, made before the node's was sent.
         our_market_position(venue, opened=now - 120_000, closed=now - 60_000)
 
         built = await h.client.generate_mass_status()
@@ -1155,7 +1158,7 @@ async def test_a_close_answered_during_a_rebuild_is_still_the_nodes() -> None:
     now = int(time.time() * 1000)
     venue = ExecutionVenue()
     our_market_position(venue, opened=now - 120_000)
-    made = answer_closes(venue)
+    made = answer_closes(venue, behind_ms=60_000)
     async with harness(execution_venue=venue) as h:
         await started(h)
         held = HeldReplies(

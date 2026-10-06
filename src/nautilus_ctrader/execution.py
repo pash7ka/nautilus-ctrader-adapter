@@ -316,6 +316,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         # Set whenever no buffer is held, so an amend whose answer was held can wait for it.
         self._model_standing = asyncio.Event()
         self._model_standing.set()
+        # The newest broker timestamp the node has seen, in ms, or -1 before any.
+        self._broker_ms = -1
         # Closes whose answer the connection lost: in flight until the next reconnect pass.
         self._lost_closes: set[str] = set()
         # The start's mass status the held events wait on, and how long they wait at most.
@@ -1206,12 +1208,21 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._log.exception("An execution event could not be applied to the venue model", e)
             records = []
         self._handle_records(records)
+        self._saw_broker_time(
+            event.order.utcLastUpdateTimestamp,
+            event.position.utcLastUpdateTimestamp,
+            event.deal.executionTimestamp,
+        )
         if any(isinstance(r, Activity) and r.kind in _EXPOSURE_KINDS for r in records):
             self._write_exposure()
         self._update_account(event)
         self._settle_brackets()
         self._drop_amend_locks()
         return records
+
+    def _saw_broker_time(self, *times_ms: int) -> None:
+        # Unset fields read as 0, which never moves the newest time.
+        self._broker_ms = max(self._broker_ms, *times_ms)
 
     def _on_order_error_event(self, event: oa.ProtoOAOrderErrorEvent) -> None:
         # One answering a request goes to that request; this one found nobody waiting.
@@ -1441,9 +1452,9 @@ class CTraderExecutionClient(LiveExecutionClient):
             return
         client_order_id = order.client_order_id.value
         # In flight before it leaves, so the broker's events of the close are matched to it.
-        self._operations.begin_close(
-            client_order_id, position_id, request.volume, self._clock.timestamp_ms()
-        )
+        # Broker time, never the node's clock: the two may disagree by more than a request takes.
+        anchor = max(self._broker_ms, self._book.updated_ms(position_id))
+        self._operations.begin_close(client_order_id, position_id, request.volume, anchor)
         self.generate_order_submitted(
             order.strategy_id,
             order.instrument_id,
@@ -1468,7 +1479,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                     f"Close {client_order_id}: no answer, so its outcome is unknown; "
                     "it is not resent",
                 )
-            elif isinstance(self._on_execution_event(outcome), _Buffered):
+            elif isinstance(self._answered(client_order_id, outcome), _Buffered):
                 # In flight until the held answer is applied, or it reads as a trader's close.
                 await self._wait_for_model()
         finally:
@@ -1477,6 +1488,12 @@ class CTraderExecutionClient(LiveExecutionClient):
                 self._lost_closes.add(client_order_id)
             else:
                 self._operations.end_close(client_order_id)
+
+    def _answered(self, client_order_id: str, outcome: Message) -> list[Record] | _Buffered:
+        """Apply the answer to the node's close, whose broker order is that close by definition."""
+        if isinstance(outcome, oa.ProtoOAExecutionEvent) and outcome.HasField("order"):
+            self._operations.answered(client_order_id, outcome.order.orderId)
+        return self._on_execution_event(outcome)
 
     def _position_to_close(self, command: SubmitOrder) -> tuple[int, PositionSide]:
         if command.position_id is None:
@@ -2033,6 +2050,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             await subscriptions.unsubscribe_spots(symbol_id, consumer, self._owner)
 
     def _on_spot(self, event: oa.ProtoOASpotEvent) -> None:
+        if event.HasField("timestamp"):
+            # TODO(verify): that a spot's `timestamp` is on the clock of the broker's execution
+            # timestamps; every recorded spot carries one, in ms.
+            self._saw_broker_time(event.timestamp)
         if not (event.HasField("bid") or event.HasField("ask")):
             return
         quote = self._quotes.setdefault(event.symbolId, _Quote())

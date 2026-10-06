@@ -309,7 +309,9 @@ def _close_id(
     close_id = known_closes.get(order.orderId)
     # A stop-out is the broker's own close, never the node's.
     if close_id is None and ask and not order.isStopOut:
-        candidate = operations.closing(order.positionId, order.tradeData.volume, created_of(order))
+        candidate = operations.closing(
+            order.positionId, order.tradeData.volume, created_of(order), order.orderId
+        )
         if candidate is not None and candidate not in claimed:
             claimed.add(candidate)
             close_id = candidate
