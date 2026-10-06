@@ -561,6 +561,39 @@ async def test_buffer_is_released_when_reconciliation_never_comes() -> None:
         assert any("0.2s" in line for line in h.logger.warnings())
 
 
+def settling_fails(monkeypatch: pytest.MonkeyPatch, h: Harness) -> None:
+    def fail() -> None:
+        raise RuntimeError("settling failed")
+
+    monkeypatch.setattr(h.client, "_settle_brackets", fail)
+
+
+async def test_a_failed_release_on_reconciliation_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(execution_venue=serving()) as h:
+        built = await h.client.generate_mass_status()
+        settling_fails(monkeypatch, h)
+
+        h.engine.reconcile_execution_mass_status(built)
+
+        assert h.client._buffer is None
+        assert h.client._model_standing.is_set()
+        assert any("held" in line for line in h.logger.errors())
+
+
+async def test_a_failed_release_after_the_wait_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with harness(execution_venue=serving()) as h:
+        h.client._reconciled_wait_secs = 0.1
+        assert await h.client.generate_mass_status() is not None
+        settling_fails(monkeypatch, h)
+
+        await wait_until(lambda: any("held" in line for line in h.logger.errors()))
+
+        assert h.client._buffer is None
+        assert h.client._model_standing.is_set()
+
+
 async def test_a_failed_list_releases_the_buffer() -> None:
     venue = serving()
     venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
@@ -591,6 +624,37 @@ async def test_the_pass_asks_each_position_once(monkeypatch: pytest.MonkeyPatch)
         assert len(built.position_reports[US100_ID]) == 25
         # The snapshot, the window's deal list, and two lists per position.
         assert any(level == "info" and "52 requests" in line for level, line in h.logger.lines)
+
+
+async def test_a_deal_list_cut_short_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The suite need not wait out the venue's historical rate for 20 pages.
+    monkeypatch.setattr("nautilus_ctrader.common.session.HISTORICAL_RATE_LIMIT_PER_SEC", 1000.0)
+    venue = ExecutionVenue()
+    venue.page_size = 2
+    foreign_position(venue, 1, ts=1_600_000_000_000)
+    position_id = 5_100_001
+    # The entry filled in 25 parts, more than 20 pages of the position's deal list hold.
+    venue.position_deals[position_id] = on_us100(
+        [
+            make_deal(
+                7_150_000 + n,
+                6_100_001,
+                position_id,
+                side=om.BUY,
+                volume=4,
+                price=85000.0,
+                ts=1_600_000_000_000 + n,
+            )
+            for n in range(25)
+        ]
+    )
+    async with harness(execution_venue=venue) as h:
+        assert await h.client.generate_mass_status() is not None
+
+        assert any(
+            f"Position {position_id}" in line and "deal list" in line
+            for line in h.logger.warnings()
+        )
 
 
 async def test_deal_pages_are_followed() -> None:

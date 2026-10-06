@@ -104,13 +104,23 @@ async def test_deal_pages_stop_at_the_page_limit() -> None:
 async def test_position_deals_ask_without_a_window_first() -> None:
     venue = Venue(deals(10, 20, 30), page_size=2)
 
-    found = await history.position_deals(venue.request, ACCOUNT, 5_000_000)
+    found, complete = await history.position_deals(venue.request, ACCOUNT, 5_000_000)
 
+    assert complete
     assert [deal.executionTimestamp for deal in found] == [10, 20, 30]
     first, second = venue.asked
     assert not first.HasField("fromTimestamp")
     assert not first.HasField("toTimestamp")
     assert second.fromTimestamp == 20
+
+
+async def test_position_deals_say_when_the_page_limit_cut_them_short() -> None:
+    venue = Venue(deals(10, 20, 30, 40, 50), page_size=2)
+
+    found, complete = await history.position_deals(venue.request, ACCOUNT, 5_000_000, max_pages=2)
+
+    assert not complete
+    assert [deal.executionTimestamp for deal in found] == [10, 20, 30]
 
 
 async def test_order_pages_are_deduplicated() -> None:

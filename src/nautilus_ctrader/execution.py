@@ -842,7 +842,7 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _on_reconciled(self, mass_status: ExecutionMassStatus) -> None:
         # Nautilus publishes a mass status more than once; the first match releases.
         if self._awaited_report is not None and mass_status.id == self._awaited_report:
-            self._release_buffer()
+            self._release_safely()
 
     def _reconciliation_waited(self) -> None:
         self._release_timer = None
@@ -850,7 +850,17 @@ class CTraderExecutionClient(LiveExecutionClient):
             "Nautilus did not reconcile the mass status within "
             f"{self._reconciled_wait_secs:g}s; applying the execution events held meanwhile",
         )
-        self._release_buffer()
+        self._release_safely()
+
+    def _release_safely(self) -> None:
+        # Runs inside the engine's publish or a timer callback: a raise there would end the
+        # engine's reconciliation, or be lost.
+        try:
+            self._release_buffer()
+        except Exception as e:
+            self._log.exception(
+                "Applying the execution events held during reconciliation failed", e
+            )
 
     def _release_buffer(self) -> None:
         """Apply the execution events held meanwhile, in order; a second call does nothing."""
@@ -975,11 +985,14 @@ class CTraderExecutionClient(LiveExecutionClient):
             if not loaded and position_id not in open_ids:
                 continue
             orders = await self._position_orders(position_id, historical)
-            found = (
-                await history.position_deals(historical, account_id, position_id)
-                if deals and loaded
-                else []
-            )
+            found: list[om.ProtoOADeal] = []
+            if deals and loaded:
+                found, complete = await history.position_deals(historical, account_id, position_id)
+                if not complete:
+                    self._log.warning(
+                        f"Position {position_id}: its deal list did not end; some of its fills "
+                        "may be missing, and whether it is open is read from those found",
+                    )
             histories[position_id] = PositionHistory(tuple(orders), tuple(found))
         lacking = {
             position_id

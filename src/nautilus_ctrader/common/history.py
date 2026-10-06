@@ -57,8 +57,8 @@ async def position_deals(
     position_id: int,
     *,
     max_pages: int = 20,
-) -> list[om.ProtoOADeal]:
-    """Every deal of one position, oldest first; what `max_pages` did not reach is left out."""
+) -> tuple[list[om.ProtoOADeal], bool]:
+    """Every deal of one position, oldest first, and whether the list ended within `max_pages`."""
 
     def ask(window: tuple[int, int]) -> Message:
         return oa.ProtoOADealListByPositionIdReq(
@@ -72,7 +72,7 @@ async def position_deals(
     first = oa.ProtoOADealListByPositionIdReq(
         ctidTraderAccountId=account_id, positionId=position_id
     )
-    found, _ = await _paged(
+    found, complete = await _paged(
         request,
         ask,
         (0, _LATEST_MS),
@@ -82,7 +82,7 @@ async def position_deals(
         max_pages,
         first=first,
     )
-    return _oldest_first(found)
+    return _oldest_first(found), complete
 
 
 async def orders_between(
