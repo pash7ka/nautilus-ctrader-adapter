@@ -22,7 +22,7 @@ from nautilus_ctrader.common.account import (
     CTraderAccountClient,
     get_cached_ctrader_account_client,
 )
-from nautilus_ctrader.config import CTraderDataClientConfig
+from nautilus_ctrader.config import CTraderDataClientConfig, CTraderExecClientConfig
 from nautilus_ctrader.data import CTraderDataClient
 from nautilus_ctrader.factories import CTraderLiveDataClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -227,3 +227,41 @@ def test_the_package_exports_what_an_application_needs() -> None:
     assert exported <= set(nautilus_ctrader.__all__)
     for name in nautilus_ctrader.__all__:
         assert getattr(nautilus_ctrader, name) is not None
+
+
+def exec_config(**overrides) -> CTraderExecClientConfig:
+    values = {
+        "client_id": "client-id",
+        "client_secret": "client-secret",
+        "access_token": "access-token",
+        "trader_login": TRADER_LOGIN,
+    }
+    values.update(overrides)
+    return CTraderExecClientConfig(**values)
+
+
+def test_the_balance_checkpoint_is_off_by_default_in_utc() -> None:
+    built = exec_config()
+
+    assert built.balance_checkpoint_hour is None
+    assert built.balance_checkpoint_timezone == "UTC"
+
+
+@pytest.mark.parametrize("hour", [0, 23])
+def test_the_checkpoint_hour_takes_0_to_23(hour) -> None:
+    assert exec_config(balance_checkpoint_hour=hour).balance_checkpoint_hour == hour
+
+
+@pytest.mark.parametrize("hour", [-1, 24])
+def test_the_checkpoint_hour_outside_0_to_23_is_refused(hour) -> None:
+    with pytest.raises(ValueError, match="balance_checkpoint_hour"):
+        exec_config(balance_checkpoint_hour=hour)
+
+
+def test_the_checkpoint_zone_is_an_iana_name() -> None:
+    built = exec_config(balance_checkpoint_timezone="America/New_York")
+
+    assert str(built.checkpoint_zone()) == "America/New_York"
+    for name in ("Mars/Olympus_Mons", "", "../UTC"):
+        with pytest.raises(ValueError, match="balance_checkpoint_timezone"):
+            exec_config(balance_checkpoint_timezone=name)

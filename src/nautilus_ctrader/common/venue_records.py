@@ -187,6 +187,83 @@ class Activity:
     ts_ms: int
 
 
+@dataclass(frozen=True, order=True)
+class Exposure:
+    """An open position or pending order on a symbol the node has not loaded.
+
+    `subject` is `"position"` or `"order"`.
+    """
+
+    symbol_id: int
+    subject: str
+    side: str
+    units: Decimal
+
+
+class ReportStatus(Enum):
+    ACCEPTED = "accepted"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELED = "canceled"
+    EXPIRED = "expired"
+    REJECTED = "rejected"
+
+
+class Contingency(Enum):
+    OTO = "oto"
+    OUO = "ouo"
+
+
+@dataclass(frozen=True)
+class ReportedOrder:
+    """An order as reconciliation reports it, from the broker's lists.
+
+    Unlike `ExternalOrder` it carries its status as it stands now, with every fill it had. A
+    `LIMIT` fills `price`; a `STOP_MARKET`, `trigger_price`; a `STOP_LIMIT`, both.
+
+    - `client_order_id`: the node's id, or `None` for an order that is not the node's.
+    - `units`: the order's quantity; `filled_units`: what its fills add up to.
+    - `avg_price`: the volume-weighted price of `fills`, `None` without one.
+    - `ts_accepted_ms`: when the broker accepted the order; `ts_ms`: its last change.
+    - `parent_order_id`, `linked_order_ids`, `contingency`: the bracket links, all client order
+      ids.
+    """
+
+    venue_order_id: str
+    client_order_id: str | None
+    symbol_id: int
+    side: str
+    order_type: ExternalType
+    status: ReportStatus
+    units: Decimal
+    filled_units: Decimal
+    reduce_only: bool
+    venue_position_id: str | None
+    ts_accepted_ms: int
+    ts_ms: int
+    avg_price: Decimal | None = None
+    price: Decimal | None = None
+    trigger_price: Decimal | None = None
+    time_in_force: str | None = None
+    expire_ts_ms: int | None = None
+    parent_order_id: str | None = None
+    linked_order_ids: tuple[str, ...] = ()
+    contingency: Contingency | None = None
+    fills: tuple[Fill, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReportedPosition:
+    """An open position; `avg_price` is the broker's position price."""
+
+    venue_position_id: str
+    symbol_id: int
+    side: str
+    units: Decimal
+    avg_price: Decimal
+    ts_ms: int
+
+
 @dataclass(frozen=True)
 class AwaitProtection:
     """The node's entry filled with legs, and the broker's protective order should follow."""
@@ -221,9 +298,12 @@ class Operations(Protocol):
         """Whether the node's own level amend of that position is in flight."""
         ...
 
-    def closing(self, position_id: int, volume: int) -> str | None:
+    def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
         """The client order id of the node's close of `volume` on that position, if in flight.
 
-        The id identifies one close; the execution client consumes it once matched.
+        `order_id` is the broker's closing order and `created_ms` its creation time, on the
+        broker's clock. A close whose own answer named `order_id` is returned; otherwise only a
+        close sent after the broker's last time the node had seen before `created_ms`. The id
+        identifies one close; the execution client consumes it once matched.
         """
         ...

@@ -22,8 +22,10 @@ class OperationsInFlight:
 
     def __init__(self) -> None:
         self._amends: dict[int, int] = {}
-        # Client order id of each close -> (position id, venue volume).
-        self._closes: dict[str, tuple[int, int]] = {}
+        # Client order id of each close -> (position id, venue volume, anchor in broker ms).
+        self._closes: dict[str, tuple[int, int, int]] = {}
+        # Client order id of each close -> the broker order its own answer named.
+        self._answers: dict[str, int] = {}
 
     def begin_amend(self, position_id: int) -> None:
         self._amends[position_id] = self._amends.get(position_id, 0) + 1
@@ -38,16 +40,41 @@ class OperationsInFlight:
     def amending(self, position_id: int) -> bool:
         return position_id in self._amends
 
-    def begin_close(self, client_order_id: str, position_id: int, volume: int) -> None:
-        self._closes[client_order_id] = (position_id, volume)
+    def begin_close(
+        self, client_order_id: str, position_id: int, volume: int, anchor_ms: int
+    ) -> None:
+        """Record a close sent when the newest broker time the node had seen was `anchor_ms`.
+
+        A broker order created no later than `anchor_ms` cannot be this close's. `-1`: no bound.
+        """
+        self._closes[client_order_id] = (position_id, volume, anchor_ms)
+
+    def answered(self, client_order_id: str, order_id: int) -> None:
+        """The close's own answer named broker order `order_id`: that order is the close's."""
+        if client_order_id in self._closes:
+            self._answers[client_order_id] = order_id
 
     def end_close(self, client_order_id: str) -> None:
         """Forget a close: answered, refused, or matched to its broker order."""
         self._closes.pop(client_order_id, None)
+        self._answers.pop(client_order_id, None)
 
-    def closing(self, position_id: int, volume: int) -> str | None:
-        for client_order_id, close in self._closes.items():
-            if close == (position_id, volume):
+    def close_position(self, client_order_id: str) -> int | None:
+        """The position the close `client_order_id` is closing, while it is in flight."""
+        close = self._closes.get(client_order_id)
+        return None if close is None else close[0]
+
+    def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
+        for client_order_id, answer in self._answers.items():
+            if answer == order_id:
+                return client_order_id
+        for client_order_id, (close_position, close_volume, anchor_ms) in self._closes.items():
+            if client_order_id in self._answers:
+                continue  # answered with another broker order
+            if (close_position, close_volume) != (position_id, volume):
+                continue
+            # Created before the node last heard from the broker: somebody else's.
+            if anchor_ms < 0 or created_ms > anchor_ms:
                 return client_order_id
         return None
 

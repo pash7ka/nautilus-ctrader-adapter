@@ -12,6 +12,7 @@ from collections.abc import Iterable, Sequence
 
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.reconciliation import PositionHistory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.fixtures import load_execution_recording
@@ -43,7 +44,7 @@ class NoOperations:
     def amending(self, position_id: int) -> bool:
         return False
 
-    def closing(self, position_id: int, volume: int) -> str | None:
+    def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
         return None
 
 
@@ -105,6 +106,58 @@ def position_orders() -> dict[int, list[om.ProtoOAOrder]]:
         if response.order:
             found[response.order[0].positionId] = list(response.order)
     return found
+
+
+def history(position_id: int, *, until_ms: int | None = None) -> PositionHistory:
+    """A position's recorded order and deal lists, as they stood at `until_ms`.
+
+    An order last changed, or a deal executed, after `until_ms` is left out.
+    """
+    orders = [
+        order
+        for response in RECORDING["closing"]["position_orders"]
+        for order in response.order
+        if order.positionId == position_id
+        and (until_ms is None or order.utcLastUpdateTimestamp <= until_ms)
+    ]
+    deals = [
+        deal
+        for response in RECORDING["closing"]["position_deals"]
+        for deal in response.deal
+        if deal.positionId == position_id
+        and (until_ms is None or deal.executionTimestamp <= until_ms)
+    ]
+    return PositionHistory(tuple(orders), tuple(deals))
+
+
+def window_deals(*position_ids: int, until_ms: int | None = None) -> tuple[om.ProtoOADeal, ...]:
+    """The account's recorded deals of the given positions, as they stood at `until_ms`."""
+    return tuple(
+        deal
+        for response in RECORDING["closing"]["account_deals"]
+        for deal in response.deal
+        if deal.positionId in position_ids
+        and (until_ms is None or deal.executionTimestamp <= until_ms)
+    )
+
+
+def snapshot_at(t: float) -> oa.ProtoOAReconcileRes:
+    """The snapshot of the last pair taken at or before timeline time `t` that lists orders.
+
+    Snapshots come in pairs, the second asked with protection orders. When neither of the pair
+    taken by `t` lists an order, the last of them is returned.
+    """
+    taken = [
+        item
+        for item in RECORDING["timeline"]
+        if item["t"] <= t and isinstance(item["message"], oa.ProtoOAReconcileRes)
+    ]
+    if not taken:
+        raise LookupError(f"no snapshot at or before {t}")
+    second = "returnProtectionOrders=true" in taken[-1]["note"]
+    pair = taken[-2:] if second else taken[-1:]
+    listing = [item for item in pair if item["message"].order]
+    return (listing or pair)[-1]["message"]
 
 
 # Hand-built messages, for what the recording did not hold.

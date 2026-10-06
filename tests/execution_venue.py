@@ -8,7 +8,8 @@ volume precision, and to the fake account; nothing else changes.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+import time
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -18,13 +19,15 @@ from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import SubmitOrderList
+from nautilus_trader.execution.messages import SubmitOrder, SubmitOrderList
+from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.live.config import LiveExecEngineConfig
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
 from nautilus_trader.model.enums import OrderSide, OrderStatus
 from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
+    PositionId,
     StrategyId,
     Symbol,
     TraderId,
@@ -34,7 +37,10 @@ from nautilus_trader.model.orders import OrderList
 from nautilus_trader.portfolio.portfolio import Portfolio
 
 from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
+from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.account import CTraderAccountClient
+from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.reconciliation import PositionHistory
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.execution import CTraderExecutionClient
@@ -48,18 +54,33 @@ from tests.account_venue import (
     for_account,
     venue,
 )
-from tests.execution_replay import FIRST, as_ours, events, first_n
+from tests.execution_replay import (
+    FIRST,
+    as_ours,
+    events,
+    first_n,
+    history,
+    make_deal,
+    make_event,
+    make_order,
+    make_position,
+    snapshot_at,
+    window_deals,
+)
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
 US100_ID = InstrumentId(Symbol("US100.cash"), CTRADER_VENUE)
 US100_SYMBOL_ID = 275
+WEEK_MS = 604_800_000
 TRADER_ID = TraderId("TESTER-001")
 STRATEGY_ID = StrategyId("S-001")
 
 
 def _orders(message: Message) -> list[om.ProtoOAOrder]:
+    if isinstance(message, om.ProtoOAOrder):
+        return [message]
     if isinstance(message, oa.ProtoOAExecutionEvent):
         return [message.order] if message.HasField("order") else []
     return list(message.order) if hasattr(message, "order") else []
@@ -72,7 +93,7 @@ def _positions(message: Message) -> list[om.ProtoOAPosition]:
 
 
 def on_us100(messages: Iterable[Message]) -> list[Message]:
-    """Copies of recorded execution messages, on `US100.cash` and the fake account."""
+    """Copies of recorded messages, orders and deals, on `US100.cash` and the fake account."""
     moved = []
     for message in messages:
         copy = type(message)()
@@ -85,6 +106,8 @@ def on_us100(messages: Iterable[Message]) -> list[Message]:
             position.tradeData.symbolId = US100_SYMBOL_ID
         if isinstance(copy, oa.ProtoOAExecutionEvent) and copy.HasField("deal"):
             copy.deal.symbolId = US100_SYMBOL_ID
+        if isinstance(copy, om.ProtoOADeal):
+            copy.symbolId = US100_SYMBOL_ID
         moved.append(copy)
     return moved
 
@@ -97,8 +120,27 @@ def trader(**overrides) -> oa.ProtoOATraderRes:
     return response
 
 
+def _between(items: Iterable, request: Message, time_of) -> list:
+    """`items` within the request's window, oldest first; a bound it does not carry is open."""
+    low = request.fromTimestamp if request.HasField("fromTimestamp") else None
+    high = request.toTimestamp if request.HasField("toTimestamp") else None
+    return sorted(
+        (
+            item
+            for item in items
+            if (low is None or time_of(item) >= low) and (high is None or time_of(item) <= high)
+        ),
+        key=time_of,
+    )
+
+
 class ExecutionVenue:
     """The fake venue's account, read at each request so a test can change it between requests.
+
+    The history lists answer oldest first, `page_size` items a page, and set `hasMore` past it.
+    The cash-flow list has no pages and refuses a window over a week, as the schema states.
+    A request whose payload type is in `fail` is answered with an error. `replies` holds each
+    served payload type's answer, for a test that holds it back.
 
     Order requests have no handler until a test registers one with `server.on`.
     """
@@ -108,9 +150,16 @@ class ExecutionVenue:
         self.trader = trader()
         self.snapshot = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
         self.position_orders: dict[int, list[om.ProtoOAOrder]] = {}
-        self.server.on(om.PROTO_OA_TRADER_REQ, lambda _r: self.trader)
-        self.server.on(om.PROTO_OA_RECONCILE_REQ, lambda _r: self.snapshot)
-        self.server.on(
+        self.position_deals: dict[int, list[om.ProtoOADeal]] = {}
+        self.deals: list[om.ProtoOADeal] = []
+        self.orders: list[om.ProtoOAOrder] = []
+        self.cash_flow: list[om.ProtoOADepositWithdraw] = []
+        self.page_size = 100
+        self.fail: set[int] = set()
+        self.replies: dict[int, Callable[[Message], Message]] = {}
+        self._serve(om.PROTO_OA_TRADER_REQ, lambda _r: self.trader)
+        self._serve(om.PROTO_OA_RECONCILE_REQ, lambda _r: self.snapshot)
+        self._serve(
             om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
             lambda r: oa.ProtoOAOrderListByPositionIdRes(
                 ctidTraderAccountId=ACCOUNT_ID,
@@ -118,6 +167,25 @@ class ExecutionVenue:
                 hasMore=False,
             ),
         )
+        self._serve(
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            lambda r: self._page(
+                oa.ProtoOADealListByPositionIdRes,
+                "deal",
+                _between(self.position_deals.get(r.positionId, []), r, _executed),
+            ),
+        )
+        self._serve(
+            om.PROTO_OA_DEAL_LIST_REQ,
+            lambda r: self._page(oa.ProtoOADealListRes, "deal", _between(self.deals, r, _executed)),
+        )
+        self._serve(
+            om.PROTO_OA_ORDER_LIST_REQ,
+            lambda r: self._page(
+                oa.ProtoOAOrderListRes, "order", _between(self.orders, r, _last_update)
+            ),
+        )
+        self._serve(om.PROTO_OA_CASH_FLOW_HISTORY_LIST_REQ, self._cash_flow)
         self.server.on(
             om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
             lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
@@ -126,6 +194,50 @@ class ExecutionVenue:
             om.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ,
             lambda r: oa.ProtoOAUnsubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
         )
+
+    def _serve(self, payload_type: int, reply: Callable[[Message], Message]) -> None:
+        def handle(request: Message) -> Message:
+            if payload_type in self.fail:
+                return oa.ProtoOAErrorRes(
+                    ctidTraderAccountId=ACCOUNT_ID,
+                    errorCode="INTERNAL_SERVER_ERROR",
+                    description="the list failed",
+                )
+            return reply(request)
+
+        self.replies[payload_type] = handle
+        self.server.on(payload_type, handle)
+
+    def _cash_flow(self, request: oa.ProtoOACashFlowHistoryListReq) -> Message:
+        if request.toTimestamp - request.fromTimestamp > WEEK_MS:
+            return oa.ProtoOAErrorRes(
+                ctidTraderAccountId=ACCOUNT_ID,
+                errorCode="INVALID_REQUEST",
+                description="the window is over a week",
+            )
+        return oa.ProtoOACashFlowHistoryListRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            depositWithdraw=_between(self.cash_flow, request, _changed),
+        )
+
+    def _page(self, response: type[Message], field: str, items: list) -> Message:
+        return response(
+            ctidTraderAccountId=ACCOUNT_ID,
+            hasMore=len(items) > self.page_size,
+            **{field: items[: self.page_size]},
+        )
+
+
+def _executed(deal: om.ProtoOADeal) -> int:
+    return deal.executionTimestamp
+
+
+def _last_update(order: om.ProtoOAOrder) -> int:
+    return order.utcLastUpdateTimestamp
+
+
+def _changed(operation: om.ProtoOADepositWithdraw) -> int:
+    return operation.changeBalanceTimestamp
 
 
 def exec_config(**overrides) -> CTraderExecClientConfig:
@@ -166,6 +278,7 @@ class Harness:
     states: list
     activity: list
     logger: RecordingLogger
+    mass_statuses: list
 
     @property
     def server(self) -> FakeCTraderServer:
@@ -187,11 +300,14 @@ async def harness(
     execution_venue: ExecutionVenue | None = None,
     config: CTraderExecClientConfig | None = None,
     connect: bool = True,
+    cache: Cache | None = None,
 ) -> AsyncIterator[Harness]:
     """The client against the fake venue, inside a live execution engine and a portfolio.
 
+    A given `cache` stands for one a restarted node reloads from a persistent backend.
+
     What the client sends Nautilus is recorded on the way in: order events, execution reports,
-    account states, and the account activity published on the message bus.
+    mass statuses, account states, and the account activity published on the message bus.
     """
     execution_venue = execution_venue or ExecutionVenue()
     server = execution_venue.server
@@ -207,7 +323,7 @@ async def harness(
     )
     clock = LiveClock()
     msgbus = MessageBus(trader_id=TRADER_ID, clock=clock)
-    cache = Cache()
+    cache = Cache() if cache is None else cache
     portfolio = Portfolio(msgbus, cache, clock)
     engine = LiveExecutionEngine(
         loop=asyncio.get_running_loop(),
@@ -220,6 +336,7 @@ async def harness(
     reports: list = []
     states: list = []
     activity: list = []
+    mass_statuses: list = []
 
     def recorded(store: list, handler):
         def handle(message) -> object:
@@ -231,6 +348,11 @@ async def harness(
     for endpoint, store, handler in (
         ("ExecEngine.process", events, engine.process),
         ("ExecEngine.reconcile_execution_report", reports, engine.reconcile_execution_report),
+        (
+            "ExecEngine.reconcile_execution_mass_status",
+            mass_statuses,
+            engine.reconcile_execution_mass_status,
+        ),
         ("Portfolio.update_account", states, portfolio.update_account),
     ):
         msgbus.deregister(endpoint=endpoint, handler=handler)
@@ -261,6 +383,7 @@ async def harness(
         states,
         activity,
         logger,
+        mass_statuses,
     )
     try:
         if connect:
@@ -291,14 +414,17 @@ async def push(h: Harness, *messages: Message) -> None:
     await sync(h)
 
 
-async def push_spot(h: Harness, bid: int, ask: int) -> None:
-    """A spot of `US100.cash`, in the venue's integer price units (1/100000)."""
-    await push(
-        h,
-        oa.ProtoOASpotEvent(
-            ctidTraderAccountId=ACCOUNT_ID, symbolId=US100_SYMBOL_ID, bid=bid, ask=ask
-        ),
+async def push_spot(h: Harness, bid: int, ask: int, *, timestamp: int | None = None) -> None:
+    """A spot of `US100.cash`, in the venue's integer price units (1/100000).
+
+    `timestamp` is the broker's time of the spot, in ms.
+    """
+    spot = oa.ProtoOASpotEvent(
+        ctidTraderAccountId=ACCOUNT_ID, symbolId=US100_SYMBOL_ID, bid=bid, ask=ask
     )
+    if timestamp is not None:
+        spot.timestamp = timestamp
+    await push(h, spot)
 
 
 def bracket(
@@ -364,3 +490,170 @@ async def submitted(h: Harness, orders: OrderList | None = None) -> OrderList:
 
 def status(h: Harness, client_order_id: str) -> OrderStatus:
     return h.cache.order(ClientOrderId(client_order_id)).status
+
+
+# -- Set-ups shared by the execution tests ------------------------------------------------------
+
+# The node's market position, hand-built: the recording holds no close of the node's.
+OURS = 5_300_001
+CLOSE = "O-C-5300001"
+
+
+def broker_lists(
+    at: float, *, mine: bool = True
+) -> tuple[oa.ProtoOAReconcileRes, dict[int, PositionHistory], tuple[om.ProtoOADeal, ...]]:
+    """What the broker lists for the first position at timeline time `at`, on US100.cash."""
+    snapshot = snapshot_at(at)
+    until = snapshot.position[0].utcLastUpdateTimestamp if snapshot.position else None
+    found = history(FIRST, until_ms=until)
+    orders = list(found.orders)
+    if mine:
+        snapshot = as_ours([snapshot], [FIRST])[0]
+        orders = as_ours(orders, [FIRST])
+    moved = PositionHistory(tuple(on_us100(orders)), tuple(on_us100(found.deals)))
+    deals = tuple(on_us100(window_deals(FIRST, until_ms=until)))
+    return on_us100([snapshot])[0], {FIRST: moved}, deals
+
+
+def serve(venue: ExecutionVenue, at: float) -> None:
+    """Make the venue's snapshot and lists the node's first position at timeline time `at`."""
+    snapshot, histories, deals = broker_lists(at)
+    venue.snapshot = snapshot
+    venue.position_orders = {pid: list(found.orders) for pid, found in histories.items()}
+    venue.position_deals = {pid: list(found.deals) for pid, found in histories.items()}
+    venue.deals = list(deals)
+
+
+async def started(h: Harness) -> ExecutionMassStatus:
+    """The start's reconciliation, reconciled by the engine as a node would."""
+    built = await h.client.generate_mass_status()
+    h.engine.reconcile_execution_mass_status(built)
+    return built
+
+
+def our_market_position(venue: ExecutionVenue, *, opened: int, closed: int | None = None) -> None:
+    """The node's market order on `US100.cash`, filled at `opened`; closed at `closed` if given."""
+    entry_id = "O-M-5300001"
+    entry = make_order(
+        6_300_001,
+        OURS,
+        utc=opened,
+        label=order_record.encode_label(entry_id),
+        comment=order_record.encode_comment(LegIds(None, None)),
+        client_order_id=entry_id,
+        symbol=US100_SYMBOL_ID,
+    )
+    entry.orderStatus = om.ORDER_STATUS_FILLED
+    orders = [entry]
+    deals = [
+        make_deal(7_300_001, 6_300_001, OURS, side=om.BUY, volume=100, price=85000.0, ts=opened)
+    ]
+    venue.snapshot = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
+    if closed is None:
+        position = make_position(OURS, symbol=US100_SYMBOL_ID)
+        position.price = 85000.0
+        position.utcLastUpdateTimestamp = opened
+        venue.snapshot.position.append(position)
+    else:
+        close = make_order(
+            6_300_002, OURS, side=om.SELL, closing=True, utc=closed, symbol=US100_SYMBOL_ID
+        )
+        close.orderStatus = om.ORDER_STATUS_FILLED
+        orders.append(close)
+        deals.append(
+            make_deal(
+                7_300_002, 6_300_002, OURS, side=om.SELL, volume=100, price=85100.0, ts=closed
+            ),
+        )
+    venue.position_orders = {OURS: orders}
+    venue.position_deals = {OURS: on_us100(deals)}
+    venue.deals = on_us100(deals)
+
+
+def answer_closes(venue: ExecutionVenue, *, behind_ms: int = 0) -> list[oa.ProtoOAExecutionEvent]:
+    """Answer the node's close with its acceptance, made when the close arrives.
+
+    The broker stamps it `behind_ms` behind the node's clock. Returns the list that then holds
+    the close's events, accepted and filled.
+    """
+    made: list[oa.ProtoOAExecutionEvent] = []
+
+    def answer(_request: Message) -> Message:
+        made[:] = node_close_events(closed=int(time.time() * 1000) - behind_ms)
+        return made[0]
+
+    venue.server.on(om.PROTO_OA_CLOSE_POSITION_REQ, answer)
+    return made
+
+
+async def close_sent(h: Harness) -> asyncio.Task:
+    """The node's close of `OURS`, sent; returns the task awaiting its answer."""
+    position_id = PositionId(str(OURS))
+    order = h.factory.market(
+        US100_ID,
+        OrderSide.SELL,
+        Quantity.from_str("1.00"),
+        reduce_only=True,
+        client_order_id=ClientOrderId(CLOSE),
+    )
+    h.cache.add_order(order, position_id=position_id)
+    closing = asyncio.create_task(
+        h.client._submit_order(
+            SubmitOrder(
+                trader_id=TRADER_ID,
+                strategy_id=STRATEGY_ID,
+                order=order,
+                command_id=UUID4(),
+                ts_init=0,
+                position_id=position_id,
+            ),
+        ),
+    )
+    await wait_until(lambda: len(h.received(oa.ProtoOAClosePositionReq)) == 1)
+    return closing
+
+
+def node_close_events(*, closed: int) -> list[oa.ProtoOAExecutionEvent]:
+    """The node's close of `OURS` created and accepted, then filled, at `closed` (hand-built).
+
+    A closing order is taken for the node's close only if it was created after the newest
+    broker time the node had seen when it sent it, so `closed` must be later than that.
+    """
+
+    def order(utc: int) -> om.ProtoOAOrder:
+        found = make_order(
+            6_300_002, OURS, side=om.SELL, closing=True, utc=utc, symbol=US100_SYMBOL_ID
+        )
+        found.tradeData.openTimestamp = closed
+        return found
+
+    def position(utc: int, status: int = om.POSITION_STATUS_OPEN) -> om.ProtoOAPosition:
+        found = make_position(
+            OURS, volume=0 if status == om.POSITION_STATUS_CLOSED else 100, status=status
+        )
+        found.utcLastUpdateTimestamp = utc
+        return found
+
+    deal = make_deal(7_300_002, 6_300_002, OURS, side=om.SELL, volume=100, price=85100.0, ts=closed)
+    deal.closePositionDetail.CopyFrom(
+        om.ProtoOAClosePositionDetail(
+            entryPrice=85000.0,
+            grossProfit=10_000,
+            swap=0,
+            commission=0,
+            balance=1_000_000,
+            balanceVersion=100,
+            moneyDigits=2,
+        ),
+    )
+    return on_us100(
+        [
+            make_event(om.ORDER_ACCEPTED, order(closed), position=position(closed)),
+            make_event(
+                om.ORDER_FILLED,
+                order(closed),
+                position=position(closed, om.POSITION_STATUS_CLOSED),
+                deal=deal,
+            ),
+        ],
+    )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from decimal import Decimal
 
 import pytest
@@ -20,7 +21,12 @@ from nautilus_trader.execution.messages import (
 )
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
-from nautilus_trader.model.events import OrderFilled, OrderPendingCancel, OrderRejected
+from nautilus_trader.model.events import (
+    OrderFilled,
+    OrderModifyRejected,
+    OrderPendingCancel,
+    OrderRejected,
+)
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientOrderId,
@@ -91,6 +97,7 @@ def test_the_config_carries_no_instrument_settings() -> None:
         {"reference_price_max_age_secs": 0.0},
         {"protective_order_timeout_secs": -1.0},
         {"order_request_timeout_secs": 0.0},
+        {"reconciliation_default_lookback_mins": 0},
     ],
 )
 def test_the_config_refuses_bad_values(overrides) -> None:
@@ -104,6 +111,7 @@ def test_the_config_defaults() -> None:
     assert config.reference_price_max_age_secs == 10.0
     assert config.protective_order_timeout_secs == 2.0
     assert config.order_request_timeout_secs == 30.0
+    assert config.reconciliation_default_lookback_mins == 1440
     assert config.environment == "auto"
 
 
@@ -418,6 +426,14 @@ async def test_an_event_for_an_order_nautilus_does_not_hold_is_a_warning() -> No
         assert h.events == []
 
 
+async def test_a_record_of_an_unknown_type_is_a_warning() -> None:
+    async with harness() as h:
+        h.client._handle_records([object()])
+
+        assert any("object" in line for line in h.logger.warnings())
+        assert h.logger.errors() == []
+
+
 async def test_an_order_error_nobody_waits_for_is_a_warning() -> None:
     async with harness() as h:
         await push(
@@ -571,7 +587,9 @@ async def test_a_query_answered_with_an_older_balance_never_takes_it_back() -> N
         assert balance_of(h.states[-1]) == Decimal("10000.00")
 
 
-async def test_an_account_event_before_the_account_is_read_is_left_to_that_read() -> None:
+async def test_an_account_event_during_the_account_read_is_stated_once_the_account_is_known() -> (
+    None
+):
     async with harness(connect=False) as h:
         # Another user of the account brings it up, so the client's own trader read is the
         # first one held.
@@ -587,7 +605,8 @@ async def test_an_account_event_before_the_account_is_read_is_left_to_that_read(
             await connecting
 
             assert h.logger.errors() == []
-            assert len(h.states) == 1
+            assert all(state.base_currency == USD for state in h.states)
+            assert balance_of(h.states[-1]) == Decimal("10000.00")
         finally:
             await h.account.disconnect()
 
@@ -645,10 +664,16 @@ def market_events() -> list:
 
 
 def close_events() -> list:
-    """The node's close of that position, accepted then filled (hand-built)."""
+    """The node's close of that position, accepted then filled (hand-built).
+
+    The broker's clock runs a minute behind the node's: its answer is the close's all the same.
+    """
+    created = int(time.time() * 1000) - 60_000
 
     def order(utc: int) -> om.ProtoOAOrder:
-        return make_order(6_100_002, MARKET_POSITION, side=om.SELL, closing=True, utc=utc)
+        found = make_order(6_100_002, MARKET_POSITION, side=om.SELL, closing=True, utc=utc)
+        found.tradeData.openTimestamp = created
+        return found
 
     deal = make_deal(
         7_100_002,
@@ -915,7 +940,7 @@ async def test_a_close_names_its_position_and_fills_under_its_own_id() -> None:
         assert request.volume == 100
         assert h.kinds_of(CLOSE_ID) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
         assert h.cache.position(PositionId(str(MARKET_POSITION))).is_closed
-        assert h.client._operations.closing(MARKET_POSITION, 100) is None
+        assert h.client._operations.close_position(CLOSE_ID) is None
         # The node's own close is never reported as somebody else's order.
         assert h.reports == []
 
@@ -948,7 +973,7 @@ async def test_a_close_is_refused_unsent_while_the_connection_is_down() -> None:
         assert rejection(h, CLOSE_ID) == "not connected to the venue"
         assert h.kinds_of(CLOSE_ID) == ["OrderRejected"]
         assert h.received(oa.ProtoOAClosePositionReq) == []
-        assert h.client._operations.closing(MARKET_POSITION, 100) is None
+        assert h.client._operations.close_position(CLOSE_ID) is None
 
 
 async def test_a_close_that_would_add_to_the_position_is_refused() -> None:
@@ -976,7 +1001,7 @@ async def test_a_close_the_broker_refuses_is_rejected_and_no_longer_in_flight() 
         await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
 
         assert rejection(h, CLOSE_ID) == "POSITION_NOT_FOUND: gone"
-        assert h.client._operations.closing(MARKET_POSITION, 100) is None
+        assert h.client._operations.close_position(CLOSE_ID) is None
 
 
 AMEND_FROM = 1_600_000_200_000
@@ -1200,6 +1225,45 @@ async def test_a_modify_waiting_on_a_rejected_entry_is_rejected_before_the_leg_i
         await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
 
         assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderModifyRejected", "OrderCanceled"]
+
+
+def closed_by_hand() -> oa.ProtoOAExecutionEvent:
+    """The first position closed whole by hand, with no level set yet (hand-built)."""
+    event = type(FIRST_EVENTS[7])()
+    event.CopyFrom(FIRST_EVENTS[7])
+    event.order.tradeData.volume = 100
+    event.order.executedVolume = 100
+    event.deal.volume = 100
+    event.deal.filledVolume = 100
+    event.deal.closePositionDetail.closedVolume = 100
+    event.position.tradeData.volume = 0
+    event.position.positionStatus = om.POSITION_STATUS_CLOSED
+    event.position.ClearField("stopLoss")
+    event.position.ClearField("takeProfit")
+    return event
+
+
+async def test_a_bracket_whose_position_closed_before_its_correction_is_dropped() -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    config = exec_config(protective_order_timeout_secs=30.0)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        sending = await in_flight(h, held)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+        await held.release()
+        await sending
+
+        await push(h, FIRST_EVENTS[1], closed_by_hand())
+        await wait_until(lambda: "OrderModifyRejected" in h.kinds_of(STOP))
+
+        assert len(h.client._brackets) == 0
+        (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]
+        assert rejected.reason == "the position closed before its levels were set"
+        assert status(h, STOP) == OrderStatus.CANCELED
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
 
 
 async def test_a_leg_is_cancelled_by_removing_its_level_alone() -> None:

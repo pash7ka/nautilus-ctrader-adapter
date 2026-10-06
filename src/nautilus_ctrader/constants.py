@@ -80,3 +80,7 @@ RECONNECT_FAILURE_THRESHOLD: int = 5
 
 # A session must stay ready this long before a loss is treated as recovery rather than failure.
 STABLE_SESSION_SECS: float = 30.0
+
+# Cache keys the execution client writes for the application, as UTF-8 JSON.
+UNLOADED_EXPOSURE_KEY: str = "ctrader.unloaded_exposure"
+BALANCE_CHECKPOINT_KEY: str = "ctrader.balance_checkpoint"

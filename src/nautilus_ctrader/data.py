@@ -248,6 +248,9 @@ class CTraderDataClient(LiveMarketDataClient):
         self._bar_errors: set[BarType] = set()
         self._bar_phases: set[BarType] = set()
         self._unknown_symbols: set[int] = set()
+        # The account counts its users without knowing who releases, and Nautilus calls
+        # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
+        self._holds_account = False
 
     @property
     def instrument_provider(self) -> CTraderInstrumentProvider:
@@ -268,6 +271,7 @@ class CTraderDataClient(LiveMarketDataClient):
         self._unknown_symbols.clear()
 
         await self._account.connect()
+        self._holds_account = True
         await self._instrument_provider.initialize()
 
         session = self._account.session
@@ -292,7 +296,9 @@ class CTraderDataClient(LiveMarketDataClient):
             await self._release_subscriptions(session)
             self._converted.clear()
         finally:
-            await self._account.disconnect()
+            if self._holds_account:
+                self._holds_account = False
+                await self._account.disconnect()
 
     async def _release_subscriptions(self, session: CTraderSession | None) -> None:
         """Release everything the registry still counts for this client.

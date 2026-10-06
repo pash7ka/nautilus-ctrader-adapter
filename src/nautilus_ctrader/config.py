@@ -8,6 +8,7 @@ never logged.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from nautilus_trader.config import (
     InstrumentProviderConfig,
@@ -166,12 +167,23 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     order_request_timeout_secs : float, default 30.0
         Response timeout for an order, a close or a level amend. An order or a close with no
         answer by then is never resent, so a slow answer must not be taken for a lost one.
+    reconciliation_default_lookback_mins : int, default 1440
+        How far back reconciliation reads fills and closed orders when Nautilus passes no
+        lookback of its own.
+    balance_checkpoint_hour : int, optional
+        The hour of day, 0-23, at which the balance is kept in the cache key
+        `ctrader.balance_checkpoint`, rebuilt from the broker's history. Unset, the key says
+        `"off"`.
+    balance_checkpoint_timezone : str, default "UTC"
+        The IANA time zone `balance_checkpoint_hour` is in.
 
     Raises
     ------
     ValueError
-        If `instrument_provider` is set, `environment` is not one of "auto", "demo", "live", or
-        a duration is not positive.
+        If `instrument_provider` is set, `environment` is not one of "auto", "demo", "live", a
+        duration or `reconciliation_default_lookback_mins` is not positive,
+        `balance_checkpoint_hour` is outside 0-23, or `balance_checkpoint_timezone` is not a
+        known time zone.
 
     Notes
     -----
@@ -192,6 +204,9 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     reference_price_max_age_secs: float = 10.0
     protective_order_timeout_secs: float = 2.0
     order_request_timeout_secs: float = 30.0
+    reconciliation_default_lookback_mins: int = 1440
+    balance_checkpoint_hour: int | None = None
+    balance_checkpoint_timezone: str = "UTC"
 
     def __post_init__(self) -> None:
         if self.instrument_provider != InstrumentProviderConfig():
@@ -208,9 +223,24 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
             "reference_price_max_age_secs",
             "protective_order_timeout_secs",
             "order_request_timeout_secs",
+            "reconciliation_default_lookback_mins",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        hour = self.balance_checkpoint_hour
+        if hour is not None and not 0 <= hour <= 23:
+            raise ValueError(f"balance_checkpoint_hour must be 0-23, got {hour}")
+        self.checkpoint_zone()
+
+    def checkpoint_zone(self) -> ZoneInfo:
+        """`balance_checkpoint_timezone` as a zone; raises `ValueError` for an unknown name."""
+        name = self.balance_checkpoint_timezone
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise ValueError(
+                f"balance_checkpoint_timezone: {name!r} is not a known time zone"
+            ) from e
 
     def credentials(self) -> AccountCredentials:
         return AccountCredentials(

@@ -6,27 +6,39 @@ venue sent as `85197.2` reaches Nautilus as exactly `85197.20`.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.reports import FillReport, OrderStatusReport
+from nautilus_trader.execution.reports import (
+    ExecutionMassStatus,
+    FillReport,
+    OrderStatusReport,
+    PositionStatusReport,
+)
 from nautilus_trader.model.enums import (
     AccountType,
+    ContingencyType,
     LiquiditySide,
     OrderSide,
     OrderStatus,
     OrderType,
+    PositionSide,
     TimeInForce,
     TriggerType,
 )
 from nautilus_trader.model.events import AccountState
 from nautilus_trader.model.identifiers import (
     AccountId,
+    ClientId,
+    ClientOrderId,
     InstrumentId,
     PositionId,
     TradeId,
+    Venue,
     VenueOrderId,
 )
 from nautilus_trader.model.instruments import Instrument
@@ -40,7 +52,17 @@ from nautilus_trader.model.objects import (
 )
 
 from nautilus_ctrader.activity import CTraderAccountActivity
-from nautilus_ctrader.common.venue_records import Activity, ExternalOrder, ExternalType, Fill
+from nautilus_ctrader.common.reconciliation import Reconciliation
+from nautilus_ctrader.common.venue_records import (
+    Activity,
+    Contingency,
+    Exposure,
+    ExternalOrder,
+    ExternalType,
+    Fill,
+    ReportedOrder,
+    ReportedPosition,
+)
 
 _NANOS_PER_MILLI = 1_000_000
 
@@ -57,6 +79,7 @@ _TIME_IN_FORCE = {
     "FILL_OR_KILL": TimeInForce.FOK,
     "MARKET_ON_OPEN": TimeInForce.AT_THE_OPEN,
 }
+_CONTINGENCY = {Contingency.OTO: ContingencyType.OTO, Contingency.OUO: ContingencyType.OUO}
 
 
 def nanos(ms: int) -> int:
@@ -92,6 +115,14 @@ def commission(fill: Fill, currency: Currency) -> Money:
     return Money(-fill.commission, currency)
 
 
+def _time_in_force(
+    name: str | None, expire_ts_ms: int | None
+) -> tuple[TimeInForce, datetime | None]:
+    if name == "GOOD_TILL_DATE" and expire_ts_ms is not None:
+        return TimeInForce.GTD, datetime.fromtimestamp(expire_ts_ms / 1000, tz=UTC)
+    return _TIME_IN_FORCE.get(name or "", TimeInForce.GTC), None
+
+
 def order_status_report(
     record: ExternalOrder,
     instrument: Instrument,
@@ -103,11 +134,7 @@ def order_status_report(
     Its fills follow as their own reports. A filled status alone would make Nautilus infer a fill
     of its own, without the commission, and refuse the real one.
     """
-    time_in_force = _TIME_IN_FORCE.get(record.time_in_force or "", TimeInForce.GTC)
-    expire_time = None
-    if record.time_in_force == "GOOD_TILL_DATE" and record.expire_ts_ms is not None:
-        time_in_force = TimeInForce.GTD
-        expire_time = datetime.fromtimestamp(record.expire_ts_ms / 1000, tz=UTC)
+    time_in_force, expire_time = _time_in_force(record.time_in_force, record.expire_ts_ms)
     accepted_ms = record.ts_ms if record.ts_accepted_ms is None else record.ts_accepted_ms
     return OrderStatusReport(
         account_id=account_id,
@@ -146,6 +173,7 @@ def fill_report(
     account_id: AccountId,
     currency: Currency,
     ts_init: int,
+    client_order_id: str | None = None,
 ) -> FillReport:
     return FillReport(
         account_id=account_id,
@@ -161,8 +189,196 @@ def fill_report(
         report_id=UUID4(),
         ts_event=nanos(fill.ts_ms),
         ts_init=ts_init,
+        client_order_id=None if client_order_id is None else ClientOrderId(client_order_id),
         venue_position_id=PositionId(fill.venue_position_id),
     )
+
+
+def reported_order(
+    record: ReportedOrder,
+    instrument: Instrument,
+    account_id: AccountId,
+    currency: Currency,
+    ts_init: int,
+) -> tuple[OrderStatusReport, list[FillReport]]:
+    """A reconciliation record as Nautilus's order report, with its fills under the same ids.
+
+    Raises `ValueError` if a price or quantity does not fit the instrument.
+    """
+    time_in_force, expire_time = _time_in_force(record.time_in_force, record.expire_ts_ms)
+    linked = [ClientOrderId(order_id) for order_id in record.linked_order_ids]
+    # Nautilus refuses a contingency with nothing linked, as on a bracket's only leg; the
+    # parent link alone still ties that leg to its entry.
+    contingency = (
+        _CONTINGENCY[record.contingency]
+        if record.contingency is not None and linked
+        else ContingencyType.NO_CONTINGENCY
+    )
+    triggered = record.order_type in (ExternalType.STOP_MARKET, ExternalType.STOP_LIMIT)
+    report = OrderStatusReport(
+        account_id=account_id,
+        instrument_id=instrument.id,
+        venue_order_id=VenueOrderId(record.venue_order_id),
+        order_side=order_side(record.side),
+        order_type=_ORDER_TYPE[record.order_type],
+        time_in_force=time_in_force,
+        order_status=OrderStatus[record.status.name],
+        quantity=quantity(record.units, instrument),
+        filled_qty=quantity(record.filled_units, instrument),
+        report_id=UUID4(),
+        ts_accepted=nanos(record.ts_accepted_ms),
+        ts_last=nanos(record.ts_ms),
+        ts_init=ts_init,
+        client_order_id=(
+            None if record.client_order_id is None else ClientOrderId(record.client_order_id)
+        ),
+        venue_position_id=(
+            None if record.venue_position_id is None else PositionId(record.venue_position_id)
+        ),
+        linked_order_ids=linked or None,
+        parent_order_id=(
+            None if record.parent_order_id is None else ClientOrderId(record.parent_order_id)
+        ),
+        contingency_type=contingency,
+        expire_time=expire_time,
+        price=None if record.price is None else price(record.price, instrument),
+        trigger_price=(
+            None if record.trigger_price is None else price(record.trigger_price, instrument)
+        ),
+        trigger_type=TriggerType.DEFAULT if triggered else TriggerType.NO_TRIGGER,
+        avg_px=record.avg_price if record.fills else None,
+        reduce_only=record.reduce_only,
+    )
+    fills = [
+        fill_report(
+            fill,
+            record.venue_order_id,
+            instrument,
+            account_id,
+            currency,
+            ts_init,
+            client_order_id=record.client_order_id,
+        )
+        for fill in record.fills
+    ]
+    return report, fills
+
+
+def position_report(
+    record: ReportedPosition,
+    instrument: Instrument,
+    account_id: AccountId,
+    ts_init: int,
+) -> PositionStatusReport:
+    return PositionStatusReport(
+        account_id=account_id,
+        instrument_id=instrument.id,
+        position_side=PositionSide.LONG if record.side == "BUY" else PositionSide.SHORT,
+        quantity=quantity(record.units, instrument),
+        report_id=UUID4(),
+        ts_last=nanos(record.ts_ms),
+        ts_init=ts_init,
+        venue_position_id=PositionId(record.venue_position_id),
+        avg_px_open=record.avg_price,
+    )
+
+
+def mass_status(
+    client_id: ClientId,
+    account_id: AccountId,
+    venue: Venue,
+    reconciliation: Reconciliation,
+    instrument_for: Callable[[int], Instrument | None],
+    currency: Currency,
+    ts_init: int,
+    *,
+    held_price: Callable[[str], Decimal | None],
+) -> tuple[ExecutionMassStatus, tuple[ReportedOrder, ...]]:
+    """The reconciliation records as one mass status, orders in record order.
+
+    - `instrument_for`: a symbol's instrument, `None` for one not loaded; its records are left
+      out silently.
+    - `held_price`: the price Nautilus holds for a leg, by client order id: the trigger price of
+      a stop, the limit price otherwise, `None` for an order it does not hold.
+
+    A leg whose level the broker no longer lists has no price of its own. It is reported at
+    the held price: no price change was seen, and Nautilus would otherwise emit an update
+    without a price. Failing that, a leg with fills is reported at their average price; one
+    without is left out. What is left out is unlinked from the orders kept, since Nautilus
+    fails on a linked order it cannot find.
+
+    Returns the mass status and the records left out for want of a price.
+    """
+    status = ExecutionMassStatus(client_id, account_id, venue, UUID4(), ts_init)
+    kept: list[tuple[ReportedOrder, Instrument]] = []
+    left_out: list[ReportedOrder] = []
+    for record in reconciliation.orders:
+        instrument = instrument_for(record.symbol_id)
+        if instrument is None:
+            continue
+        priced = _priced(record, held_price, instrument.price_precision)
+        if priced is None:
+            left_out.append(record)
+        else:
+            kept.append((priced, instrument))
+    gone = {record.client_order_id for record in left_out}
+    order_reports: list[OrderStatusReport] = []
+    fill_reports: list[FillReport] = []
+    for record, instrument in kept:
+        if gone.intersection(record.linked_order_ids):
+            linked = tuple(i for i in record.linked_order_ids if i not in gone)
+            record = replace(record, linked_order_ids=linked)
+        report, fills = reported_order(record, instrument, account_id, currency, ts_init)
+        order_reports.append(report)
+        fill_reports += fills
+    position_reports = [
+        position_report(record, instrument, account_id, ts_init)
+        for record in reconciliation.positions
+        if (instrument := instrument_for(record.symbol_id)) is not None
+    ]
+    status.add_order_reports(order_reports)
+    status.add_fill_reports(fill_reports)
+    status.add_position_reports(position_reports)
+    return status, tuple(left_out)
+
+
+def _priced(
+    record: ReportedOrder, held_price: Callable[[str], Decimal | None], precision: int
+) -> ReportedOrder | None:
+    """`record` with every price its type needs, or `None` if one is missing and unknown."""
+    if record.order_type == ExternalType.LIMIT and record.price is None:
+        field = "price"
+    elif record.order_type == ExternalType.STOP_MARKET and record.trigger_price is None:
+        field = "trigger_price"
+    elif record.order_type == ExternalType.STOP_LIMIT and None in (
+        record.price,
+        record.trigger_price,
+    ):
+        return None
+    else:
+        return record
+    held = None if record.client_order_id is None else held_price(record.client_order_id)
+    if held is None and record.fills:
+        units = sum((fill.units for fill in record.fills), Decimal(0))
+        total = sum((fill.price * fill.units for fill in record.fills), Decimal(0))
+        held = (total / units).quantize(Decimal(1).scaleb(-precision), rounding=ROUND_HALF_EVEN)
+    return None if held is None else replace(record, **{field: held})
+
+
+def exposure_json(items: Sequence[Exposure], symbol_name: Callable[[int], str]) -> bytes:
+    """`items` as UTF-8 JSON, sorted by symbol name, then subject, side and volume.
+
+    Each item is `{"symbol", "subject", "side", "volume"}`, the volume as plain decimal text.
+    """
+    named = sorted(
+        (symbol_name(item.symbol_id), item.subject, item.side, item.units) for item in items
+    )
+    return json.dumps(
+        [
+            {"symbol": symbol, "subject": subject, "side": side, "volume": format(units, "f")}
+            for symbol, subject, side, units in named
+        ]
+    ).encode("utf-8")
 
 
 def account_activity(record: Activity, symbol: str, ts_init: int) -> CTraderAccountActivity:

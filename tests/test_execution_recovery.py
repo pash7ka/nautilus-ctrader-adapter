@@ -1,0 +1,1500 @@
+"""Restarts through Nautilus's own engine: the broker's lists reconciled as one mass status.
+
+The first tests build the records with `reconcile`, convert them with `mass_status` and hand
+the result to the live execution engine, then read what Nautilus made of it from the cache. The
+later ones run the client's own reconciliation pass against the fake venue's lists.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import UTC, datetime
+from decimal import Decimal
+
+import pytest
+from google.protobuf.message import Message
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import (
+    GenerateFillReports,
+    GenerateOrderStatusReports,
+    GeneratePositionStatusReports,
+    ModifyOrder,
+    SubmitOrder,
+)
+from nautilus_trader.execution.reports import ExecutionMassStatus
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.enums import ContingencyType, OrderSide, OrderStatus, OrderType
+from nautilus_trader.model.events import OrderFilled, OrderModifyRejected
+from nautilus_trader.model.identifiers import (
+    ClientOrderId,
+    InstrumentId,
+    PositionId,
+    Symbol,
+    TradeId,
+    VenueOrderId,
+)
+from nautilus_trader.model.objects import Money, Price, Quantity
+
+from nautilus_ctrader.common import order_record
+from nautilus_ctrader.common.execution_reports import mass_status
+from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.reconciliation import PositionHistory, Reconciliation, reconcile
+from nautilus_ctrader.common.venue_records import Fill, Level, ReportedOrder, money_of
+from nautilus_ctrader.constants import CTRADER_VENUE, UNLOADED_EXPOSURE_KEY
+from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+from tests.account_venue import ACCOUNT_ID, HeldReplies
+from tests.execution_replay import (
+    FIRST,
+    NoOperations,
+    history,
+    make_deal,
+    make_event,
+    make_order,
+    make_position,
+    snapshot_at,
+)
+from tests.execution_venue import (
+    CLOSE,
+    ENTRY,
+    FIRST_EVENTS,
+    OURS,
+    STOP,
+    STRATEGY_ID,
+    TARGET,
+    TRADER_ID,
+    US100_ID,
+    US100_SYMBOL_ID,
+    ExecutionVenue,
+    Harness,
+    answer_closes,
+    bracket,
+    broker_lists,
+    close_sent,
+    exec_config,
+    harness,
+    on_us100,
+    our_market_position,
+    push,
+    push_spot,
+    serve,
+    started,
+    status,
+    submit_bracket,
+    submitted,
+)
+from tests.polling import wait_until
+
+CLOSED_AT = 408.8  # FIRST closed by its stop-loss, nothing open
+OPEN_AT = 358.0  # FIRST open with 0.99 after a manual partial close, both levels set
+REMOVED_AT = 228.8  # FIRST open, its take-profit removed by hand
+UUID_SHAPED = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def precision(symbol_id: int) -> int | None:
+    return 2 if symbol_id == US100_SYMBOL_ID else None
+
+
+def records(snapshot, histories, deals) -> Reconciliation:
+    return reconcile(snapshot, histories, deals, precision, {}, NoOperations())
+
+
+def records_at(at: float, *, mine: bool = True) -> Reconciliation:
+    return records(*broker_lists(at, mine=mine))
+
+
+def held_price(h: Harness) -> Callable[[str], Decimal | None]:
+    """The price Nautilus holds for a leg, read from the harness's cache."""
+
+    def held(client_order_id: str) -> Decimal | None:
+        order = h.cache.order(ClientOrderId(client_order_id))
+        if order is None:
+            return None
+        if order.order_type == OrderType.STOP_MARKET:
+            return order.trigger_price.as_decimal()
+        if order.order_type == OrderType.LIMIT:
+            return order.price.as_decimal()
+        return None
+
+    return held
+
+
+def convert(
+    h: Harness, reconciliation: Reconciliation
+) -> tuple[ExecutionMassStatus, tuple[ReportedOrder, ...]]:
+    return mass_status(
+        h.client.id,
+        h.client.account_id,
+        CTRADER_VENUE,
+        reconciliation,
+        lambda symbol_id: h.cache.instrument(US100_ID) if symbol_id == US100_SYMBOL_ID else None,
+        USD,
+        ts_init=0,
+        held_price=held_price(h),
+    )
+
+
+def into_nautilus(h: Harness, reconciliation: Reconciliation) -> tuple[ReportedOrder, ...]:
+    """Reconcile `reconciliation` in the harness's engine; returns what was left out."""
+    built, left_out = convert(h, reconciliation)
+    h.engine.reconcile_execution_mass_status(built)
+    return left_out
+
+
+def records_with_legs(at: float, legs: LegIds) -> Reconciliation:
+    """The node's records at `at`, its entry's record naming only `legs`."""
+    snapshot, histories, deals = broker_lists(at)
+    orders = list(histories[FIRST].orders)
+    for order in orders:
+        if order.orderId == 6000001:
+            order.tradeData.comment = order_record.encode_comment(legs)
+    found = PositionHistory(tuple(orders), histories[FIRST].deals)
+    return records(snapshot, {FIRST: found}, deals)
+
+
+def kinds(h: Harness, client_order_id: str) -> list[str]:
+    """Every event of the order as the cache holds it, the engine's own included."""
+    return [type(e).__name__ for e in h.cache.order(ClientOrderId(client_order_id)).events]
+
+
+def order_at(h: Harness, venue_order_id: str):
+    return h.cache.order(h.cache.client_order_id(VenueOrderId(venue_order_id)))
+
+
+async def legs_accepted() -> Cache:
+    """The cache of a node that sent the bracket and saw both legs accepted, then stopped."""
+    async with harness() as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS[:3])
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+        return h.cache
+
+
+async def position_closed() -> Cache:
+    """The cache of a node that saw the whole first position, then stopped."""
+    async with harness() as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS)
+        await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
+        return h.cache
+
+
+async def test_restart_without_cache_rebuilds_under_node_ids() -> None:
+    async with harness() as h:
+        assert into_nautilus(h, records_at(OPEN_AT)) == ()
+
+        position = h.cache.position(PositionId("5000001"))
+        assert position.opening_order_id == ClientOrderId(ENTRY)
+        assert position.is_open
+        assert str(position.quantity) == "0.99"
+        assert status(h, ENTRY) == OrderStatus.FILLED
+        for leg in (STOP, TARGET):
+            order = h.cache.order(ClientOrderId(leg))
+            assert order.status == OrderStatus.ACCEPTED
+            assert order.parent_order_id == ClientOrderId(ENTRY)
+        # Only the trader's manual close, not the node's, gets an id Nautilus made up.
+        generated = [o for o in h.cache.orders() if UUID_SHAPED.match(o.client_order_id.value)]
+        assert [o.venue_order_id for o in generated] == [VenueOrderId("6000003")]
+
+
+async def test_closed_position_ends_closed_not_reversed() -> None:
+    async with harness() as h:
+        into_nautilus(h, records_at(CLOSED_AT))
+
+        assert h.cache.position(PositionId("5000001")).is_closed
+        assert h.cache.positions_open() == []
+        assert status(h, STOP) == OrderStatus.FILLED
+        assert h.cache.order(ClientOrderId(STOP)).trade_ids == [TradeId("7000003")]
+        assert status(h, TARGET) == OrderStatus.CANCELED
+
+
+async def test_restart_with_cache_cancels_a_removed_leg() -> None:
+    cache = await legs_accepted()
+
+    async with harness(cache=cache) as h:
+        into_nautilus(h, records_at(REMOVED_AT))
+
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+        # Cancelled at the price Nautilus held: no update without a price before it.
+        assert kinds(h, TARGET) == [
+            "OrderInitialized",
+            "OrderSubmitted",
+            "OrderAccepted",
+            "OrderCanceled",
+        ]
+
+
+async def test_a_priceless_leg_still_in_flight_is_accepted_then_cancelled() -> None:
+    async with harness() as h:
+        await submitted(h)
+
+        assert into_nautilus(h, records_at(REMOVED_AT)) == ()
+
+        assert kinds(h, TARGET) == [
+            "OrderInitialized",
+            "OrderSubmitted",
+            "OrderAccepted",
+            "OrderCanceled",
+        ]
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+
+
+async def test_a_priceless_leg_nautilus_does_not_hold_is_left_out() -> None:
+    reconciliation = records_at(REMOVED_AT)
+    (removed,) = (r for r in reconciliation.orders if r.client_order_id == TARGET)
+    assert removed.price is None
+
+    async with harness() as h:
+        built, left_out = convert(h, reconciliation)
+        assert left_out == (removed,)
+        reports = built.order_reports
+        assert reports[VenueOrderId("6000001")].linked_order_ids == [ClientOrderId(STOP)]
+        assert reports[VenueOrderId("6000001-SL")].linked_order_ids is None
+
+        h.engine.reconcile_execution_mass_status(built)
+
+        assert h.cache.order(ClientOrderId(TARGET)) is None
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+        assert h.cache.position(PositionId("5000001")).is_open
+        linked = {i for order in h.cache.orders() for i in order.linked_order_ids or []}
+        assert linked == {ClientOrderId(STOP)}
+        assert all(h.cache.order(i) is not None for i in linked)
+
+
+async def test_a_priceless_leg_with_a_fill_reaches_nautilus_at_its_fill_price() -> None:
+    # Hand-built: the recording holds no leg partly filled before its level was removed.
+    reconciliation = records_at(REMOVED_AT)
+    (removed,) = (r for r in reconciliation.orders if r.client_order_id == TARGET)
+    fills = (
+        Fill(
+            "7000010",
+            "5000001",
+            "SELL",
+            Decimal("0.10"),
+            Decimal("85353.41"),
+            Decimal("-0.30"),
+            removed.ts_ms - 2,
+        ),
+        Fill(
+            "7000011",
+            "5000001",
+            "SELL",
+            Decimal("0.30"),
+            Decimal("85353.42"),
+            Decimal("-0.93"),
+            removed.ts_ms - 1,
+        ),
+    )
+    partly = replace(
+        removed, filled_units=Decimal("0.40"), avg_price=Decimal("85353.42"), fills=fills
+    )
+    orders = tuple(partly if r is removed else r for r in reconciliation.orders)
+    # Without a position report: the broker's position would not match these fills.
+    hand_built = Reconciliation(orders, (), ())
+
+    async with harness() as h:
+        assert into_nautilus(h, hand_built) == ()
+
+        target = h.cache.order(ClientOrderId(TARGET))
+        assert target.status == OrderStatus.CANCELED
+        assert target.price == Price.from_str("85353.42")
+        assert str(target.filled_qty) == "0.40"
+        filled = [e for e in target.events if isinstance(e, OrderFilled)]
+        assert [(e.trade_id, e.commission) for e in filled] == [
+            (TradeId("7000010"), Money(Decimal("0.30"), USD)),
+            (TradeId("7000011"), Money(Decimal("0.93"), USD)),
+        ]
+
+
+async def test_restart_with_cache_fills_a_triggered_leg() -> None:
+    cache = await legs_accepted()
+    (deal,) = (d for d in history(FIRST).deals if d.dealId == 7_000_003)
+
+    async with harness(cache=cache) as h:
+        into_nautilus(h, records_at(CLOSED_AT))
+
+        assert status(h, STOP) == OrderStatus.FILLED
+        (filled,) = [
+            e for e in h.cache.order(ClientOrderId(STOP)).events if isinstance(e, OrderFilled)
+        ]
+        assert filled.trade_id == TradeId("7000003")
+        assert filled.commission == Money(-money_of(deal.commission, deal.moneyDigits), USD)
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert h.cache.position(PositionId("5000001")).is_closed
+
+
+async def test_restart_with_cache_changes_nothing_known() -> None:
+    cache = await position_closed()
+    before = {o.client_order_id: len(o.events) for o in cache.orders()}
+
+    async with harness(cache=cache) as h:
+        into_nautilus(h, records_at(CLOSED_AT))
+
+        assert {o.client_order_id: len(o.events) for o in h.cache.orders()} == before
+        assert len(h.cache.positions()) == 1
+
+
+async def test_a_one_leg_bracket_is_taken_by_nautilus() -> None:
+    async with harness() as h:
+        into_nautilus(h, records_with_legs(OPEN_AT, LegIds(STOP, None)))
+
+        stop = h.cache.order(ClientOrderId(STOP))
+        assert stop.status == OrderStatus.ACCEPTED
+        assert stop.parent_order_id == ClientOrderId(ENTRY)
+        assert stop.contingency_type == ContingencyType.NO_CONTINGENCY
+        assert h.cache.order(ClientOrderId(ENTRY)).linked_order_ids == [ClientOrderId(STOP)]
+        assert h.cache.order(ClientOrderId(TARGET)) is None
+
+
+def stop_out() -> tuple[Reconciliation, str, str]:
+    # Hand-built: the recording holds no stop-out.
+    pid = 5_000_201
+    opened = make_order(6_000_201, pid, utc=1_600_000_001_000, symbol=US100_SYMBOL_ID)
+    closed = make_order(
+        6_000_202,
+        pid,
+        side=om.SELL,
+        closing=True,
+        utc=1_600_000_002_000,
+        stop_out=True,
+        symbol=US100_SYMBOL_ID,
+    )
+    for order in (opened, closed):
+        order.orderStatus = om.ORDER_STATUS_FILLED
+    deals = tuple(
+        on_us100(
+            [
+                make_deal(
+                    7_000_201,
+                    6_000_201,
+                    pid,
+                    side=om.BUY,
+                    volume=100,
+                    price=85000.0,
+                    ts=1_600_000_001_000,
+                ),
+                make_deal(
+                    7_000_202,
+                    6_000_202,
+                    pid,
+                    side=om.SELL,
+                    volume=100,
+                    price=84000.0,
+                    ts=1_600_000_002_000,
+                ),
+            ]
+        )
+    )
+    snapshot = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
+    found = PositionHistory((opened, closed), deals)
+    return records(snapshot, {pid: found}, deals), "6000202", str(pid)
+
+
+CLOSES = {
+    "manual close": lambda: (records_at(CLOSED_AT), "6000003", "5000001"),
+    # The node's own position with no stop leg, closed by its stop-loss.
+    "no-leg level trigger": lambda: (
+        records_with_legs(CLOSED_AT, LegIds(None, TARGET)),
+        "6000002",
+        "5000001",
+    ),
+    "stop-out": stop_out,
+    "foreign close": lambda: (records_at(CLOSED_AT, mine=False), "6000003", "5000001"),
+}
+
+
+@pytest.mark.parametrize("case", list(CLOSES))
+async def test_every_close_from_a_report_is_reduce_only(case: str) -> None:
+    reconciliation, venue_order_id, position_id = CLOSES[case]()
+
+    async with harness() as h:
+        into_nautilus(h, reconciliation)
+
+        order = order_at(h, venue_order_id)
+        assert order.is_reduce_only
+        assert order.status == OrderStatus.FILLED
+        assert order.position_id == PositionId(position_id)
+        assert h.cache.position(PositionId(position_id)).is_closed
+
+
+async def test_same_reports_with_and_without_cache() -> None:
+    cache = await legs_accepted()
+    lists = broker_lists(OPEN_AT)
+
+    async with harness() as fresh:
+        without = records(*lists)
+        into_nautilus(fresh, without)
+        fresh_states = {o.venue_order_id: o.status for o in fresh.cache.orders()}
+    async with harness(cache=cache) as restarted:
+        with_cache = records(*lists)
+        into_nautilus(restarted, with_cache)
+        restarted_states = {o.venue_order_id: o.status for o in restarted.cache.orders()}
+
+    assert with_cache == without
+    assert restarted_states == fresh_states
+
+
+# -- The client's reconciliation pass --------------------------------------------------------
+
+EURUSD_SYMBOL_ID = 1  # not loaded by the harness
+MINUTE_MS = 60_000
+
+
+def serving(at: float = OPEN_AT) -> ExecutionVenue:
+    """A venue whose snapshot and lists are the node's first position at timeline time `at`."""
+    venue = ExecutionVenue()
+    serve(venue, at)
+    return venue
+
+
+def unloaded_position(position_id: int) -> om.ProtoOAPosition:
+    return make_position(position_id, symbol=EURUSD_SYMBOL_ID)
+
+
+def exposure(h: Harness) -> list[dict]:
+    return json.loads(h.cache.get(UNLOADED_EXPOSURE_KEY))
+
+
+def foreign_position(venue: ExecutionVenue, n: int, *, ts: int) -> None:
+    """An open position the node did not open, its entry filled at `ts`, on `US100.cash`."""
+    position_id, order_id = 5_100_000 + n, 6_100_000 + n
+    position = make_position(position_id, symbol=US100_SYMBOL_ID)
+    position.price = 85000.0
+    position.utcLastUpdateTimestamp = ts
+    venue.snapshot.position.append(position)
+    entry = make_order(order_id, position_id, utc=ts, symbol=US100_SYMBOL_ID)
+    entry.orderStatus = om.ORDER_STATUS_FILLED
+    venue.position_orders[position_id] = [entry]
+    deal = make_deal(
+        7_100_000 + n, order_id, position_id, side=om.BUY, volume=100, price=85000.0, ts=ts
+    )
+    venue.position_deals[position_id] = on_us100([deal])
+
+
+def closed_position(
+    venue: ExecutionVenue, n: int, *, opened: int, closed: int
+) -> list[om.ProtoOADeal]:
+    """A foreign position opened at `opened` and closed at `closed`; returns its two deals."""
+    position_id, entry_id, close_id = 5_200_000 + n, 6_200_000 + 2 * n, 6_200_001 + 2 * n
+    entry = make_order(entry_id, position_id, utc=opened, symbol=US100_SYMBOL_ID)
+    close = make_order(
+        close_id, position_id, side=om.SELL, closing=True, utc=closed, symbol=US100_SYMBOL_ID
+    )
+    for order in (entry, close):
+        order.orderStatus = om.ORDER_STATUS_FILLED
+    deals = on_us100(
+        [
+            make_deal(
+                7_200_000 + 2 * n,
+                entry_id,
+                position_id,
+                side=om.BUY,
+                volume=100,
+                price=85000.0,
+                ts=opened,
+            ),
+            make_deal(
+                7_200_001 + 2 * n,
+                close_id,
+                position_id,
+                side=om.SELL,
+                volume=100,
+                price=85100.0,
+                ts=closed,
+            ),
+        ]
+    )
+    venue.position_orders[position_id] = [entry, close]
+    venue.position_deals[position_id] = deals
+    venue.deals += deals
+    return deals
+
+
+async def test_generate_mass_status_reports_the_recorded_state() -> None:
+    async with harness(execution_venue=serving()) as h:
+        built = await h.client.generate_mass_status()
+
+        ids = {report.client_order_id for report in built.order_reports.values()}
+        assert {ClientOrderId(ENTRY), ClientOrderId(STOP), ClientOrderId(TARGET)} <= ids
+        assert len(built.position_reports[US100_ID]) == 1
+        view = h.client._book.view(FIRST)
+        assert view.legs == {Level.STOP_LOSS: (STOP, True), Level.TAKE_PROFIT: (TARGET, True)}
+
+
+async def test_an_event_during_the_start_pass_is_applied_after_reconciliation() -> None:
+    venue = serving()
+    async with harness(execution_venue=venue) as h:
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+        )
+        passing = asyncio.create_task(h.client.generate_mass_status())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        # The stop-loss moved by hand, then the protective order filled at it.
+        await push(h, *FIRST_EVENTS[-2:])
+        await held.stop_holding()
+        built = await asyncio.wait_for(passing, timeout=10)
+
+        h.engine.reconcile_execution_mass_status(built)
+
+        await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
+        assert kinds(h, STOP)[-1] == "OrderFilled"
+        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+
+
+async def test_buffer_is_released_when_reconciliation_never_comes() -> None:
+    async with harness(execution_venue=serving()) as h:
+        h.client._reconciled_wait_secs = 0.2
+        assert await h.client.generate_mass_status() is not None
+
+        await push(h, *FIRST_EVENTS[-2:])
+
+        await wait_until(lambda: not h.client._book.view(FIRST).open)
+        assert any("0.2s" in line for line in h.logger.warnings())
+
+
+def settling_fails(monkeypatch: pytest.MonkeyPatch, h: Harness) -> None:
+    def fail() -> None:
+        raise RuntimeError("settling failed")
+
+    monkeypatch.setattr(h.client, "_settle_brackets", fail)
+
+
+async def test_a_failed_release_on_reconciliation_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(execution_venue=serving()) as h:
+        built = await h.client.generate_mass_status()
+        settling_fails(monkeypatch, h)
+
+        h.engine.reconcile_execution_mass_status(built)
+
+        assert h.client._buffer is None
+        assert h.client._model_standing.is_set()
+        assert any("held" in line for line in h.logger.errors())
+
+
+async def test_a_failed_release_after_the_wait_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with harness(execution_venue=serving()) as h:
+        h.client._reconciled_wait_secs = 0.1
+        assert await h.client.generate_mass_status() is not None
+        settling_fails(monkeypatch, h)
+
+        await wait_until(lambda: any("held" in line for line in h.logger.errors()))
+
+        assert h.client._buffer is None
+        assert h.client._model_standing.is_set()
+
+
+async def test_a_failed_list_releases_the_buffer() -> None:
+    venue = serving()
+    venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
+    async with harness(execution_venue=venue) as h:
+        assert await h.client.generate_mass_status() is None
+
+        await push(h, *FIRST_EVENTS[-2:])
+
+        assert not h.client._book.view(FIRST).open
+        assert h.logger.errors() == []
+        assert any("INTERNAL_SERVER_ERROR" in line for line in h.logger.warnings())
+
+
+async def test_the_pass_asks_each_position_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The suite need not wait out the venue's historical rate for 50 lists.
+    monkeypatch.setattr("nautilus_ctrader.common.session.HISTORICAL_RATE_LIMIT_PER_SEC", 1000.0)
+    venue = ExecutionVenue()
+    for n in range(25):
+        foreign_position(venue, n, ts=1_600_000_000_000 + n)
+    async with harness(execution_venue=venue) as h:
+        orders_before = len(h.received(oa.ProtoOAOrderListByPositionIdReq))
+        deals_before = len(h.received(oa.ProtoOADealListByPositionIdReq))
+
+        built = await h.client.generate_mass_status()
+
+        assert len(h.received(oa.ProtoOAOrderListByPositionIdReq)) - orders_before == 25
+        assert len(h.received(oa.ProtoOADealListByPositionIdReq)) - deals_before == 25
+        assert len(built.position_reports[US100_ID]) == 25
+        # The snapshot, the window's deal list, and two lists per position.
+        assert any(level == "info" and "52 requests" in line for level, line in h.logger.lines)
+
+
+async def test_a_deal_list_cut_short_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The suite need not wait out the venue's historical rate for 20 pages.
+    monkeypatch.setattr("nautilus_ctrader.common.session.HISTORICAL_RATE_LIMIT_PER_SEC", 1000.0)
+    venue = ExecutionVenue()
+    venue.page_size = 2
+    foreign_position(venue, 1, ts=1_600_000_000_000)
+    position_id = 5_100_001
+    # The entry filled in 25 parts, more than 20 pages of the position's deal list hold.
+    venue.position_deals[position_id] = on_us100(
+        [
+            make_deal(
+                7_150_000 + n,
+                6_100_001,
+                position_id,
+                side=om.BUY,
+                volume=4,
+                price=85000.0,
+                ts=1_600_000_000_000 + n,
+            )
+            for n in range(25)
+        ]
+    )
+    async with harness(execution_venue=venue) as h:
+        built = await h.client.generate_mass_status()
+
+        assert any(
+            f"Position {position_id}" in line and "deal list" in line
+            for line in h.logger.warnings()
+        )
+        # The deals found do not add up to the position: its volume is the snapshot's.
+        (report,) = built.position_reports[US100_ID]
+        assert report.quantity == Quantity.from_str("1.00")
+
+
+async def test_deal_pages_are_followed() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    venue.page_size = 2
+    in_window = closed_position(venue, 1, opened=now - 50_000, closed=now - 40_000)
+    in_window += closed_position(venue, 2, opened=now - 30_000, closed=now - 20_000)
+    # Opened before the window, closed in it.
+    before = now - 2 * 1440 * MINUTE_MS
+    in_window += closed_position(venue, 3, opened=before, closed=now - 10_000)[1:]
+    assert len(in_window) == 5
+    async with harness(execution_venue=venue) as h:
+        built = await h.client.generate_mass_status()
+
+        trade_ids = [f.trade_id.value for fills in built.fill_reports.values() for f in fills]
+        assert len(trade_ids) == len(set(trade_ids))
+        assert {str(deal.dealId) for deal in in_window} <= set(trade_ids)
+        assert len(h.received(oa.ProtoOADealListReq)) > 1
+
+
+async def test_window_uses_the_default_lookback() -> None:
+    async with harness() as h:
+        await h.client.generate_mass_status(lookback_mins=None)
+
+        (asked,) = h.received(oa.ProtoOADealListReq)
+        expected = int(time.time() * 1000) - 1440 * MINUTE_MS
+        assert abs(asked.fromTimestamp - expected) < 5_000
+
+
+async def test_exposure_written_at_connect_and_on_change() -> None:
+    async with harness() as h:
+        assert h.cache.get(UNLOADED_EXPOSURE_KEY) == b"[]"
+
+        order = make_order(6_900_002, 5_900_002, symbol=EURUSD_SYMBOL_ID)
+        order.orderStatus = om.ORDER_STATUS_FILLED
+        deal = make_deal(
+            7_900_002, 6_900_002, 5_900_002, side=om.BUY, volume=100, price=1.1, ts=1_000
+        )
+        deal.symbolId = EURUSD_SYMBOL_ID
+        await push(
+            h,
+            make_event(om.ORDER_FILLED, order, position=unloaded_position(5_900_002), deal=deal),
+        )
+
+        await wait_until(lambda: len(exposure(h)) == 1)
+        (item,) = exposure(h)
+        assert (item["symbol"], item["subject"], item["side"]) == ("EURUSD", "position", "BUY")
+
+    async with harness(connect=False) as h:
+        h.cache.add(UNLOADED_EXPOSURE_KEY, b"stale")
+
+        await h.client._connect()
+
+        assert h.cache.get(UNLOADED_EXPOSURE_KEY) == b"[]"
+
+
+async def test_a_pass_publishes_no_unloaded_activity() -> None:
+    venue = ExecutionVenue()
+    venue.snapshot.position.append(unloaded_position(5_900_003))
+    async with harness(execution_venue=venue) as h:
+        await h.client.generate_mass_status()
+
+        assert h.activity == []
+        assert [item["subject"] for item in exposure(h)] == ["position"]
+
+
+async def test_the_key_is_fresh_when_the_reconciliation_topic_fires() -> None:
+    async with harness() as h:
+        seen: list[bytes] = []
+        h.client._msgbus.subscribe(
+            topic=f"reports.execution.{CTRADER_VENUE}",
+            handler=lambda _status: seen.append(h.cache.get(UNLOADED_EXPOSURE_KEY)),
+        )
+        h.venue.snapshot.position.append(unloaded_position(5_900_004))
+
+        built = await h.client.generate_mass_status()
+        h.engine.reconcile_execution_mass_status(built)
+
+        assert seen
+        assert [item["subject"] for item in json.loads(seen[0])] == ["position"]
+
+
+async def test_reports_outside_a_mass_status_never_carry_a_filled_order() -> None:
+    async with harness(execution_venue=serving()) as h:
+        found = await h.client.generate_order_status_reports(
+            GenerateOrderStatusReports(
+                instrument_id=None,
+                start=None,
+                end=None,
+                open_only=False,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+
+        assert all(report.order_status != OrderStatus.FILLED for report in found)
+        assert {report.client_order_id for report in found} == {
+            ClientOrderId(STOP),
+            ClientOrderId(TARGET),
+        }
+
+
+def closed_before_the_window() -> ExecutionVenue:
+    """The node's first position closed by its stop-loss longer ago than the fill window."""
+    venue = serving(CLOSED_AT)
+    venue.deals = []
+    return venue
+
+
+async def test_a_cached_position_closed_before_the_window_is_closed_at_start() -> None:
+    cache = await legs_accepted()
+
+    async with harness(execution_venue=closed_before_the_window(), cache=cache) as h:
+        assert h.cache.position(PositionId(str(FIRST))).is_open
+
+        await h.engine.reconcile_execution_state()
+
+        assert h.cache.position(PositionId(str(FIRST))).is_closed
+        assert h.cache.positions_open() == []
+        assert status(h, STOP) == OrderStatus.FILLED
+        assert h.cache.order(ClientOrderId(STOP)).trade_ids == [TradeId("7000003")]
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert not any(o.tags and "RECONCILIATION" in o.tags for o in h.cache.orders())
+
+
+def unknown_to_the_broker() -> ExecutionVenue:
+    """A venue holding one foreign position, and nothing of the node's first position."""
+    venue = ExecutionVenue()
+    foreign_position(venue, 1, ts=int(time.time() * 1000) - 10_000)
+    return venue
+
+
+async def test_a_cached_position_the_broker_refuses_to_list_fails_no_pass() -> None:
+    cache = await legs_accepted()
+    venue = unknown_to_the_broker()
+    orders_of = venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ]
+
+    def refuse_first(request: oa.ProtoOAOrderListByPositionIdReq) -> Message:
+        if request.positionId == FIRST:
+            return oa.ProtoOAErrorRes(
+                ctidTraderAccountId=ACCOUNT_ID,
+                errorCode="POSITION_NOT_FOUND",
+                description="no such position",
+            )
+        return orders_of(request)
+
+    venue.server.on(om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ, refuse_first)
+    async with harness(execution_venue=venue, cache=cache) as h:
+        built = await h.client.generate_mass_status()
+
+        assert built is not None
+        (report,) = built.position_reports[US100_ID]
+        assert report.venue_position_id == PositionId("5100001")
+        (warning,) = [line for line in h.logger.warnings() if str(FIRST) in line]
+        assert "POSITION_NOT_FOUND" in warning
+
+
+async def test_a_cached_position_the_broker_lists_nothing_of_is_skipped() -> None:
+    cache = await legs_accepted()
+
+    async with harness(execution_venue=unknown_to_the_broker(), cache=cache) as h:
+        built = await h.client.generate_mass_status()
+
+        assert built is not None
+        assert list(built.order_reports) == [VenueOrderId("6100001")]
+        (warning,) = [line for line in h.logger.warnings() if str(FIRST) in line]
+        assert "unknown" in warning
+
+
+def fills_command(**filters) -> GenerateFillReports:
+    values = {"instrument_id": None, "venue_order_id": None, "start": None, "end": None}
+    values.update(filters)
+    return GenerateFillReports(**values, command_id=UUID4(), ts_init=0)
+
+
+def positions_command(instrument_id: InstrumentId | None) -> GeneratePositionStatusReports:
+    return GeneratePositionStatusReports(
+        instrument_id=instrument_id, start=None, end=None, command_id=UUID4(), ts_init=0
+    )
+
+
+def moment(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000, tz=UTC)
+
+
+EURUSD_ID = InstrumentId(Symbol("EURUSD"), CTRADER_VENUE)
+
+
+async def test_fill_reports_keep_to_the_window_the_order_and_the_instrument() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    earlier = closed_position(venue, 1, opened=now - 50_000, closed=now - 40_000)
+    later = closed_position(venue, 2, opened=now - 30_000, closed=now - 20_000)
+    async with harness(execution_venue=venue) as h:
+
+        async def trade_ids(**filters) -> set[str]:
+            found = await h.client.generate_fill_reports(fills_command(**filters))
+            return {fill.trade_id.value for fill in found}
+
+        def ids(deals: list[om.ProtoOADeal]) -> set[str]:
+            return {str(deal.dealId) for deal in deals}
+
+        assert await trade_ids() == ids(earlier + later)
+        assert await trade_ids(start=moment(now - 35_000)) == ids(later)
+        assert await trade_ids(end=moment(now - 35_000)) == ids(earlier)
+        closing = later[1]
+        assert await trade_ids(venue_order_id=VenueOrderId(str(closing.orderId))) == ids([closing])
+        assert await trade_ids(instrument_id=US100_ID) == ids(earlier + later)
+        assert await trade_ids(instrument_id=EURUSD_ID) == set()
+
+
+async def test_position_reports_are_per_instrument_and_only_what_stands() -> None:
+    cache = await legs_accepted()
+    venue = closed_before_the_window()
+    foreign_position(venue, 1, ts=int(time.time() * 1000) - 10_000)
+
+    async with harness(execution_venue=venue, cache=cache) as h:
+        before = len(h.received(oa.ProtoOADealListByPositionIdReq))
+
+        found = await h.client.generate_position_status_reports(positions_command(US100_ID))
+
+        # The cached position is read and found closed, so it has no report.
+        assert [report.venue_position_id for report in found] == [PositionId("5100001")]
+        asked = h.received(oa.ProtoOADealListByPositionIdReq)[before:]
+        assert {request.positionId for request in asked} == {5_100_001, FIRST}
+        assert await h.client.generate_position_status_reports(positions_command(EURUSD_ID)) == []
+        assert len(await h.client.generate_position_status_reports(positions_command(None))) == 1
+
+
+# -- Reconnect ---------------------------------------------------------------------------------
+
+TP_BACK_AT = 256.5  # FIRST open, its take-profit set again by hand
+
+
+async def test_reconnect_sends_a_mass_status_not_events() -> None:
+    venue = serving(TP_BACK_AT)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        assert status(h, TARGET) == OrderStatus.ACCEPTED
+
+        # What the broker holds once the session is back.
+        serve(venue, REMOVED_AT)
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        # The cancel came from the engine's reconciliation, not from the client.
+        assert "OrderCanceled" not in h.kinds_of(TARGET)
+        assert any("Rebuilding the venue model" in line for line in h.logger.warnings())
+
+
+async def test_a_reconnect_during_the_start_wait_releases_after_its_own_mass_status() -> None:
+    venue = serving()
+    async with harness(execution_venue=venue) as h:
+        h.client._reconciled_wait_secs = 60.0
+        assert await h.client.generate_mass_status() is not None
+        # Nautilus has not reconciled the start's mass status yet.
+        await push(h, *FIRST_EVENTS[-2:])
+        held_when_reconciled: list[int] = []
+        h.client._msgbus.subscribe(
+            topic=f"reports.execution.{CTRADER_VENUE}",
+            handler=lambda _status: held_when_reconciled.append(len(h.client._buffer or [])),
+        )
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+
+        # The start's wait is over once the reconnect pass runs; its timer can release nothing.
+        assert h.client._awaited_report is None
+        assert h.client._release_timer is None
+        assert len(h.client._buffer) == 2
+        await held.stop_holding()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        assert held_when_reconciled == [2]
+        assert h.client._buffer is None
+        await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
+        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+
+
+async def test_a_close_in_flight_across_a_reconnect_keeps_the_node_id() -> None:
+    # Hand-built: the recording holds no close of the node's.
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        position_id = PositionId(str(OURS))
+        assert h.cache.position(position_id).is_open
+        order = h.factory.market(
+            US100_ID,
+            OrderSide.SELL,
+            Quantity.from_str("1.00"),
+            reduce_only=True,
+            client_order_id=ClientOrderId(CLOSE),
+        )
+        h.cache.add_order(order, position_id=position_id)
+        # The venue never answers the close.
+        closing = asyncio.create_task(
+            h.client._submit_order(
+                SubmitOrder(
+                    trader_id=TRADER_ID,
+                    strategy_id=STRATEGY_ID,
+                    order=order,
+                    command_id=UUID4(),
+                    ts_init=0,
+                    position_id=position_id,
+                ),
+            ),
+        )
+        await wait_until(lambda: len(h.received(oa.ProtoOAClosePositionReq)) == 1)
+
+        # The broker's clock runs a minute behind the node's.
+        our_market_position(venue, opened=now - 120_000, closed=int(time.time() * 1000) - 60_000)
+        await h.server.drop_connections()
+        await asyncio.wait_for(closing, timeout=10)
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+
+        (built,) = h.mass_statuses
+        assert built.order_reports[VenueOrderId("6300002")].client_order_id == ClientOrderId(CLOSE)
+        assert not any(UUID_SHAPED.match(o.client_order_id.value) for o in h.cache.orders())
+        assert status(h, CLOSE) == OrderStatus.FILLED
+        assert h.cache.position(position_id).is_closed
+        assert h.client._operations.close_position(CLOSE) is None
+
+
+def target_moved_to(price: float) -> oa.ProtoOAExecutionEvent:
+    """The broker's answer to an amend moving the take-profit of the position at `OPEN_AT`."""
+    at = snapshot_at(OPEN_AT).position[0].utcLastUpdateTimestamp
+    (last,) = [
+        e
+        for e in FIRST_EVENTS
+        if e.executionType == om.ORDER_REPLACED and e.order.utcLastUpdateTimestamp == at
+    ]
+    event = type(last)()
+    event.CopyFrom(last)
+    event.isServerEvent = False
+    event.order.limitPrice = price
+    event.order.utcLastUpdateTimestamp = at + 1_000
+    event.position.takeProfit = price
+    event.position.utcLastUpdateTimestamp = at + 1_000
+    return event
+
+
+async def test_an_amend_answered_during_a_rebuild_reads_the_rebuilt_view() -> None:
+    venue = serving()
+    venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: target_moved_to(85400.0))
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+        rebuilding = asyncio.create_task(h.client._reload())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        modifying = asyncio.create_task(
+            h.client._modify_order(
+                ModifyOrder(
+                    trader_id=TRADER_ID,
+                    strategy_id=STRATEGY_ID,
+                    instrument_id=US100_ID,
+                    client_order_id=ClientOrderId(TARGET),
+                    venue_order_id=None,
+                    quantity=None,
+                    price=Price.from_str("85400.00"),
+                    trigger_price=None,
+                    command_id=UUID4(),
+                    ts_init=0,
+                ),
+            ),
+        )
+        await wait_until(lambda: len(h.client._buffer or []) == 1)
+
+        await held.stop_holding()
+        await asyncio.wait_for(rebuilding, timeout=10)
+        await asyncio.wait_for(modifying, timeout=10)
+
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
+        )
+        assert "OrderModifyRejected" not in h.kinds_of(TARGET)
+        assert h.kinds_of(TARGET)[-1] == "OrderUpdated"
+        assert h.logger.errors() == []
+
+
+async def test_an_amend_waits_for_the_model_no_longer_than_the_connect_timeout() -> None:
+    async with harness(config=exec_config(connect_timeout_secs=0.1)) as h:
+        h.client._hold_buffer()
+
+        await asyncio.wait_for(h.client._wait_for_model(), timeout=5)
+
+        assert any("not rebuilt within 0.1s" in line for line in h.logger.warnings())
+
+
+async def test_a_failed_reconnect_pass_releases_the_buffer() -> None:
+    venue = serving()
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
+
+        await h.server.drop_connections()
+        await wait_until(lambda: any("Restore" in line for line in h.logger.errors()))
+
+        assert h.client._buffer is None
+        assert h.client._model_standing.is_set()
+        assert h.mass_statuses == []
+
+
+# -- The node's close around a rebuild -------------------------------------------------------
+
+
+def in_flight(h: Harness) -> int | None:
+    """The position the node's close is closing, while it is in flight."""
+    return h.client._operations.close_position(CLOSE)
+
+
+async def test_a_lost_close_stays_in_flight_until_a_reconnect_pass_succeeds() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        closing = await close_sent(h)
+        # The broker's clock runs a minute behind the node's.
+        our_market_position(venue, opened=now - 120_000, closed=int(time.time() * 1000) - 60_000)
+        venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
+
+        await h.server.drop_connections()
+        await asyncio.wait_for(closing, timeout=10)
+        await wait_until(lambda: any("Restore" in line for line in h.logger.errors()))
+        assert h.mass_statuses == []
+        assert in_flight(h) == OURS
+
+        venue.fail = set()
+        await h.account.session.retry_failed_restores()
+
+        (built,) = h.mass_statuses
+        assert built.order_reports[VenueOrderId("6300002")].client_order_id == ClientOrderId(CLOSE)
+        assert in_flight(h) is None
+        assert h.client._lost_closes == set()
+
+
+async def test_the_pass_never_names_an_earlier_close_by_the_close_in_flight() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        # A trader's close of the same volume, made before a spot the node saw, then the node's.
+        await push_spot(h, 8_528_600_000, 8_528_721_000, timestamp=now - 30_000)
+        closing = await close_sent(h)
+        our_market_position(venue, opened=now - 120_000, closed=now - 60_000)
+
+        built = await h.client.generate_mass_status()
+
+        assert built.order_reports[VenueOrderId("6300002")].client_order_id is None
+        assert in_flight(h) == OURS
+        await h.client._disconnect()
+        await asyncio.wait_for(closing, timeout=10)
+
+
+async def test_a_close_pending_at_disconnect_is_not_left_in_flight() -> None:
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=int(time.time() * 1000) - 120_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        closing = await close_sent(h)
+
+        await h.client._disconnect()
+        await asyncio.wait_for(closing, timeout=10)
+
+        assert in_flight(h) is None
+        assert h.client._lost_closes == set()
+
+
+async def test_a_close_that_times_out_on_a_live_connection_is_no_longer_in_flight() -> None:
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=int(time.time() * 1000) - 120_000)
+    config = exec_config(order_request_timeout_secs=0.2)
+    async with harness(execution_venue=venue, config=config) as h:
+        await started(h)
+        closing = await close_sent(h)
+
+        await asyncio.wait_for(closing, timeout=10)
+
+        assert h.account.session.is_ready
+        assert in_flight(h) is None
+        assert h.client._lost_closes == set()
+
+
+async def test_a_close_answered_during_a_rebuild_is_still_the_nodes() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    made = answer_closes(venue, behind_ms=60_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+        rebuilding = asyncio.create_task(h.client._reload())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        closing = await close_sent(h)
+        await wait_until(lambda: len(made) == 2)
+        await push(h, made[1])
+        assert len(h.client._buffer) == 2
+
+        await held.stop_holding()
+        await asyncio.wait_for(rebuilding, timeout=10)
+        await asyncio.wait_for(closing, timeout=10)
+
+        await wait_until(lambda: status(h, CLOSE) == OrderStatus.FILLED)
+        assert h.kinds_of(CLOSE) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+        assert not any(r.venue_order_id == VenueOrderId("6300002") for r in h.reports)
+        assert not any(a.kind == "manual_change" for a in h.activity)
+        assert in_flight(h) is None
+
+
+# -- A bracket in flight across a reconnect ------------------------------------------------------
+
+BRACKET_POSITION, BRACKET_ORDER = 5_400_001, 6_400_001
+# The bracket's answer is given up on quickly, so a test can lose it.
+LOSING = exec_config(order_request_timeout_secs=0.2)
+
+
+def bracket_closed_meanwhile(venue: ExecutionVenue, *, opened: int, closed: int) -> None:
+    """The node's bracket filled at `opened` and closed by hand at `closed`, with no level set."""
+    entry = make_order(
+        BRACKET_ORDER,
+        BRACKET_POSITION,
+        utc=opened,
+        label=order_record.encode_label(ENTRY),
+        comment=order_record.encode_comment(LegIds(STOP, TARGET)),
+        client_order_id=ENTRY,
+        symbol=US100_SYMBOL_ID,
+    )
+    close = make_order(
+        BRACKET_ORDER + 1,
+        BRACKET_POSITION,
+        side=om.SELL,
+        closing=True,
+        utc=closed,
+        symbol=US100_SYMBOL_ID,
+    )
+    for order in (entry, close):
+        order.orderStatus = om.ORDER_STATUS_FILLED
+    deals = on_us100(
+        [
+            make_deal(
+                7_400_001,
+                BRACKET_ORDER,
+                BRACKET_POSITION,
+                side=om.BUY,
+                volume=100,
+                price=85000.0,
+                ts=opened,
+            ),
+            make_deal(
+                7_400_002,
+                BRACKET_ORDER + 1,
+                BRACKET_POSITION,
+                side=om.SELL,
+                volume=100,
+                price=85100.0,
+                ts=closed,
+            ),
+        ]
+    )
+    venue.position_orders[BRACKET_POSITION] = [entry, close]
+    venue.position_deals[BRACKET_POSITION] = deals
+    venue.deals += deals
+
+
+async def lost_bracket_with_a_waiting_modify(h: Harness) -> None:
+    await push_spot(h, 8_528_600_000, 8_528_721_000)
+    await submit_bracket(h, bracket(h))
+    await h.client._modify_order(
+        ModifyOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            instrument_id=US100_ID,
+            client_order_id=ClientOrderId(STOP),
+            venue_order_id=None,
+            quantity=None,
+            price=None,
+            trigger_price=Price.from_str("85150.00"),
+            command_id=UUID4(),
+            ts_init=0,
+        ),
+    )
+    assert len(h.client._brackets) == 1
+
+
+async def test_a_bracket_whose_position_closed_during_a_disconnect_ends_at_the_reconnect() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await lost_bracket_with_a_waiting_modify(h)
+        bracket_closed_meanwhile(venue, opened=now - 120_000, closed=now - 60_000)
+
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        await wait_until(lambda: "OrderModifyRejected" in h.kinds_of(STOP))
+
+        assert len(h.client._brackets) == 0
+        (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]
+        assert rejected.reason == "the position closed before its levels were set"
+        assert status(h, ENTRY) == OrderStatus.FILLED
+
+
+async def test_a_bracket_the_broker_does_not_list_stays_pending_across_a_reconnect() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await lost_bracket_with_a_waiting_modify(h)
+
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+
+        assert len(h.client._brackets) == 1
+        assert "OrderModifyRejected" not in h.kinds_of(STOP)
+        assert status(h, STOP) == OrderStatus.SUBMITTED
+
+
+def moved(event: oa.ProtoOAExecutionEvent, by_ms: int) -> oa.ProtoOAExecutionEvent:
+    """A copy of a recorded event with every timestamp moved by `by_ms`."""
+    copy = oa.ProtoOAExecutionEvent()
+    copy.CopyFrom(event)
+    for message, fields in (
+        (copy.order, ("utcLastUpdateTimestamp",)),
+        (copy.order.tradeData, ("openTimestamp", "closeTimestamp")),
+        (copy.position, ("utcLastUpdateTimestamp",)),
+        (copy.position.tradeData, ("openTimestamp",)),
+        (copy.deal, ("executionTimestamp", "createTimestamp", "utcLastUpdateTimestamp")),
+    ):
+        for name in fields:
+            if message.HasField(name):
+                setattr(message, name, getattr(message, name) + by_ms)
+    return copy
+
+
+def bracket_events() -> tuple[oa.ProtoOAExecutionEvent, ...]:
+    """The bracket's entry accepted, filled a minute ago, and protected, as pushed."""
+    by_ms = int(time.time() * 1000) - 60_000 - FIRST_EVENTS[0].order.utcLastUpdateTimestamp
+    return tuple(moved(e, by_ms) for e in FIRST_EVENTS[:3])
+
+
+def answer_amends(venue: ExecutionVenue, protected: oa.ProtoOAExecutionEvent) -> list:
+    """Answer each level amend as the broker would; returns the amends asked, as they come."""
+    amends: list = []
+
+    def amend(request: oa.ProtoOAAmendPositionSLTPReq) -> oa.ProtoOAExecutionEvent:
+        amends.append(request)
+        answer = oa.ProtoOAExecutionEvent()
+        answer.CopyFrom(protected)
+        answer.executionType = om.ORDER_REPLACED
+        answer.isServerEvent = False
+        answer.order.stopPrice = request.stopLoss
+        answer.order.limitPrice = request.takeProfit
+        answer.order.utcLastUpdateTimestamp += len(amends)
+        answer.position.utcLastUpdateTimestamp += len(amends)
+        return answer
+
+    venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, amend)
+    return amends
+
+
+def entry_listed(venue: ExecutionVenue, filled: oa.ProtoOAExecutionEvent) -> None:
+    """The broker's lists and fill window holding the bracket's filled entry."""
+    entry = om.ProtoOAOrder()
+    entry.CopyFrom(filled.order)
+    venue.position_orders[FIRST] = [entry]
+    venue.position_deals[FIRST] = [filled.deal]
+    venue.deals = [filled.deal]
+
+
+def reconciliation_orders(h: Harness) -> list:
+    """Orders Nautilus made up to align a position with a report; never the broker's."""
+    return [o for o in h.cache.orders() if o.tags and "RECONCILIATION" in o.tags]
+
+
+def legs_stand(h: Harness) -> None:
+    assert status(h, ENTRY) == OrderStatus.FILLED
+    assert status(h, STOP) == OrderStatus.ACCEPTED
+    assert status(h, TARGET) == OrderStatus.ACCEPTED
+    assert [p.id for p in h.cache.positions_open()] == [PositionId(str(FIRST))]
+    assert reconciliation_orders(h) == []
+
+
+async def test_a_fill_held_during_the_reconnect_pass_keeps_its_bracket() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await lost_bracket_with_a_waiting_modify(h)
+        accepted, filled, protected = bracket_events()
+        amends = answer_amends(venue, protected)
+        # The fill window and the lists hold the fill; the snapshot does not, even read again.
+        entry_listed(venue, filled)
+        held = HeldReplies(
+            venue.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        for event in (accepted, filled, protected):
+            await h.server.push(event)
+        await held.stop_holding()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        await wait_until(lambda: len(h.client._brackets) == 0)
+
+        assert h.client._book.view(FIRST).open
+        assert "OrderModifyRejected" not in h.kinds_of(STOP)
+        (sent,) = amends
+        assert sent.stopLoss == 85150.0
+        legs_stand(h)
+        (built,) = h.mass_statuses
+        assert built.order_reports == {}
+        assert any(
+            f"position {FIRST}" in line and "snapshot" in line for line in h.logger.warnings()
+        )
+
+
+# -- One pass reads one moment -------------------------------------------------------------------
+
+
+async def test_a_fill_right_after_the_snapshot_is_left_to_its_events() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await lost_bracket_with_a_waiting_modify(h)
+        accepted, filled, protected = bracket_events()
+        answer_amends(venue, protected)
+
+        def snapshot_then_fill(_request: Message) -> Message:
+            # The entry fills at the broker just after this snapshot is taken.
+            entry_listed(venue, filled)
+            return venue.snapshot
+
+        venue.server.on(om.PROTO_OA_RECONCILE_REQ, snapshot_then_fill)
+
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        for event in (accepted, filled, protected):
+            await h.server.push(event)
+        await wait_until(lambda: len(h.client._brackets) == 0)
+
+        legs_stand(h)
+        (built,) = h.mass_statuses
+        assert built.order_reports == {}
+
+
+async def test_a_position_closed_after_the_snapshot_is_reported_closed() -> None:
+    venue = serving(OPEN_AT)
+    # The by-position lists are read after the stop-loss closed what the snapshot holds open.
+    _, histories, _ = broker_lists(CLOSED_AT)
+    venue.position_orders = {FIRST: list(histories[FIRST].orders)}
+    venue.position_deals = {FIRST: list(histories[FIRST].deals)}
+    async with harness(execution_venue=venue) as h:
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+        )
+        passing = asyncio.create_task(h.client.generate_mass_status())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        # The stop-loss moved by hand, then the protective order filled at it.
+        await push(h, *FIRST_EVENTS[-2:])
+        await held.stop_holding()
+        built = await asyncio.wait_for(passing, timeout=10)
+
+        h.engine.reconcile_execution_mass_status(built)
+        await wait_until(lambda: h.client._buffer is None)
+
+        assert built.position_reports == {}
+        assert status(h, STOP) == OrderStatus.FILLED
+        assert h.cache.order(ClientOrderId(STOP)).trade_ids == [TradeId("7000003")]
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert h.cache.position(PositionId(str(FIRST))).is_closed
+        assert h.cache.positions_open() == []
+        assert reconciliation_orders(h) == []
+
+
+async def test_a_partial_close_after_the_snapshot_sizes_the_position_by_the_lists() -> None:
+    # The snapshot holds the whole position; the lists, read later, a trader's partial close.
+    venue = serving(TP_BACK_AT)
+    _, histories, _ = broker_lists(OPEN_AT)
+    venue.position_orders = {FIRST: list(histories[FIRST].orders)}
+    venue.position_deals = {FIRST: list(histories[FIRST].deals)}
+    async with harness(execution_venue=venue) as h:
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+        )
+        passing = asyncio.create_task(h.client.generate_mass_status())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        # The partial close: accepted, filled, and the protective order resized.
+        await push(h, *FIRST_EVENTS[6:9])
+        await held.stop_holding()
+        built = await asyncio.wait_for(passing, timeout=10)
+
+        h.engine.reconcile_execution_mass_status(built)
+        await wait_until(lambda: h.client._buffer is None)
+
+        (report,) = built.position_reports[US100_ID]
+        assert report.quantity == Quantity.from_str("0.99")
+        assert h.cache.position(PositionId(str(FIRST))).quantity == Quantity.from_str("0.99")
+        assert reconciliation_orders(h) == []
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+        assert status(h, TARGET) == OrderStatus.ACCEPTED
+
+
+async def test_a_position_missing_from_the_snapshot_is_read_again() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    standing = venue.snapshot
+    answers = [oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)]
+    async with harness(execution_venue=venue) as h:
+        # The pass's first snapshot lacks the position its fill window and lists hold open.
+        venue.server.on(
+            om.PROTO_OA_RECONCILE_REQ, lambda _r: answers.pop(0) if answers else standing
+        )
+        before = len(h.received(oa.ProtoOAReconcileReq))
+
+        built = await h.client.generate_mass_status()
+        h.engine.reconcile_execution_mass_status(built)
+
+        assert len(h.received(oa.ProtoOAReconcileReq)) - before == 2
+        (report,) = built.position_reports[US100_ID]
+        assert report.venue_position_id == PositionId(str(OURS))
+        assert h.cache.position(PositionId(str(OURS))).is_open
+        assert reconciliation_orders(h) == []

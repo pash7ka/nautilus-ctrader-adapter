@@ -41,6 +41,7 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import (
+    CTraderAuthError,
     CTraderConnectionError,
     CTraderProtocolError,
     CTraderRequestError,
@@ -577,6 +578,30 @@ async def test_a_failed_connect_republishes_no_reloaded_instrument() -> None:
         await wait_until(lambda: reloaded, description="EURUSD reloaded")
 
         assert not republished(h.published[before:], EURUSD_ID)
+
+
+async def test_failed_connect_does_not_release_the_account_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    async with harness() as h:
+        # Another client of the same account, whose session is reconnecting and refused.
+        await h.account.connect()
+        h.server.on(
+            om.PROTO_OA_ACCOUNT_AUTH_REQ,
+            lambda _r: oa.ProtoOAErrorRes(errorCode="RET_ACCOUNT_DISABLED"),
+        )
+        await h.server.drop_connections()
+        await wait_until(lambda: not h.account.session.is_ready, description="loss noticed")
+
+        with pytest.raises(CTraderAuthError):
+            await h.client._connect()
+        # What Nautilus does after a failed connect, and again when the node stops.
+        await h.client._disconnect()
+        await h.client._disconnect()
+
+        assert h.account._users == 1
+        assert h.account.session is not None
 
 
 async def test_connect_re_queries_the_conversion_chain_every_time() -> None:

@@ -31,25 +31,69 @@ def test_ending_an_amend_never_begun_changes_nothing() -> None:
     assert not table.amending(1)
 
 
+# The newest broker time the node had seen when it sent the close.
+ANCHOR = 1_000
+LATER = ANCHOR + 1
+ORDER = 6_000_001
+
+
 def test_a_close_is_found_by_its_position_and_volume_until_it_ends() -> None:
     table = OperationsInFlight()
-    table.begin_close("O-C-1", 1, 100)
+    table.begin_close("O-C-1", 1, 100, ANCHOR)
 
-    assert table.closing(1, 100) == "O-C-1"
-    assert table.closing(1, 50) is None
-    assert table.closing(2, 100) is None
+    assert table.closing(1, 100, LATER, ORDER) == "O-C-1"
+    assert table.closing(1, 50, LATER, ORDER) is None
+    assert table.closing(2, 100, LATER, ORDER) is None
     table.end_close("O-C-1")
-    assert table.closing(1, 100) is None
+    assert table.closing(1, 100, LATER, ORDER) is None
+
+
+def test_a_close_takes_no_broker_order_created_by_the_time_it_was_sent() -> None:
+    table = OperationsInFlight()
+    table.begin_close("O-C-1", 1, 100, ANCHOR)
+
+    assert table.closing(1, 100, ANCHOR, ORDER) is None
+    assert table.closing(1, 100, ANCHOR - 60_000, ORDER) is None
+    assert table.closing(1, 100, LATER, ORDER) == "O-C-1"
+
+
+def test_a_close_sent_before_any_broker_time_has_no_bound() -> None:
+    table = OperationsInFlight()
+    table.begin_close("O-C-1", 1, 100, -1)
+
+    assert table.closing(1, 100, 0, ORDER) == "O-C-1"
+
+
+def test_the_order_a_close_s_own_answer_names_is_the_close_s_whatever_its_time() -> None:
+    table = OperationsInFlight()
+    table.begin_close("O-C-1", 1, 100, ANCHOR)
+    table.answered("O-C-1", ORDER)
+
+    assert table.closing(1, 100, ANCHOR - 60_000, ORDER) == "O-C-1"
+    # Answered with that order, the close takes no other.
+    assert table.closing(1, 100, LATER, ORDER + 1) is None
+    table.end_close("O-C-1")
+    assert table.closing(1, 100, ANCHOR - 60_000, ORDER) is None
+
+
+def test_a_close_in_flight_names_its_position_until_it_ends() -> None:
+    table = OperationsInFlight()
+    table.begin_close("O-C-1", 1, 100, ANCHOR)
+
+    assert table.close_position("O-C-1") == 1
+    assert table.close_position("O-C-2") is None
+    table.end_close("O-C-1")
+    assert table.close_position("O-C-1") is None
 
 
 def test_two_closes_of_one_volume_are_matched_one_at_a_time() -> None:
     table = OperationsInFlight()
-    table.begin_close("O-C-1", 1, 100)
-    table.begin_close("O-C-2", 1, 100)
+    table.begin_close("O-C-1", 1, 100, ANCHOR)
+    table.begin_close("O-C-2", 1, 100, ANCHOR)
 
-    assert table.closing(1, 100) == "O-C-1"
+    assert table.closing(1, 100, LATER, ORDER) == "O-C-1"
     table.end_close("O-C-1")
-    assert table.closing(1, 100) == "O-C-2"
+    assert table.closing(1, 100, LATER, ORDER) == "O-C-2"
 
 
 def bracket(entry: str = "O-E") -> PendingBracket:
