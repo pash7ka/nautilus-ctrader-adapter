@@ -22,8 +22,8 @@ class OperationsInFlight:
 
     def __init__(self) -> None:
         self._amends: dict[int, int] = {}
-        # Client order id of each close -> (position id, venue volume).
-        self._closes: dict[str, tuple[int, int]] = {}
+        # Client order id of each close -> (position id, venue volume, sent at in ms).
+        self._closes: dict[str, tuple[int, int, int]] = {}
 
     def begin_amend(self, position_id: int) -> None:
         self._amends[position_id] = self._amends.get(position_id, 0) + 1
@@ -38,8 +38,11 @@ class OperationsInFlight:
     def amending(self, position_id: int) -> bool:
         return position_id in self._amends
 
-    def begin_close(self, client_order_id: str, position_id: int, volume: int) -> None:
-        self._closes[client_order_id] = (position_id, volume)
+    def begin_close(
+        self, client_order_id: str, position_id: int, volume: int, sent_ms: int
+    ) -> None:
+        """Record a close sent at `sent_ms`, on the node's clock."""
+        self._closes[client_order_id] = (position_id, volume, sent_ms)
 
     def end_close(self, client_order_id: str) -> None:
         """Forget a close: answered, refused, or matched to its broker order."""
@@ -50,9 +53,10 @@ class OperationsInFlight:
         close = self._closes.get(client_order_id)
         return None if close is None else close[0]
 
-    def closing(self, position_id: int, volume: int) -> str | None:
-        for client_order_id, close in self._closes.items():
-            if close == (position_id, volume):
+    def closing(self, position_id: int, volume: int, created_ms: int) -> str | None:
+        for client_order_id, (close_position, close_volume, sent_ms) in self._closes.items():
+            # A broker order created before the close was sent is somebody else's.
+            if (close_position, close_volume) == (position_id, volume) and sent_ms <= created_ms:
                 return client_order_id
         return None
 

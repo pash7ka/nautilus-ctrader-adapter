@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from decimal import Decimal
 
 import pytest
@@ -663,10 +664,16 @@ def market_events() -> list:
 
 
 def close_events() -> list:
-    """The node's close of that position, accepted then filled (hand-built)."""
+    """The node's close of that position, accepted then filled (hand-built).
+
+    The closing order is created now: one created before the node sent its close is not its.
+    """
+    created = int(time.time() * 1000)
 
     def order(utc: int) -> om.ProtoOAOrder:
-        return make_order(6_100_002, MARKET_POSITION, side=om.SELL, closing=True, utc=utc)
+        found = make_order(6_100_002, MARKET_POSITION, side=om.SELL, closing=True, utc=utc)
+        found.tradeData.openTimestamp = created
+        return found
 
     deal = make_deal(
         7_100_002,
@@ -933,7 +940,7 @@ async def test_a_close_names_its_position_and_fills_under_its_own_id() -> None:
         assert request.volume == 100
         assert h.kinds_of(CLOSE_ID) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
         assert h.cache.position(PositionId(str(MARKET_POSITION))).is_closed
-        assert h.client._operations.closing(MARKET_POSITION, 100) is None
+        assert h.client._operations.close_position(CLOSE_ID) is None
         # The node's own close is never reported as somebody else's order.
         assert h.reports == []
 
@@ -966,7 +973,7 @@ async def test_a_close_is_refused_unsent_while_the_connection_is_down() -> None:
         assert rejection(h, CLOSE_ID) == "not connected to the venue"
         assert h.kinds_of(CLOSE_ID) == ["OrderRejected"]
         assert h.received(oa.ProtoOAClosePositionReq) == []
-        assert h.client._operations.closing(MARKET_POSITION, 100) is None
+        assert h.client._operations.close_position(CLOSE_ID) is None
 
 
 async def test_a_close_that_would_add_to_the_position_is_refused() -> None:
@@ -994,7 +1001,7 @@ async def test_a_close_the_broker_refuses_is_rejected_and_no_longer_in_flight() 
         await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
 
         assert rejection(h, CLOSE_ID) == "POSITION_NOT_FOUND: gone"
-        assert h.client._operations.closing(MARKET_POSITION, 100) is None
+        assert h.client._operations.close_position(CLOSE_ID) is None
 
 
 AMEND_FROM = 1_600_000_200_000

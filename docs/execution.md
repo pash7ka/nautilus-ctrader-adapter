@@ -505,7 +505,9 @@ sign flipped to Nautilus's convention (a charge is positive).
 - **A manual change at the same moment as the node's own is taken for the node's.** The adapter
   tells a trader's change from its own by what it has in flight: a level amend of that position,
   or a close of that volume on that position. A trader's change landing while one is in flight is
-  read as the answer to it. This includes a close whose answer was lost: until the next successful
+  read as the answer to it. For a close, only a closing order the broker created no earlier than
+  the node sent its close can be taken, judged by the broker's creation time against the node's
+  clock. This includes a close whose answer was lost: until the next successful
   reconnect pass, a trader's close of the same volume on that position during the outage is taken
   for the node's.
 - **A level re-added by hand after its leg was cancelled is adopted after a restart.** After a

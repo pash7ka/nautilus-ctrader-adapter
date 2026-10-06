@@ -8,6 +8,7 @@ volume precision, and to the fake account; nothing else changes.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -566,6 +567,21 @@ def our_market_position(venue: ExecutionVenue, *, opened: int, closed: int | Non
     venue.deals = on_us100(deals)
 
 
+def answer_closes(venue: ExecutionVenue) -> list[oa.ProtoOAExecutionEvent]:
+    """Answer the node's close with its acceptance, made when the close arrives.
+
+    Returns the list that then holds the close's events, accepted and filled.
+    """
+    made: list[oa.ProtoOAExecutionEvent] = []
+
+    def answer(_request: Message) -> Message:
+        made[:] = node_close_events(closed=int(time.time() * 1000))
+        return made[0]
+
+    venue.server.on(om.PROTO_OA_CLOSE_POSITION_REQ, answer)
+    return made
+
+
 async def close_sent(h: Harness) -> asyncio.Task:
     """The node's close of `OURS`, sent; returns the task awaiting its answer."""
     position_id = PositionId(str(OURS))
@@ -594,12 +610,18 @@ async def close_sent(h: Harness) -> asyncio.Task:
 
 
 def node_close_events(*, closed: int) -> list[oa.ProtoOAExecutionEvent]:
-    """The node's close of `OURS` accepted, then filled at `closed` (hand-built)."""
+    """The node's close of `OURS` created and accepted, then filled, at `closed` (hand-built).
+
+    The broker takes a closing order for the node's close only if it was created no earlier
+    than the close was sent, so `closed` must not precede the send.
+    """
 
     def order(utc: int) -> om.ProtoOAOrder:
-        return make_order(
+        found = make_order(
             6_300_002, OURS, side=om.SELL, closing=True, utc=utc, symbol=US100_SYMBOL_ID
         )
+        found.tradeData.openTimestamp = closed
+        return found
 
     def position(utc: int, status: int = om.POSITION_STATUS_OPEN) -> om.ProtoOAPosition:
         found = make_position(
@@ -622,7 +644,7 @@ def node_close_events(*, closed: int) -> list[oa.ProtoOAExecutionEvent]:
     )
     return on_us100(
         [
-            make_event(om.ORDER_ACCEPTED, order(closed - 1), position=position(closed - 1)),
+            make_event(om.ORDER_ACCEPTED, order(closed), position=position(closed)),
             make_event(
                 om.ORDER_FILLED,
                 order(closed),

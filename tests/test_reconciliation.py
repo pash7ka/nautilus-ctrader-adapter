@@ -200,7 +200,7 @@ class OneClose:
     def amending(self, position_id: int) -> bool:
         return False
 
-    def closing(self, position_id: int, volume: int) -> str | None:
+    def closing(self, position_id: int, volume: int, created_ms: int) -> str | None:
         return self._close_id if (position_id, volume) == self._close else None
 
 

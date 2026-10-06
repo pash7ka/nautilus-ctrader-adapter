@@ -10,6 +10,7 @@ from decimal import Decimal
 
 import pytest
 
+from nautilus_ctrader.common.operations import OperationsInFlight
 from nautilus_ctrader.common.order_record import LegIds, encode_comment, encode_label
 from nautilus_ctrader.common.venue_book import VenueBook
 from nautilus_ctrader.common.venue_records import (
@@ -57,7 +58,7 @@ class Closing(NoOperations):
     def __init__(self, client_order_id: str) -> None:
         self.client_order_id = client_order_id
 
-    def closing(self, position_id: int, volume: int) -> str | None:
+    def closing(self, position_id: int, volume: int, created_ms: int) -> str | None:
         return self.client_order_id
 
 
@@ -445,6 +446,21 @@ def test_a_level_added_back_under_a_new_protective_order_is_the_traders() -> Non
     view = b.view(P)
     assert view.protective_order_id == 9_100_009
     assert view.legs[Level.STOP_LOSS] == (stop_id(P), False)
+
+
+def test_a_close_created_before_the_node_sent_its_own_is_not_the_nodes() -> None:
+    b = book()
+    opened(b)
+    table = OperationsInFlight()
+    table.begin_close("O-C", P, 100, 50)
+    earlier = make_order(9_100_003, P, side=om.SELL, closing=True, utc=40)
+    later = make_order(9_100_004, P, side=om.SELL, closing=True, utc=50)
+
+    trader = b.apply(make_event(om.ORDER_ACCEPTED, earlier, position=make_position(P)), table)
+    node = b.apply(make_event(om.ORDER_ACCEPTED, later, position=make_position(P)), table)
+
+    assert not any(isinstance(r, OrderEvent) and r.client_order_id == "O-C" for r in trader)
+    assert node == [OrderEvent(OrderEventKind.ACCEPTED, "9100004", "O-C", 50)]
 
 
 def test_the_nodes_own_close_is_reported_under_its_id_to_the_end() -> None:

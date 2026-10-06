@@ -1409,7 +1409,9 @@ class CTraderExecutionClient(LiveExecutionClient):
             return
         client_order_id = order.client_order_id.value
         # In flight before it leaves, so the broker's events of the close are matched to it.
-        self._operations.begin_close(client_order_id, position_id, request.volume)
+        self._operations.begin_close(
+            client_order_id, position_id, request.volume, self._clock.timestamp_ms()
+        )
         self.generate_order_submitted(
             order.strategy_id,
             order.instrument_id,

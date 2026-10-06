@@ -298,9 +298,11 @@ class Operations(Protocol):
         """Whether the node's own level amend of that position is in flight."""
         ...
 
-    def closing(self, position_id: int, volume: int) -> str | None:
+    def closing(self, position_id: int, volume: int, created_ms: int) -> str | None:
         """The client order id of the node's close of `volume` on that position, if in flight.
 
-        The id identifies one close; the execution client consumes it once matched.
+        Only a close sent at or before `created_ms`, the broker's creation time of the closing
+        order, is returned. The id identifies one close; the execution client consumes it once
+        matched.
         """
         ...

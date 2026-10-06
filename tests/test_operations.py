@@ -31,20 +31,31 @@ def test_ending_an_amend_never_begun_changes_nothing() -> None:
     assert not table.amending(1)
 
 
+SENT = 1_000
+
+
 def test_a_close_is_found_by_its_position_and_volume_until_it_ends() -> None:
     table = OperationsInFlight()
-    table.begin_close("O-C-1", 1, 100)
+    table.begin_close("O-C-1", 1, 100, SENT)
 
-    assert table.closing(1, 100) == "O-C-1"
-    assert table.closing(1, 50) is None
-    assert table.closing(2, 100) is None
+    assert table.closing(1, 100, SENT) == "O-C-1"
+    assert table.closing(1, 50, SENT) is None
+    assert table.closing(2, 100, SENT) is None
     table.end_close("O-C-1")
-    assert table.closing(1, 100) is None
+    assert table.closing(1, 100, SENT) is None
+
+
+def test_a_close_takes_no_broker_order_created_before_it_was_sent() -> None:
+    table = OperationsInFlight()
+    table.begin_close("O-C-1", 1, 100, SENT)
+
+    assert table.closing(1, 100, SENT - 1) is None
+    assert table.closing(1, 100, SENT + 1) == "O-C-1"
 
 
 def test_a_close_in_flight_names_its_position_until_it_ends() -> None:
     table = OperationsInFlight()
-    table.begin_close("O-C-1", 1, 100)
+    table.begin_close("O-C-1", 1, 100, SENT)
 
     assert table.close_position("O-C-1") == 1
     assert table.close_position("O-C-2") is None
@@ -54,12 +65,12 @@ def test_a_close_in_flight_names_its_position_until_it_ends() -> None:
 
 def test_two_closes_of_one_volume_are_matched_one_at_a_time() -> None:
     table = OperationsInFlight()
-    table.begin_close("O-C-1", 1, 100)
-    table.begin_close("O-C-2", 1, 100)
+    table.begin_close("O-C-1", 1, 100, SENT)
+    table.begin_close("O-C-2", 1, 100, SENT)
 
-    assert table.closing(1, 100) == "O-C-1"
+    assert table.closing(1, 100, SENT) == "O-C-1"
     table.end_close("O-C-1")
-    assert table.closing(1, 100) == "O-C-2"
+    assert table.closing(1, 100, SENT) == "O-C-2"
 
 
 def bracket(entry: str = "O-E") -> PendingBracket:

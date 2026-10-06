@@ -14,6 +14,7 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.venue_book import (
     EXTERNAL_TYPE,
+    created_of,
     entry_of,
     levels_of,
     remaining_of,
@@ -296,7 +297,7 @@ def _close_id(
     close_id = known_closes.get(order.orderId)
     # A stop-out is the broker's own close, never the node's.
     if close_id is None and ask and not order.isStopOut:
-        candidate = operations.closing(order.positionId, order.tradeData.volume)
+        candidate = operations.closing(order.positionId, order.tradeData.volume, created_of(order))
         if candidate is not None and candidate not in claimed:
             claimed.add(candidate)
             close_id = candidate
