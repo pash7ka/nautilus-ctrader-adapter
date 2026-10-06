@@ -349,8 +349,9 @@ class CTraderExecutionClient(LiveExecutionClient):
                 now_ms=self._clock.timestamp_ms,
                 log=self._log,
             )
-            # Written before the node reconciles and its trader starts.
-            await self._checkpoint.refresh(trader, at_start=True)
+            # Written before the node reconciles and its trader starts. A connection lost
+            # meanwhile leaves the key to the reconnect pass.
+            await self._checkpoint.refresh(trader, bounded=True)
             self._checkpoint.schedule()
             # The first bring-up has run its restores already; this one serves every later one.
             session.add_restore(self._restore_key, self._reload)
@@ -418,9 +419,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._emit_account_state(self._clock.timestamp_ns())
 
     async def _refresh_checkpoint(self, trader: om.ProtoOATrader) -> None:
-        # With no hour, the off value written at connect stands.
+        # With no hour, the off value written at connect stands. Bounded like the start's: the
+        # execution events wait on it.
         if self._checkpoint is not None and self._config.balance_checkpoint_hour is not None:
-            await self._checkpoint.refresh(trader, at_start=False)
+            await self._checkpoint.refresh(trader, bounded=True)
 
     def _end_lost_closes(self) -> None:
         for client_order_id in self._lost_closes:

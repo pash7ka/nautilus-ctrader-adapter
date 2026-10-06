@@ -7,12 +7,13 @@ each checkpoint:
   the rule has its answer, at most 156 weeks.
 - **The first-deposit walk** reads cash flows a week at a time, forward from the account's
   registration, until it finds the deposit; what it finds is kept for the session.
-- **At start** each walk reads at most 8 weeks, so the start is not held up. The key is written
-  with what is known (`history incomplete`, or no first deposit yet), and the walks finish in
-  the background, writing the key again.
+- **At start and on a reconnect** each walk reads at most 8 weeks, so neither is held up. The
+  key is written with what is known (`history incomplete`, or no first deposit yet), and the
+  walks finish in the background, writing the key again.
 
 A walk cut short by a lost connection writes nothing: the key keeps its previous value, with its
-own checkpoint, until the reconnect writes it.
+own checkpoint, until the reconnect writes it. Nor does a walk whose checkpoint has been
+overtaken by the next one: the newer value stands.
 """
 
 from __future__ import annotations
@@ -122,18 +123,21 @@ class BalanceCheckpoint:
         # Where the first-deposit walk goes on from; `None` until it starts.
         self._deposit_from_ms: int | None = None
         self._deposit_windows = 0
+        # Overlapping refreshes share the walk, so none reads a window twice or counts it twice.
+        self._deposit_lock = asyncio.Lock()
 
-    async def refresh(self, trader: om.ProtoOATrader, *, at_start: bool) -> None:
+    async def refresh(self, trader: om.ProtoOATrader, *, bounded: bool) -> None:
         """Write the balance at the most recent checkpoint, `trader` being read just before.
 
-        A walk still running in the background is given up for this one. At start the walks are
-        bounded and go on in the background; otherwise they run to their end here.
+        A walk still running in the background is given up for this one. `bounded` walks 8
+        windows each here and the rest in the background; otherwise the walks run to their end
+        here. Never raises but for cancellation: a failure is written as `history request failed`.
         """
         self._cancel_task()
         if self._hour is None:
             self._write(value_json(OFF, None))
             return
-        await self._run(trader, at_start=at_start)
+        await self._run(trader, bounded=bounded)
 
     def schedule(self) -> None:
         """Arm the timer for the next checkpoint plus the grace; it recomputes the checkpoint."""
@@ -159,11 +163,11 @@ class BalanceCheckpoint:
 
     def _fire(self, t_ms: int) -> None:
         self._timer = None
-        # From the checkpoint just due, not the clock: a wall clock behind the loop's would
-        # otherwise arm the same checkpoint again.
-        self._arm(t_ms)
+        # Not before the checkpoint just due: a wall clock behind the loop's would otherwise arm
+        # it again.
+        self._arm(max(t_ms, self._now_ms() - GRACE_MS))
         self._cancel_task()
-        self._start_task(self._run(None, at_start=False))
+        self._start_task(self._run(None, bounded=False))
 
     def _start_task(self, work) -> None:
         self._task = self._loop.create_task(work)
@@ -178,14 +182,14 @@ class BalanceCheckpoint:
             self._task.cancel()
             self._task = None
 
-    async def _run(self, trader: om.ProtoOATrader | None, *, at_start: bool) -> None:
+    async def _run(self, trader: om.ProtoOATrader | None, *, bounded: bool) -> None:
         assert self._hour is not None
         now = self._now_ms()
         t_ms = _ms(checkpoint_at(_moment(now), self._hour, self._zone))
         walk = _Walk(t_ms, upper_ms=now, covered_from_ms=now)
-        limit = START_WINDOWS if at_start else MAX_WINDOWS
+        limit = START_WINDOWS if bounded else MAX_WINDOWS
         trader = await self._settle(walk, trader, limit)
-        if trader is not None and at_start and self._unfinished(walk, trader):
+        if trader is not None and bounded and self._unfinished(walk, trader):
             self._start_task(self._settle(walk, trader, MAX_WINDOWS))
 
     async def _settle(
@@ -193,7 +197,8 @@ class BalanceCheckpoint:
     ) -> om.ProtoOATrader | None:
         """Walk up to `limit` windows each and write the key; returns the trader it read first.
 
-        Writes nothing and returns `None` when the connection is lost.
+        Writes nothing and returns `None` when the connection is lost, or when a later
+        checkpoint is due by the time the value is known.
         """
         digits = None
         try:
@@ -215,6 +220,16 @@ class BalanceCheckpoint:
             value = CheckpointValue(
                 "unavailable", walk.t_ms, None, Reason.REQUEST_FAILED, None, digits
             )
+        except Exception as e:
+            self._log.exception("Balance checkpoint could not be rebuilt", e)
+            walk.failure = Reason.REQUEST_FAILED
+            value = CheckpointValue(
+                "unavailable", walk.t_ms, None, Reason.REQUEST_FAILED, None, digits
+            )
+        assert self._hour is not None
+        if _ms(checkpoint_at(_moment(self._now_ms()), self._hour, self._zone)) != walk.t_ms:
+            self._log.debug("Balance checkpoint dropped: a later checkpoint is due")
+            return None
         if trader is not None:
             value = self._with_deposit(value, _registration(trader))
         self._write(value_json(value, self._currency))
@@ -269,11 +284,15 @@ class BalanceCheckpoint:
 
     async def _read(self, walk: _Walk, start: int, end: int) -> None:
         """Add one window's closing deals and cash flows to `walk`."""
+        # TODO(verify): whether a list includes items exactly at a window's edges; both edges are
+        # assumed, and a repeat is dropped by its id.
         deals, complete = await deals_between(self._request, self._account_id, start, end)
         if not complete:
             self._log.warning("Balance checkpoint: a deal list did not end; history incomplete")
             walk.failure = Reason.INCOMPLETE
             return
+        # TODO(verify): that the cash-flow list has no pages and takes at most a week, as the
+        # schema states; a week with many operations shows whether a list is cut.
         response = await self._request(
             oa.ProtoOACashFlowHistoryListReq(
                 ctidTraderAccountId=self._account_id, fromTimestamp=start, toTimestamp=end
@@ -291,6 +310,12 @@ class BalanceCheckpoint:
             walk.failure = Reason.NO_CHAIN if e.field == "balanceVersion" else Reason.MIXED_SCALES
 
     async def _walk_deposit(self, registration_ms: int | None, limit: int) -> None:
+        async with self._deposit_lock:
+            await self._walk_deposit_locked(registration_ms, limit)
+
+    async def _walk_deposit_locked(self, registration_ms: int | None, limit: int) -> None:
+        # TODO(verify): that an account's first funding is a `BALANCE_DEPOSIT`; one recorded
+        # account only.
         if not self._deposit_unfinished(registration_ms):
             return
         if self._deposit_from_ms is None:
