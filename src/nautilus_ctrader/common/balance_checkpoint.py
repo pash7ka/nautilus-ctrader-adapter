@@ -119,6 +119,9 @@ class BalanceCheckpoint:
         self._log = log
         self._timer: asyncio.TimerHandle | None = None
         self._task: asyncio.Task | None = None
+        # Set for good by `stop()`: a refresh still running then writes nothing, so it starts no
+        # background walk either.
+        self._stopped = False
         self._deposit: BalanceChange | None = None
         # Where the first-deposit walk goes on from; `None` until it starts.
         self._deposit_from_ms: int | None = None
@@ -133,7 +136,8 @@ class BalanceCheckpoint:
 
         A walk still running in the background is given up for this one. `bounded` walks 8
         windows each here and the rest in the background; otherwise the walks run to their end
-        here. Never raises but for cancellation: a failure is written as `history request failed`.
+        here. Never raises but for cancellation: a failed history request is written as
+        `history request failed`, and a failed write is logged.
         """
         self._cancel_task()
         if self._hour is None:
@@ -143,12 +147,13 @@ class BalanceCheckpoint:
 
     def schedule(self) -> None:
         """Arm the timer for the next checkpoint plus the grace; it recomputes the checkpoint."""
-        if self._hour is not None:
+        if self._hour is not None and not self._stopped:
             # A checkpoint whose grace has not yet run out is still the next one due.
             self._arm(self._now_ms() - GRACE_MS)
 
     def stop(self) -> None:
-        """Cancel the timer and any walk in progress."""
+        """Cancel the timer and any walk in progress; nothing is written or started after this."""
+        self._stopped = True
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
@@ -168,10 +173,11 @@ class BalanceCheckpoint:
         # Not before the checkpoint just due: a wall clock behind the loop's would otherwise arm
         # it again.
         self._arm(max(t_ms, self._now_ms() - GRACE_MS))
-        self._cancel_task()
         self._start_task(self._run(None, bounded=False))
 
     def _start_task(self, work) -> None:
+        # One walk in the background at a time: an orphan would outlive `stop()`.
+        self._cancel_task()
         self._task = self._loop.create_task(work)
         self._task.add_done_callback(self._task_done)
 
@@ -228,14 +234,21 @@ class BalanceCheckpoint:
             value = CheckpointValue(
                 "unavailable", walk.t_ms, None, Reason.REQUEST_FAILED, None, digits
             )
+        if self._stopped:
+            self._log.debug("Balance checkpoint dropped: stopped")
+            return None
         # A value for its own checkpoint stands even once a later one is due, until that one
         # is written.
         if self._written_ms is not None and self._written_ms > walk.t_ms:
             self._log.debug("Balance checkpoint dropped: a later checkpoint is written")
             return None
-        if trader is not None:
-            value = self._with_deposit(value, _registration(trader))
-        self._write(value_json(value, self._currency))
+        try:
+            if trader is not None:
+                value = self._with_deposit(value, _registration(trader))
+            self._write(value_json(value, self._currency))
+        except Exception as e:
+            self._log.exception("Balance checkpoint could not be written", e)
+            return None
         self._written_ms = walk.t_ms
         reason = "" if value.reason is None else f" ({value.reason.value})"
         self._log.info(f"Balance checkpoint written: {value.status}{reason}")

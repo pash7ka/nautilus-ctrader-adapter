@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from functools import partial
 from zoneinfo import ZoneInfo
 
+from nautilus_trader.cache.cache import Cache
+
 from nautilus_ctrader import execution
 from nautilus_ctrader.common import balance_checkpoint
 from nautilus_ctrader.common.balance_checkpoint import BalanceCheckpoint
@@ -496,3 +498,92 @@ async def test_an_item_without_a_scale_is_mixed_scales() -> None:
         assert key(h)["reason"] == "mixed money scales"
         assert key(h)["first_deposit"] is None
         assert any("moneyDigits" in line for line in h.logger.warnings())
+
+
+def gated(h, gates: dict) -> object:
+    """The harness's request, held while the asking task is a key of `gates` and its gate shut."""
+    plain = partial(h.client._request, bucket=BUCKET_HISTORICAL)
+
+    async def request(payload):
+        gate = gates.get(asyncio.current_task())
+        if gate is not None:
+            await gate.wait()
+        return await plain(payload)
+
+    return request
+
+
+async def test_a_task_replaced_by_a_continuation_is_cancelled() -> None:
+    t_ms = last_t()
+    last_at = t_ms - 12 * WEEK_MS
+    venue = history_venue(last_at=last_at, registration=deposit_at(last_at) - 20 * WEEK_MS)
+    async with harness(execution_venue=venue) as h:
+        gates: dict = {}
+        written: list[bytes] = []
+        checkpoint = direct(h, {"now": now_ms()}, written, gated(h, gates))
+        inline_gate, timer_gate = asyncio.Event(), asyncio.Event()
+        try:
+            inline = asyncio.create_task(checkpoint.refresh(venue.trader.trader, bounded=True))
+            gates[inline] = inline_gate
+            await asyncio.sleep(0)
+            # The timer fires while the reconnect's bounded refresh is still reading.
+            checkpoint._fire(t_ms)
+            timer_task = checkpoint._task
+            gates[timer_task] = timer_gate
+            inline_gate.set()
+            await asyncio.wait_for(inline, timeout=5)
+            assert checkpoint._task is not timer_task
+
+            checkpoint.stop()
+            count = len(written)
+            timer_gate.set()
+            await asyncio.wait_for(asyncio.gather(timer_task, return_exceptions=True), timeout=20)
+
+            assert timer_task.cancelled()
+            assert len(written) == count
+        finally:
+            timer_gate.set()
+            checkpoint.stop()
+
+
+async def test_a_stopped_checkpoint_starts_no_background_walk() -> None:
+    t_ms = last_t()
+    last_at = t_ms - 12 * WEEK_MS
+    venue = history_venue(last_at=last_at, registration=deposit_at(last_at) - 20 * WEEK_MS)
+    async with harness(execution_venue=venue) as h:
+        gates: dict = {}
+        written: list[bytes] = []
+        checkpoint = direct(h, {"now": now_ms()}, written, gated(h, gates))
+        gate = asyncio.Event()
+        try:
+            inline = asyncio.create_task(checkpoint.refresh(venue.trader.trader, bounded=True))
+            gates[inline] = gate
+            await asyncio.sleep(0)
+
+            checkpoint.stop()
+            gate.set()
+            await asyncio.wait_for(inline, timeout=5)
+
+            assert checkpoint._task is None
+            assert written == []
+        finally:
+            gate.set()
+            checkpoint.stop()
+
+
+async def test_a_failed_checkpoint_write_is_logged_and_connect_succeeds() -> None:
+    class FailingCache(Cache):
+        def add(self, key: str, value: bytes) -> None:
+            if key == BALANCE_CHECKPOINT_KEY:
+                raise RuntimeError("cache unavailable")
+            super().add(key, value)
+
+    venue = history_venue(last_at=last_t() - DAY_MS)
+    async with harness(
+        execution_venue=venue, config=config(), connect=False, cache=FailingCache()
+    ) as h:
+        await h.client._connect()
+
+        assert h.client._checkpoint is not None
+        assert h.cache.get(BALANCE_CHECKPOINT_KEY) is None
+        assert any("could not be written" in line for line in h.logger.errors())
