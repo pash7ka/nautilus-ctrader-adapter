@@ -149,8 +149,12 @@ assumption to a fact.
 
 ## 8. Secrets and logging
 
-- `clientId`, `clientSecret`, access and refresh tokens, and account identifiers never appear
-  in the repository, in test fixtures, in log output, or in error messages.
+- `clientId`, `clientSecret`, and access and refresh tokens never appear in the repository, in
+  test fixtures, in log output, or in error messages.
+- Account identifiers (the trader login, the protocol's `ctidTraderAccountId`) grant nothing,
+  so they may appear in log output and error messages at run time. The Nautilus `AccountId`
+  carries the trader login. Real account numbers still never appear in committed content:
+  code, tests, fixtures, docs and commit messages use obviously fake values.
 - The transport layer never logs payload bytes, only payload type, correlation id and
   length. That one structural guarantee replaces masking, so it cannot be forgotten at a call
   site.
