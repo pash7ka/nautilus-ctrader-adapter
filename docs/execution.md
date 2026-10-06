@@ -45,7 +45,7 @@ legs of a refused bracket are cancelled, so a refused bracket is one rejection a
 | A stop-loss with a trigger type other than the default; a take-profit with a display quantity | The venue has no such level |
 | A level at or beyond the market, or off the instrument's price grid | It has no valid distance from the fill |
 | A bracket with no spot price newer than `reference_price_max_age_secs` | The levels cannot be measured (see below) |
-| A client order id longer than 50 characters, or with a space, a `|` or a non-ASCII character | It must fit the venue's fields (see [Restarts](#4-restarts-and-reconnects)) |
+| A client order id longer than 50 characters, or with a space, a vertical bar or a non-ASCII character | It must fit the venue's fields (see [Restarts](#4-restarts-and-reconnects)) |
 | A new order or close while the connection is down | Nothing can be sent |
 
 An order or a close that was sent and got **no answer** within `order_request_timeout_secs` is
@@ -55,7 +55,8 @@ A level amend, which sets the whole state of a position's levels, is the one req
 repeated, up to three times.
 
 A refusal by the broker is an `OrderRejected` (or `OrderCancelRejected`, `OrderModifyRejected`)
-whose reason is the broker's error code and description. It never carries an account number.
+whose reason is the broker's error code and description. The adapter adds no account identifier
+to it; whether the broker's own text could contain one is not confirmed.
 
 ## 2. Brackets and legs
 
@@ -154,8 +155,9 @@ connection, and the connection settings of the first config built for the accoun
 | `balance_checkpoint_timezone` | `"UTC"` | The IANA time zone `balance_checkpoint_hour` is in |
 
 The config refuses, with a `ValueError`: an `instrument_provider`, an `environment` other than
-the three above, a duration or `reconciliation_default_lookback_mins` that is not positive, an
-hour outside 0 to 23, and an unknown time zone.
+the three above, a value that is not positive in `reference_price_max_age_secs`,
+`protective_order_timeout_secs`, `order_request_timeout_secs` or
+`reconciliation_default_lookback_mins`, an hour outside 0 to 23, and an unknown time zone.
 
 The in-flight check belongs to Nautilus's `LiveExecEngineConfig`, not to this config; see
 [section 5](#5-order-queries-and-in-flight-settings) for the values to set there.
@@ -170,8 +172,8 @@ One pass reads the broker, in this order:
 2. The deals of the fill window, which covers `lookback_mins` when Nautilus passes one and
    `reconciliation_default_lookback_mins` otherwise.
 3. For each position that is open or has a deal in the window, its own order list and deal list.
-   A position on an instrument that is not loaded gets no deal list, and a closed one is not read
-   at all.
+   A position on an instrument that is not loaded gets no deal list, and a closed position on
+   such an instrument is not read at all.
 
 The venue model is rebuilt from that same snapshot. The request count is logged at INFO. The
 history lists use the historical rate-limit bucket, so they never queue ahead of orders.
@@ -520,6 +522,11 @@ it. The main groups:
 - **Events not yet seen**: a stop-out and how it is flagged; a trader-update and a margin-change
   event; a protective order that triggers partially, and whether a partly filled protective order
   reports its total volume or its rest.
+- **Matching the node's close**: whether the broker's closing order carries the volume the node's
+  close asked for. The match of a close to the node's order rests on it.
+- **Rejected orders**: whether a rejected order carries a position id.
+- **Error text**: whether the broker's description of a refusal can ever contain an account
+  identifier. The adapter adds none, but it passes the broker's text through.
 - **History lists**: the order lists come in, which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
   whether the edges of a window are inclusive, and whether the cash-flow list has no pages and
