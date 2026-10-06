@@ -420,7 +420,8 @@ value.
 
 **Timing.** The key is written at connect, before the connect returns and so before the node
 reconciles and the trader starts; again on every reconnect; and by a timer at the checkpoint plus
-30 seconds, every day. With `balance_checkpoint_hour` unset, the key says it is off:
+30 seconds, every day. With `balance_checkpoint_hour` unset, the key is written once at connect
+and says it is off; a reconnect writes nothing, and no timer runs:
 
 ```json
 {"status": "off", "checkpoint": null, "balance": null, "currency": null,

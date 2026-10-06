@@ -710,6 +710,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         env = get_tokens.load_env(_REPO_ROOT / ".env")
         expired = token_expired(env, time.time())
+        if not env.get(get_tokens.TOKEN_EXPIRES_AT_KEY):
+            print(
+                f"Note: {get_tokens.TOKEN_EXPIRES_AT_KEY} is not in .env, so the access token's "
+                "expiry is unknown; going on as if it were valid.",
+                file=sys.stderr,
+            )
         config = node_config(env, args.symbol)
     except (OSError, MissingCredentials) as e:
         print(f"error: {e}", file=sys.stderr)

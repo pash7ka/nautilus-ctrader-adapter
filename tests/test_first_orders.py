@@ -126,6 +126,27 @@ def test_refuses_an_expired_access_token(
     assert nothing_may_be_built == []
 
 
+@pytest.mark.parametrize(("expiry", "noticed"), [(None, True), ("4102444800", False)])
+def test_an_unknown_token_expiry_is_noticed(
+    expiry: str | None,
+    noticed: bool,
+    nothing_may_be_built: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": "EURUSD")
+    # No client id, so the run stops at the config, before anything is built.
+    env = {key: value for key, value in FAKE_ENV.items() if key != "CTRADER_CLIENT_ID"}
+    if expiry is not None:
+        env["CTRADER_TOKEN_EXPIRES_AT"] = expiry
+    monkeypatch.setattr(fo.get_tokens, "load_env", lambda _path: dict(env))
+
+    argv = ["--symbol", "EURUSD", "--distance", "0.00100", "--send-live-orders"]
+    assert fo.main(argv) == 1
+    assert nothing_may_be_built == []
+    assert ("expiry is unknown" in capsys.readouterr().err) == noticed
+
+
 def test_a_token_expiry_that_is_absent_or_ahead_is_not_expired() -> None:
     assert not fo.token_expired(FAKE_ENV, now_secs=1_000.0)
     assert not fo.token_expired({**FAKE_ENV, "CTRADER_TOKEN_EXPIRES_AT": "1001"}, 1_000.0)
