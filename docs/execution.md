@@ -364,6 +364,24 @@ Notes on reading it:
   `manual_change` activity and, because Nautilus needs it for its own bookkeeping, as an external
   closing order. A trader's move, removal or addition of a level is the activity alone, plus the
   node's leg events (`OrderUpdated` or `OrderCanceled`).
+- **One path per order.** An order the node did not send reaches Nautilus through reports only,
+  which Nautilus applies at once: an `OrderStatusReport` when it is first seen, a `FillReport` for
+  each fill, and an `OrderStatusReport` with its current status, quantities and prices for
+  each later change, cancel, expiry or rejection, from which Nautilus makes the `OrderUpdated`,
+  `OrderCanceled` and other events itself. A change of such an order that Nautilus already holds
+  as closed is logged as a warning and not reported. The node's own orders (entries, legs,
+  closes) reach Nautilus as events for their whole life, which it queues and applies in order.
+  Mixing the two for one order could apply its news out of order: a report applied at once
+  overtakes an event still in the queue.
+- **A close is in the position before its activity.** When a `closed` or `partially_closed`
+  activity (`manual_change` or `stop_out`) is published for an instrument the node has loaded,
+  Nautilus's position already holds that fill: the fill's report is applied before the activity
+  is published. A handler that closes the rest reads the right quantity.
+- **Leg events may come after their activity.** The node's own orders keep their events, which
+  Nautilus queues: a `level_moved`, `level_removed` or `level_added` activity can be published
+  before the leg's `OrderUpdated`, `OrderCanceled` or `OrderAccepted` is applied. The same holds
+  for the legs' `OrderCanceled` when a close ends the position, and for their `OrderUpdated` to the
+  smaller quantity after a partial close.
 - A stop-out closes under an external `MARKET` order, so deriving the close reason from the
   closing order's type reads it as manual. The `stop_out` activity is what marks it. How a stop-out
   is flagged on the wire is unconfirmed.

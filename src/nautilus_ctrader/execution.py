@@ -1265,9 +1265,11 @@ class CTraderExecutionClient(LiveExecutionClient):
                 f"its {record.kind.value} event is not reported",
             )
             return
-        if record.client_order_id is not None:
-            # Matched to its broker order: the model knows the close from now on.
-            self._operations.end_close(record.client_order_id)
+        if record.client_order_id is None:
+            self._external_update(record, order)
+            return
+        # Matched to its broker order: the model knows the close from now on.
+        self._operations.end_close(record.client_order_id)
         instrument = self._instrument_provider.find(order.instrument_id)
         venue_order_id = (
             VenueOrderId(record.venue_order_id) if record.venue_order_id else order.venue_order_id
@@ -1317,15 +1319,41 @@ class CTraderExecutionClient(LiveExecutionClient):
         elif kind == OrderEventKind.EXPIRED:
             self.generate_order_expired(*ids, venue_order_id, ts)
         if kind in (OrderEventKind.REJECTED, OrderEventKind.CANCELED, OrderEventKind.EXPIRED):
-            bracket = (
-                None
-                if record.client_order_id is None
-                else self._brackets.by_entry(record.client_order_id)
-            )
+            bracket = self._brackets.by_entry(record.client_order_id)
             if bracket is not None and not any(
                 self._leg_alive(leg_id) for leg_id in bracket.legs.values()
             ):
                 self._end_bracket(bracket.entry_id, record.reason or f"the entry {kind.value}")
+
+    def _external_update(self, record: OrderEvent, order: Order) -> None:
+        """News of an external order Nautilus holds, as a report, never as an event.
+
+        Nautilus applies a report at once but only queues an event. Reports alone keep one order's
+        news in order, and put a fill in the position before any activity published after it.
+        """
+        instrument = self._instrument_provider.find(order.instrument_id)
+        ts_init = self._clock.timestamp_ns()
+        if record.kind == OrderEventKind.FILLED:
+            self._send_fill_report(
+                reports.fill_report(
+                    record.fill,
+                    record.venue_order_id,
+                    instrument,
+                    self.account_id,
+                    self._currency,
+                    ts_init,
+                ),
+            )
+        elif order.is_closed:
+            # A closed order can take no transition a report would ask of it.
+            self._log.warning(
+                f"Order {order.venue_order_id} is already {order.status_string()} in Nautilus; "
+                f"its {record.kind.value} is not reported",
+            )
+        else:
+            self._send_order_status_report(
+                reports.held_order_report(order, record, instrument, self.account_id, ts_init),
+            )
 
     def _external_order(self, record: ExternalOrder) -> None:
         """An order Nautilus does not know yet: its report, then a report of each fill."""
