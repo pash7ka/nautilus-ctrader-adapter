@@ -1060,3 +1060,67 @@ async def test_a_bracket_the_broker_does_not_list_stays_pending_across_a_reconne
         assert len(h.client._brackets) == 1
         assert "OrderModifyRejected" not in h.kinds_of(STOP)
         assert status(h, STOP) == OrderStatus.SUBMITTED
+
+
+def moved(event: oa.ProtoOAExecutionEvent, by_ms: int) -> oa.ProtoOAExecutionEvent:
+    """A copy of a recorded event with every timestamp moved by `by_ms`."""
+    copy = oa.ProtoOAExecutionEvent()
+    copy.CopyFrom(event)
+    for message, fields in (
+        (copy.order, ("utcLastUpdateTimestamp",)),
+        (copy.order.tradeData, ("openTimestamp", "closeTimestamp")),
+        (copy.position, ("utcLastUpdateTimestamp",)),
+        (copy.position.tradeData, ("openTimestamp",)),
+        (copy.deal, ("executionTimestamp", "createTimestamp", "utcLastUpdateTimestamp")),
+    ):
+        for name in fields:
+            if message.HasField(name):
+                setattr(message, name, getattr(message, name) + by_ms)
+    return copy
+
+
+async def test_a_fill_held_during_the_reconnect_pass_keeps_its_bracket() -> None:
+    venue = ExecutionVenue()
+    amends: list = []
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await lost_bracket_with_a_waiting_modify(h)
+        by_ms = int(time.time() * 1000) - 60_000 - FIRST_EVENTS[0].order.utcLastUpdateTimestamp
+        accepted, filled, protected = (moved(e, by_ms) for e in FIRST_EVENTS[:3])
+
+        def amend(request: oa.ProtoOAAmendPositionSLTPReq) -> oa.ProtoOAExecutionEvent:
+            amends.append(request)
+            answer = oa.ProtoOAExecutionEvent()
+            answer.CopyFrom(protected)
+            answer.executionType = om.ORDER_REPLACED
+            answer.isServerEvent = False
+            answer.order.stopPrice = request.stopLoss
+            answer.order.limitPrice = request.takeProfit
+            answer.order.utcLastUpdateTimestamp += len(amends)
+            answer.position.utcLastUpdateTimestamp += len(amends)
+            return answer
+
+        venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, amend)
+        # The snapshot is read before the fill; the fill window and the lists hold it.
+        entry = om.ProtoOAOrder()
+        entry.CopyFrom(filled.order)
+        venue.position_orders[FIRST] = [entry]
+        venue.position_deals[FIRST] = [filled.deal]
+        venue.deals = [filled.deal]
+        held = HeldReplies(
+            venue.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        for event in (accepted, filled, protected):
+            await h.server.push(event)
+        await held.stop_holding()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        await wait_until(lambda: len(h.client._brackets) == 0)
+
+        assert h.client._book.view(FIRST).open
+        assert "OrderModifyRejected" not in h.kinds_of(STOP)
+        (sent,) = amends
+        assert sent.stopLoss == 85150.0

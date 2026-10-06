@@ -409,7 +409,6 @@ class CTraderExecutionClient(LiveExecutionClient):
             # Reported under the node's id if it reached the broker; never in flight past this.
             self._end_lost_closes()
             self._send_mass_status_report(status)
-            self._end_closed_brackets(status)
         except BaseException:
             # Lost closes stay in flight: the retried pass may still find them.
             self._release_buffer()
@@ -418,6 +417,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._refresh_checkpoint(trader)
         finally:
             self._release_buffer()
+        # Only once the held events are applied: an entry's fill after the snapshot opens its
+        # position in the model, which the pass's reports alone read as closed.
+        if self._session is not None:
+            self._end_closed_brackets(status)
         self._emit_account_state(self._clock.timestamp_ns())
 
     async def _refresh_checkpoint(self, trader: om.ProtoOATrader) -> None:
