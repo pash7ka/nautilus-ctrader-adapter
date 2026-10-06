@@ -16,7 +16,8 @@ does exactly this:
    one size step, so that one size step can be closed by hand and the minimum still remains;
 6. asks the owner to move the stop-loss and to close one size step of the position by hand
    (the prompt names the exact volume);
-7. waits, up to `--manual-wait-secs`, until the adapter reports both changes;
+7. waits, up to `--manual-wait-secs`, until the adapter reports both changes and Nautilus's
+   position shows the smaller volume;
 8. closes the rest and stops.
 
 A refusal, or a position that ends some other way, stops the sequence with a message; anything
@@ -63,6 +64,7 @@ from nautilus_trader.model.events import (
     OrderEvent,
     OrderExpired,
     OrderRejected,
+    PositionChanged,
     PositionClosed,
     PositionEvent,
     PositionOpened,
@@ -208,6 +210,7 @@ class Steps:
         self._bracket: BracketSubmitted | None = None
         self._accepted: set[ClientOrderId] = set()
         self._position_id: PositionId | None = None
+        self._quantity: Quantity | None = None
         self._seen: set[str] = set()
 
     @property
@@ -257,7 +260,11 @@ class Steps:
             return self._stop("The entry ended without a fill.")
         if isinstance(event, PositionOpened) and event.opening_order_id == bracket.entry:
             self._position_id = event.position_id
+            self._quantity = event.quantity
             return []
+        if isinstance(event, PositionChanged) and event.position_id == self._position_id:
+            self._quantity = event.quantity
+            return self._close_second_when_ready() if self._stage is _Stage.MANUAL else []
         if isinstance(event, PositionClosed) and event.position_id == self._position_id:
             return self._on_position_closed()
         if isinstance(event, OrderAccepted) and client_order_id in (
@@ -308,7 +315,17 @@ class Steps:
             return []
         if activity.action in _MANUAL_ACTIONS:
             self._seen.add(activity.action)
+        return self._close_second_when_ready()
+
+    def _close_second_when_ready(self) -> list[Action]:
+        """Close the rest once both changes are reported and the position shows the partial close.
+
+        Closing on the activity alone could read the position's volume from before the fill.
+        """
         if self._seen != _MANUAL_ACTIONS:
+            return []
+        reduced = self._quantity is not None and self._quantity < self._sizes.second
+        if self._position_id is not None and not reduced:
             return []
         return self._close_second([])
 
