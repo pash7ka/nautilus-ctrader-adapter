@@ -582,7 +582,6 @@ class CTraderSession:
         invalidation deliberately does not trigger a refresh - the schema lists "token was
         refreshed" among its causes, so refreshing in response could feed itself forever.
         """
-        # TODO(verify): that the venue's reason text never carries account identifiers.
         if isinstance(payload, oa.ProtoOAClientDisconnectEvent):
             reason = payload.reason or "no reason given"
             self._log.error(f"Venue cancelled the application connection: {reason}")

@@ -55,8 +55,7 @@ A level amend, which sets the whole state of a position's levels, is the one req
 repeated, up to three times.
 
 A refusal by the broker is an `OrderRejected` (or `OrderCancelRejected`, `OrderModifyRejected`)
-whose reason is the broker's error code and description. The adapter adds no account identifier
-to it; whether the broker's own text could contain one is not confirmed.
+whose reason is the broker's error code and description, as the broker gave them.
 
 ## 2. Brackets and legs
 
@@ -184,8 +183,9 @@ broker. A cached position the broker refuses to list, or lists nothing of, is le
 WARNING; it never fails the pass.
 
 **A persistent cache must not be reused across a change of trading account.** The Nautilus
-account id is the same for every account (`CTRADER-001`), so a cache kept from another account
-holds that account's positions. They are asked about, found unknown and left open in Nautilus.
+account id is `CTRADER-` followed by the account's trader login, so accounts do not mix in one
+cache. A cache kept from another account still holds that account's positions under its own id.
+They are asked about, found unknown and left open in Nautilus.
 
 The broker keeps trading while these are read, so the reads do not describe one moment. Their
 order keeps them consistent:
@@ -568,8 +568,6 @@ it. The main groups:
   broker's one clock: the bound that keeps a trader's earlier close from being taken for the
   node's compares them.
 - **Rejected orders**: whether a rejected order carries a position id.
-- **Error text**: whether the broker's description of a refusal can ever contain an account
-  identifier. The adapter adds none, but it passes the broker's text through.
 - **History lists**: the order lists come in, which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
   whether the edges of a window are inclusive, and whether the cash-flow list has no pages and

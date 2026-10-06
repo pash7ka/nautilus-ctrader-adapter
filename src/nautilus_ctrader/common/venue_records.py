@@ -282,7 +282,7 @@ class ProtectionMissing:
 
 @dataclass(frozen=True)
 class Notice:
-    """Something a person should know, for a WARNING. Never holds an account identifier."""
+    """Something a person should know, for a WARNING. Never holds a credential."""
 
     text: str
 

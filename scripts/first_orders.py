@@ -28,9 +28,8 @@ stops it.
 Credentials and the trader login come from `.env` in the repository root. The script does no
 token refresh, so it refuses to start with an access token whose `CTRADER_TOKEN_EXPIRES_AT` has
 passed. Every order event, position event and account activity is appended to a JSONL file under
-`--log-dir` (by default `tests/recordings/`, which git ignores). The script writes no account
-field, and masks the trader login wherever it appears in a text; whether the broker's own text,
-such as a refusal reason, could hold another account identifier is not confirmed. Run
+`--log-dir` (by default `tests/recordings/`, which git ignores). A line carries only the fixed
+list of the event's fields, which includes the account id, never the whole event. Run
 `scripts/record_execution.py` alongside it: the checklist printed at the end says what to
 compare between the two.
 """
@@ -46,7 +45,6 @@ import math
 import pathlib
 import sys
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TextIO
@@ -335,8 +333,9 @@ class Steps:
 
 # -- The event log ------------------------------------------------------------------------
 
-# A whitelist, so that an event's `account_id` can never reach a line.
+# A whitelist, so that a line holds named fields and never a dump of the whole event.
 _LOGGED_FIELDS = (
+    "account_id",
     "instrument_id",
     "client_order_id",
     "venue_order_id",
@@ -370,13 +369,8 @@ def _text(value: object) -> str:
     return value.name if isinstance(value, enum.Enum) else str(value)
 
 
-def event_record(
-    event: object,
-    *,
-    status: str | None = None,
-    hidden: Iterable[str] = (),
-) -> dict[str, object]:
-    """The loggable fields of `event`, with each of `hidden` replaced in every text."""
+def event_record(event: object, *, status: str | None = None) -> dict[str, object]:
+    """The loggable fields of `event`."""
     record: dict[str, object] = {"event": type(event).__name__}
     ts_event = getattr(event, "ts_event", None)
     if ts_event is not None:
@@ -388,19 +382,15 @@ def event_record(
         value = getattr(event, name, None)
         if value is None:
             continue
-        text = _text(value)
-        for secret in hidden:
-            text = text.replace(secret, "<hidden>")
-        record[name] = text
+        record[name] = _text(value)
     return record
 
 
 class EventLog:
     """Appends one JSON line per event to `path`, flushed at once."""
 
-    def __init__(self, path: pathlib.Path, *, hidden: Iterable[str] = ()) -> None:
+    def __init__(self, path: pathlib.Path) -> None:
         self.path = path
-        self._hidden = tuple(h for h in hidden if h)
         self._file: TextIO | None = None
 
     def __enter__(self) -> EventLog:
@@ -413,7 +403,7 @@ class EventLog:
             self._file = None
 
     def write(self, event: object, *, status: str | None = None) -> None:
-        record = event_record(event, status=status, hidden=self._hidden)
+        record = event_record(event, status=status)
         self._file.write(json.dumps(record) + "\n")
         self._file.flush()
 
@@ -731,8 +721,7 @@ def main(argv: list[str] | None = None) -> int:
     args.log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
     log_path = args.log_dir / f"first_orders-{stamp}.jsonl"
-    trader_login = str(config.exec_clients[CTRADER].trader_login)
-    with EventLog(log_path, hidden=(trader_login,)) as log:
+    with EventLog(log_path) as log:
         driver = _Driver(
             instrument_id_of(args.symbol),
             distance=args.distance,
