@@ -11,6 +11,7 @@ from nautilus_ctrader.common.reconciliation import (
     Reconciliation,
     entry_named,
     one_position,
+    open_volume,
     reconcile,
     unfilled_order,
 )
@@ -396,7 +397,7 @@ def test_one_position_is_reported_from_its_own_lists_alone() -> None:
     # Another open position, with no lists given: left out, not reported with a notice.
     snapshot = as_ours([snapshot_at(OPEN_AT)], [FIRST])[0]
     snapshot.position.append(make_position(SECOND))
-    found = ours(history(FIRST), FIRST)
+    found = ours(history(FIRST, until_ms=snapshot.position[0].utcLastUpdateTimestamp), FIRST)
 
     result = one_position(snapshot, FIRST, found, precision, {}, NOTHING)
 
@@ -434,3 +435,47 @@ def test_the_entry_is_never_a_protective_or_closing_order_carrying_its_ids() -> 
     assert entry_named(orders, entry_id(FIRST)).orderId == 6_000_153
     assert entry_named(orders[:3], entry_id(FIRST)) is None
     assert entry_named(orders, entry_id(SECOND)) is None
+
+
+# -- The lists, read after the snapshot, decide open or closed -------------------------------
+
+
+def test_open_volume_nets_the_entry_side_against_the_other() -> None:
+    until = snapshot_at(OPEN_AT).position[0].utcLastUpdateTimestamp
+
+    assert open_volume(history(FIRST, until_ms=until)) == 99
+    assert open_volume(history(FIRST)) == 0
+    assert open_volume(PositionHistory((), history(FIRST).deals)) == 0
+
+
+def test_a_position_its_deals_close_is_closed_whatever_the_snapshot_says() -> None:
+    # The snapshot still holds it open; its lists, read later, hold the stop-loss's fill.
+    snapshot = as_ours([snapshot_at(OPEN_AT)], [FIRST])[0]
+
+    result = run(snapshot, {FIRST: ours(history(FIRST), FIRST)}, window(FIRST))
+
+    assert result == closed_first(mine=True)
+
+
+def test_a_position_its_deals_leave_open_that_the_snapshot_lacks_is_skipped() -> None:
+    _, histories, deals = open_first(mine=True)
+
+    result = run(as_ours([snapshot_at(CLOSED_AT)], [FIRST])[0], histories, deals)
+
+    assert result.orders == ()
+    assert result.positions == ()
+    (notice,) = result.notices
+    assert str(FIRST) in notice.text
+    assert "snapshot" in notice.text
+
+
+def test_a_position_in_the_histories_alone_is_taken() -> None:
+    # Closed before the fill window: neither the snapshot nor the window names it.
+    snapshot = as_ours([snapshot_at(CLOSED_AT)], [FIRST])[0]
+
+    result = run(snapshot, {FIRST: ours(history(FIRST), FIRST)}, ())
+
+    assert [r.venue_order_id for r in result.orders] == [
+        r.venue_order_id for r in closed_first(mine=True).orders
+    ]
+    assert result.positions == ()

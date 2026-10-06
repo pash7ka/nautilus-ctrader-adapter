@@ -168,12 +168,23 @@ The in-flight check belongs to Nautilus's `LiveExecEngineConfig`, not to this co
 
 One pass reads the broker, in this order:
 
-1. The snapshot: every open position and pending order, with the protective orders.
-2. The deals of the fill window, which covers `lookback_mins` when Nautilus passes one and
+1. The deals of the fill window, which covers `lookback_mins` when Nautilus passes one and
    `reconciliation_default_lookback_mins` otherwise.
+2. The snapshot: every open position and pending order, with the protective orders.
 3. For each position that is open or has a deal in the window, its own order list and deal list.
    A position on an instrument that is not loaded gets no deal list, and a closed position on
    such an instrument is not read at all.
+
+The broker keeps trading while these are read, so the reads do not describe one moment. Their
+order keeps them consistent:
+
+- The window comes first, so a position that opens after the snapshot is not named by it. Its
+  execution events, held during the pass, bring it to Nautilus.
+- The position's own lists, read last, decide whether it is open. A position whose deals add up
+  to nothing left is reported closed, with its real fills, even if the snapshot still holds it.
+- A position whose deals leave it open but which the snapshot lacks makes the pass read the
+  snapshot once more. If it is still missing, the position is left out with a WARNING, and its
+  execution events bring it.
 
 The venue model is rebuilt from that same snapshot. The request count is logged at INFO. The
 history lists use the historical rate-limit bucket, so they never queue ahead of orders.

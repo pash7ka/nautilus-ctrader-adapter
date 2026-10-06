@@ -87,6 +87,7 @@ from nautilus_ctrader.common.reconciliation import (
     Reconciliation,
     entry_named,
     one_position,
+    open_volume,
     reconcile,
     unfilled_order,
 )
@@ -170,6 +171,25 @@ def _ms(moment) -> int:
 def _reason(code: str, description: str | None) -> str:
     # TODO(verify): that the venue's description never carries an account id or login.
     return f"{code}: {description}" if description else code
+
+
+def _with_positions(
+    snapshot: oa.ProtoOAReconcileRes,
+    again: oa.ProtoOAReconcileRes,
+    position_ids: set[int],
+) -> oa.ProtoOAReconcileRes:
+    """`snapshot` with the positions `position_ids` and their orders as `again` holds them.
+
+    Nothing else is taken from `again`: no lists were read for what is new in it.
+    """
+    merged = oa.ProtoOAReconcileRes()
+    merged.CopyFrom(snapshot)
+    known = {order.orderId for order in snapshot.order}
+    merged.position.extend(p for p in again.position if p.positionId in position_ids)
+    merged.order.extend(
+        o for o in again.order if o.positionId in position_ids and o.orderId not in known
+    )
+    return merged
 
 
 @dataclass(frozen=True)
@@ -866,7 +886,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         positions: Iterable[int] | None = None,
         deals: bool = True,
     ) -> BrokerState:
-        """One read of the broker: the snapshot, then each covered position's lists, once each.
+        """One read of the broker: the window's deals, the snapshot, then the positions' lists.
+
+        Each covered position's lists are read once.
 
         - `since_ms`: the start of the fill window; the positions its deals name are covered
           too. `None` reads no window, so only the open positions.
@@ -875,6 +897,10 @@ class CTraderExecutionClient(LiveExecutionClient):
 
         A position on a symbol not loaded gets no deal list, as nothing is reported from it, and
         a closed one no list at all.
+
+        The lists, read last, decide whether a position is open (`reconcile`). When a position's
+        deals leave it open but the snapshot lacks it, the snapshot is read once more and that
+        position taken from it.
         """
         requests = 0
 
@@ -883,11 +909,16 @@ class CTraderExecutionClient(LiveExecutionClient):
             requests += 1
             return await self._request(payload, bucket=BUCKET_HISTORICAL)
 
+        async def read_snapshot() -> oa.ProtoOAReconcileRes:
+            nonlocal requests
+            requests += 1
+            return await self._request(
+                oa.ProtoOAReconcileReq(ctidTraderAccountId=account_id, returnProtectionOrders=True),
+            )
+
         account_id = self._account.account_id
-        snapshot = await self._request(
-            oa.ProtoOAReconcileReq(ctidTraderAccountId=account_id, returnProtectionOrders=True),
-        )
-        requests += 1
+        # The window before the snapshot: a deal after the snapshot must not name a position the
+        # snapshot cannot show.
         window: dict[int, om.ProtoOADeal] = {}
         if since_ms is not None:
             complete = True
@@ -900,6 +931,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                     "The deal list of the fill window did not end; a position traded early in "
                     "the window may be missing from the reports",
                 )
+        snapshot = await read_snapshot()
         symbols = {
             position.positionId: position.tradeData.symbolId for position in snapshot.position
         }
@@ -920,6 +952,13 @@ class CTraderExecutionClient(LiveExecutionClient):
                 else []
             )
             histories[position_id] = PositionHistory(tuple(orders), tuple(found))
+        lacking = {
+            position_id
+            for position_id, found in histories.items()
+            if position_id not in open_ids and open_volume(found) > 0
+        }
+        if lacking:
+            snapshot = _with_positions(snapshot, await read_snapshot(), lacking)
         return BrokerState(snapshot, histories, tuple(window.values()), requests)
 
     def _stand(self, state: BrokerState) -> None:

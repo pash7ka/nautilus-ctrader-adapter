@@ -79,11 +79,16 @@ def reconcile(
     position id. `known_closes` maps a broker order id to the node's close the venue model has
     matched it to. `precision` gives a symbol's price precision, `None` for an unloaded one.
 
-    Positions taken: every open one in `snapshot` and every one with a deal in `window_deals`.
+    Positions taken: every open one in `snapshot`, every one with a deal in `window_deals`, and
+    every one in `histories`.
 
     - One on an unloaded symbol is skipped silently: the unloaded exposure covers it.
     - One without a history, or whose history lists no entry, is skipped with a `Notice`.
     - One whose entry never filled is never reported.
+
+    Whether a position is open is decided by its own deals (`open_volume`), read after
+    `snapshot`: one they leave at zero is closed whatever `snapshot` says, and one they leave
+    open that `snapshot` lacks is skipped with a `Notice`.
 
     What a taken position reports:
 
@@ -109,10 +114,11 @@ def reconcile(
     - An open position's `ReportedPosition`, even when its lists show no entry fill (with a
       `Notice`): the position stands at the broker whatever its lists say.
 
-    Never reported: an open protective order (it is its position's levels) and a closing order
-    with no deal. Every other order in `snapshot` on a loaded symbol not reported above is
-    reported as it stands, with the node's id when it is the node's: for an entry, the one in its
-    `label`; for a closing order, the matched or in-flight close, as above but with no deal.
+    Never reported: an open protective order (it is its position's levels) and a closing order in
+    a position's lists with no deal. Every other order in `snapshot` on a loaded symbol not
+    reported above is reported as it stands, with the node's id when it is the node's: for an
+    entry, the one in its `label`; for a closing order, the matched or in-flight close, as above
+    but with no deal.
 
     `orders` is sorted by the first fill's time, or `ts_ms` for a report with no fill, so a
     cancelled leg of a closed position sorts at the closing deal. Ties put a non-closing order
@@ -123,6 +129,10 @@ def reconcile(
     symbols = {pid: position.tradeData.symbolId for pid, position in open_positions.items()}
     for deal in window_deals:
         symbols.setdefault(deal.positionId, deal.symbolId)
+    for position_id, found in histories.items():
+        symbol_id = _symbol_of(found)
+        if symbol_id is not None:
+            symbols.setdefault(position_id, symbol_id)
     live_protective = {
         order.positionId: order
         for order in snapshot.order
@@ -161,6 +171,18 @@ def reconcile(
                     )
                 )
                 positions.append(_position_report(venue_position, digits))
+            continue
+        still_open = open_volume(found) > 0
+        if venue_position is not None and not still_open:
+            # Closed after the snapshot was taken.
+            venue_position = None
+        elif venue_position is None and still_open:
+            notices.append(
+                Notice(
+                    f"position {position_id} is open by its own deals but not in the snapshot; "
+                    "it is not reported, and its execution events carry it",
+                )
+            )
             continue
         reports, said = built.reports(
             venue_position,
@@ -214,6 +236,27 @@ def one_position(
         order=[o for o in snapshot.order if o.positionId == position_id],
     )
     return reconcile(alone, {position_id: found}, found.deals, precision, known_closes, operations)
+
+
+def open_volume(found: PositionHistory) -> int:
+    """The venue volume a position's own deals leave open: its entry's side less the other's.
+
+    Zero when its lists show no entry.
+    """
+    entry = entry_of(found.orders)
+    if entry is None:
+        return 0
+    side = entry.tradeData.tradeSide
+    return sum(
+        deal.filledVolume if deal.tradeSide == side else -deal.filledVolume for deal in found.deals
+    )
+
+
+def _symbol_of(found: PositionHistory) -> int | None:
+    entry = entry_of(found.orders)
+    if entry is not None:
+        return entry.tradeData.symbolId
+    return found.deals[0].symbolId if found.deals else None
 
 
 def entry_named(orders: Iterable[om.ProtoOAOrder], client_order_id: str) -> om.ProtoOAOrder | None:
@@ -452,6 +495,9 @@ class _Position:
                 else sum((fill.units for fill in self.entry_fills), Decimal(0))
             )
             units = max(leg_units, filled)
+            # TODO(verify): whether a partly filled protective order's `volume` is its total or
+            # its rest, the question `remaining_of` has; read as the total here. A level that
+            # closes part of a position would settle it.
             if fills and filled >= leg_units:
                 status, ts_ms = ReportStatus.FILLED, fills[-1].ts_ms
             else:

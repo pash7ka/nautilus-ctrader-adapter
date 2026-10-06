@@ -16,6 +16,7 @@ from dataclasses import replace
 from decimal import Decimal
 
 import pytest
+from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
@@ -1079,33 +1080,62 @@ def moved(event: oa.ProtoOAExecutionEvent, by_ms: int) -> oa.ProtoOAExecutionEve
     return copy
 
 
+def bracket_events() -> tuple[oa.ProtoOAExecutionEvent, ...]:
+    """The bracket's entry accepted, filled a minute ago, and protected, as pushed."""
+    by_ms = int(time.time() * 1000) - 60_000 - FIRST_EVENTS[0].order.utcLastUpdateTimestamp
+    return tuple(moved(e, by_ms) for e in FIRST_EVENTS[:3])
+
+
+def answer_amends(venue: ExecutionVenue, protected: oa.ProtoOAExecutionEvent) -> list:
+    """Answer each level amend as the broker would; returns the amends asked, as they come."""
+    amends: list = []
+
+    def amend(request: oa.ProtoOAAmendPositionSLTPReq) -> oa.ProtoOAExecutionEvent:
+        amends.append(request)
+        answer = oa.ProtoOAExecutionEvent()
+        answer.CopyFrom(protected)
+        answer.executionType = om.ORDER_REPLACED
+        answer.isServerEvent = False
+        answer.order.stopPrice = request.stopLoss
+        answer.order.limitPrice = request.takeProfit
+        answer.order.utcLastUpdateTimestamp += len(amends)
+        answer.position.utcLastUpdateTimestamp += len(amends)
+        return answer
+
+    venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, amend)
+    return amends
+
+
+def entry_listed(venue: ExecutionVenue, filled: oa.ProtoOAExecutionEvent) -> None:
+    """The broker's lists and fill window holding the bracket's filled entry."""
+    entry = om.ProtoOAOrder()
+    entry.CopyFrom(filled.order)
+    venue.position_orders[FIRST] = [entry]
+    venue.position_deals[FIRST] = [filled.deal]
+    venue.deals = [filled.deal]
+
+
+def reconciliation_orders(h: Harness) -> list:
+    """Orders Nautilus made up to align a position with a report; never the broker's."""
+    return [o for o in h.cache.orders() if o.tags and "RECONCILIATION" in o.tags]
+
+
+def legs_stand(h: Harness) -> None:
+    assert status(h, ENTRY) == OrderStatus.FILLED
+    assert status(h, STOP) == OrderStatus.ACCEPTED
+    assert status(h, TARGET) == OrderStatus.ACCEPTED
+    assert [p.id for p in h.cache.positions_open()] == [PositionId(str(FIRST))]
+    assert reconciliation_orders(h) == []
+
+
 async def test_a_fill_held_during_the_reconnect_pass_keeps_its_bracket() -> None:
     venue = ExecutionVenue()
-    amends: list = []
     async with harness(execution_venue=venue, config=LOSING) as h:
         await lost_bracket_with_a_waiting_modify(h)
-        by_ms = int(time.time() * 1000) - 60_000 - FIRST_EVENTS[0].order.utcLastUpdateTimestamp
-        accepted, filled, protected = (moved(e, by_ms) for e in FIRST_EVENTS[:3])
-
-        def amend(request: oa.ProtoOAAmendPositionSLTPReq) -> oa.ProtoOAExecutionEvent:
-            amends.append(request)
-            answer = oa.ProtoOAExecutionEvent()
-            answer.CopyFrom(protected)
-            answer.executionType = om.ORDER_REPLACED
-            answer.isServerEvent = False
-            answer.order.stopPrice = request.stopLoss
-            answer.order.limitPrice = request.takeProfit
-            answer.order.utcLastUpdateTimestamp += len(amends)
-            answer.position.utcLastUpdateTimestamp += len(amends)
-            return answer
-
-        venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, amend)
-        # The snapshot is read before the fill; the fill window and the lists hold it.
-        entry = om.ProtoOAOrder()
-        entry.CopyFrom(filled.order)
-        venue.position_orders[FIRST] = [entry]
-        venue.position_deals[FIRST] = [filled.deal]
-        venue.deals = [filled.deal]
+        accepted, filled, protected = bracket_events()
+        amends = answer_amends(venue, protected)
+        # The fill window and the lists hold the fill; the snapshot does not, even read again.
+        entry_listed(venue, filled)
         held = HeldReplies(
             venue.server,
             om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
@@ -1124,3 +1154,91 @@ async def test_a_fill_held_during_the_reconnect_pass_keeps_its_bracket() -> None
         assert "OrderModifyRejected" not in h.kinds_of(STOP)
         (sent,) = amends
         assert sent.stopLoss == 85150.0
+        legs_stand(h)
+        (built,) = h.mass_statuses
+        assert built.order_reports == {}
+        assert any(
+            f"position {FIRST}" in line and "snapshot" in line for line in h.logger.warnings()
+        )
+
+
+# -- One pass reads one moment -------------------------------------------------------------------
+
+
+async def test_a_fill_right_after_the_snapshot_is_left_to_its_events() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await lost_bracket_with_a_waiting_modify(h)
+        accepted, filled, protected = bracket_events()
+        answer_amends(venue, protected)
+
+        def snapshot_then_fill(_request: Message) -> Message:
+            # The entry fills at the broker just after this snapshot is taken.
+            entry_listed(venue, filled)
+            return venue.snapshot
+
+        venue.server.on(om.PROTO_OA_RECONCILE_REQ, snapshot_then_fill)
+
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        for event in (accepted, filled, protected):
+            await h.server.push(event)
+        await wait_until(lambda: len(h.client._brackets) == 0)
+
+        legs_stand(h)
+        (built,) = h.mass_statuses
+        assert built.order_reports == {}
+
+
+async def test_a_position_closed_after_the_snapshot_is_reported_closed() -> None:
+    venue = serving(OPEN_AT)
+    # The by-position lists are read after the stop-loss closed what the snapshot holds open.
+    _, histories, _ = broker_lists(CLOSED_AT)
+    venue.position_orders = {FIRST: list(histories[FIRST].orders)}
+    venue.position_deals = {FIRST: list(histories[FIRST].deals)}
+    async with harness(execution_venue=venue) as h:
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+        )
+        passing = asyncio.create_task(h.client.generate_mass_status())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        # The stop-loss moved by hand, then the protective order filled at it.
+        await push(h, *FIRST_EVENTS[-2:])
+        await held.stop_holding()
+        built = await asyncio.wait_for(passing, timeout=10)
+
+        h.engine.reconcile_execution_mass_status(built)
+        await wait_until(lambda: h.client._buffer is None)
+
+        assert built.position_reports == {}
+        assert status(h, STOP) == OrderStatus.FILLED
+        assert h.cache.order(ClientOrderId(STOP)).trade_ids == [TradeId("7000003")]
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert h.cache.position(PositionId(str(FIRST))).is_closed
+        assert h.cache.positions_open() == []
+        assert reconciliation_orders(h) == []
+
+
+async def test_a_position_missing_from_the_snapshot_is_read_again() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 120_000)
+    standing = venue.snapshot
+    answers = [oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)]
+    async with harness(execution_venue=venue) as h:
+        # The pass's first snapshot lacks the position its fill window and lists hold open.
+        venue.server.on(
+            om.PROTO_OA_RECONCILE_REQ, lambda _r: answers.pop(0) if answers else standing
+        )
+        before = len(h.received(oa.ProtoOAReconcileReq))
+
+        built = await h.client.generate_mass_status()
+        h.engine.reconcile_execution_mass_status(built)
+
+        assert len(h.received(oa.ProtoOAReconcileReq)) - before == 2
+        (report,) = built.position_reports[US100_ID]
+        assert report.venue_position_id == PositionId(str(OURS))
+        assert h.cache.position(PositionId(str(OURS))).is_open
+        assert reconciliation_orders(h) == []
