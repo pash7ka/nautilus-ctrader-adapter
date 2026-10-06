@@ -347,6 +347,30 @@ async def test_query_for_a_close_in_flight_answers_under_the_node_id() -> None:
         assert h.reports == []
 
 
+async def test_a_close_named_by_a_query_keeps_its_late_events_after_the_timeout() -> None:
+    now = now_ms()
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 2 * MINUTE_MS)
+    config = exec_config(order_request_timeout_secs=1.5)
+    async with harness(execution_venue=venue, config=config) as h:
+        await started(h)
+        closing = await close_sent(h)
+        closed = now_ms()
+        our_market_position(venue, opened=now - 2 * MINUTE_MS, closed=closed)
+        await h.client._query_order(query(h, CLOSE))
+        await wait_until(lambda: status(h, CLOSE) == OrderStatus.FILLED)
+        # The close's answer never came; it is no longer in flight.
+        await asyncio.wait_for(closing, timeout=10)
+        assert h.client._operations.close_position(CLOSE) is None
+
+        await push(h, *node_close_events(closed=closed))
+
+        await wait_until(lambda: "OrderFilled" in h.kinds_of(CLOSE))
+        assert trade_ids(h, CLOSE) == [TradeId("7300002")]
+        assert h.reports == []
+        assert not any(a.kind == "manual_change" for a in h.activity)
+
+
 async def test_query_for_a_close_in_flight_never_claims_an_earlier_close() -> None:
     now = now_ms()
     venue = ExecutionVenue()

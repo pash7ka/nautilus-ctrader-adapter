@@ -251,6 +251,19 @@ class VenueBook:
                 return order_id, self._close_positions[order_id]
         return None
 
+    def match_close(self, order_id: int, position_id: int, close_id: str) -> None:
+        """Take broker order `order_id` for the node's close `close_id`, as a query found it.
+
+        Its later events are then the node's close's, even once the close is no longer in
+        flight. Nothing changes when either is already matched.
+        """
+        if order_id in self._closes or close_id in self._closes.values():
+            return
+        self._closes[order_id] = close_id
+        self._close_positions[order_id] = position_id
+        # Listed by the broker, so accepted: a late acceptance adds nothing.
+        self._closes_accepted.add(order_id)
+
     def load(
         self,
         snapshot: oa.ProtoOAReconcileRes,

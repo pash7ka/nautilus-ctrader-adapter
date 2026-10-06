@@ -637,6 +637,14 @@ class CTraderExecutionClient(LiveExecutionClient):
                         self._operations,
                     )
                     record = next((r for r in built.orders if r.client_order_id == order_id), None)
+                    if (
+                        record is not None
+                        and leg is None
+                        and close is None
+                        and order.is_reduce_only
+                    ):
+                        # Its late events, after the close's timeout, stay the node's close's.
+                        self._book.match_close(int(record.venue_order_id), position_id, order_id)
         except CTraderError as e:
             return unanswered(str(e))
         unfilled = listed is not None and listed.orderStatus != om.ORDER_STATUS_FILLED

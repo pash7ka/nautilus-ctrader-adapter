@@ -534,6 +534,11 @@ sign flipped to Nautilus's convention (a charge is positive).
   both levels.
 - **A late fill after the in-flight retries ran out** leaves the order `REJECTED`; see
   [section 5](#5-order-queries-and-in-flight-settings).
+- **A close's event later than its timeout, with no query in between, is a trader's close.** On
+  a live connection a close stops being in flight once `order_request_timeout_secs` passes with no
+  answer. If a query named its broker order meanwhile, that order's later events stay the node's
+  close's. Without one, an event of it after the timeout is reported as an external reduce-only
+  order and a `manual_change`.
 
 ## 10. Not yet confirmed against a live endpoint
 
