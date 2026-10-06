@@ -246,3 +246,57 @@ async def test_the_recorded_session_through_the_nodes_own_commands() -> None:
         assert status(h, f"O-TP-{SECOND}") == OrderStatus.CANCELED
         assert fills_by_trade(h) == {str(deal): 1 for deal in range(7_000_001, 7_000_006)}
         assert h.logger.errors() == []
+
+
+async def test_a_close_in_the_same_burst_as_the_entry_fill_waits_for_the_entry() -> None:
+    async with harness(instruments=(EURUSD_ID,)) as h:
+        position_id = PositionId(str(SECOND))
+        seen: list[tuple[str, str, Decimal]] = []
+        external_positions: list = []
+
+        def on_activity(activity) -> None:
+            position = h.cache.position(position_id)
+            seen.append(
+                (activity.action, position.strategy_id.value, position.signed_decimal_qty())
+            )
+
+        h.client._msgbus.subscribe(topic=ACCOUNT_ACTIVITY_TOPIC, handler=on_activity)
+        h.client._msgbus.subscribe(
+            topic="events.position.EXTERNAL", handler=external_positions.append
+        )
+        await submitted(h, second_bracket(h))
+        events = position_events(SECOND)
+
+        # The entry's acceptance and fill, then the trader's close of half, in one read.
+        for event in (events[0], events[1], events[4], events[5]):
+            h.client._on_execution_event(event)
+        await wait_until(lambda: seen, description="activity published")
+        await wait_until(lambda: h.engine.evt_qsize() == 0, description="event queue drained")
+
+        assert seen == [("partially_closed", "S-001", Decimal(1000))]
+        assert external_positions == []
+        position = h.cache.position(position_id)
+        assert position.strategy_id.value == "S-001"
+        assert position.signed_decimal_qty() == Decimal(1000)
+        assert fills_by_trade(h) == {"7000003": 1, "7000004": 1}
+        assert h.logger.errors() == []
+
+
+async def test_a_stop_moved_by_hand_is_on_the_leg_when_its_activity_arrives() -> None:
+    async with harness(instruments=(EURUSD_ID,)) as h:
+        seen: list[tuple[str, Price]] = []
+
+        def on_activity(activity) -> None:
+            stop = h.cache.order(ClientOrderId(f"O-SL-{SECOND}"))
+            seen.append((activity.action, stop.trigger_price))
+
+        h.client._msgbus.subscribe(topic=ACCOUNT_ACTIVITY_TOPIC, handler=on_activity)
+        await submitted(h, second_bracket(h))
+
+        # Filled, protected, and the stop moved by hand, in one read.
+        for event in position_events(SECOND)[:4]:
+            h.client._on_execution_event(event)
+        await wait_until(lambda: seen, description="activity published")
+
+        assert seen == [("level_moved", Price.from_str("1.12384"))]
+        assert h.logger.errors() == []

@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from nautilus_trader.execution.reports import FillReport, OrderStatusReport
-from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import OrderStatus, OrderType
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import TradeId, VenueOrderId
 from nautilus_trader.model.objects import Price, Quantity
@@ -164,3 +164,76 @@ async def test_news_of_an_order_nautilus_has_closed_is_not_reported() -> None:
         assert len(h.reports) == before
         assert external(h).status == OrderStatus.FILLED
         assert any("already FILLED" in line for line in h.logger.warnings())
+
+
+def stop(kind: int, utc: int, *, price: float) -> object:
+    """The trader's stop buy `ORDER`, in an event of `kind` at `utc`."""
+    order = make_order(ORDER, POSITION, order_type=om.STOP, utc=utc, stop=price, volume=200)
+    return make_event(kind, order, position=created())
+
+
+async def test_a_stop_order_moved_takes_its_new_trigger_price() -> None:
+    async with harness() as h:
+        with no_events_of_the_order(h):
+            burst(h, stop(om.ORDER_ACCEPTED, 10, price=86000.0))
+            burst(h, stop(om.ORDER_REPLACED, 11, price=86100.0))
+            await wait_until(lambda: "OrderUpdated" in kinds(h))
+
+        order = external(h)
+        assert order.order_type == OrderType.STOP_MARKET
+        assert order.status == OrderStatus.ACCEPTED
+        assert order.trigger_price == Price.from_str("86100.00")
+        update = h.reports[-1]
+        assert update.order_status == OrderStatus.ACCEPTED
+        assert update.trigger_price == Price.from_str("86100.00")
+        assert update.price is None
+        assert h.logger.errors() == []
+
+
+async def test_an_order_that_expires_ends_expired() -> None:
+    async with harness() as h:
+        with no_events_of_the_order(h):
+            burst(
+                h,
+                limit(om.ORDER_ACCEPTED, 10, position=created()),
+                limit(om.ORDER_EXPIRED, 11, position=created()),
+            )
+            await wait_until(lambda: external(h) is not None and external(h).is_closed)
+
+        assert external(h).status == OrderStatus.EXPIRED
+        assert kinds(h)[-2:] == ["OrderAccepted", "OrderExpired"]
+        assert reported(h)[-1] == (OrderStatusReport.__name__, OrderStatus.EXPIRED)
+        assert h.logger.errors() == []
+
+
+async def test_an_order_the_venue_rejects_ends_rejected_with_its_reason() -> None:
+    async with harness() as h:
+        with no_events_of_the_order(h):
+            burst(
+                h,
+                limit(om.ORDER_ACCEPTED, 10, position=created()),
+                limit(om.ORDER_REJECTED, 11, position=created(), error="NOT_ENOUGH_MONEY"),
+            )
+            await wait_until(lambda: external(h) is not None and external(h).is_closed)
+
+        order = external(h)
+        assert order.status == OrderStatus.REJECTED
+        assert order.events[-1].reason == "NOT_ENOUGH_MONEY"
+        assert reported(h)[-1] == (OrderStatusReport.__name__, OrderStatus.REJECTED)
+        assert h.logger.errors() == []
+
+
+async def test_a_fill_nautilus_refuses_is_an_error() -> None:
+    async with harness() as h:
+        burst(
+            h,
+            limit(om.ORDER_ACCEPTED, 10, position=created()),
+            # More than the order holds: Nautilus refuses an overfill.
+            filled(11, 7_800_001, 300, 0, price=84000.0, order_volume=200),
+        )
+        await wait_until(lambda: h.logger.errors())
+
+        (error,) = h.logger.errors()
+        assert "fill 7800001 of order 6800001" in error
+        assert "may differ from the broker's" in error
+        assert external(h).filled_qty == Quantity.zero(2)

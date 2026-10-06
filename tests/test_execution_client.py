@@ -1297,6 +1297,8 @@ async def test_a_bracket_whose_position_closed_before_its_correction_is_dropped(
 
         await push(h, FIRST_EVENTS[1], closed_by_hand())
         await wait_until(lambda: "OrderModifyRejected" in h.kinds_of(STOP))
+        # The legs' cancels come behind the trader's close, which waits for the entry's fill.
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
 
         assert len(h.client._brackets) == 0
         (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]

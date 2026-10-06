@@ -6,7 +6,8 @@ This client translates between that model and Nautilus:
 - each command becomes a venue request, registered as in flight before it leaves, so the model
   can tell the node's own changes from a trader's;
 - a request's response and the pushed events go through one entry point into the model;
-- the model's records become Nautilus events, reports and account activity.
+- the model's records become Nautilus events, reports and account activity, delivered in the
+  order the broker sent them.
 
 An order or a close whose outcome is unknown is never resent: the lost answer may hide a fill.
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -53,6 +55,7 @@ from nautilus_trader.model.enums import (
     OrderType,
     PositionSide,
 )
+from nautilus_trader.model.events import OrderEvent as NautilusOrderEvent
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -135,6 +138,9 @@ _OPEN = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _ENDED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
 # Activity after which what stands on unloaded symbols may have changed.
 _EXPOSURE_KINDS = (ActivityKind.UNLOADED_SYMBOL, ActivityKind.STOP_OUT)
+# How long a report or an activity waits for the client's earlier events to be applied. Nautilus
+# applies a queued event within a few passes of the loop; an event it refuses never appears.
+_EVENT_WAIT_SECS = 0.1
 
 
 @dataclass
@@ -330,6 +336,11 @@ class CTraderExecutionClient(LiveExecutionClient):
         # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
         self._holds_account = False
         self._checkpoint: BalanceCheckpoint | None = None
+        # Events sent to Nautilus's queue and not yet seen applied: event id -> client order id.
+        self._unapplied: dict[UUID4, ClientOrderId] = {}
+        # Records held behind those events, in order, and the task that delivers them.
+        self._outbox: deque[Record] = deque()
+        self._outbox_task: asyncio.Task | None = None
 
     @property
     def instrument_provider(self) -> CTraderInstrumentProvider:
@@ -402,6 +413,11 @@ class CTraderExecutionClient(LiveExecutionClient):
         for timer in self._protection_timers:
             timer.cancel()
         self._protection_timers.clear()
+        if self._outbox_task is not None:
+            self._outbox_task.cancel()
+            self._outbox_task = None
+        self._outbox.clear()
+        self._unapplied.clear()
         self._stop_awaiting()
         # Whatever it held is dropped: its next connect rebuilds anew.
         self._buffer = None
@@ -431,6 +447,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         # This pass's own mass status supersedes a start's still awaited; one release serves both.
         self._stop_awaiting()
         self._hold_buffer()
+        # What the model said before the reconnect reaches Nautilus before the pass's reports.
+        if self._outbox_task is not None:
+            await asyncio.shield(self._outbox_task)
         try:
             trader = await self._trader()
             self._take_trader(trader)
@@ -1230,23 +1249,84 @@ class CTraderExecutionClient(LiveExecutionClient):
             f"{_reason(event.errorCode, event.description or None)}",
         )
 
+    def _send_order_event(self, event: NautilusOrderEvent) -> None:
+        # Nautilus queues an event; a report or an activity after it waits until it is applied.
+        self._unapplied[event.id] = event.client_order_id
+        super()._send_order_event(event)
+
+    def _events_unapplied(self) -> bool:
+        """Whether an event this client sent is still in Nautilus's queue."""
+        for event_id, client_order_id in list(self._unapplied.items()):
+            order = self._cache.order(client_order_id)
+            # Without its order the event can never be applied.
+            if order is None or any(e.id == event_id for e in order.events):
+                del self._unapplied[event_id]
+        return bool(self._unapplied)
+
+    @staticmethod
+    def _applied_at_once(record: Record) -> bool:
+        """Whether Nautilus applies what the record becomes at once: a report or an activity."""
+        if isinstance(record, OrderEvent):
+            return record.client_order_id is None
+        return isinstance(record, (ExternalOrder, Activity))
+
     def _handle_records(self, records: Iterable[Record]) -> None:
+        """Deliver the records in order, each behind the events this client sent before it.
+
+        A report or an activity would overtake an event still in Nautilus's queue, so it waits,
+        and every record after it, until those events are applied.
+        """
         for record in records:
-            try:
-                if isinstance(record, OrderEvent):
-                    self._order_event(record)
-                elif isinstance(record, ExternalOrder):
-                    self._external_order(record)
-                elif isinstance(record, Activity):
-                    self._activity(record)
-                elif isinstance(record, Notice):
-                    self._log.warning(record.text)
-                elif isinstance(record, (AwaitProtection, ProtectionMissing)):
-                    self._on_protection(record)
-                else:
-                    self._log.warning(f"{type(record).__name__} is not a known record; ignored")
-            except Exception as e:
-                self._log.exception(f"{type(record).__name__} could not be reported", e)
+            if self._outbox or (self._applied_at_once(record) and self._events_unapplied()):
+                self._outbox.append(record)
+                if self._outbox_task is None:
+                    self._outbox_task = self._loop.create_task(self._deliver_outbox())
+            else:
+                self._handle_record(record)
+
+    async def _deliver_outbox(self) -> None:
+        try:
+            while self._outbox:
+                deadline = self._loop.time() + _EVENT_WAIT_SECS
+                # Polled, not awaited: nothing signals that Nautilus applied an event.
+                while self._loop.time() < deadline:
+                    if not self._events_unapplied():
+                        break
+                    await asyncio.sleep(0)
+                if self._unapplied:
+                    self._log.warning(
+                        f"Nautilus did not apply {len(self._unapplied)} order event(s) within "
+                        f"{_EVENT_WAIT_SECS:g}s; the reports and activity behind them are "
+                        "delivered anyway",
+                    )
+                    self._unapplied.clear()
+                while self._outbox:
+                    record = self._outbox[0]
+                    if self._applied_at_once(record) and self._events_unapplied():
+                        break
+                    self._outbox.popleft()
+                    self._handle_record(record)
+        finally:
+            # A detach may have replaced this task already.
+            if self._outbox_task is asyncio.current_task():
+                self._outbox_task = None
+
+    def _handle_record(self, record: Record) -> None:
+        try:
+            if isinstance(record, OrderEvent):
+                self._order_event(record)
+            elif isinstance(record, ExternalOrder):
+                self._external_order(record)
+            elif isinstance(record, Activity):
+                self._activity(record)
+            elif isinstance(record, Notice):
+                self._log.warning(record.text)
+            elif isinstance(record, (AwaitProtection, ProtectionMissing)):
+                self._on_protection(record)
+            else:
+                self._log.warning(f"{type(record).__name__} is not a known record; ignored")
+        except Exception as e:
+            self._log.exception(f"{type(record).__name__} could not be reported", e)
 
     def _nautilus_order(self, record: OrderEvent) -> Order | None:
         """The order a record is about: the node's by its own id, an external one by venue id."""
@@ -1334,7 +1414,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         instrument = self._instrument_provider.find(order.instrument_id)
         ts_init = self._clock.timestamp_ns()
         if record.kind == OrderEventKind.FILLED:
-            self._send_fill_report(
+            self._send_external_fill(
                 reports.fill_report(
                     record.fill,
                     record.venue_order_id,
@@ -1366,7 +1446,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             reports.order_status_report(record, instrument, self.account_id, ts_init),
         )
         for fill in record.fills:
-            self._send_fill_report(
+            self._send_external_fill(
                 reports.fill_report(
                     fill,
                     record.venue_order_id,
@@ -1375,6 +1455,19 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self._currency,
                     ts_init,
                 ),
+            )
+
+    def _send_external_fill(self, report: FillReport) -> None:
+        """Send an external order's fill, and say so if Nautilus did not apply it."""
+        # TODO(verify): that the deals of one order arrive in time order. Nautilus skips a
+        # reconciliation fill older than one it applied to the same order.
+        self._send_fill_report(report)
+        client_order_id = self._cache.client_order_id(report.venue_order_id)
+        order = None if client_order_id is None else self._cache.order(client_order_id)
+        if order is None or report.trade_id not in order.trade_ids:
+            self._log.error(
+                f"Nautilus did not apply fill {report.trade_id} of order "
+                f"{report.venue_order_id}; its position may differ from the broker's",
             )
 
     def _activity(self, record: Activity) -> None:
