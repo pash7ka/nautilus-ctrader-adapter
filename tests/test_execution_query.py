@@ -434,3 +434,24 @@ async def test_a_partly_filled_pending_entry_is_answered_with_its_fill() -> None
         assert h.cache.order(ClientOrderId(MARKET_ID)).filled_qty == Quantity.from_str("0.50")
         (built,) = h.mass_statuses
         assert list(built.order_reports) == [VenueOrderId(str(MARKET_ORDER))]
+
+
+async def test_an_entry_answered_filled_leaves_a_known_position_unrebuilt() -> None:
+    venue = ExecutionVenue()
+    config = exec_config(order_request_timeout_secs=0.2, protective_order_timeout_secs=30.0)
+    async with harness(execution_venue=venue, config=config) as h:
+        await lost_bracket(h)
+        # The model learns the position from its events; the protective order has not come.
+        await push(h, *FIRST_EVENTS[:2])
+        assert all(alive for _, alive in h.client._book.view(FIRST).legs.values())
+        filled_at_the_broker(venue)
+        rebuilds: list[None] = []
+        load = h.client._load
+        h.client._load = lambda: (rebuilds.append(None), load())[1]
+
+        await h.client._query_order(query(h, ENTRY))
+
+        assert len(h.mass_statuses) == 1
+        assert rebuilds == []
+        assert all(alive for _, alive in h.client._book.view(FIRST).legs.values())
+        assert len(h.client._brackets) == 1

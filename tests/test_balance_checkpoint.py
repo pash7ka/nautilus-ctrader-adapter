@@ -23,7 +23,7 @@ from nautilus_ctrader.common.balance_history import OFF, checkpoint_at, next_che
 from nautilus_ctrader.constants import BALANCE_CHECKPOINT_KEY, BUCKET_HISTORICAL
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.account_venue import ACCOUNT_ID
+from tests.account_venue import ACCOUNT_ID, HeldReplies
 from tests.execution_replay import RECORDING
 from tests.execution_venue import WEEK_MS, ExecutionVenue, exec_config, harness, trader
 from tests.polling import wait_until
@@ -571,13 +571,16 @@ async def test_a_stopped_checkpoint_starts_no_background_walk() -> None:
             checkpoint.stop()
 
 
-async def test_a_failed_checkpoint_write_is_logged_and_connect_succeeds() -> None:
-    class FailingCache(Cache):
-        def add(self, key: str, value: bytes) -> None:
-            if key == BALANCE_CHECKPOINT_KEY:
-                raise RuntimeError("cache unavailable")
-            super().add(key, value)
+class FailingCache(Cache):
+    """A cache whose write of the checkpoint key fails."""
 
+    def add(self, key: str, value: bytes) -> None:
+        if key == BALANCE_CHECKPOINT_KEY:
+            raise RuntimeError("cache unavailable")
+        super().add(key, value)
+
+
+async def test_a_failed_checkpoint_write_is_logged_and_connect_succeeds() -> None:
     venue = history_venue(last_at=last_t() - DAY_MS)
     async with harness(
         execution_venue=venue, config=config(), connect=False, cache=FailingCache()
@@ -587,3 +590,53 @@ async def test_a_failed_checkpoint_write_is_logged_and_connect_succeeds() -> Non
         assert h.client._checkpoint is not None
         assert h.cache.get(BALANCE_CHECKPOINT_KEY) is None
         assert any("could not be written" in line for line in h.logger.errors())
+
+
+async def test_a_failed_off_write_is_logged_and_connect_succeeds() -> None:
+    async with harness(connect=False, cache=FailingCache()) as h:
+        await h.client._connect()
+
+        assert h.client._checkpoint is not None
+        assert h.cache.get(BALANCE_CHECKPOINT_KEY) is None
+        assert any("could not be written" in line for line in h.logger.errors())
+
+
+async def test_a_stopped_checkpoint_writes_no_off_value() -> None:
+    async with harness() as h:
+        written: list[bytes] = []
+        checkpoint = BalanceCheckpoint(
+            request=partial(h.client._request, bucket=BUCKET_HISTORICAL),
+            account_id=ACCOUNT_ID,
+            hour=None,
+            zone=UTC_ZONE,
+            currency="USD",
+            write=written.append,
+            loop=asyncio.get_running_loop(),
+            now_ms=now_ms,
+            log=h.logger,
+        )
+        checkpoint.stop()
+
+        await checkpoint.refresh(h.venue.trader.trader, bounded=True)
+
+        assert written == []
+
+
+async def test_a_detach_during_the_start_refresh_raises_nothing_from_the_checkpoint() -> None:
+    venue = history_venue(last_at=last_t() - DAY_MS)
+    held = HeldReplies(
+        venue.server, om.PROTO_OA_DEAL_LIST_REQ, venue.replies[om.PROTO_OA_DEAL_LIST_REQ]
+    )
+    async with harness(execution_venue=venue, config=config(), connect=False) as h:
+        connecting = asyncio.create_task(h.client._connect())
+        await asyncio.wait_for(held.arrived.wait(), timeout=5)
+
+        # What a disconnect does first while the refresh is out.
+        h.client._detach()
+        await held.stop_holding()
+        outcome = await asyncio.wait_for(
+            asyncio.gather(connecting, return_exceptions=True), timeout=10
+        )
+
+        assert not any(isinstance(result, AttributeError) for result in outcome)
+        assert h.cache.get(BALANCE_CHECKPOINT_KEY) is None

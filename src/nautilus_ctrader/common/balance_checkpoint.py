@@ -141,7 +141,7 @@ class BalanceCheckpoint:
         """
         self._cancel_task()
         if self._hour is None:
-            self._write(value_json(OFF, None))
+            self._put(lambda: value_json(OFF, None))
             return
         await self._run(trader, bounded=bounded)
 
@@ -234,25 +234,32 @@ class BalanceCheckpoint:
             value = CheckpointValue(
                 "unavailable", walk.t_ms, None, Reason.REQUEST_FAILED, None, digits
             )
-        if self._stopped:
-            self._log.debug("Balance checkpoint dropped: stopped")
-            return None
         # A value for its own checkpoint stands even once a later one is due, until that one
         # is written.
         if self._written_ms is not None and self._written_ms > walk.t_ms:
             self._log.debug("Balance checkpoint dropped: a later checkpoint is written")
             return None
-        try:
-            if trader is not None:
-                value = self._with_deposit(value, _registration(trader))
-            self._write(value_json(value, self._currency))
-        except Exception as e:
-            self._log.exception("Balance checkpoint could not be written", e)
+        registration = None if trader is None else _registration(trader)
+        if not self._put(
+            lambda: value_json(self._with_deposit(value, registration), self._currency)
+        ):
             return None
         self._written_ms = walk.t_ms
         reason = "" if value.reason is None else f" ({value.reason.value})"
         self._log.info(f"Balance checkpoint written: {value.status}{reason}")
         return trader
+
+    def _put(self, payload: Callable[[], bytes]) -> bool:
+        """Write `payload()` to the key; `False`, writing nothing, once stopped or if it fails."""
+        if self._stopped:
+            self._log.debug("Balance checkpoint dropped: stopped")
+            return False
+        try:
+            self._write(payload())
+        except Exception as e:
+            self._log.exception("Balance checkpoint could not be written", e)
+            return False
+        return True
 
     def _unfinished(self, walk: _Walk, trader: om.ProtoOATrader) -> bool:
         if walk.failure is not None:

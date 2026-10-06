@@ -338,7 +338,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._load()
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
-            self._checkpoint = BalanceCheckpoint(
+            checkpoint = self._checkpoint = BalanceCheckpoint(
                 request=partial(self._request, bucket=BUCKET_HISTORICAL),
                 account_id=self._account.account_id,
                 hour=self._config.balance_checkpoint_hour,
@@ -350,9 +350,10 @@ class CTraderExecutionClient(LiveExecutionClient):
                 log=self._log,
             )
             # Written before the node reconciles and its trader starts. A connection lost
-            # meanwhile leaves the key to the reconnect pass.
-            await self._checkpoint.refresh(trader, bounded=True)
-            self._checkpoint.schedule()
+            # meanwhile leaves the key to the reconnect pass. Held locally: a detach meanwhile
+            # stops it and drops the attribute.
+            await checkpoint.refresh(trader, bounded=True)
+            checkpoint.schedule()
             # The first bring-up has run its restores already; this one serves every later one.
             session.add_restore(self._restore_key, self._reload)
         except BaseException:
@@ -408,6 +409,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             # Reported under the node's id if it reached the broker; never in flight past this.
             self._end_lost_closes()
             self._send_mass_status_report(status)
+            self._end_closed_brackets(status)
         except BaseException:
             # Lost closes stay in flight: the retried pass may still find them.
             self._release_buffer()
@@ -423,6 +425,27 @@ class CTraderExecutionClient(LiveExecutionClient):
         # execution events wait on it.
         if self._checkpoint is not None and self._config.balance_checkpoint_hour is not None:
             await self._checkpoint.refresh(trader, bounded=True)
+
+    def _end_closed_brackets(self, status: ExecutionMassStatus) -> None:
+        """End each pending bracket whose entry filled at the broker but whose position is gone.
+
+        Such a position opened and closed while the connection was down: no protective order
+        will come for it. An entry the broker does not list stays pending, for Nautilus's own
+        in-flight check.
+        """
+        filled = {
+            report.client_order_id.value
+            for report in status.order_reports.values()
+            if report.client_order_id is not None and report.filled_qty.as_decimal() > 0
+        }
+        for bracket in self._brackets:
+            if bracket.entry_id not in filled:
+                continue
+            view = self._bracket_position(bracket)
+            if view is None or not view.open:
+                self._end_bracket(
+                    bracket.entry_id, "the position closed before its levels were set"
+                )
 
     def _end_lost_closes(self) -> None:
         for client_order_id in self._lost_closes:
@@ -620,6 +643,9 @@ class CTraderExecutionClient(LiveExecutionClient):
           has come would end legs still alive.
         - Not while a rebuild holds the buffer: releasing it here would apply the held events
           before Nautilus has reconciled the start.
+
+        The rebuild also resets the in-flight state of other brackets (rare; their own queries
+        heal it).
         """
         if self._buffer is not None:
             self._log.debug(f"Bracket {entry_id}: its entry filled; left to the rebuild under way")

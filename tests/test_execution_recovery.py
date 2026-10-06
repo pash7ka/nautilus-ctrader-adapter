@@ -26,7 +26,7 @@ from nautilus_trader.execution.messages import (
 from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import ContingencyType, OrderSide, OrderStatus, OrderType
-from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.events import OrderFilled, OrderModifyRejected
 from nautilus_trader.model.identifiers import ClientOrderId, PositionId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Money, Price, Quantity
 
@@ -62,6 +62,7 @@ from tests.execution_venue import (
     US100_SYMBOL_ID,
     ExecutionVenue,
     Harness,
+    bracket,
     broker_lists,
     close_sent,
     exec_config,
@@ -70,9 +71,11 @@ from tests.execution_venue import (
     on_us100,
     our_market_position,
     push,
+    push_spot,
     serve,
     started,
     status,
+    submit_bracket,
     submitted,
 )
 from tests.polling import wait_until
@@ -952,3 +955,108 @@ async def test_a_close_answered_during_a_rebuild_is_still_the_nodes() -> None:
         assert not any(r.venue_order_id == VenueOrderId("6300002") for r in h.reports)
         assert not any(a.kind == "manual_change" for a in h.activity)
         assert in_flight(h) is None
+
+
+# -- A bracket in flight across a reconnect ------------------------------------------------------
+
+BRACKET_POSITION, BRACKET_ORDER = 5_400_001, 6_400_001
+# The bracket's answer is given up on quickly, so a test can lose it.
+LOSING = exec_config(order_request_timeout_secs=0.2)
+
+
+def bracket_closed_meanwhile(venue: ExecutionVenue, *, opened: int, closed: int) -> None:
+    """The node's bracket filled at `opened` and closed by hand at `closed`, with no level set."""
+    entry = make_order(
+        BRACKET_ORDER,
+        BRACKET_POSITION,
+        utc=opened,
+        label=order_record.encode_label(ENTRY),
+        comment=order_record.encode_comment(LegIds(STOP, TARGET)),
+        client_order_id=ENTRY,
+        symbol=US100_SYMBOL_ID,
+    )
+    close = make_order(
+        BRACKET_ORDER + 1,
+        BRACKET_POSITION,
+        side=om.SELL,
+        closing=True,
+        utc=closed,
+        symbol=US100_SYMBOL_ID,
+    )
+    for order in (entry, close):
+        order.orderStatus = om.ORDER_STATUS_FILLED
+    deals = on_us100(
+        [
+            make_deal(
+                7_400_001,
+                BRACKET_ORDER,
+                BRACKET_POSITION,
+                side=om.BUY,
+                volume=100,
+                price=85000.0,
+                ts=opened,
+            ),
+            make_deal(
+                7_400_002,
+                BRACKET_ORDER + 1,
+                BRACKET_POSITION,
+                side=om.SELL,
+                volume=100,
+                price=85100.0,
+                ts=closed,
+            ),
+        ]
+    )
+    venue.position_orders[BRACKET_POSITION] = [entry, close]
+    venue.position_deals[BRACKET_POSITION] = deals
+    venue.deals += deals
+
+
+async def lost_bracket_with_a_waiting_modify(h: Harness) -> None:
+    await push_spot(h, 8_528_600_000, 8_528_721_000)
+    await submit_bracket(h, bracket(h))
+    await h.client._modify_order(
+        ModifyOrder(
+            trader_id=TRADER_ID,
+            strategy_id=STRATEGY_ID,
+            instrument_id=US100_ID,
+            client_order_id=ClientOrderId(STOP),
+            venue_order_id=None,
+            quantity=None,
+            price=None,
+            trigger_price=Price.from_str("85150.00"),
+            command_id=UUID4(),
+            ts_init=0,
+        ),
+    )
+    assert len(h.client._brackets) == 1
+
+
+async def test_a_bracket_whose_position_closed_during_a_disconnect_ends_at_the_reconnect() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await lost_bracket_with_a_waiting_modify(h)
+        bracket_closed_meanwhile(venue, opened=now - 120_000, closed=now - 60_000)
+
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        await wait_until(lambda: "OrderModifyRejected" in h.kinds_of(STOP))
+
+        assert len(h.client._brackets) == 0
+        (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]
+        assert rejected.reason == "the position closed before its levels were set"
+        assert status(h, ENTRY) == OrderStatus.FILLED
+
+
+async def test_a_bracket_the_broker_does_not_list_stays_pending_across_a_reconnect() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await lost_bracket_with_a_waiting_modify(h)
+
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+
+        assert len(h.client._brackets) == 1
+        assert "OrderModifyRejected" not in h.kinds_of(STOP)
+        assert status(h, STOP) == OrderStatus.SUBMITTED
