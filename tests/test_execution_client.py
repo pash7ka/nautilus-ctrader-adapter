@@ -20,7 +20,12 @@ from nautilus_trader.execution.messages import (
 )
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
-from nautilus_trader.model.events import OrderFilled, OrderPendingCancel, OrderRejected
+from nautilus_trader.model.events import (
+    OrderFilled,
+    OrderModifyRejected,
+    OrderPendingCancel,
+    OrderRejected,
+)
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientOrderId,
@@ -1213,6 +1218,45 @@ async def test_a_modify_waiting_on_a_rejected_entry_is_rejected_before_the_leg_i
         await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
 
         assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderModifyRejected", "OrderCanceled"]
+
+
+def closed_by_hand() -> oa.ProtoOAExecutionEvent:
+    """The first position closed whole by hand, with no level set yet (hand-built)."""
+    event = type(FIRST_EVENTS[7])()
+    event.CopyFrom(FIRST_EVENTS[7])
+    event.order.tradeData.volume = 100
+    event.order.executedVolume = 100
+    event.deal.volume = 100
+    event.deal.filledVolume = 100
+    event.deal.closePositionDetail.closedVolume = 100
+    event.position.tradeData.volume = 0
+    event.position.positionStatus = om.POSITION_STATUS_CLOSED
+    event.position.ClearField("stopLoss")
+    event.position.ClearField("takeProfit")
+    return event
+
+
+async def test_a_bracket_whose_position_closed_before_its_correction_is_dropped() -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    config = exec_config(protective_order_timeout_secs=30.0)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        sending = await in_flight(h, held)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+        await held.release()
+        await sending
+
+        await push(h, FIRST_EVENTS[1], closed_by_hand())
+        await wait_until(lambda: "OrderModifyRejected" in h.kinds_of(STOP))
+
+        assert len(h.client._brackets) == 0
+        (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]
+        assert rejected.reason == "the position closed before its levels were set"
+        assert status(h, STOP) == OrderStatus.CANCELED
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
 
 
 async def test_a_leg_is_cancelled_by_removing_its_level_alone() -> None:

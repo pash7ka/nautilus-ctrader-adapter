@@ -1686,11 +1686,24 @@ class CTraderExecutionClient(LiveExecutionClient):
     # -- Bracket levels ---------------------------------------------------------------------------
 
     def _settle_brackets(self) -> None:
-        """Start the correcting amend of each bracket whose protective order has come."""
+        """Start the correcting amend of each bracket whose protective order has come.
+
+        A bracket whose position has closed is dropped: its levels will never be set.
+        """
         for bracket in self._brackets:
             if bracket.correcting:
                 continue
             view = self._bracket_position(bracket)
+            # A position only created is not open either; a closed one has ended every leg.
+            if (
+                view is not None
+                and not view.open
+                and not any(alive for _, alive in view.legs.values())
+            ):
+                self._end_bracket(
+                    bracket.entry_id, "the position closed before its levels were set"
+                )
+                continue
             if view is None or view.protective_order_id is None:
                 continue
             if self._wanted_levels(bracket, view) == view.levels:
