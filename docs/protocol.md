@@ -395,6 +395,40 @@ and **already names a new `positionId`**, in `POSITION_STATUS_CREATED` with zero
   Together the two lists rebuild the balance at any past moment the deal history covers.
 - **Unconfirmed**: the sign of `delta` for a withdrawal; the session had none.
 
+### The lists reconciliation reads
+
+After a restart or a reconnect the adapter rebuilds what happened from five lists. All were asked
+at the end of the recorded session, which held three positions, all closed by then (two traded
+and closed, one pending order cancelled before it ever opened).
+
+- **The snapshot** (`ProtoOAReconcileReq`) lists the open positions and the pending orders, and
+  nothing about closed ones. An open position carries its `stopLoss` and `takeProfit`. Its
+  protective order is listed among the orders **only when `returnProtectionOrders` is set**, and
+  then under its own `orderId`; without the flag the order list held none (confirmed, on every
+  snapshot taken both ways). A pending `LIMIT` order appeared in both.
+- **A position's own order list** (`ProtoOAOrderListByPositionIdReq`) answered **without a time
+  window** for all three positions (confirmed). For a closed position it holds the entry (a
+  `MARKET` order, `IMMEDIATE_OR_CANCEL`), each closing order, and the protective order, which
+  after a level triggered is `ORDER_STATUS_FILLED` with `executedVolume` equal to its volume and
+  both levels (`stopPrice` and `limitPrice`) as they stood. A pending order cancelled before it
+  opened is listed with `ORDER_STATUS_CANCELLED` and nothing executed. Every order carries its
+  `positionId`. **Unconfirmed**: the list of a position that is still open.
+- **A position's own deal list** (`ProtoOADealListByPositionIdReq`) likewise answered without a
+  window. Each deal's `orderId` matches an order of the position's own order list, which is how a
+  fill is tied to its order. Opening deals carry a commission too, not only closing ones. The list
+  for the cancelled pending order was empty.
+- **The account's deal list** and **order list** over a time window answered; each fitted in one
+  page (`hasMore` false), so paging is **unconfirmed**, as are the order the lists come in, the
+  order of items inside one millisecond, which of an order's times the order list filters by,
+  and whether either end of a window is inclusive. The adapter asks in windows of a week and
+  de-duplicates by id.
+- **The cash-flow list** answered for a window of a week. **Unconfirmed**: whether it has pages
+  at all, and whether a week is its maximum.
+
+The orders a trader placed in the recorded session carry no `label`, because the terminal sets
+none, so every recorded position is foreign. That the venue returns the adapter's own `label` and
+`comment` fields unchanged is **unconfirmed**; so is whether a rejected order is listed.
+
 ### Messages not seen
 
 No margin-change, trader-update, margin-call or order-error event arrived in the session; their

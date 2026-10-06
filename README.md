@@ -4,11 +4,11 @@ A [cTrader Open API](https://help.ctrader.com/open-api/) adapter for
 [NautilusTrader](https://github.com/nautechsystems/nautilus_trader): market data and order
 execution against any broker that exposes cTrader Open API.
 
-> **Status: early development (pre-alpha).** The transport layer, the instrument provider and
-> the market data client are in place and tested offline; the execution client comes next. The
-> public API is not stable and there is no PyPI release yet. Nothing here trades: the adapter
-> sends no orders at all, and the scripts that do connect to a real account only read from it.
-> See [Roadmap](#roadmap).
+> **Status: early development (pre-alpha).** The transport layer, the instrument provider, the
+> market data client and the execution client are in place and tested offline against recorded
+> fixtures and a fake server. The execution client has not yet been confirmed with a live order:
+> the scripts that connect to a real account only read from it. The public API is not stable and
+> there is no PyPI release yet. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -42,7 +42,7 @@ what to trade or when.
 | Authentication | Application-level and account-level auth; access-token refresh over the socket (the one-time authorization-code exchange stays with the host application — see Credentials) |
 | Instrument provider | Builds Nautilus `Instrument` objects from broker symbol specifications (precision, lot size, volume step and limits) |
 | Data client | Live trendbar (OHLC) and spot (bid/ask) subscriptions, plus historical trendbar requests |
-| Execution client | Order submission, modification and cancellation; translation between the Nautilus order model and the cTrader position model; execution reports for state reconciliation |
+| Execution client | Market orders and market brackets on hedging accounts; translation between the Nautilus order model and the cTrader position model (stop-loss and take-profit are levels on a position); execution reports and a full mass status at start and on every reconnect; answers to order queries; account state; a balance checkpoint and the account's activity on instruments the node has not loaded, for the application to read — see [docs/execution.md](docs/execution.md) |
 | Configuration & factories | `LiveDataClientConfig` / `LiveExecClientConfig` subclasses and the factories a `TradingNode` needs |
 | Test doubles | Recorded protobuf fixtures and a fake cTrader server, so reconnect, heartbeat, timeout and re-subscription logic can be tested without a broker |
 
@@ -95,36 +95,62 @@ never written to logs: the transport logs no payload bytes at all.
 
 ## Usage
 
-> Subject to change while the package is pre-alpha. There is no execution client yet.
+> Subject to change while the package is pre-alpha.
 
 ```python
 from nautilus_trader.config import InstrumentProviderConfig
-from nautilus_trader.live.config import TradingNodeConfig
+from nautilus_trader.live.config import LiveExecEngineConfig, TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 
-from nautilus_ctrader import CTRADER, CTraderDataClientConfig, CTraderLiveDataClientFactory
+from nautilus_ctrader import (
+    CTRADER,
+    CTraderDataClientConfig,
+    CTraderExecClientConfig,
+    CTraderLiveDataClientFactory,
+    CTraderLiveExecClientFactory,
+)
+
+account = dict(
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET,
+    access_token=ACCESS_TOKEN,
+    refresh_token=REFRESH_TOKEN,
+    trader_login=TRADER_LOGIN,
+)
 
 config = TradingNodeConfig(
     data_clients={
         CTRADER: CTraderDataClientConfig(
-            client_id=CLIENT_ID,
-            client_secret=CLIENT_SECRET,
-            access_token=ACCESS_TOKEN,
-            refresh_token=REFRESH_TOKEN,
-            trader_login=TRADER_LOGIN,
+            **account,
             instrument_provider=InstrumentProviderConfig(load_ids=frozenset(["EURUSD.CTRADER"])),
         ),
     },
+    exec_clients={
+        CTRADER: CTraderExecClientConfig(
+            **account,
+            balance_checkpoint_hour=17,
+            balance_checkpoint_timezone="America/New_York",
+        ),
+    },
+    exec_engine=LiveExecEngineConfig(
+        inflight_check_threshold_ms=5_000,
+        inflight_check_retries=18,
+    ),
 )
 
 node = TradingNode(config=config)
 node.add_data_client_factory(CTRADER, CTraderLiveDataClientFactory)
+node.add_exec_client_factory(CTRADER, CTraderLiveExecClientFactory)
 node.build()
 ```
 
 `trader_login` is the broker's own account number; the host is chosen from the account's own
-live flag unless `environment` says otherwise. To persist the tokens the adapter refreshes
-while it runs, see [docs/market_data.md](docs/market_data.md).
+live flag unless `environment` says otherwise. The execution client trades the instruments the
+data client's configuration loads, so a data client for the same account is required.
+`balance_checkpoint_hour` is optional and switches on the daily balance checkpoint. The in-flight
+settings in `LiveExecEngineConfig` follow the recommendation in
+[docs/execution.md](docs/execution.md#5-order-queries-and-in-flight-settings). To persist the
+tokens the adapter refreshes while it runs, see [docs/market_data.md](docs/market_data.md).
 
 ## Protocol notes
 
@@ -157,7 +183,9 @@ and it hard-pins `protobuf==3.20.1`, which conflicts with the rest of a modern s
 confirmed against a live connection or still unconfirmed.
 [docs/instruments.md](docs/instruments.md) is the symbol-to-instrument mapping, and
 [docs/market_data.md](docs/market_data.md) says what the data client delivers and what it does
-not guarantee.
+not guarantee, and [docs/execution.md](docs/execution.md) says what the execution client
+accepts, how brackets map onto cTrader positions, how it recovers after a restart or a reconnect,
+and what an application should read from the cache.
 
 ## Development
 
@@ -176,8 +204,8 @@ real broker connection are opt-in and never run in CI.
 |---|---|
 | M1 | Transport: connection, framing, both authentication levels, token refresh, fake server, tests |
 | M2 | Data: instrument provider, trendbar and spot subscriptions, historical warm-up |
-| M3 | Execution: order submission and modification, Nautilus/cTrader order model translation, execution reports |
-| M4 | Reconciliation, hardening, first tagged release |
+| M3 | Execution: order submission and modification, Nautilus/cTrader order model translation, execution reports, reconciliation and recovery after a restart or a reconnect, order queries, account activity and the balance checkpoint |
+| M4 | Confirmation with live orders, hardening, first tagged release |
 
 ## Disclaimer
 
