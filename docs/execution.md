@@ -371,10 +371,11 @@ Notes on reading it:
   `OrderStatusReport` with its current status, quantities and prices for each later change,
   cancel, expiry or rejection, from which Nautilus makes the `OrderUpdated`, `OrderCanceled` and
   other events itself. A report or an activity therefore waits until Nautilus has applied every
-  event the adapter sent before it, and everything after it waits behind it. Each wait lasts at
-  most 0.1 s: Nautilus applies a queued event within a few passes of the event loop, but one it
-  refuses never appears. Past that, a WARNING says how many events were not applied, and what
-  waited is delivered anyway.
+  event the adapter sent before it, and everything after it waits behind it. An event holds
+  anything back for at most 0.1 s after it was sent: Nautilus applies a queued event within a few
+  passes of the event loop, but one it refuses never appears. When something waited that long, a
+  WARNING says how many events were not applied, and what waited is delivered anyway; an event
+  refused long before delays nothing.
 - **One path per order.** Mixing events and reports for one order could apply its news out of
   order, so an external order never gets an event from the broker's news. Two exceptions: a
   change of an order Nautilus already holds as closed is logged as a WARNING and not reported,

@@ -138,8 +138,8 @@ _OPEN = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _ENDED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
 # Activity after which what stands on unloaded symbols may have changed.
 _EXPOSURE_KINDS = (ActivityKind.UNLOADED_SYMBOL, ActivityKind.STOP_OUT)
-# How long a report or an activity waits for the client's earlier events to be applied. Nautilus
-# applies a queued event within a few passes of the loop; an event it refuses never appears.
+# How long after it is sent an event can hold back a report or an activity. Nautilus applies a
+# queued event within a few passes of the loop; an event it refuses never appears.
 _EVENT_WAIT_SECS = 0.1
 
 
@@ -336,8 +336,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
         self._holds_account = False
         self._checkpoint: BalanceCheckpoint | None = None
-        # Events sent to Nautilus's queue and not yet seen applied: event id -> client order id.
-        self._unapplied: dict[UUID4, ClientOrderId] = {}
+        # Events sent to Nautilus's queue and not yet seen applied, oldest first:
+        # event id -> (client order id, loop time sent).
+        self._unapplied: dict[UUID4, tuple[ClientOrderId, float]] = {}
         # Records held behind those events, in order, and the task that delivers them.
         self._outbox: deque[Record] = deque()
         self._outbox_task: asyncio.Task | None = None
@@ -449,7 +450,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._hold_buffer()
         # What the model said before the reconnect reaches Nautilus before the pass's reports.
         if self._outbox_task is not None:
-            await asyncio.shield(self._outbox_task)
+            # Unlike `shield`, this does not raise when a detach cancels the delivery.
+            await asyncio.wait({self._outbox_task})
+            if self._session is None:
+                return
         try:
             trader = await self._trader()
             self._take_trader(trader)
@@ -1251,17 +1255,49 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     def _send_order_event(self, event: NautilusOrderEvent) -> None:
         # Nautilus queues an event; a report or an activity after it waits until it is applied.
-        self._unapplied[event.id] = event.client_order_id
+        self._expire_unapplied()
+        self._unapplied[event.id] = (event.client_order_id, self._loop.time())
         super()._send_order_event(event)
 
-    def _events_unapplied(self) -> bool:
-        """Whether an event this client sent is still in Nautilus's queue."""
-        for event_id, client_order_id in list(self._unapplied.items()):
+    def _expire_unapplied(self) -> int:
+        """Stop waiting for the events sent longer ago than the bound; returns how many."""
+        oldest = self._loop.time() - _EVENT_WAIT_SECS
+        expired = 0
+        while self._unapplied:
+            event_id, (_, sent) = next(iter(self._unapplied.items()))
+            if sent > oldest:
+                break
+            del self._unapplied[event_id]
+            expired += 1
+        return expired
+
+    def _check_unapplied(self) -> int:
+        """Forget the events Nautilus applied and those past the bound; returns the latter."""
+        for event_id, (client_order_id, _) in list(self._unapplied.items()):
             order = self._cache.order(client_order_id)
             # Without its order the event can never be applied.
             if order is None or any(e.id == event_id for e in order.events):
                 del self._unapplied[event_id]
-        return bool(self._unapplied)
+        return self._expire_unapplied()
+
+    def _bookkeep(self, record: Record) -> None:
+        """What the client itself learns from a record, done as soon as the model makes it."""
+        if not isinstance(record, OrderEvent) or record.client_order_id is None:
+            return
+        # Matched to its broker order: the model knows the close from now on.
+        self._operations.end_close(record.client_order_id)
+        if record.kind in (
+            OrderEventKind.REJECTED,
+            OrderEventKind.CANCELED,
+            OrderEventKind.EXPIRED,
+        ):
+            bracket = self._brackets.by_entry(record.client_order_id)
+            if bracket is not None and not any(
+                self._leg_alive(leg_id) for leg_id in bracket.legs.values()
+            ):
+                self._end_bracket(
+                    bracket.entry_id, record.reason or f"the entry {record.kind.value}"
+                )
 
     @staticmethod
     def _applied_at_once(record: Record) -> bool:
@@ -1274,10 +1310,16 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Deliver the records in order, each behind the events this client sent before it.
 
         A report or an activity would overtake an event still in Nautilus's queue, so it waits,
-        and every record after it, until those events are applied.
+        and every record after it, until those events are applied. Only the delivery waits: the
+        client's own bookkeeping is done at once.
         """
         for record in records:
-            if self._outbox or (self._applied_at_once(record) and self._events_unapplied()):
+            self._bookkeep(record)
+            at_once = self._applied_at_once(record)
+            if at_once:
+                # Events past the bound are dropped without a warning: nothing waited for them.
+                self._check_unapplied()
+            if self._outbox or (at_once and self._unapplied):
                 self._outbox.append(record)
                 if self._outbox_task is None:
                     self._outbox_task = self._loop.create_task(self._deliver_outbox())
@@ -1287,22 +1329,22 @@ class CTraderExecutionClient(LiveExecutionClient):
     async def _deliver_outbox(self) -> None:
         try:
             while self._outbox:
-                deadline = self._loop.time() + _EVENT_WAIT_SECS
-                # Polled, not awaited: nothing signals that Nautilus applied an event.
-                while self._loop.time() < deadline:
-                    if not self._events_unapplied():
-                        break
+                # Polled, not awaited: nothing signals that Nautilus applied an event. Each
+                # tracked event expires within the bound, which ends the loop.
+                expired = self._check_unapplied()
+                while self._unapplied:
                     await asyncio.sleep(0)
-                if self._unapplied:
+                    expired += self._check_unapplied()
+                if expired:
                     self._log.warning(
-                        f"Nautilus did not apply {len(self._unapplied)} order event(s) within "
+                        f"Nautilus did not apply {expired} order event(s) within "
                         f"{_EVENT_WAIT_SECS:g}s; the reports and activity behind them are "
                         "delivered anyway",
                     )
-                    self._unapplied.clear()
+                # Up to a report or an activity behind events the delivered records sent.
                 while self._outbox:
                     record = self._outbox[0]
-                    if self._applied_at_once(record) and self._events_unapplied():
+                    if self._applied_at_once(record) and self._unapplied:
                         break
                     self._outbox.popleft()
                     self._handle_record(record)
@@ -1348,8 +1390,6 @@ class CTraderExecutionClient(LiveExecutionClient):
         if record.client_order_id is None:
             self._external_update(record, order)
             return
-        # Matched to its broker order: the model knows the close from now on.
-        self._operations.end_close(record.client_order_id)
         instrument = self._instrument_provider.find(order.instrument_id)
         venue_order_id = (
             VenueOrderId(record.venue_order_id) if record.venue_order_id else order.venue_order_id
@@ -1398,12 +1438,6 @@ class CTraderExecutionClient(LiveExecutionClient):
             self.generate_order_rejected(*ids, record.reason or "rejected by the venue", ts)
         elif kind == OrderEventKind.EXPIRED:
             self.generate_order_expired(*ids, venue_order_id, ts)
-        if kind in (OrderEventKind.REJECTED, OrderEventKind.CANCELED, OrderEventKind.EXPIRED):
-            bracket = self._brackets.by_entry(record.client_order_id)
-            if bracket is not None and not any(
-                self._leg_alive(leg_id) for leg_id in bracket.legs.values()
-            ):
-                self._end_bracket(bracket.entry_id, record.reason or f"the entry {kind.value}")
 
     def _external_update(self, record: OrderEvent, order: Order) -> None:
         """News of an external order Nautilus holds, as a report, never as an event.
