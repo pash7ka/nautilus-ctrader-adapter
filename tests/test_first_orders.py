@@ -12,6 +12,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import time
 from decimal import Decimal
 
 import pytest
@@ -54,6 +55,14 @@ FAKE_LOGIN = 9_000_001
 EURUSD = TestInstrumentProvider.default_fx_ccy("EURUSD", venue=CTRADER_VENUE)
 DISTANCE = Decimal("0.00100")
 WAIT_SECS = 600.0
+# The test instrument trades in steps of 1 unit from a minimum of 1000.
+SIZES = fo.bracket_sizes(EURUSD)
+FIRST = Quantity.from_int(1000)
+SECOND = Quantity.from_int(1001)
+
+
+def new_steps() -> fo.Steps:
+    return fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS, sizes=SIZES)
 
 
 # -- Refusals before anything is built ----------------------------------------------------
@@ -105,6 +114,26 @@ def test_refuses_a_mistyped_symbol(
     assert nothing_may_be_built == []
 
 
+def test_refuses_an_expired_access_token(
+    nothing_may_be_built: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": "EURUSD")
+    expired = {**FAKE_ENV, "CTRADER_TOKEN_EXPIRES_AT": str(int(time.time()) - 60)}
+    monkeypatch.setattr(fo.get_tokens, "load_env", lambda _path: dict(expired))
+
+    argv = ["--symbol", "EURUSD", "--distance", "0.00100", "--send-live-orders"]
+    assert fo.main(argv) == 2
+    assert nothing_may_be_built == []
+
+
+def test_a_token_expiry_that_is_absent_or_ahead_is_not_expired() -> None:
+    assert not fo.token_expired(FAKE_ENV, now_secs=1_000.0)
+    assert not fo.token_expired({**FAKE_ENV, "CTRADER_TOKEN_EXPIRES_AT": "1001"}, 1_000.0)
+    assert fo.token_expired({**FAKE_ENV, "CTRADER_TOKEN_EXPIRES_AT": "1000"}, 1_000.0)
+    with pytest.raises(fo.MissingCredentials):
+        fo.token_expired({**FAKE_ENV, "CTRADER_TOKEN_EXPIRES_AT": "soon"}, 1_000.0)
+
+
 def test_the_parser_reads_the_distance_as_a_decimal() -> None:
     args = fo.build_arg_parser().parse_args(
         ["--symbol", "EURUSD", "--distance", "0.00100", "--send-live-orders"],
@@ -121,8 +150,18 @@ def test_the_parser_refuses_a_distance_that_is_not_positive(distance: str) -> No
         fo.build_arg_parser().parse_args(["--symbol", "EURUSD", "--distance", distance])
 
 
-def test_the_volume_is_the_instruments_minimum() -> None:
-    assert fo.trade_quantity(EURUSD) == EURUSD.min_quantity
+def test_the_second_bracket_is_one_size_step_over_the_minimum() -> None:
+    assert SIZES.first == EURUSD.min_quantity == FIRST
+    assert SIZES.second == SECOND
+    assert SIZES.partial_close == "1 EUR (0.001 lots)"
+
+
+@pytest.mark.parametrize("wait", ["0", "-1", "inf", "nan", "abc"])
+def test_the_parser_refuses_a_manual_wait_that_is_not_finite_and_positive(wait: str) -> None:
+    with pytest.raises(SystemExit):
+        fo.build_arg_parser().parse_args(
+            ["--symbol", "EURUSD", "--distance", "0.001", "--manual-wait-secs", wait],
+        )
 
 
 FAKE_ENV = {
@@ -191,7 +230,7 @@ class Venue:
         orders = self.factory.bracket(
             instrument_id=EURUSD.id,
             order_side=OrderSide.BUY,
-            quantity=EURUSD.min_quantity,
+            quantity=action.quantity,
             sl_trigger_price=EURUSD.make_price(action.stop_loss),
             tp_price=EURUSD.make_price(action.take_profit),
         )
@@ -275,15 +314,15 @@ def run_to_manual_wait(steps: fo.Steps, venue: Venue) -> None:
 
 
 def test_steps_run_the_fixed_sequence() -> None:
-    steps = fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS)
+    steps = new_steps()
     venue = Venue()
 
     # 1-2. A fresh quote, then a bracket measured from its ask.
     assert steps.on(venue.quote("1.10000", "1.10010")) == [
-        fo.SubmitBracket(stop_loss=Decimal("1.09910"), take_profit=Decimal("1.10110")),
+        fo.SubmitBracket(FIRST, stop_loss=Decimal("1.09910"), take_profit=Decimal("1.10110")),
     ]
     entry, stop_loss, take_profit, submitted = venue.bracket(
-        fo.SubmitBracket(stop_loss=Decimal("1.09910"), take_profit=Decimal("1.10110")),
+        fo.SubmitBracket(FIRST, stop_loss=Decimal("1.09910"), take_profit=Decimal("1.10110")),
     )
     assert steps.on(submitted) == []
     assert steps.on(venue.accepted(entry)) == []
@@ -303,7 +342,7 @@ def test_steps_run_the_fixed_sequence() -> None:
     assert steps.on(venue.quote("1.10010", "1.10020")) == []
     fill, closed = venue.closed("P-1", "1.10000")
     assert steps.on(fill) == []
-    second = fo.SubmitBracket(stop_loss=Decimal("1.09920"), take_profit=Decimal("1.10120"))
+    second = fo.SubmitBracket(SECOND, stop_loss=Decimal("1.09920"), take_profit=Decimal("1.10120"))
     assert steps.on(closed) == [second]
     assert steps.on(TestEventStubs.order_canceled(stop_loss, account_id=ACCOUNT_ID)) == []
 
@@ -317,6 +356,7 @@ def test_steps_run_the_fixed_sequence() -> None:
     (prompt,) = steps.on(venue.accepted(take_profit))
     assert isinstance(prompt, fo.Prompt)
     assert prompt.wait_secs == WAIT_SECS
+    assert "close 1 EUR (0.001 lots) of it" in prompt.text
 
     # 7-8. Both manual changes seen: close the rest, then stop.
     assert steps.on(activity("level_moved")) == []
@@ -328,7 +368,7 @@ def test_steps_run_the_fixed_sequence() -> None:
 
 
 def test_steps_wait_for_both_manual_activities() -> None:
-    steps = fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS)
+    steps = new_steps()
     run_to_manual_wait(steps, Venue())
 
     assert steps.on(activity("partially_closed")) == []
@@ -339,7 +379,7 @@ def test_steps_wait_for_both_manual_activities() -> None:
 
 
 def test_steps_close_the_rest_when_the_manual_wait_runs_out() -> None:
-    steps = fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS)
+    steps = new_steps()
     run_to_manual_wait(steps, Venue())
     assert steps.on(activity("level_moved")) == []
 
@@ -352,7 +392,7 @@ def test_steps_close_the_rest_when_the_manual_wait_runs_out() -> None:
 
 
 def test_steps_stop_when_the_owner_closes_everything_by_hand() -> None:
-    steps = fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS)
+    steps = new_steps()
     venue = Venue()
     run_to_manual_wait(steps, venue)
 
@@ -366,7 +406,7 @@ def test_steps_stop_when_the_owner_closes_everything_by_hand() -> None:
 
 
 def test_steps_stop_on_a_rejection() -> None:
-    steps = fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS)
+    steps = new_steps()
     venue = Venue()
     (submit,) = steps.on(venue.quote("1.10000", "1.10010"))
     entry, stop_loss, _take_profit, submitted = venue.bracket(submit)
@@ -384,7 +424,7 @@ def test_steps_stop_on_a_rejection() -> None:
 
 
 def test_steps_stop_when_the_entry_ends_without_a_fill() -> None:
-    steps = fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS)
+    steps = new_steps()
     venue = Venue()
     (submit,) = steps.on(venue.quote("1.10000", "1.10010"))
     entry, *_legs, submitted = venue.bracket(submit)
@@ -397,7 +437,7 @@ def test_steps_stop_when_the_entry_ends_without_a_fill() -> None:
 
 
 def test_steps_stop_when_the_first_position_closes_before_the_script_closes_it() -> None:
-    steps = fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS)
+    steps = new_steps()
     venue = Venue()
     (submit,) = steps.on(venue.quote("1.10000", "1.10010"))
     entry, stop_loss, take_profit, submitted = venue.bracket(submit)
@@ -416,13 +456,57 @@ def test_steps_stop_when_the_first_position_closes_before_the_script_closes_it()
     assert steps.on(TestEventStubs.order_canceled(take_profit, account_id=ACCOUNT_ID)) == []
 
 
+def second_bracket_without_its_position(steps: fo.Steps, venue: Venue) -> None:
+    """Run to the manual stage, with no PositionOpened ever reported for the second entry."""
+    (submit,) = steps.on(venue.quote("1.10000", "1.10010"))
+    entry, stop_loss, take_profit, submitted = venue.bracket(submit)
+    steps.on(submitted)
+    for event in venue.opened(entry, "P-1", "1.10010"):
+        steps.on(event)
+    steps.on(venue.accepted(stop_loss))
+    steps.on(venue.accepted(take_profit))
+    steps.on(TestEventStubs.order_canceled(take_profit, account_id=ACCOUNT_ID))
+    _fill, closed = venue.closed("P-1", "1.10000")
+    (submit,) = steps.on(closed)
+    _entry, stop_loss, take_profit, submitted = venue.bracket(submit)
+    steps.on(submitted)
+    steps.on(venue.accepted(stop_loss))
+    (prompt,) = steps.on(venue.accepted(take_profit))
+    assert prompt.wait_secs == WAIT_SECS
+
+
+def test_steps_end_the_run_when_the_second_position_was_never_reported() -> None:
+    steps = new_steps()
+    second_bracket_without_its_position(steps, Venue())
+    steps.on(activity("level_moved"))
+
+    prompt, done = steps.on(activity("partially_closed"))
+
+    assert isinstance(prompt, fo.Prompt)
+    assert "terminal" in prompt.text
+    assert done == fo.Done()
+    assert steps.finished
+
+
+def test_steps_end_the_run_when_the_wait_runs_out_with_no_second_position() -> None:
+    steps = new_steps()
+    second_bracket_without_its_position(steps, Venue())
+
+    prompt, done = steps.on(fo.ManualWaitExpired())
+
+    assert isinstance(prompt, fo.Prompt)
+    assert "terminal" in prompt.text
+    assert done == fo.Done()
+    assert steps.finished
+
+
 # -- The event log ------------------------------------------------------------------------
 
 
 def test_log_lines_carry_no_account_identifiers(tmp_path: pathlib.Path) -> None:
     venue = Venue()
     entry, stop_loss, _take_profit, _submitted = venue.bracket(
-        fo.SubmitBracket(stop_loss=Decimal("1.09910"), take_profit=Decimal("1.10110")),
+        fo.SubmitBracket(FIRST, stop_loss=Decimal("1.09910"), take_profit=Decimal("1.10110")),
     )
     fill, opened = venue.opened(entry, "P-1", "1.10010")
     rejected = OrderRejected(
@@ -477,9 +561,7 @@ class RecordingDriver:
         self.cache = Cache()
         self.cache.add_instrument(EURUSD)
         msgbus = MessageBus(trader_id=TraderId("TESTER-001"), clock=self.clock)
-        self.driver = fo._Driver(
-            EURUSD.id, fo.Steps(distance=DISTANCE, manual_wait_secs=WAIT_SECS), log
-        )
+        self.driver = fo._Driver(EURUSD.id, distance=DISTANCE, manual_wait_secs=WAIT_SECS, log=log)
         self.driver.register(
             trader_id=TraderId("TESTER-001"),
             portfolio=Portfolio(msgbus=msgbus, cache=self.cache, clock=self.clock),
@@ -538,10 +620,11 @@ def test_the_driver_carries_out_the_sequence(tmp_path: pathlib.Path, capsys) -> 
         kind, orders = r.sent[-1]
         assert kind == "bracket"
         entry, stop_loss, take_profit = orders.orders
+        assert entry.quantity == stop_loss.quantity == take_profit.quantity == SECOND
         r.open(venue, entry, "P-2", "1.10010")
         r.driver.on_event(venue.accepted(stop_loss))
         r.driver.on_event(venue.accepted(take_profit))
-        assert "by hand" in capsys.readouterr().out
+        assert "close 1 EUR (0.001 lots) of it" in capsys.readouterr().out
 
         # Nothing by hand within the wait: the rest is closed anyway.
         r.advance(WAIT_SECS + 1)

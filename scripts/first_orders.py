@@ -4,16 +4,18 @@
 hand, watching the trading terminal, and only with `--send-live-orders`; it then asks for the
 symbol to be typed again before anything starts. Nothing in the test suite runs it.
 
-It builds a `TradingNode` with this adapter's data and execution clients and, on one symbol at
-the instrument's minimum volume, does exactly this:
+It builds a `TradingNode` with this adapter's data and execution clients and, on one symbol,
+does exactly this:
 
 1. waits for a quote;
-2. buys with a bracket: a stop-loss `--distance` below the ask and a take-profit `--distance`
-   above it;
+2. buys the instrument's minimum volume with a bracket: a stop-loss `--distance` below the ask
+   and a take-profit `--distance` above it;
 3. once both levels are accepted, cancels the take-profit;
 4. once that is cancelled, closes the position;
-5. once the position is closed, buys a second bracket the same way;
-6. asks the owner to move the stop-loss and to close part of the position by hand;
+5. once the position is closed, buys a second bracket the same way, of the minimum volume plus
+   one size step, so that one size step can be closed by hand and the minimum still remains;
+6. asks the owner to move the stop-loss and to close one size step of the position by hand
+   (the prompt names the exact volume);
 7. waits, up to `--manual-wait-secs`, until the adapter reports both changes;
 8. closes the rest and stops.
 
@@ -23,9 +25,12 @@ stops it.
 
     uv run python scripts/first_orders.py --symbol EURUSD --distance 0.00100 --send-live-orders
 
-Credentials and the trader login come from `.env` in the repository root. Every order event,
-position event and account activity is appended to a JSONL file under `--log-dir` (by default
-`tests/recordings/`, which git ignores); no line holds an account id or the trader login. Run
+Credentials and the trader login come from `.env` in the repository root. The script does no
+token refresh, so it refuses to start with an access token whose `CTRADER_TOKEN_EXPIRES_AT` has
+passed. Every order event, position event and account activity is appended to a JSONL file under
+`--log-dir` (by default `tests/recordings/`, which git ignores). The script writes no account
+field, and masks the trader login wherever it appears in a text; whether the broker's own text,
+such as a refusal reason, could hold another account identifier is not confirmed. Run
 `scripts/record_execution.py` alongside it: the checklist printed at the end says what to
 compare between the two.
 """
@@ -37,8 +42,10 @@ import datetime
 import enum
 import importlib.util
 import json
+import math
 import pathlib
 import sys
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -100,8 +107,9 @@ _MANUAL_WAIT_ALERT = "first-orders-manual-wait"
 
 @dataclass(frozen=True)
 class SubmitBracket:
-    """Buy at the minimum volume with these two levels."""
+    """Buy `quantity` with these two levels."""
 
+    quantity: Quantity
     stop_loss: Decimal
     take_profit: Decimal
 
@@ -149,6 +157,31 @@ class ManualWaitExpired:
 # -- The step driver ----------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Sizes:
+    first: Quantity
+    second: Quantity
+    # The volume the owner closes by hand, as the prompt states it.
+    partial_close: str
+
+
+def bracket_sizes(instrument: Instrument) -> Sizes:
+    """The minimum volume for the first bracket; one size step more for the second.
+
+    Where the size step equals the minimum, a position of the minimum cannot be partly closed,
+    so the second is sized for a hand close of one step to leave the minimum standing.
+    """
+    step = instrument.size_increment
+    first = instrument.min_quantity if instrument.min_quantity is not None else step
+    second = instrument.make_qty(first.as_decimal() + step.as_decimal())
+    base = getattr(instrument, "base_currency", None)
+    partial = f"{step} {base.code if base is not None else 'units'}"
+    if instrument.lot_size is not None:
+        lots = (step.as_decimal() / instrument.lot_size.as_decimal()).normalize()
+        partial += f" ({lots:f} lots)"
+    return Sizes(first=first, second=second, partial_close=partial)
+
+
 class _Stage(enum.Enum):
     WAIT_QUOTE = enum.auto()
     FIRST_BRACKET = enum.auto()
@@ -168,9 +201,10 @@ class Steps:
     asked for.
     """
 
-    def __init__(self, *, distance: Decimal, manual_wait_secs: float) -> None:
+    def __init__(self, *, distance: Decimal, manual_wait_secs: float, sizes: Sizes) -> None:
         self._distance = distance
         self._manual_wait_secs = manual_wait_secs
+        self._sizes = sizes
         self._stage = _Stage.WAIT_QUOTE
         self._ask: Decimal | None = None
         self._bracket: BracketSubmitted | None = None
@@ -209,11 +243,12 @@ class Steps:
         if self._stage is not _Stage.WAIT_QUOTE:
             return []
         self._stage = _Stage.FIRST_BRACKET
-        return [self._submit()]
+        return [self._submit(self._sizes.first)]
 
-    def _submit(self) -> SubmitBracket:
+    def _submit(self, quantity: Quantity) -> SubmitBracket:
         # A buy fills at the ask, which is also what the adapter measures the levels from.
         return SubmitBracket(
+            quantity=quantity,
             stop_loss=self._ask - self._distance,
             take_profit=self._ask + self._distance,
         )
@@ -253,7 +288,8 @@ class Steps:
             return [
                 Prompt(
                     "Now, by hand in the trading terminal, on the position this script just "
-                    "opened: move its stop-loss, then close part of it. Waiting up to "
+                    "opened: move its stop-loss, then close "
+                    f"{self._sizes.partial_close} of it. Waiting up to "
                     f"{self._manual_wait_secs:g} s for the adapter to report both.",
                     wait_secs=self._manual_wait_secs,
                 ),
@@ -263,7 +299,7 @@ class Steps:
     def _on_position_closed(self) -> list[Action]:
         if self._stage is _Stage.CLOSING_FIRST:
             self._stage = _Stage.SECOND_BRACKET
-            return [self._submit()]
+            return [self._submit(self._sizes.second)]
         if self._stage is _Stage.CLOSING_SECOND:
             self._stage = _Stage.DONE
             return [Done()]
@@ -276,18 +312,21 @@ class Steps:
             self._seen.add(activity.action)
         if self._seen != _MANUAL_ACTIONS:
             return []
-        self._stage = _Stage.CLOSING_SECOND
-        return [ClosePosition(self._position_id)]
+        return self._close_second([])
 
     def _on_manual_wait_expired(self) -> list[Action]:
         if self._stage is not _Stage.MANUAL:
             return []
-        self._stage = _Stage.CLOSING_SECOND
         missing = ", ".join(sorted(_MANUAL_ACTIONS - self._seen))
-        return [
-            Prompt(f"Not reported within the wait: {missing}. Closing the rest."),
-            ClosePosition(self._position_id),
-        ]
+        return self._close_second(
+            [Prompt(f"Not reported within the wait: {missing}. Closing the rest.")],
+        )
+
+    def _close_second(self, before: list[Action]) -> list[Action]:
+        if self._position_id is None:
+            return self._stop("No position was reported for the second entry.")
+        self._stage = _Stage.CLOSING_SECOND
+        return [*before, ClosePosition(self._position_id)]
 
     def _stop(self, reason: str) -> list[Action]:
         self._stage = _Stage.DONE
@@ -382,27 +421,31 @@ class EventLog:
 # -- The Nautilus side --------------------------------------------------------------------
 
 
-def trade_quantity(instrument: Instrument) -> Quantity:
-    """The instrument's minimum volume; the size step when the broker states no minimum."""
-    if instrument.min_quantity is not None:
-        return instrument.min_quantity
-    return instrument.size_increment
-
-
 class _Driver(Strategy):
-    """Feeds the run's events to `Steps` and carries out what it answers."""
+    """Feeds the run's events to `Steps` and carries out what it answers.
 
-    def __init__(self, instrument_id: InstrumentId, steps: Steps, log: EventLog) -> None:
+    `Steps` is built in `on_start`, once the instrument, and so the volumes, are known.
+    """
+
+    def __init__(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        distance: Decimal,
+        manual_wait_secs: float,
+        log: EventLog,
+    ) -> None:
         super().__init__(StrategyConfig(order_id_tag="001"))
         self._instrument_id = instrument_id
-        self._steps = steps
+        self._distance = distance
+        self._manual_wait_secs = manual_wait_secs
         self._event_log = log
         self._instrument: Instrument | None = None
-        self._quantity: Quantity | None = None
+        self._steps: Steps | None = None
 
     @property
     def finished(self) -> bool:
-        return self._steps.finished
+        return self._steps is not None and self._steps.finished
 
     def on_start(self) -> None:
         self._instrument = self.cache.instrument(self._instrument_id)
@@ -410,15 +453,23 @@ class _Driver(Strategy):
             print(f"\n>>> {self._instrument_id} did not load; nothing was sent.\n")
             self.shutdown_system("instrument not loaded")
             return
-        self._quantity = trade_quantity(self._instrument)
-        print(f"\n>>> Volume: {self._quantity}. Waiting for a quote of {self._instrument_id}.\n")
+        sizes = bracket_sizes(self._instrument)
+        self._steps = Steps(
+            distance=self._distance,
+            manual_wait_secs=self._manual_wait_secs,
+            sizes=sizes,
+        )
+        print(
+            f"\n>>> Volumes: {sizes.first}, then {sizes.second}. "
+            f"Waiting for a quote of {self._instrument_id}.\n",
+        )
         self.msgbus.subscribe(topic=ACCOUNT_ACTIVITY_TOPIC, handler=self._on_activity)
         self.subscribe_quote_ticks(self._instrument_id)
 
     def on_stop(self) -> None:
         if self._instrument is not None:
             self.msgbus.unsubscribe(topic=ACCOUNT_ACTIVITY_TOPIC, handler=self._on_activity)
-        if not self._steps.finished:
+        if not self.finished:
             print("\n>>> Stopped before the sequence finished: check the terminal.\n")
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
@@ -439,6 +490,8 @@ class _Driver(Strategy):
             self._feed(activity)
 
     def _feed(self, event: object) -> None:
+        if self._steps is None:
+            return
         for action in self._steps.on(event):
             self._execute(action)
 
@@ -471,7 +524,7 @@ class _Driver(Strategy):
         orders = self.order_factory.bracket(
             instrument_id=self._instrument_id,
             order_side=OrderSide.BUY,
-            quantity=self._quantity,
+            quantity=action.quantity,
             sl_trigger_price=self._instrument.make_price(action.stop_loss),
             tp_price=self._instrument.make_price(action.take_profit),
         )
@@ -485,7 +538,7 @@ class _Driver(Strategy):
             ),
         )
         print(
-            f"\n>>> Buying {self._quantity} {self._instrument_id}: stop-loss "
+            f"\n>>> Buying {action.quantity} {self._instrument_id}: stop-loss "
             f"{action.stop_loss}, take-profit {action.take_profit}.\n",
         )
         self.submit_order_list(orders)
@@ -539,6 +592,20 @@ def node_config(env: dict[str, str], symbol: str) -> TradingNodeConfig:
     )
 
 
+def token_expired(env: dict[str, str], now_secs: float) -> bool:
+    """Whether `.env` says the access token expired by `now_secs`; unknown counts as not."""
+    text = env.get(get_tokens.TOKEN_EXPIRES_AT_KEY)
+    if not text:
+        return False
+    try:
+        expires_at = float(text)
+    except ValueError:
+        raise MissingCredentials(
+            f"{get_tokens.TOKEN_EXPIRES_AT_KEY} in .env is not a number"
+        ) from None
+    return expires_at <= now_secs
+
+
 def build_node(config: TradingNodeConfig, driver: _Driver) -> TradingNode:
     node = TradingNode(config=config)
     node.trader.add_strategy(driver)
@@ -559,7 +626,8 @@ def checklist(log_path: pathlib.Path) -> str:
             "amend, equal the legs' prices here; the moved stop-loss is an OrderUpdated;",
             "- commission: each OrderFilled's commission equals its deal's, sign flipped;",
             "- volume scaling: each quantity here, in units, is the broker's volume / 100, "
-            "for both entries, both closes and the partial close.",
+            "for the first entry (the minimum), the second (the minimum plus one size step), "
+            "both closes and the partial close of one size step.",
         ],
     )
 
@@ -579,7 +647,7 @@ def _positive_decimal(text: str) -> Decimal:
 
 def _positive_float(text: str) -> float:
     value = float(text)
-    if not value > 0:
+    if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError(f"must be positive: {text!r}")
     return value
 
@@ -640,18 +708,31 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        config = node_config(get_tokens.load_env(_REPO_ROOT / ".env"), args.symbol)
+        env = get_tokens.load_env(_REPO_ROOT / ".env")
+        expired = token_expired(env, time.time())
+        config = node_config(env, args.symbol)
     except (OSError, MissingCredentials) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    if expired:
+        print(
+            "Refused: the access token in .env has expired, and this script does not refresh "
+            "it. Issue a new one with scripts/get_tokens.py. Nothing was sent.",
+            file=sys.stderr,
+        )
+        return 2
 
     args.log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
     log_path = args.log_dir / f"first_orders-{stamp}.jsonl"
-    steps = Steps(distance=args.distance, manual_wait_secs=args.manual_wait_secs)
     trader_login = str(config.exec_clients[CTRADER].trader_login)
     with EventLog(log_path, hidden=(trader_login,)) as log:
-        driver = _Driver(instrument_id_of(args.symbol), steps, log)
+        driver = _Driver(
+            instrument_id_of(args.symbol),
+            distance=args.distance,
+            manual_wait_secs=args.manual_wait_secs,
+            log=log,
+        )
         node = build_node(config, driver)
         try:
             node.run()
