@@ -171,9 +171,16 @@ One pass reads the broker, in this order:
 1. The deals of the fill window, which covers `lookback_mins` when Nautilus passes one and
    `reconciliation_default_lookback_mins` otherwise.
 2. The snapshot: every open position and pending order, with the protective orders.
-3. For each position that is open or has a deal in the window, its own order list and deal list.
-   A position on an instrument that is not loaded gets no deal list, and a closed position on
-   such an instrument is not read at all.
+3. For each position that is open, has a deal in the window, or is open in Nautilus's cache on
+   this account, its own order list and deal list. A position on an instrument that is not loaded
+   gets no deal list, and a closed position on such an instrument is not read at all.
+
+The positions open in Nautilus's cache matter with a persistent cache. A position that closed
+while the node was down, earlier than the fill window reaches, is named by nothing else the
+broker lists, and Nautilus does nothing about a cached position the broker reports no position
+for. Read by its own lists, it is reported closed with its real fills, and its legs filled or
+cancelled. The cache only says which positions to ask about; what is reported comes from the
+broker.
 
 The broker keeps trading while these are read, so the reads do not describe one moment. Their
 order keeps them consistent:

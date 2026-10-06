@@ -777,6 +777,18 @@ class CTraderExecutionClient(LiveExecutionClient):
             )
         return status
 
+    def _cached_open_positions(self) -> list[int]:
+        """The broker's ids of the positions Nautilus holds open on this account.
+
+        Read only to answer Nautilus about what it holds: a position that closed while the node
+        was down, before the fill window, is named by nothing the broker lists now.
+        """
+        found = []
+        for position in self._cache.positions_open(account_id=self.account_id):
+            with contextlib.suppress(ValueError):
+                found.append(int(position.id.value))
+        return found
+
     def _held_price(self, client_order_id: str) -> Decimal | None:
         """The price Nautilus holds for a leg: a stop's trigger price, a limit's price."""
         order = self._cache.order(ClientOrderId(client_order_id))
@@ -891,9 +903,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         Each covered position's lists are read once.
 
         - `since_ms`: the start of the fill window; the positions its deals name are covered
-          too. `None` reads no window, so only the open positions.
+          too. `None` reads no window.
         - `positions`: exactly these positions are covered instead.
-        - `deals`: `False` reads only the order lists, all the venue model needs.
+        - `deals`: `False` reads only the open positions' order lists, all the venue model
+          needs. Otherwise the positions Nautilus holds open are covered too.
 
         A position on a symbol not loaded gets no deal list, as nothing is reported from it, and
         a closed one no list at all.
@@ -932,12 +945,16 @@ class CTraderExecutionClient(LiveExecutionClient):
                     "the window may be missing from the reports",
                 )
         snapshot = await read_snapshot()
-        symbols = {
+        symbols: dict[int, int | None] = {
             position.positionId: position.tradeData.symbolId for position in snapshot.position
         }
         open_ids = set(symbols)
         for deal in window.values():
             symbols.setdefault(deal.positionId, deal.symbolId)
+        if positions is None and deals:
+            for position_id in self._cached_open_positions():
+                # Its symbol is known once its lists are read.
+                symbols.setdefault(position_id, None)
         covered = sorted(symbols) if positions is None else list(dict.fromkeys(positions))
         histories: dict[int, PositionHistory] = {}
         for position_id in covered:

@@ -13,6 +13,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -20,7 +21,9 @@ from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
+    GenerateFillReports,
     GenerateOrderStatusReports,
+    GeneratePositionStatusReports,
     ModifyOrder,
     SubmitOrder,
 )
@@ -28,7 +31,14 @@ from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import ContingencyType, OrderSide, OrderStatus, OrderType
 from nautilus_trader.model.events import OrderFilled, OrderModifyRejected
-from nautilus_trader.model.identifiers import ClientOrderId, PositionId, TradeId, VenueOrderId
+from nautilus_trader.model.identifiers import (
+    ClientOrderId,
+    InstrumentId,
+    PositionId,
+    Symbol,
+    TradeId,
+    VenueOrderId,
+)
 from nautilus_trader.model.objects import Money, Price, Quantity
 
 from nautilus_ctrader.common import order_record
@@ -682,6 +692,89 @@ async def test_reports_outside_a_mass_status_never_carry_a_filled_order() -> Non
             ClientOrderId(STOP),
             ClientOrderId(TARGET),
         }
+
+
+def closed_before_the_window() -> ExecutionVenue:
+    """The node's first position closed by its stop-loss longer ago than the fill window."""
+    venue = serving(CLOSED_AT)
+    venue.deals = []
+    return venue
+
+
+async def test_a_cached_position_closed_before_the_window_is_closed_at_start() -> None:
+    cache = await legs_accepted()
+
+    async with harness(execution_venue=closed_before_the_window(), cache=cache) as h:
+        assert h.cache.position(PositionId(str(FIRST))).is_open
+
+        await h.engine.reconcile_execution_state()
+
+        assert h.cache.position(PositionId(str(FIRST))).is_closed
+        assert h.cache.positions_open() == []
+        assert status(h, STOP) == OrderStatus.FILLED
+        assert h.cache.order(ClientOrderId(STOP)).trade_ids == [TradeId("7000003")]
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert not any(o.tags and "RECONCILIATION" in o.tags for o in h.cache.orders())
+
+
+def fills_command(**filters) -> GenerateFillReports:
+    values = {"instrument_id": None, "venue_order_id": None, "start": None, "end": None}
+    values.update(filters)
+    return GenerateFillReports(**values, command_id=UUID4(), ts_init=0)
+
+
+def positions_command(instrument_id: InstrumentId | None) -> GeneratePositionStatusReports:
+    return GeneratePositionStatusReports(
+        instrument_id=instrument_id, start=None, end=None, command_id=UUID4(), ts_init=0
+    )
+
+
+def moment(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000, tz=UTC)
+
+
+EURUSD_ID = InstrumentId(Symbol("EURUSD"), CTRADER_VENUE)
+
+
+async def test_fill_reports_keep_to_the_window_the_order_and_the_instrument() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    earlier = closed_position(venue, 1, opened=now - 50_000, closed=now - 40_000)
+    later = closed_position(venue, 2, opened=now - 30_000, closed=now - 20_000)
+    async with harness(execution_venue=venue) as h:
+
+        async def trade_ids(**filters) -> set[str]:
+            found = await h.client.generate_fill_reports(fills_command(**filters))
+            return {fill.trade_id.value for fill in found}
+
+        def ids(deals: list[om.ProtoOADeal]) -> set[str]:
+            return {str(deal.dealId) for deal in deals}
+
+        assert await trade_ids() == ids(earlier + later)
+        assert await trade_ids(start=moment(now - 35_000)) == ids(later)
+        assert await trade_ids(end=moment(now - 35_000)) == ids(earlier)
+        closing = later[1]
+        assert await trade_ids(venue_order_id=VenueOrderId(str(closing.orderId))) == ids([closing])
+        assert await trade_ids(instrument_id=US100_ID) == ids(earlier + later)
+        assert await trade_ids(instrument_id=EURUSD_ID) == set()
+
+
+async def test_position_reports_are_per_instrument_and_only_what_stands() -> None:
+    cache = await legs_accepted()
+    venue = closed_before_the_window()
+    foreign_position(venue, 1, ts=int(time.time() * 1000) - 10_000)
+
+    async with harness(execution_venue=venue, cache=cache) as h:
+        before = len(h.received(oa.ProtoOADealListByPositionIdReq))
+
+        found = await h.client.generate_position_status_reports(positions_command(US100_ID))
+
+        # The cached position is read and found closed, so it has no report.
+        assert [report.venue_position_id for report in found] == [PositionId("5100001")]
+        asked = h.received(oa.ProtoOADealListByPositionIdReq)[before:]
+        assert {request.positionId for request in asked} == {5_100_001, FIRST}
+        assert await h.client.generate_position_status_reports(positions_command(EURUSD_ID)) == []
+        assert len(await h.client.generate_position_status_reports(positions_command(None))) == 1
 
 
 # -- Reconnect ---------------------------------------------------------------------------------
