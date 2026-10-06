@@ -289,7 +289,9 @@ A `QueryOrder`, and Nautilus's own check of an order left in flight, are answere
 broker's lists:
 
 - a leg is answered from the venue model;
-- a close is answered from its broker order, once the model has matched it;
+- a close is answered from its broker order, once the model has matched it. Before that, while
+  the close is still in flight, it is answered from its position's lists, where the closing order
+  of the same volume is named by the node's close;
 - an entry or a market order is looked up in the broker's pending orders, then in the order list
   over the fill window. A partly filled entry is answered from its position, with its fills.
 

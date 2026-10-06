@@ -318,6 +318,34 @@ async def test_query_for_a_matched_close_answers_from_its_position() -> None:
         assert list(built.order_reports) == [VenueOrderId("6300002")]
 
 
+async def test_query_for_a_close_in_flight_answers_under_the_node_id() -> None:
+    now = now_ms()
+    venue = ExecutionVenue()
+    our_market_position(venue, opened=now - 2 * MINUTE_MS)
+    # The close's answer never comes; the query arrives while it is awaited.
+    config = exec_config(order_request_timeout_secs=2.0)
+    async with harness(execution_venue=venue, config=config) as h:
+        await started(h)
+        closing = await close_sent(h)
+        # The broker executed it; its lists hold the fill.
+        our_market_position(venue, opened=now - 2 * MINUTE_MS, closed=now - MINUTE_MS)
+
+        await h.client._query_order(query(h, CLOSE))
+
+        await wait_until(lambda: status(h, CLOSE) == OrderStatus.FILLED)
+        assert trade_ids(h, CLOSE) == [TradeId("7300002")]
+        (built,) = h.mass_statuses
+        assert built.order_reports[VenueOrderId("6300002")].client_order_id == ClientOrderId(CLOSE)
+        assert h.cache.client_order_id(VenueOrderId("6300002")) == ClientOrderId(CLOSE)
+        assert h.cache.position(PositionId(str(OURS))).is_closed
+        # The broker's events of the close come late, while it is still in flight.
+        await push(h, *node_close_events(closed=now - MINUTE_MS))
+        await asyncio.wait_for(closing, timeout=10)
+        assert trade_ids(h, CLOSE) == [TradeId("7300002")]
+        assert not any(a.kind == "manual_change" for a in h.activity)
+        assert h.reports == []
+
+
 async def test_unanswerable_queries_send_nothing() -> None:
     venue = ExecutionVenue()
     async with harness(execution_venue=venue) as h:

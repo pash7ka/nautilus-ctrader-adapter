@@ -556,7 +556,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         The order is looked up by what it is:
 
         - a leg: its position in the venue model;
-        - a close: its broker order, once the model has matched it;
+        - a close: its broker order once the model has matched it, else, while it is still in
+          flight, its position, where the lists name it by the close in flight;
         - an entry or a market order: the broker's pending orders, then its order list over
           the fill window.
 
@@ -590,7 +591,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             if leg is not None or close is not None:
                 position_id = leg[0] if leg is not None else close[1]
             elif order.is_reduce_only:
-                return unanswered("not found at the venue")
+                # Not matched yet: its position's lists name it by the close still in flight.
+                position_id = self._operations.close_position(order_id)
+                if position_id is None:
+                    return unanswered("not found at the venue")
             else:
                 pending = await self._request(
                     oa.ProtoOAReconcileReq(ctidTraderAccountId=self._account.account_id),

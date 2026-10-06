@@ -45,6 +45,11 @@ class OperationsInFlight:
         """Forget a close: answered, refused, or matched to its broker order."""
         self._closes.pop(client_order_id, None)
 
+    def close_position(self, client_order_id: str) -> int | None:
+        """The position the close `client_order_id` is closing, while it is in flight."""
+        close = self._closes.get(client_order_id)
+        return None if close is None else close[0]
+
     def closing(self, position_id: int, volume: int) -> str | None:
         for client_order_id, close in self._closes.items():
             if close == (position_id, volume):

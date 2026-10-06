@@ -42,6 +42,16 @@ def test_a_close_is_found_by_its_position_and_volume_until_it_ends() -> None:
     assert table.closing(1, 100) is None
 
 
+def test_a_close_in_flight_names_its_position_until_it_ends() -> None:
+    table = OperationsInFlight()
+    table.begin_close("O-C-1", 1, 100)
+
+    assert table.close_position("O-C-1") == 1
+    assert table.close_position("O-C-2") is None
+    table.end_close("O-C-1")
+    assert table.close_position("O-C-1") is None
+
+
 def test_two_closes_of_one_volume_are_matched_one_at_a_time() -> None:
     table = OperationsInFlight()
     table.begin_close("O-C-1", 1, 100)
