@@ -50,8 +50,8 @@ _SPEC.loader.exec_module(first_orders)
 
 fo = first_orders
 
-ACCOUNT_ID = AccountId("CTRADER-001")
 FAKE_LOGIN = 9_000_001
+ACCOUNT_ID = AccountId(f"CTRADER-{FAKE_LOGIN}")
 EURUSD = TestInstrumentProvider.default_fx_ccy("EURUSD", venue=CTRADER_VENUE)
 DISTANCE = Decimal("0.00100")
 WAIT_SECS = 600.0
@@ -524,7 +524,7 @@ def test_steps_end_the_run_when_the_wait_runs_out_with_no_second_position() -> N
 # -- The event log ------------------------------------------------------------------------
 
 
-def test_log_lines_carry_no_account_identifiers(tmp_path: pathlib.Path) -> None:
+def test_log_lines_carry_the_listed_fields_and_nothing_else(tmp_path: pathlib.Path) -> None:
     venue = Venue()
     entry, stop_loss, _take_profit, _submitted = venue.bracket(
         fo.SubmitBracket(FIRST, stop_loss=Decimal("1.09910"), take_profit=Decimal("1.10110")),
@@ -544,14 +544,13 @@ def test_log_lines_carry_no_account_identifiers(tmp_path: pathlib.Path) -> None:
     events = [venue.accepted(entry), fill, opened, rejected, activity("level_moved")]
 
     path = tmp_path / "first_orders.jsonl"
-    with fo.EventLog(path, hidden=(str(FAKE_LOGIN),)) as log:
+    with fo.EventLog(path) as log:
         for event in events:
             log.write(event, status="FILLED")
 
-    text = path.read_text(encoding="utf-8")
-    assert ACCOUNT_ID.value not in text
-    assert str(FAKE_LOGIN) not in text
-    lines = [json.loads(line) for line in text.splitlines()]
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    allowed = {"event", "ts_event", "time", "status", *fo._LOGGED_FIELDS}
+    assert all(set(line) <= allowed for line in lines)
     assert [line["event"] for line in lines] == [
         "OrderAccepted",
         "OrderFilled",
@@ -566,7 +565,8 @@ def test_log_lines_carry_no_account_identifiers(tmp_path: pathlib.Path) -> None:
     assert lines[1]["order_side"] == "BUY"
     assert lines[1]["status"] == "FILLED"
     assert lines[2]["position_id"] == "P-1"
-    assert lines[3]["reason"] == "TRADING_BAD_STOPS: account <hidden> refused"
+    assert lines[3]["account_id"] == ACCOUNT_ID.value
+    assert lines[3]["reason"] == f"TRADING_BAD_STOPS: account {FAKE_LOGIN} refused"
     assert lines[4]["action"] == "level_moved"
     assert all("time" in line for line in lines)
 
@@ -615,7 +615,7 @@ class RecordingDriver:
 def test_the_driver_carries_out_the_sequence(tmp_path: pathlib.Path, capsys) -> None:
     path = tmp_path / "first_orders.jsonl"
     venue = Venue()
-    with fo.EventLog(path, hidden=(str(FAKE_LOGIN),)) as log:
+    with fo.EventLog(path) as log:
         r = RecordingDriver(log)
         r.driver.on_start()
         r.driver.on_quote_tick(venue.quote("1.10000", "1.10010"))

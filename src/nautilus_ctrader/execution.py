@@ -169,7 +169,6 @@ def _ms(moment) -> int:
 
 
 def _reason(code: str, description: str | None) -> str:
-    # TODO(verify): that the venue's description never carries an account id or login.
     return f"{code}: {description}" if description else code
 
 
@@ -288,8 +287,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             clock=clock,
             config=config,
         )
-        # Nautilus logs account ids, so this is never the broker's account number.
-        self._set_account_id(AccountId(f"{CTRADER}-001"))
+        # The login keeps accounts apart: several in one node, or in one persistent cache.
+        self._set_account_id(AccountId(f"{CTRADER}-{config.trader_login}"))
         self._instrument_provider: CTraderInstrumentProvider = instrument_provider
         self._account = account
         self._config = config

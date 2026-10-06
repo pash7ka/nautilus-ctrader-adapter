@@ -147,7 +147,8 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     access_token : str
         An access token granting this application the account.
     trader_login : int
-        The account number the broker gave you, as for `CTraderDataClientConfig`.
+        The account number the broker gave you, as for `CTraderDataClientConfig`. The Nautilus
+        account id is built from it: `CTRADER-<trader_login>`.
     refresh_token : str, optional
         Used to renew `access_token`.
     token_expires_at : float, optional

@@ -64,6 +64,7 @@ from tests.execution_venue import (
     STRATEGY_ID,
     TARGET,
     TRADER_ID,
+    TRADER_LOGIN,
     US100_ID,
     US100_SYMBOL_ID,
     ExecutionVenue,
@@ -82,7 +83,7 @@ from tests.execution_venue import (
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
-ACCOUNT = AccountId("CTRADER-001")
+ACCOUNT = AccountId(f"CTRADER-{TRADER_LOGIN}")
 
 
 def test_the_config_carries_no_instrument_settings() -> None:
@@ -144,6 +145,37 @@ async def test_a_provider_that_is_not_the_accounts_own_fails_construction() -> N
             instrument_provider=foreign,
             config=config,
         )
+
+
+async def test_the_account_id_carries_the_trader_login() -> None:
+    logger = RecordingLogger()
+    clock = LiveClock()
+
+    def client_for(trader_login: int) -> CTraderExecutionClient:
+        config = exec_config(trader_login=trader_login)
+        account = account_client_from_config(config, logger)
+        provider = account.get_instrument_provider(
+            config=InstrumentProviderConfig(),
+            asset_class_overrides={},
+            fail_on_instrument_error=False,
+            logger=logger,
+        )
+        return CTraderExecutionClient(
+            loop=asyncio.get_running_loop(),
+            account=account,
+            msgbus=MessageBus(trader_id=TRADER_ID, clock=clock),
+            cache=Cache(),
+            clock=clock,
+            instrument_provider=provider,
+            config=config,
+        )
+
+    first = client_for(TRADER_LOGIN)
+    second = client_for(TRADER_LOGIN + 1)
+
+    assert first.account_id == AccountId(f"CTRADER-{TRADER_LOGIN}")
+    assert second.account_id == AccountId(f"CTRADER-{TRADER_LOGIN + 1}")
+    assert first.account_id != second.account_id
 
 
 async def test_the_factory_needs_the_accounts_provider_built_first() -> None:
@@ -562,7 +594,7 @@ async def test_a_query_reads_the_account_again() -> None:
         await h.client._query_account(
             QueryAccount(
                 trader_id=TRADER_ID,
-                account_id=AccountId("CTRADER-001"),
+                account_id=ACCOUNT,
                 command_id=UUID4(),
                 ts_init=0,
             ),
@@ -578,7 +610,7 @@ async def test_a_query_answered_with_an_older_balance_never_takes_it_back() -> N
         await h.client._query_account(
             QueryAccount(
                 trader_id=TRADER_ID,
-                account_id=AccountId("CTRADER-001"),
+                account_id=ACCOUNT,
                 command_id=UUID4(),
                 ts_init=0,
             ),

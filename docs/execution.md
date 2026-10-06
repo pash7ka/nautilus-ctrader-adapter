@@ -55,8 +55,7 @@ A level amend, which sets the whole state of a position's levels, is the one req
 repeated, up to three times.
 
 A refusal by the broker is an `OrderRejected` (or `OrderCancelRejected`, `OrderModifyRejected`)
-whose reason is the broker's error code and description. The adapter adds no account identifier
-to it; whether the broker's own text could contain one is not confirmed.
+whose reason is the broker's error code and description, as the broker gave them.
 
 ## 2. Brackets and legs
 
@@ -141,7 +140,7 @@ connection, and the connection settings of the first config built for the accoun
 |---|---|---|
 | `client_id`, `client_secret` | required | The registered application's credentials |
 | `access_token` | required | An access token granting the application the account |
-| `trader_login` | required | The broker's own account number; the adapter looks up the protocol's account id itself |
+| `trader_login` | required | The broker's own account number; the adapter looks up the protocol's account id itself. The Nautilus account id is `CTRADER-<trader_login>` |
 | `refresh_token` | `None` | Renews `access_token`; without it an expired token ends the session |
 | `token_expires_at` | `None` | Unix seconds the access token expires at; without it no proactive refresh happens |
 | `environment` | `"auto"` | `"auto"` reads the account's own live flag and picks the host; `"demo"` or `"live"` force it |
@@ -183,9 +182,11 @@ cancelled. The cache only says which positions to ask about; what is reported co
 broker. A cached position the broker refuses to list, or lists nothing of, is left out with a
 WARNING; it never fails the pass.
 
-**A persistent cache must not be reused across a change of trading account.** The Nautilus
-account id is the same for every account (`CTRADER-001`), so a cache kept from another account
-holds that account's positions. They are asked about, found unknown and left open in Nautilus.
+The Nautilus account id is `CTRADER-` followed by the account's trader login, so the state of
+different accounts does not mix in one cache. A persistent cache written by an earlier build,
+which used the fixed id `CTRADER-001`, holds its orders and positions under that id. Reset it
+once when upgrading, or close its positions and clear it; otherwise those positions are asked
+about, found unknown and left open in Nautilus.
 
 The broker keeps trading while these are read, so the reads do not describe one moment. Their
 order keeps them consistent:
@@ -568,8 +569,6 @@ it. The main groups:
   broker's one clock: the bound that keeps a trader's earlier close from being taken for the
   node's compares them.
 - **Rejected orders**: whether a rejected order carries a position id.
-- **Error text**: whether the broker's description of a refusal can ever contain an account
-  identifier. The adapter adds none, but it passes the broker's text through.
 - **History lists**: the order lists come in, which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
   whether the edges of a window are inclusive, and whether the cash-flow list has no pages and
