@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from functools import partial
 from zoneinfo import ZoneInfo
 
+from nautilus_ctrader import execution
 from nautilus_ctrader.common import balance_checkpoint
 from nautilus_ctrader.common.balance_checkpoint import BalanceCheckpoint
 from nautilus_ctrader.common.balance_history import OFF, checkpoint_at, next_checkpoint, value_json
@@ -280,6 +281,37 @@ async def test_timer_fires_after_the_grace_and_recomputes() -> None:
             assert firings == [next_t]
         finally:
             checkpoint.stop()
+
+
+async def test_a_connect_whose_refresh_crosses_the_hour_still_writes(monkeypatch) -> None:
+    t_ms = last_t()
+    next_t = as_ms(next_checkpoint(moment(now_ms()), HOUR, UTC_ZONE))
+    crossed = {"done": False}
+
+    class Crossing(BalanceCheckpoint):
+        """The client's checkpoint, its clock past the next hour once a deal list answered."""
+
+        def __init__(self, *, request, now_ms, **kwargs) -> None:
+            async def crossing(payload):
+                response = await request(payload)
+                if isinstance(payload, oa.ProtoOADealListReq):
+                    crossed["done"] = True
+                return response
+
+            super().__init__(
+                request=crossing,
+                now_ms=lambda: next_t + 1000 if crossed["done"] else now_ms(),
+                **kwargs,
+            )
+
+    monkeypatch.setattr(execution, "BalanceCheckpoint", Crossing)
+    venue = history_venue(last_at=t_ms - DAY_MS)
+    async with harness(execution_venue=venue, config=config(), connect=False) as h:
+        await h.client._connect()
+
+        assert crossed["done"]
+        assert key(h)["checkpoint"] == iso(t_ms)
+        assert key(h)["status"] == "available"
 
 
 async def test_a_refresh_overtaken_by_the_next_checkpoint_writes_nothing() -> None:

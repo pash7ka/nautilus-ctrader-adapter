@@ -12,8 +12,8 @@ each checkpoint:
   walks finish in the background, writing the key again.
 
 A walk cut short by a lost connection writes nothing: the key keeps its previous value, with its
-own checkpoint, until the reconnect writes it. Nor does a walk whose checkpoint has been
-overtaken by the next one: the newer value stands.
+own checkpoint, until the reconnect writes it. Nor does a walk whose checkpoint is older than
+the one last written: the newer value stands.
 """
 
 from __future__ import annotations
@@ -123,6 +123,8 @@ class BalanceCheckpoint:
         # Where the first-deposit walk goes on from; `None` until it starts.
         self._deposit_from_ms: int | None = None
         self._deposit_windows = 0
+        # The checkpoint of the value last written.
+        self._written_ms: int | None = None
         # Overlapping refreshes share the walk, so none reads a window twice or counts it twice.
         self._deposit_lock = asyncio.Lock()
 
@@ -198,7 +200,7 @@ class BalanceCheckpoint:
         """Walk up to `limit` windows each and write the key; returns the trader it read first.
 
         Writes nothing and returns `None` when the connection is lost, or when a later
-        checkpoint is due by the time the value is known.
+        checkpoint was written meanwhile.
         """
         digits = None
         try:
@@ -226,13 +228,15 @@ class BalanceCheckpoint:
             value = CheckpointValue(
                 "unavailable", walk.t_ms, None, Reason.REQUEST_FAILED, None, digits
             )
-        assert self._hour is not None
-        if _ms(checkpoint_at(_moment(self._now_ms()), self._hour, self._zone)) != walk.t_ms:
-            self._log.debug("Balance checkpoint dropped: a later checkpoint is due")
+        # A value for its own checkpoint stands even once a later one is due, until that one
+        # is written.
+        if self._written_ms is not None and self._written_ms > walk.t_ms:
+            self._log.debug("Balance checkpoint dropped: a later checkpoint is written")
             return None
         if trader is not None:
             value = self._with_deposit(value, _registration(trader))
         self._write(value_json(value, self._currency))
+        self._written_ms = walk.t_ms
         reason = "" if value.reason is None else f" ({value.reason.value})"
         self._log.info(f"Balance checkpoint written: {value.status}{reason}")
         return trader
