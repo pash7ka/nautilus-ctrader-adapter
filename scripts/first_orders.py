@@ -226,6 +226,7 @@ class Steps:
             self._bracket = event
             self._accepted.clear()
             self._position_id = None
+            self._quantity = None
             return []
         if isinstance(event, (OrderRejected, OrderDenied)):
             return self._stop(f"Order {event.client_order_id} was refused: {event.reason}.")
@@ -333,9 +334,14 @@ class Steps:
         if self._stage is not _Stage.MANUAL:
             return []
         missing = ", ".join(sorted(_MANUAL_ACTIONS - self._seen))
-        return self._close_second(
-            [Prompt(f"Not reported within the wait: {missing}. Closing the rest.")],
-        )
+        if missing:
+            text = f"Not reported within the wait: {missing}. Closing the rest."
+        else:
+            text = (
+                "Both changes were reported, but the position did not show the partial close "
+                "within the wait. Closing the rest."
+            )
+        return self._close_second([Prompt(text)])
 
     def _close_second(self, before: list[Action]) -> list[Action]:
         if self._position_id is None:

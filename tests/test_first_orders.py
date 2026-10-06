@@ -455,6 +455,32 @@ def test_steps_close_the_rest_when_the_manual_wait_runs_out() -> None:
     assert close == fo.ClosePosition(PositionId("P-2"))
 
 
+def test_steps_say_so_when_the_position_never_shows_the_partial_close() -> None:
+    steps = new_steps()
+    run_to_manual_wait(steps, Venue())
+    steps.on(activity("level_moved"))
+    steps.on(activity("partially_closed"))
+
+    prompt, close = steps.on(fo.ManualWaitExpired())
+
+    assert "did not show the partial close" in prompt.text
+    assert "Not reported" not in prompt.text
+    assert close == fo.ClosePosition(PositionId("P-2"))
+
+
+def test_steps_take_no_volume_from_the_bracket_before() -> None:
+    steps = new_steps()
+    venue = Venue()
+    run_to_manual_wait(steps, venue)
+    # A third bracket, as no run sends: its position not reported yet.
+    _entry, *_legs, submitted = venue.bracket(
+        fo.SubmitBracket(SECOND, stop_loss=Decimal("1.09920"), take_profit=Decimal("1.10120")),
+    )
+    steps.on(submitted)
+
+    assert steps._quantity is None
+
+
 def test_steps_stop_when_the_owner_closes_everything_by_hand() -> None:
     steps = new_steps()
     venue = Venue()
