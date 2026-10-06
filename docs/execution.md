@@ -140,7 +140,7 @@ connection, and the connection settings of the first config built for the accoun
 |---|---|---|
 | `client_id`, `client_secret` | required | The registered application's credentials |
 | `access_token` | required | An access token granting the application the account |
-| `trader_login` | required | The broker's own account number; the adapter looks up the protocol's account id itself |
+| `trader_login` | required | The broker's own account number; the adapter looks up the protocol's account id itself. The Nautilus account id is `CTRADER-<trader_login>` |
 | `refresh_token` | `None` | Renews `access_token`; without it an expired token ends the session |
 | `token_expires_at` | `None` | Unix seconds the access token expires at; without it no proactive refresh happens |
 | `environment` | `"auto"` | `"auto"` reads the account's own live flag and picks the host; `"demo"` or `"live"` force it |
@@ -182,10 +182,11 @@ cancelled. The cache only says which positions to ask about; what is reported co
 broker. A cached position the broker refuses to list, or lists nothing of, is left out with a
 WARNING; it never fails the pass.
 
-**A persistent cache must not be reused across a change of trading account.** The Nautilus
-account id is `CTRADER-` followed by the account's trader login, so accounts do not mix in one
-cache. A cache kept from another account still holds that account's positions under its own id.
-They are asked about, found unknown and left open in Nautilus.
+The Nautilus account id is `CTRADER-` followed by the account's trader login, so the state of
+different accounts does not mix in one cache. A persistent cache written by an earlier build,
+which used the fixed id `CTRADER-001`, holds its orders and positions under that id. Reset it
+once when upgrading, or close its positions and clear it; otherwise those positions are asked
+about, found unknown and left open in Nautilus.
 
 The broker keeps trading while these are read, so the reads do not describe one moment. Their
 order keeps them consistent:

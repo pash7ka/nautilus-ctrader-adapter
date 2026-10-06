@@ -2,8 +2,7 @@
 
 It picks the host, owns the only `CTraderSession` for the account (and with it the only party
 allowed to refresh tokens) and the only instrument provider, and caches the account's reference
-data. Nothing about the account it resolves - its id, login or broker - is ever logged or put
-into an error message.
+data. Its log lines and error messages say what went wrong, not which account it resolved.
 """
 
 from __future__ import annotations
@@ -402,7 +401,7 @@ class CTraderAccountClient:
         finally:
             await connection.close()
 
-        # The list also carries logins and broker names: it is read here and never logged.
+        # The list also carries logins and broker names; this module does not log them.
         # TODO(verify): the venue populates `traderLogin` on every listed account. An entry
         # without it can never be matched, and this reports it as a login not granted.
         matched = [
