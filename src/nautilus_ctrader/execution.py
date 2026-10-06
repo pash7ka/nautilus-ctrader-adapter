@@ -358,6 +358,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._load()
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
+            self._check_attached()
             checkpoint = self._checkpoint = BalanceCheckpoint(
                 request=partial(self._request, bucket=BUCKET_HISTORICAL),
                 account_id=self._account.account_id,
@@ -373,12 +374,19 @@ class CTraderExecutionClient(LiveExecutionClient):
             # meanwhile leaves the key to the reconnect pass. Held locally: a detach meanwhile
             # stops it and drops the attribute.
             await checkpoint.refresh(trader, bounded=True)
+            self._check_attached()
             checkpoint.schedule()
             # The first bring-up has run its restores already; this one serves every later one.
             session.add_restore(self._restore_key, self._reload)
         except BaseException:
             await self._disconnect()
             raise
+
+    def _check_attached(self) -> None:
+        # A disconnect during `_connect`'s awaits detached the client: arming anything now would
+        # leave a timer or a restore behind on a client Nautilus considers stopped.
+        if self._session is None:
+            raise CTraderConnectionError("disconnected while connecting")
 
     async def _disconnect(self) -> None:
         self._detach()

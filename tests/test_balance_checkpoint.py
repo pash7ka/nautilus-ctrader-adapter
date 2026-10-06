@@ -20,6 +20,7 @@ from nautilus_ctrader import execution
 from nautilus_ctrader.common import balance_checkpoint
 from nautilus_ctrader.common.balance_checkpoint import BalanceCheckpoint
 from nautilus_ctrader.common.balance_history import OFF, checkpoint_at, next_checkpoint, value_json
+from nautilus_ctrader.common.errors import CTraderConnectionError
 from nautilus_ctrader.constants import BALANCE_CHECKPOINT_KEY, BUCKET_HISTORICAL
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -630,6 +631,7 @@ async def test_a_detach_during_the_start_refresh_raises_nothing_from_the_checkpo
     async with harness(execution_venue=venue, config=config(), connect=False) as h:
         connecting = asyncio.create_task(h.client._connect())
         await asyncio.wait_for(held.arrived.wait(), timeout=5)
+        session = h.account.session
 
         # What a disconnect does first while the refresh is out.
         h.client._detach()
@@ -640,3 +642,34 @@ async def test_a_detach_during_the_start_refresh_raises_nothing_from_the_checkpo
 
         assert not any(isinstance(result, AttributeError) for result in outcome)
         assert h.cache.get(BALANCE_CHECKPOINT_KEY) is None
+        # The detached client serves no later reconnect.
+        assert h.client._restore_key not in session._restores
+        assert h.client._checkpoint is None
+
+
+async def test_a_detach_while_the_spots_are_asked_ends_the_connect() -> None:
+    venue = history_venue(last_at=last_t() - DAY_MS)
+    held = HeldReplies(
+        venue.server,
+        om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
+        lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
+    )
+    async with harness(execution_venue=venue, config=config(), connect=False) as h:
+        # Another client of the account keeps the session up.
+        await h.account.connect()
+        try:
+            connecting = asyncio.create_task(h.client._connect())
+            await asyncio.wait_for(held.arrived.wait(), timeout=5)
+
+            h.client._detach()
+            await held.stop_holding()
+            (outcome,) = await asyncio.wait_for(
+                asyncio.gather(connecting, return_exceptions=True), timeout=10
+            )
+
+            assert isinstance(outcome, CTraderConnectionError)
+            assert h.client._restore_key not in h.account.session._restores
+            assert h.client._checkpoint is None
+            assert h.cache.get(BALANCE_CHECKPOINT_KEY) is None
+        finally:
+            await h.account.disconnect()
