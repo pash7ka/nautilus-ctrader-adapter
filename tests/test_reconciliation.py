@@ -469,6 +469,30 @@ def test_a_position_its_deals_leave_open_that_the_snapshot_lacks_is_skipped() ->
     assert "snapshot" in notice.text
 
 
+def test_an_open_position_is_sized_by_its_own_deals() -> None:
+    # The snapshot from before the trader's partial close, the lists from after it.
+    snapshot = as_ours([snapshot_at(256.5)], [FIRST])[0]
+    _, histories, deals = open_first(mine=True)
+
+    (position,) = run(snapshot, histories, deals).positions
+
+    assert snapshot.position[0].tradeData.volume == 100
+    assert position.units == units_of(99)
+    assert position.avg_price == Decimal("85287.21")
+
+
+def test_a_deal_list_cut_short_never_closes_what_the_snapshot_holds_open() -> None:
+    snapshot = as_ours([snapshot_at(OPEN_AT)], [FIRST])[0]
+    found = ours(history(FIRST), FIRST)
+    cut_short = PositionHistory(found.orders, found.deals, complete=False)
+
+    result = run(snapshot, {FIRST: cut_short}, window(FIRST))
+
+    (position,) = result.positions
+    assert position.units == units_of(99)
+    assert by_id(result)["6000001-TP"].status != ReportStatus.CANCELED
+
+
 def test_a_position_in_the_histories_alone_is_taken() -> None:
     # Closed before the fill window: neither the snapshot nor the window names it.
     snapshot = as_ours([snapshot_at(CLOSED_AT)], [FIRST])[0]

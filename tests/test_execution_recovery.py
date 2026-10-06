@@ -649,12 +649,15 @@ async def test_a_deal_list_cut_short_is_logged(monkeypatch: pytest.MonkeyPatch) 
         ]
     )
     async with harness(execution_venue=venue) as h:
-        assert await h.client.generate_mass_status() is not None
+        built = await h.client.generate_mass_status()
 
         assert any(
             f"Position {position_id}" in line and "deal list" in line
             for line in h.logger.warnings()
         )
+        # The deals found do not add up to the position: its volume is the snapshot's.
+        (report,) = built.position_reports[US100_ID]
+        assert report.quantity == Quantity.from_str("1.00")
 
 
 async def test_deal_pages_are_followed() -> None:
@@ -1439,6 +1442,36 @@ async def test_a_position_closed_after_the_snapshot_is_reported_closed() -> None
         assert h.cache.position(PositionId(str(FIRST))).is_closed
         assert h.cache.positions_open() == []
         assert reconciliation_orders(h) == []
+
+
+async def test_a_partial_close_after_the_snapshot_sizes_the_position_by_the_lists() -> None:
+    # The snapshot holds the whole position; the lists, read later, a trader's partial close.
+    venue = serving(TP_BACK_AT)
+    _, histories, _ = broker_lists(OPEN_AT)
+    venue.position_orders = {FIRST: list(histories[FIRST].orders)}
+    venue.position_deals = {FIRST: list(histories[FIRST].deals)}
+    async with harness(execution_venue=venue) as h:
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+        )
+        passing = asyncio.create_task(h.client.generate_mass_status())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        # The partial close: accepted, filled, and the protective order resized.
+        await push(h, *FIRST_EVENTS[6:9])
+        await held.stop_holding()
+        built = await asyncio.wait_for(passing, timeout=10)
+
+        h.engine.reconcile_execution_mass_status(built)
+        await wait_until(lambda: h.client._buffer is None)
+
+        (report,) = built.position_reports[US100_ID]
+        assert report.quantity == Quantity.from_str("0.99")
+        assert h.cache.position(PositionId(str(FIRST))).quantity == Quantity.from_str("0.99")
+        assert reconciliation_orders(h) == []
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+        assert status(h, TARGET) == OrderStatus.ACCEPTED
 
 
 async def test_a_position_missing_from_the_snapshot_is_read_again() -> None:

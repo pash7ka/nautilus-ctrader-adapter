@@ -192,8 +192,12 @@ order keeps them consistent:
 
 - The window comes first, so a position that opens after the snapshot is not named by it. Its
   execution events, held during the pass, bring it to Nautilus.
-- The position's own lists, read last, decide whether it is open. A position whose deals add up
-  to nothing left is reported closed, with its real fills, even if the snapshot still holds it.
+- The position's own lists, read last, decide whether it is open and how much of it. A position
+  whose deals add up to nothing left is reported closed, with its real fills, even if the
+  snapshot still holds it. An open position is reported with the volume its deals leave, so a
+  partial close after the snapshot does not make Nautilus add a fill of its own.
+- A deal list that did not end, which a WARNING reports, may miss deals. It then never closes a
+  position the snapshot holds open, and the position's volume is the snapshot's.
 - A position whose deals leave it open but which the snapshot lacks makes the pass read the
   snapshot once more. If it is still missing, the position is left out with a WARNING, and its
   execution events bring it.

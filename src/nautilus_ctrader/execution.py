@@ -989,6 +989,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             if not loaded and position_id not in open_ids:
                 continue
             found: list[om.ProtoOADeal] = []
+            complete = True
             try:
                 orders = await self._position_orders(position_id, historical)
                 if deals and loaded:
@@ -1016,7 +1017,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                     "so it is not reconciled",
                 )
                 continue
-            histories[position_id] = PositionHistory(tuple(orders), tuple(found))
+            histories[position_id] = PositionHistory(tuple(orders), tuple(found), complete)
         lacking = {
             position_id
             for position_id, found in histories.items()

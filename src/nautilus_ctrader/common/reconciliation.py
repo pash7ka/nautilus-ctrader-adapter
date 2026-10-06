@@ -51,10 +51,14 @@ _GOOD_TILL_CANCEL = om.ProtoOATimeInForce.Name(om.GOOD_TILL_CANCEL)
 
 @dataclass(frozen=True)
 class PositionHistory:
-    """One position's order and deal lists, as the broker returned them."""
+    """One position's order and deal lists, as the broker returned them.
+
+    `complete` is false when the deal list did not end, so some deals may be missing.
+    """
 
     orders: tuple[om.ProtoOAOrder, ...]
     deals: tuple[om.ProtoOADeal, ...]
+    complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -87,9 +91,15 @@ def reconcile(
     - One without a history, or whose history lists no entry, is skipped with a `Notice`.
     - One whose entry never filled is never reported.
 
-    Whether a position is open is decided by its own deals (`open_volume`), read after
-    `snapshot`: one they leave at zero is closed whatever `snapshot` says, and one they leave
-    open that `snapshot` lacks is skipped with a `Notice`.
+    Whether a position is open, and how much of it, is decided by its own deals
+    (`open_volume`), read after `snapshot`:
+
+    - one they leave at zero is closed whatever `snapshot` says;
+    - one they leave open that `snapshot` lacks is skipped with a `Notice`;
+    - an open one is reported with the volume they leave, at `snapshot`'s price and time.
+
+    A history that is not `complete` never closes a position `snapshot` holds open, and its
+    position is reported with `snapshot`'s volume.
 
     What a taken position reports:
 
@@ -173,8 +183,9 @@ def reconcile(
                 )
                 positions.append(_position_report(venue_position, digits))
             continue
-        still_open = open_volume(found) > 0
-        if venue_position is not None and not still_open:
+        held = open_volume(found)
+        still_open = held > 0
+        if venue_position is not None and not still_open and found.complete:
             # Closed after the snapshot was taken.
             venue_position = None
         elif venue_position is None and still_open:
@@ -197,7 +208,8 @@ def reconcile(
         entry_ts = _sort_key(reports[0])[0]
         keyed += [(_sort_key(report, not_before=entry_ts), report) for report in reports]
         if venue_position is not None:
-            positions.append(_position_report(venue_position, digits))
+            units = units_of(held) if found.complete and still_open else None
+            positions.append(_position_report(venue_position, digits, units))
     reported = {report.venue_order_id for _, report in keyed}
     for order in snapshot.order:
         if order.orderType == om.STOP_LOSS_TAKE_PROFIT or str(order.orderId) in reported:
@@ -620,12 +632,15 @@ def _order_report(
     )
 
 
-def _position_report(position: om.ProtoOAPosition, precision: int) -> ReportedPosition:
+def _position_report(
+    position: om.ProtoOAPosition, precision: int, units: Decimal | None = None
+) -> ReportedPosition:
+    """`position` as the snapshot holds it, with `units` instead of its volume when given."""
     return ReportedPosition(
         venue_position_id=str(position.positionId),
         symbol_id=position.tradeData.symbolId,
         side=_SIDE[position.tradeData.tradeSide],
-        units=units_of(position.tradeData.volume),
+        units=units_of(position.tradeData.volume) if units is None else units,
         avg_price=price_of(position.price, precision),
         ts_ms=position.utcLastUpdateTimestamp,
     )
