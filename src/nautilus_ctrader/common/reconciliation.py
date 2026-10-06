@@ -247,6 +247,8 @@ def open_volume(found: PositionHistory) -> int:
     if entry is None:
         return 0
     side = entry.tradeData.tradeSide
+    # TODO(verify): that a deal which did not fill carries no `filledVolume`; every recorded
+    # deal filled.
     return sum(
         deal.filledVolume if deal.tradeSide == side else -deal.filledVolume for deal in found.deals
     )
