@@ -103,7 +103,8 @@ of the access token's known expiry, and reactively, when account authentication 
   Refreshing under an authenticated session makes the venue end it — it sends
   `ProtoOAAccountsTokenInvalidatedEvent` and `ProtoOAAccountDisconnectEvent` (confirmed) — and
   the requests in flight then fail; at start-up those would be the clients' connect. A refresh
-  that fails here is logged and the current token is used until the next attempt.
+  that fails here is logged, and the session goes on with the current token until the next
+  attempt.
 - *Reactive*: refresh runs once when `ProtoOAAccountAuthReq` is rejected with one of two error
   codes the schema defines for a token problem — `OA_AUTH_TOKEN_EXPIRED` or
   `CH_ACCESS_TOKEN_INVALID` — and never for any other rejection reason, since a new token
