@@ -138,11 +138,14 @@ _OPEN = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _ENDED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
 # Activity after which what stands on unloaded symbols may have changed.
 _EXPOSURE_KINDS = (ActivityKind.UNLOADED_SYMBOL, ActivityKind.STOP_OUT)
-# How long after it is sent an event can hold back a report or an activity. Nautilus applies a
-# queued event within a few passes of the loop; an event it refuses never appears.
+# The least time an event not yet applied holds back a report or an activity; the pass floor
+# below can make it longer. Nautilus applies a queued event within a few passes of the loop; an
+# event it refuses never appears.
 _EVENT_WAIT_SECS = 0.1
 # Whole loop passes an event gets before it can expire, however long the loop stalled: in the
 # first, Nautilus puts it on its queue; in the second, its queue task applies it.
+# TODO(verify): measured on the standard asyncio loop only, not on uvloop, and with Nautilus's
+# event queue below capacity; a full queue enqueues through a task, which takes more passes.
 _EVENT_WAIT_PASSES = 2
 
 
@@ -1298,7 +1301,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._pass_counter = self._loop.call_soon(self._count_pass)
 
     def _count_pass(self) -> None:
-        # Each run schedules the next, which the loop runs at the start of its next pass.
+        # Each run schedules the next, which the loop runs in its next pass.
         self._pass_counter = None
         self._passes += 1
         self._check_unapplied()
@@ -1306,7 +1309,7 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _expire_unapplied(self) -> None:
         """Stop waiting for the events past both the time bound and the pass floor."""
         oldest = self._time() - _EVENT_WAIT_SECS
-        # The count moves at the start of a pass: the pass of the send is not a whole one.
+        # The count moves somewhere within a pass, so the pass of the send is not a whole one.
         latest_pass = self._passes - _EVENT_WAIT_PASSES - 1
         while self._unapplied:
             event_id, (_, sent, sent_pass) = next(iter(self._unapplied.items()))
@@ -1398,7 +1401,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self._delivering = True
                     try:
                         if isinstance(item, _Deferred):
-                            self._send_order_event(item.event)
+                            self._send_deferred(item)
                         else:
                             self._handle_record(item)
                     finally:
@@ -1407,6 +1410,12 @@ class CTraderExecutionClient(LiveExecutionClient):
             # A detach may have replaced this task already.
             if self._outbox_task is asyncio.current_task():
                 self._outbox_task = None
+
+    def _send_deferred(self, item: _Deferred) -> None:
+        try:
+            self._send_order_event(item.event)
+        except Exception as e:
+            self._log.exception("A held order event could not be sent", e)
 
     def _handle_record(self, record: Record) -> None:
         try:
@@ -1954,12 +1963,14 @@ class CTraderExecutionClient(LiveExecutionClient):
         instrument = self._instrument_provider.find(order.instrument_id)
         price = reports.price(value, instrument)
         stop = level == Level.STOP_LOSS
+        # The model's, not Nautilus's: a change of the quantity may still be held for Nautilus.
+        quantity = self._leg_quantity(order, self._book.leg_position(client_order_id.value))
         self.generate_order_updated(
             order.strategy_id,
             order.instrument_id,
             client_order_id,
             order.venue_order_id,
-            order.quantity,
+            quantity,
             None if stop else price,
             price if stop else None,
             self._clock.timestamp_ns(),

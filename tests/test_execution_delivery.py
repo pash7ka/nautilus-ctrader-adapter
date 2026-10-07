@@ -25,6 +25,7 @@ from nautilus_ctrader.common.venue_records import (
     Action,
     Activity,
     ActivityKind,
+    Level,
     OrderEvent,
     OrderEventKind,
 )
@@ -310,3 +311,68 @@ async def test_an_answer_held_when_the_client_detaches_is_still_sent() -> None:
 
         assert [type(e).__name__ for e in h.events][-1] == "OrderModifyRejected"
         assert h.activity == []
+
+
+async def bracket_opened(h: Harness) -> None:
+    await push_spot(h, 8_528_600_000, 8_528_721_000)
+    await submit_bracket(h, bracket(h))
+    await wait_until(lambda: status(h, STOP) == OrderStatus.ACCEPTED)
+
+
+def bracket_venue() -> ExecutionVenue:
+    venue = ExecutionVenue()
+    venue.server.on(om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[:3])
+    return venue
+
+
+async def test_a_leg_update_held_behind_a_partial_close_keeps_the_smaller_quantity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
+    async with harness(execution_venue=bracket_venue()) as h:
+        await bracket_opened(h)
+        track_unapplied(h, ENTRY)
+        await push(h, unloaded_order(6_900_001))
+        # A trader closes 0.01 of the position; the leg follows to 0.99, held for Nautilus.
+        await push(h, *FIRST_EVENTS[6:9])
+
+        h.client._leg_updated(ClientOrderId(STOP), Level.STOP_LOSS, Decimal("85197.20"))
+        h.client._unapplied.clear()
+        await wait_until(lambda: not h.client._outbox)
+
+        stop = h.cache.order(ClientOrderId(STOP))
+        assert type(stop.events[-1]).__name__ == "OrderUpdated"
+        assert stop.quantity == Quantity.from_str("0.99")
+
+
+async def test_the_pass_count_runs_only_while_an_event_is_tracked() -> None:
+    async with harness(execution_venue=bracket_venue()) as h:
+        await bracket_opened(h)
+        await wait_until(lambda: h.client._pass_counter is None)
+        assert h.client._unapplied == {}
+
+        track_unapplied(h, ENTRY)
+        h.client._count_passes()
+        counting = h.client._pass_counter
+        assert counting is not None
+
+        await h.client._disconnect()
+
+        assert counting.cancelled()
+        assert h.client._pass_counter is None
+
+
+async def test_a_held_event_that_cannot_be_sent_does_not_stop_what_follows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
+    async with harness() as h:
+        await never_applied(h)
+        await push(h, unloaded_order(6_900_001))
+        # Not an event: its send raises.
+        h.client._outbox.append(execution._Deferred(None))
+        h.client._handle_records([unloaded_activity()])
+        h.client._unapplied.clear()
+
+        await wait_until(lambda: len(h.activity) == 2)
+        assert any("could not be sent" in line for line in h.logger.errors())
