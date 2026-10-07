@@ -13,8 +13,10 @@ from decimal import Decimal
 
 import pytest
 from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.objects import Quantity
 
 from nautilus_ctrader import execution
 from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
@@ -23,6 +25,7 @@ from nautilus_ctrader.common.venue_records import (
     Action,
     Activity,
     ActivityKind,
+    Level,
     OrderEvent,
     OrderEventKind,
 )
@@ -36,18 +39,22 @@ from tests.execution_venue import (
     OURS,
     STOP,
     STRATEGY_ID,
+    TRADER_ID,
     US100_ID,
     US100_SYMBOL_ID,
     ExecutionVenue,
     Harness,
+    bracket,
     close_sent,
     harness,
     node_close_events,
     on_us100,
     our_market_position,
     push,
+    push_spot,
     started,
     status,
+    submit_bracket,
     submitted,
 )
 from tests.polling import wait_until
@@ -61,10 +68,19 @@ def unloaded_order(order_id: int) -> object:
     return make_event(om.ORDER_ACCEPTED, order)
 
 
+def track_unapplied(h: Harness, client_order_id: str) -> None:
+    """An event of `client_order_id` sent now, which Nautilus will never apply."""
+    h.client._unapplied[UUID4()] = (
+        ClientOrderId(client_order_id),
+        h.client._time(),
+        h.client._passes,
+    )
+
+
 async def never_applied(h: Harness) -> None:
-    """An event of the node's that Nautilus will never apply, as when it refuses one."""
+    """The bracket in Nautilus, and an event of its entry Nautilus will never apply."""
     await submitted(h)
-    h.client._unapplied[UUID4()] = (ClientOrderId(ENTRY), h.client._loop.time())
+    track_unapplied(h, ENTRY)
 
 
 async def test_an_activity_behind_an_event_never_applied_is_published_after_a_warning() -> None:
@@ -203,7 +219,7 @@ async def test_a_close_held_behind_an_event_is_matched_at_once(
     async with harness(execution_venue=venue) as h:
         await started(h)
         closing = await close_sent(h)
-        h.client._unapplied[UUID4()] = (ClientOrderId(CLOSE), h.client._loop.time())
+        track_unapplied(h, CLOSE)
         await push(h, unloaded_order(6_900_001))
         accepted, _filled = node_close_events(closed=now)
 
@@ -222,3 +238,141 @@ async def test_a_close_held_behind_an_event_is_matched_at_once(
 
         await h.client._disconnect()
         await asyncio.wait_for(closing, timeout=10)
+
+
+async def test_a_stalled_loop_does_not_expire_an_event_still_queued() -> None:
+    async with harness() as h:
+        await submitted(h)
+        started_at = h.client._time()
+        entry_seen: list[OrderStatus] = []
+        h.client._msgbus.subscribe(
+            topic=ACCOUNT_ACTIVITY_TOPIC,
+            handler=lambda _a: entry_seen.append(status(h, ENTRY)),
+        )
+
+        # The entry's acceptance goes to Nautilus's queue; then the loop stalls for a second.
+        h.client._on_execution_event(FIRST_EVENTS[0])
+        h.client._time = lambda: started_at + 1.0
+        h.client._handle_records([unloaded_activity()])
+
+        assert h.activity == []
+        await wait_until(lambda: h.activity)
+        assert entry_seen == [OrderStatus.ACCEPTED]
+        assert not any("did not apply" in line for line in h.logger.warnings())
+
+
+async def test_an_answer_the_client_sends_itself_waits_behind_a_held_event_of_its_leg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
+    venue = ExecutionVenue()
+    venue.server.on(om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[:3])
+    async with harness(execution_venue=venue) as h:
+        await push_spot(h, 8_528_600_000, 8_528_721_000)
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, STOP) == OrderStatus.ACCEPTED)
+        track_unapplied(h, ENTRY)
+        await push(h, unloaded_order(6_900_001))
+        # The stop moved by hand: its OrderUpdated is held behind the activity above.
+        await push(h, FIRST_EVENTS[3])
+
+        await h.client._modify_order(
+            ModifyOrder(
+                trader_id=TRADER_ID,
+                strategy_id=STRATEGY_ID,
+                instrument_id=US100_ID,
+                client_order_id=ClientOrderId(STOP),
+                venue_order_id=None,
+                quantity=Quantity.from_str("5.00"),
+                price=None,
+                trigger_price=None,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+        h.client._unapplied.clear()
+
+        def kinds() -> list[str]:
+            return [type(e).__name__ for e in h.cache.order(ClientOrderId(STOP)).events]
+
+        await wait_until(lambda: "OrderModifyRejected" in kinds())
+        await wait_until(lambda: not h.client._outbox)
+        assert kinds()[-2:] == ["OrderUpdated", "OrderModifyRejected"]
+
+
+async def test_an_answer_held_when_the_client_detaches_is_still_sent() -> None:
+    async with harness() as h:
+        await never_applied(h)
+        await push(h, unloaded_order(6_900_001))
+        h.client._modify_rejected(ClientOrderId(STOP), "refused while held")
+        assert not any(type(e).__name__ == "OrderModifyRejected" for e in h.events)
+
+        await h.client._disconnect()
+
+        assert [type(e).__name__ for e in h.events][-1] == "OrderModifyRejected"
+        assert h.activity == []
+
+
+async def bracket_opened(h: Harness) -> None:
+    await push_spot(h, 8_528_600_000, 8_528_721_000)
+    await submit_bracket(h, bracket(h))
+    await wait_until(lambda: status(h, STOP) == OrderStatus.ACCEPTED)
+
+
+def bracket_venue() -> ExecutionVenue:
+    venue = ExecutionVenue()
+    venue.server.on(om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[:3])
+    return venue
+
+
+async def test_a_leg_update_held_behind_a_partial_close_keeps_the_smaller_quantity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
+    async with harness(execution_venue=bracket_venue()) as h:
+        await bracket_opened(h)
+        track_unapplied(h, ENTRY)
+        await push(h, unloaded_order(6_900_001))
+        # A trader closes 0.01 of the position; the leg follows to 0.99, held for Nautilus.
+        await push(h, *FIRST_EVENTS[6:9])
+
+        h.client._leg_updated(ClientOrderId(STOP), Level.STOP_LOSS, Decimal("85197.20"))
+        h.client._unapplied.clear()
+        await wait_until(lambda: not h.client._outbox)
+
+        stop = h.cache.order(ClientOrderId(STOP))
+        assert type(stop.events[-1]).__name__ == "OrderUpdated"
+        assert stop.quantity == Quantity.from_str("0.99")
+
+
+async def test_the_pass_count_runs_only_while_an_event_is_tracked() -> None:
+    async with harness(execution_venue=bracket_venue()) as h:
+        await bracket_opened(h)
+        await wait_until(lambda: h.client._pass_counter is None)
+        assert h.client._unapplied == {}
+
+        track_unapplied(h, ENTRY)
+        h.client._count_passes()
+        counting = h.client._pass_counter
+        assert counting is not None
+
+        await h.client._disconnect()
+
+        assert counting.cancelled()
+        assert h.client._pass_counter is None
+
+
+async def test_a_held_event_that_cannot_be_sent_does_not_stop_what_follows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
+    async with harness() as h:
+        await never_applied(h)
+        await push(h, unloaded_order(6_900_001))
+        # Not an event: its send raises.
+        h.client._outbox.append(execution._Deferred(None))
+        h.client._handle_records([unloaded_activity()])
+        h.client._unapplied.clear()
+
+        await wait_until(lambda: len(h.activity) == 2)
+        assert any("could not be sent" in line for line in h.logger.errors())

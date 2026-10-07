@@ -1308,6 +1308,55 @@ async def test_a_bracket_whose_position_closed_before_its_correction_is_dropped(
         assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
 
 
+def entry_ended(kind: int, status: int) -> oa.ProtoOAExecutionEvent:
+    """The first entry ended by the broker with nothing filled (hand-built)."""
+    event = type(FIRST_EVENTS[0])()
+    event.CopyFrom(FIRST_EVENTS[0])
+    event.executionType = kind
+    event.order.orderStatus = status
+    event.order.utcLastUpdateTimestamp += 1
+    return event
+
+
+@pytest.mark.parametrize(
+    ("kind", "order_status", "reason"),
+    [
+        (om.ORDER_CANCELLED, om.ORDER_STATUS_CANCELLED, "the entry canceled"),
+        (om.ORDER_EXPIRED, om.ORDER_STATUS_EXPIRED, "the entry expired"),
+        (om.ORDER_REJECTED, om.ORDER_STATUS_REJECTED, "the entry rejected"),
+    ],
+)
+async def test_a_bracket_whose_entry_ends_unfilled_answers_its_waiting_modify(
+    kind: int, order_status: int, reason: str
+) -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    config = exec_config(protective_order_timeout_secs=30.0)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        sending = await in_flight(h, held)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+        await held.release()
+        await sending
+
+        await push(h, entry_ended(kind, order_status))
+
+        assert len(h.client._brackets) == 0
+        await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]
+        assert rejected.reason == reason
+        # Each leg's events in the order Nautilus applied them: the answer, then the cancel.
+        assert h.kinds_of(STOP)[-2:] == ["OrderModifyRejected", "OrderCanceled"]
+        assert [type(e).__name__ for e in h.cache.order(ClientOrderId(STOP)).events][-2:] == [
+            "OrderModifyRejected",
+            "OrderCanceled",
+        ]
+        assert h.kinds_of(TARGET)[-1] == "OrderCanceled"
+        assert h.logger.errors() == []
+
+
 async def test_a_leg_is_cancelled_by_removing_its_level_alone() -> None:
     execution_venue = answered(FIRST_EVENTS[:3])
     amends = echo_amends(execution_venue)

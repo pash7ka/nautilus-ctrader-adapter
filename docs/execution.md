@@ -371,11 +371,18 @@ Notes on reading it:
   `OrderStatusReport` with its current status, quantities and prices for each later change,
   cancel, expiry or rejection, from which Nautilus makes the `OrderUpdated`, `OrderCanceled` and
   other events itself. A report or an activity therefore waits until Nautilus has applied every
-  event the adapter sent before it, and everything after it waits behind it. An event holds
-  anything back for at most 0.1 s after it was sent: Nautilus applies a queued event within a few
-  passes of the event loop, but one it refuses never appears. When something waited that long, a
-  WARNING says how many events were not applied, and what waited is delivered anyway; an event
-  refused long before delays nothing.
+  event the adapter sent before it, and everything after it waits behind it. That includes the
+  events the adapter makes itself rather than from the broker's news: its answers to commands
+  (`OrderModifyRejected`, `OrderCancelRejected`, a refused order's `OrderRejected` and its legs'
+  `OrderCanceled`), `OrderSubmitted`, and the `OrderUpdated` of a leg moved by a modify. An event
+  holds anything back until it is at least 0.1 s old and two whole passes of the event loop have
+  run since it was sent: Nautilus applies a queued event within two passes, but one it refuses
+  never appears, and the passes keep a stalled loop from giving up on an event its queue has not
+  yet reached. When something waited that long, a WARNING says how many events were not applied,
+  and what waited is delivered anyway; an event refused long before delays nothing. When the
+  client disconnects (Nautilus stops it), the waiting records are dropped but the adapter's own
+  events are sent. A dropped connection that the transport restores drops nothing: the reconnect
+  pass delivers everything waiting before it reconciles.
 - **One path per order.** Mixing events and reports for one order could apply its news out of
   order, so an external order never gets an event from the broker's news. Two exceptions: a
   change of an order Nautilus already holds as closed is logged as a WARNING and not reported,

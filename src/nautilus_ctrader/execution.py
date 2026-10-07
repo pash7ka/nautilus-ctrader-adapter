@@ -138,9 +138,15 @@ _OPEN = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _ENDED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
 # Activity after which what stands on unloaded symbols may have changed.
 _EXPOSURE_KINDS = (ActivityKind.UNLOADED_SYMBOL, ActivityKind.STOP_OUT)
-# How long after it is sent an event can hold back a report or an activity. Nautilus applies a
-# queued event within a few passes of the loop; an event it refuses never appears.
+# The least time an event not yet applied holds back a report or an activity; the pass floor
+# below can make it longer. Nautilus applies a queued event within a few passes of the loop; an
+# event it refuses never appears.
 _EVENT_WAIT_SECS = 0.1
+# Whole loop passes an event gets before it can expire, however long the loop stalled: in the
+# first, Nautilus puts it on its queue; in the second, its queue task applies it.
+# TODO(verify): measured on the standard asyncio loop only, not on uvloop, and with Nautilus's
+# event queue below capacity; a full queue enqueues through a task, which takes more passes.
+_EVENT_WAIT_PASSES = 2
 
 
 @dataclass
@@ -216,6 +222,13 @@ class _Buffered:
 
 
 _BUFFERED = _Buffered()
+
+
+@dataclass(frozen=True)
+class _Deferred:
+    """An order event the client made itself while records were held, sent in its turn."""
+
+    event: NautilusOrderEvent
 
 
 @dataclass(frozen=True)
@@ -336,12 +349,21 @@ class CTraderExecutionClient(LiveExecutionClient):
         # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
         self._holds_account = False
         self._checkpoint: BalanceCheckpoint | None = None
+        # The clock the tracking below reads.
+        self._time: Callable[[], float] = loop.time
         # Events sent to Nautilus's queue and not yet seen applied, oldest first:
-        # event id -> (client order id, loop time sent).
-        self._unapplied: dict[UUID4, tuple[ClientOrderId, float]] = {}
-        # Records held behind those events, in order, and the task that delivers them.
-        self._outbox: deque[Record] = deque()
+        # event id -> (client order id, time sent, loop pass sent).
+        self._unapplied: dict[UUID4, tuple[ClientOrderId, float, int]] = {}
+        # Loop passes, counted only while an event is tracked, and the callback counting them.
+        self._passes = 0
+        self._pass_counter: asyncio.Handle | None = None
+        # Tracked events that expired while records were held, not yet warned about.
+        self._expired_held = 0
+        # Records and the client's own events held behind those events, in order, and the task
+        # that delivers them; set while it does.
+        self._outbox: deque[Record | _Deferred] = deque()
         self._outbox_task: asyncio.Task | None = None
+        self._delivering = False
 
     @property
     def instrument_provider(self) -> CTraderInstrumentProvider:
@@ -417,8 +439,17 @@ class CTraderExecutionClient(LiveExecutionClient):
         if self._outbox_task is not None:
             self._outbox_task.cancel()
             self._outbox_task = None
-        self._outbox.clear()
+        if self._pass_counter is not None:
+            self._pass_counter.cancel()
+            self._pass_counter = None
+        held, self._outbox = self._outbox, deque()
         self._unapplied.clear()
+        self._expired_held = 0
+        # The held records are dropped, as a rebuild replaces them; the client's own answers to
+        # commands are not, since no reconciliation restores them.
+        for item in held:
+            if isinstance(item, _Deferred):
+                super()._send_order_event(item.event)
         self._stop_awaiting()
         # Whatever it held is dropped: its next connect rebuilds anew.
         self._buffer = None
@@ -1254,31 +1285,49 @@ class CTraderExecutionClient(LiveExecutionClient):
         )
 
     def _send_order_event(self, event: NautilusOrderEvent) -> None:
+        if self._outbox and not self._delivering:
+            # Sent now, it could overtake a held record of the same order.
+            self._outbox.append(_Deferred(event))
+            return
         # Nautilus queues an event; a report or an activity after it waits until it is applied.
         self._expire_unapplied()
-        self._unapplied[event.id] = (event.client_order_id, self._loop.time())
+        self._unapplied[event.id] = (event.client_order_id, self._time(), self._passes)
+        self._count_passes()
         super()._send_order_event(event)
 
-    def _expire_unapplied(self) -> int:
-        """Stop waiting for the events sent longer ago than the bound; returns how many."""
-        oldest = self._loop.time() - _EVENT_WAIT_SECS
-        expired = 0
+    def _count_passes(self) -> None:
+        """Count loop passes while an event is tracked."""
+        if self._unapplied and self._pass_counter is None:
+            self._pass_counter = self._loop.call_soon(self._count_pass)
+
+    def _count_pass(self) -> None:
+        # Each run schedules the next, which the loop runs in its next pass.
+        self._pass_counter = None
+        self._passes += 1
+        self._check_unapplied()
+
+    def _expire_unapplied(self) -> None:
+        """Stop waiting for the events past both the time bound and the pass floor."""
+        oldest = self._time() - _EVENT_WAIT_SECS
+        # The count moves somewhere within a pass, so the pass of the send is not a whole one.
+        latest_pass = self._passes - _EVENT_WAIT_PASSES - 1
         while self._unapplied:
-            event_id, (_, sent) = next(iter(self._unapplied.items()))
-            if sent > oldest:
+            event_id, (_, sent, sent_pass) = next(iter(self._unapplied.items()))
+            if sent > oldest or sent_pass > latest_pass:
                 break
             del self._unapplied[event_id]
-            expired += 1
-        return expired
+            if self._outbox:
+                self._expired_held += 1
 
-    def _check_unapplied(self) -> int:
-        """Forget the events Nautilus applied and those past the bound; returns the latter."""
-        for event_id, (client_order_id, _) in list(self._unapplied.items()):
+    def _check_unapplied(self) -> None:
+        """Forget the events Nautilus applied, and those past the bound."""
+        for event_id, (client_order_id, _, _) in list(self._unapplied.items()):
             order = self._cache.order(client_order_id)
             # Without its order the event can never be applied.
             if order is None or any(e.id == event_id for e in order.events):
                 del self._unapplied[event_id]
-        return self._expire_unapplied()
+        self._expire_unapplied()
+        self._count_passes()
 
     def _bookkeep(self, record: Record) -> None:
         """What the client itself learns from a record, done as soon as the model makes it."""
@@ -1300,7 +1349,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 )
 
     @staticmethod
-    def _applied_at_once(record: Record) -> bool:
+    def _applied_at_once(record: Record | _Deferred) -> bool:
         """Whether Nautilus applies what the record becomes at once: a report or an activity."""
         if isinstance(record, OrderEvent):
             return record.client_order_id is None
@@ -1317,7 +1366,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._bookkeep(record)
             at_once = self._applied_at_once(record)
             if at_once:
-                # Events past the bound are dropped without a warning: nothing waited for them.
+                # With nothing held, events past the bound go without a warning: none held a
+                # record back.
                 self._check_unapplied()
             if self._outbox or (at_once and self._unapplied):
                 self._outbox.append(record)
@@ -1331,27 +1381,41 @@ class CTraderExecutionClient(LiveExecutionClient):
             while self._outbox:
                 # Polled, not awaited: nothing signals that Nautilus applied an event. Each
                 # tracked event expires within the bound, which ends the loop.
-                expired = self._check_unapplied()
+                self._check_unapplied()
                 while self._unapplied:
                     await asyncio.sleep(0)
-                    expired += self._check_unapplied()
-                if expired:
+                    self._check_unapplied()
+                if self._expired_held:
                     self._log.warning(
-                        f"Nautilus did not apply {expired} order event(s) within "
+                        f"Nautilus did not apply {self._expired_held} order event(s) within "
                         f"{_EVENT_WAIT_SECS:g}s; the reports and activity behind them are "
                         "delivered anyway",
                     )
-                # Up to a report or an activity behind events the delivered records sent.
+                    self._expired_held = 0
+                # Up to a report or an activity behind events the delivered ones sent.
                 while self._outbox:
-                    record = self._outbox[0]
-                    if self._applied_at_once(record) and self._unapplied:
+                    item = self._outbox[0]
+                    if self._applied_at_once(item) and self._unapplied:
                         break
                     self._outbox.popleft()
-                    self._handle_record(record)
+                    self._delivering = True
+                    try:
+                        if isinstance(item, _Deferred):
+                            self._send_deferred(item)
+                        else:
+                            self._handle_record(item)
+                    finally:
+                        self._delivering = False
         finally:
             # A detach may have replaced this task already.
             if self._outbox_task is asyncio.current_task():
                 self._outbox_task = None
+
+    def _send_deferred(self, item: _Deferred) -> None:
+        try:
+            self._send_order_event(item.event)
+        except Exception as e:
+            self._log.exception("A held order event could not be sent", e)
 
     def _handle_record(self, record: Record) -> None:
         try:
@@ -1899,12 +1963,14 @@ class CTraderExecutionClient(LiveExecutionClient):
         instrument = self._instrument_provider.find(order.instrument_id)
         price = reports.price(value, instrument)
         stop = level == Level.STOP_LOSS
+        # The model's, not Nautilus's: a change of the quantity may still be held for Nautilus.
+        quantity = self._leg_quantity(order, self._book.leg_position(client_order_id.value))
         self.generate_order_updated(
             order.strategy_id,
             order.instrument_id,
             client_order_id,
             order.venue_order_id,
-            order.quantity,
+            quantity,
             None if stop else price,
             price if stop else None,
             self._clock.timestamp_ns(),
