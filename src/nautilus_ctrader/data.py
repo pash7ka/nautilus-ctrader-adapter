@@ -838,6 +838,9 @@ class CTraderDataClient(LiveMarketDataClient):
         closed = [raw for raw in served if raw.boundary_secs + period_secs <= now_secs]
         if request.limit:
             closed = closed[-request.limit :]
+        elif request.start is None:
+            # One page of the newest bars, although a page asks the venue for one more.
+            closed = closed[-self._page_size() :]
 
         sub = self._bars.get(bar_type)
         if sub is not None and closed:

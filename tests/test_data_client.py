@@ -1927,9 +1927,22 @@ async def test_request_bars_without_a_start_or_a_limit_asks_for_one_page() -> No
         bars = await request_bars(h, EURUSD_H1, end=at_minute(LAST_H1_MINUTE + 60))
 
         assert len(received(h.server, oa.ProtoOAGetTrendbarsReq)) == 1
-        # Everything that page served: the page size plus the one more it always asks for.
+        # Exactly a page of the newest, although the page asks the venue for one more.
         assert [b.ts_event for b in bars] == [
-            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(21))
+            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(20))
+        ]
+
+
+async def test_request_bars_without_a_start_or_a_limit_leaves_out_the_forming_bar() -> None:
+    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+        await h.client._connect()
+        # Half way into the bar opening at LAST_H1_MINUTE, which is therefore still forming.
+        h.client._bar_clock = PinnedClock(LAST_H1_MINUTE * 60 + 1800)
+
+        bars = await request_bars(h, EURUSD_H1)
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(1, 21))
         ]
 
 
