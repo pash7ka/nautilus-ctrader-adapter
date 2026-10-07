@@ -90,8 +90,8 @@ not.
 
 Generated `*_pb2.py` files are build output. Never hand-edit them; regenerate instead with
 `scripts/gen_protobuf.py`, which also rewrites the two bare imports protoc emits into
-package-absolute ones. Its protobuf version check and the `grpcio-tools` pin in
-`pyproject.toml` move together.
+package-absolute ones. It refuses bindings stamped newer than the `protobuf` floor in
+`pyproject.toml`, so raising the `grpcio-tools` pin usually means raising that floor.
 
 ## 5. Layout
 
