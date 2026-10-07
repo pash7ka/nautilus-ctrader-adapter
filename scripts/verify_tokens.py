@@ -84,8 +84,9 @@ from datetime import UTC, datetime
 
 from google.protobuf.message import Message
 
+from nautilus_ctrader import oauth
 from nautilus_ctrader.common.connection import CTraderConnection
-from nautilus_ctrader.common.errors import CTraderRequestError
+from nautilus_ctrader.common.errors import CTraderAuthorizationDenied, CTraderRequestError
 from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 
@@ -785,19 +786,14 @@ class Runner:
         )
         try:
             response = await _in_daemon_thread(self._authorise)
-        except get_tokens.AuthorizationError as e:
+        except CTraderAuthorizationDenied as e:
             # The redirect's own error value, already sanitised; it carries no secret.
-            self._say(f"step 2  browser authorisation: not granted ({e})")
+            self._say(f"step 2  browser authorisation: not granted ({e.error_code})")
             return None
         except Exception as e:
             self._say(f"step 2  browser authorisation failed: {type(e).__name__}")
             return None
-        pair = TokenPair(
-            "B",
-            response.access_token,
-            response.refresh_token,
-            time.time() + response.expires_in,
-        )
+        pair = TokenPair("B", response.access_token, response.refresh_token, response.expires_at)
         self._say("step 2  browser authorisation: pair B obtained")
         await self._obtained(pair, "step 2")
         return pair
@@ -817,8 +813,8 @@ class Runner:
                 oa.ProtoOARefreshTokenReq(refreshToken=pair.refresh_token),
             )
             if not (
-                get_tokens.is_clean_token(response.accessToken)
-                and get_tokens.is_clean_token(response.refreshToken)
+                oauth.is_clean_token(response.accessToken)
+                and oauth.is_clean_token(response.refreshToken)
             ):
                 raise ValueError("the refresh response carries an unusable token")
             obtained.append(
@@ -1058,11 +1054,9 @@ def browser_authorisation(
     settings: Settings,
     *,
     redirect_uri: str,
-    port: int,
-    path: str,
     timeout_secs: float,
 ) -> Callable[[], object]:
-    """`get_tokens.py`'s browser authorisation as one blocking call returning its `TokenResponse`.
+    """The package's browser authorisation as one blocking call returning its `oauth.TokenPair`.
 
     The authorisation URL carries the client id, so it is only ever handed to the browser; with
     no browser to open, the call fails at once instead of waiting out the timeout.
@@ -1070,7 +1064,7 @@ def browser_authorisation(
 
     def authorise() -> object:
         state = secrets.token_urlsafe(32)
-        url = get_tokens.build_authorization_url(settings.client_id, redirect_uri, state)
+        url = oauth.build_authorization_url(settings.client_id, redirect_uri, state)
 
         def open_browser() -> None:
             try:
@@ -1080,19 +1074,17 @@ def browser_authorisation(
             if not opened:
                 raise BrowserNotOpened("no browser could be opened for the authorisation page")
 
-        code = get_tokens.wait_for_authorization_code(
-            "127.0.0.1",
-            port,
-            path,
+        code = oauth.wait_for_authorization_code(
+            redirect_uri,
+            state,
             timeout_secs,
-            state=state,
             on_listening=open_browser,
         )
-        return get_tokens.exchange_code(
+        return oauth.exchange_code(
+            settings.client_id,
+            settings.client_secret,
             code,
-            client_id=settings.client_id,
-            client_secret=settings.client_secret,
-            redirect_uri=redirect_uri,
+            redirect_uri,
         )
 
     return authorise
@@ -1182,7 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     try:
-        port, path = get_tokens.parse_redirect_uri(args.redirect_uri)
+        get_tokens.parse_redirect_uri(args.redirect_uri)
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
@@ -1207,8 +1199,6 @@ def main(argv: list[str] | None = None) -> int:
         authorise=browser_authorisation(
             settings,
             redirect_uri=args.redirect_uri,
-            port=port,
-            path=path,
             timeout_secs=args.timeout_secs,
         ),
         logger=QuietLogger(),

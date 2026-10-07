@@ -21,6 +21,8 @@ import time
 
 import pytest
 
+from nautilus_ctrader import oauth
+from nautilus_ctrader.common.errors import CTraderAuthorizationDenied
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests import account_venue
@@ -531,7 +533,7 @@ class TokenVenue:
                 self.refresh.clear()
             access, refresh = self.issue(foreign=self.browser_grants_other_account)
         self.browser_refresh.add(refresh)
-        return v.get_tokens.TokenResponse(access, refresh, 2_628_000, "bearer")
+        return oauth.TokenPair(access, refresh, time.time() + 2_628_000)
 
     @staticmethod
     def _error(code: str, token: str) -> oa.ProtoOAErrorRes:
@@ -741,6 +743,23 @@ async def test_a_failed_browser_authorisation_still_rotates_and_keeps_the_first_
     assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
 
 
+async def test_a_denied_browser_authorisation_is_reported_by_its_error_code(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    venue = TokenVenue()
+
+    def denied():
+        raise CTraderAuthorizationDenied("access_denied")
+
+    runner, logger, _env_file = await run_against(venue, tmp_path, authorise=denied)
+
+    assert runner.kept is not None and runner.kept.label == "A'"
+    captured = capsys.readouterr()
+    assert "browser authorisation: not granted (access_denied)" in captured.out + captured.err
+    assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
+
+
 async def test_with_no_working_pair_it_says_so_and_points_to_get_tokens(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -830,8 +849,6 @@ def test_the_browser_step_fails_at_once_without_a_browser_and_never_prints_the_u
     authorise = v.browser_authorisation(
         settings,
         redirect_uri=f"http://127.0.0.1:{port}/callback",
-        port=port,
-        path="/callback",
         timeout_secs=30.0,
     )
 
