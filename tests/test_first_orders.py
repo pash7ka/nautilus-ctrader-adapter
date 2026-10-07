@@ -281,6 +281,19 @@ class Venue:
         self.positions[position.id] = position
         return fill, TestEventStubs.position_opened(position)
 
+    def partly_closed(self, position_id: str, quantity: Quantity, price: str):
+        position = self.positions[PositionId(position_id)]
+        close = self.factory.market(EURUSD.id, OrderSide.SELL, quantity, reduce_only=True)
+        fill = TestEventStubs.order_filled(
+            close,
+            EURUSD,
+            account_id=ACCOUNT_ID,
+            position_id=position.id,
+            last_px=Price.from_str(price),
+        )
+        position.apply(fill)
+        return fill, TestEventStubs.position_changed(position)
+
     def closed(self, position_id: str, price: str):
         position = self.positions[PositionId(position_id)]
         close = self.factory.market(EURUSD.id, OrderSide.SELL, position.quantity, reduce_only=True)
@@ -379,8 +392,10 @@ def test_steps_run_the_fixed_sequence() -> None:
     assert prompt.wait_secs == WAIT_SECS
     assert "close 1 EUR (0.001 lots) of it" in prompt.text
 
-    # 7-8. Both manual changes seen: close the rest, then stop.
+    # 7-8. Both manual changes seen and the position smaller: close the rest, then stop.
     assert steps.on(activity("level_moved")) == []
+    for event in venue.partly_closed("P-2", Quantity.from_int(1), "1.10030"):
+        assert steps.on(event) == []
     assert steps.on(activity("partially_closed")) == [fo.ClosePosition(PositionId("P-2"))]
     fill, closed = venue.closed("P-2", "1.10030")
     assert steps.on(fill) == []
@@ -390,13 +405,41 @@ def test_steps_run_the_fixed_sequence() -> None:
 
 def test_steps_wait_for_both_manual_activities() -> None:
     steps = new_steps()
-    run_to_manual_wait(steps, Venue())
+    venue = Venue()
+    run_to_manual_wait(steps, venue)
+    for event in venue.partly_closed("P-2", Quantity.from_int(1), "1.10030"):
+        steps.on(event)
 
     assert steps.on(activity("partially_closed")) == []
     assert steps.on(activity("level_moved", kind="unloaded_symbol")) == []
     assert steps.on(activity("partially_closed")) == []
     assert steps.on(activity("level_moved")) == [fo.ClosePosition(PositionId("P-2"))]
     assert steps.on(fo.ManualWaitExpired()) == []
+
+
+def test_steps_wait_for_the_position_to_show_a_partial_close_reported_first() -> None:
+    steps = new_steps()
+    venue = Venue()
+    run_to_manual_wait(steps, venue)
+
+    assert steps.on(activity("level_moved")) == []
+    assert steps.on(activity("partially_closed")) == []
+    fill, changed = venue.partly_closed("P-2", Quantity.from_int(1), "1.10030")
+    assert steps.on(fill) == []
+
+    assert steps.on(changed) == [fo.ClosePosition(PositionId("P-2"))]
+    assert changed.quantity == FIRST
+
+
+def test_steps_close_the_rest_on_the_activity_when_the_position_is_already_smaller() -> None:
+    steps = new_steps()
+    venue = Venue()
+    run_to_manual_wait(steps, venue)
+    assert steps.on(activity("level_moved")) == []
+    for event in venue.partly_closed("P-2", Quantity.from_int(1), "1.10030"):
+        assert steps.on(event) == []
+
+    assert steps.on(activity("partially_closed")) == [fo.ClosePosition(PositionId("P-2"))]
 
 
 def test_steps_close_the_rest_when_the_manual_wait_runs_out() -> None:
@@ -410,6 +453,32 @@ def test_steps_close_the_rest_when_the_manual_wait_runs_out() -> None:
     assert "partially_closed" in prompt.text
     assert "level_moved" not in prompt.text
     assert close == fo.ClosePosition(PositionId("P-2"))
+
+
+def test_steps_say_so_when_the_position_never_shows_the_partial_close() -> None:
+    steps = new_steps()
+    run_to_manual_wait(steps, Venue())
+    steps.on(activity("level_moved"))
+    steps.on(activity("partially_closed"))
+
+    prompt, close = steps.on(fo.ManualWaitExpired())
+
+    assert "did not show the partial close" in prompt.text
+    assert "Not reported" not in prompt.text
+    assert close == fo.ClosePosition(PositionId("P-2"))
+
+
+def test_steps_take_no_volume_from_the_bracket_before() -> None:
+    steps = new_steps()
+    venue = Venue()
+    run_to_manual_wait(steps, venue)
+    # A third bracket, as no run sends: its position not reported yet.
+    _entry, *_legs, submitted = venue.bracket(
+        fo.SubmitBracket(SECOND, stop_loss=Decimal("1.09920"), take_profit=Decimal("1.10120")),
+    )
+    steps.on(submitted)
+
+    assert steps._quantity is None
 
 
 def test_steps_stop_when_the_owner_closes_everything_by_hand() -> None:

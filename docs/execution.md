@@ -364,6 +364,34 @@ Notes on reading it:
   `manual_change` activity and, because Nautilus needs it for its own bookkeeping, as an external
   closing order. A trader's move, removal or addition of a level is the activity alone, plus the
   node's leg events (`OrderUpdated` or `OrderCanceled`).
+- **In the broker's order.** What the adapter tells Nautilus follows the order in which the
+  broker sent it. The node's own orders (entries, legs, closes) reach Nautilus as events, which it
+  queues. An order the node did not send reaches it through reports only, which it applies at
+  once: an `OrderStatusReport` when it is first seen, a `FillReport` for each fill, and an
+  `OrderStatusReport` with its current status, quantities and prices for each later change,
+  cancel, expiry or rejection, from which Nautilus makes the `OrderUpdated`, `OrderCanceled` and
+  other events itself. A report or an activity therefore waits until Nautilus has applied every
+  event the adapter sent before it, and everything after it waits behind it. An event holds
+  anything back for at most 0.1 s after it was sent: Nautilus applies a queued event within a few
+  passes of the event loop, but one it refuses never appears. When something waited that long, a
+  WARNING says how many events were not applied, and what waited is delivered anyway; an event
+  refused long before delays nothing.
+- **One path per order.** Mixing events and reports for one order could apply its news out of
+  order, so an external order never gets an event from the broker's news. Two exceptions: a
+  change of an order Nautilus already holds as closed is logged as a WARNING and not reported,
+  and a cancel or modify command for an external order is still answered with an
+  `OrderCancelRejected` or `OrderModifyRejected` event.
+- **A close is in the position before its activity.** When a `closed` or `partially_closed`
+  activity (`manual_change` or `stop_out`) is published for an instrument the node has loaded,
+  Nautilus's position already holds that fill, and every earlier fill of the node's own orders
+  (within the wait above). A handler that closes the rest reads the right quantity. If Nautilus
+  refuses the fill report (for example as an overfill), an ERROR names the trade and the order,
+  says the position may differ from the broker's, and the activity is still published.
+- **What comes after an activity.** A `level_moved`, `level_removed` or `level_added` activity
+  follows its leg's `OrderUpdated`, `OrderCanceled` or `OrderAccepted`. The legs' `OrderCanceled`
+  when a close ends the position are sent after the `closed` activity, and their `OrderUpdated` to
+  the smaller quantity after a partial close comes with the broker's next event, after the
+  `partially_closed` activity.
 - A stop-out closes under an external `MARKET` order, so deriving the close reason from the
   closing order's type reads it as manual. The `stop_out` activity is what marks it. How a stop-out
   is flagged on the wire is unconfirmed.

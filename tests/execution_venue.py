@@ -1,8 +1,9 @@
 """A fake venue for the execution client, and a Nautilus execution engine around the client.
 
-The recorded execution session was traded on a symbol the market-data fixture holds no
+The first recorded execution session was traded on a symbol the market-data fixture holds no
 reference data for. `on_us100` moves its messages to `US100.cash`, which has the same price and
-volume precision, and to the fake account; nothing else changes.
+volume precision, and to the fake account; nothing else changes. The stage-2 session was traded
+on EURUSD, which the fixture holds: `on_fake_account` only re-addresses its messages.
 """
 
 from __future__ import annotations
@@ -73,6 +74,8 @@ from tests.recording_logger import RecordingLogger
 
 US100_ID = InstrumentId(Symbol("US100.cash"), CTRADER_VENUE)
 US100_SYMBOL_ID = 275
+EURUSD_ID = InstrumentId(Symbol("EURUSD"), CTRADER_VENUE)
+EURUSD_SYMBOL_ID = 1
 WEEK_MS = 604_800_000
 TRADER_ID = TraderId("TESTER-001")
 STRATEGY_ID = StrategyId("S-001")
@@ -92,14 +95,22 @@ def _positions(message: Message) -> list[om.ProtoOAPosition]:
     return list(message.position) if hasattr(message, "position") else []
 
 
-def on_us100(messages: Iterable[Message]) -> list[Message]:
-    """Copies of recorded messages, orders and deals, on `US100.cash` and the fake account."""
+def on_fake_account(messages: Iterable[Message]) -> list[Message]:
+    """Copies of recorded messages, addressed to the fake account."""
     moved = []
     for message in messages:
         copy = type(message)()
         copy.CopyFrom(message)
         if hasattr(copy, "ctidTraderAccountId"):
             copy.ctidTraderAccountId = ACCOUNT_ID
+        moved.append(copy)
+    return moved
+
+
+def on_us100(messages: Iterable[Message]) -> list[Message]:
+    """Copies of recorded messages, orders and deals, on `US100.cash` and the fake account."""
+    moved = []
+    for copy in on_fake_account(messages):
         for order in _orders(copy):
             order.tradeData.symbolId = US100_SYMBOL_ID
         for position in _positions(copy):
@@ -301,10 +312,12 @@ async def harness(
     config: CTraderExecClientConfig | None = None,
     connect: bool = True,
     cache: Cache | None = None,
+    instruments: Iterable[InstrumentId] = (US100_ID,),
 ) -> AsyncIterator[Harness]:
     """The client against the fake venue, inside a live execution engine and a portfolio.
 
     A given `cache` stands for one a restarted node reloads from a persistent backend.
+    `instruments` are the ones the node loads.
 
     What the client sends Nautilus is recorded on the way in: order events, execution reports,
     mass statuses, account states, and the account activity published on the message bus.
@@ -316,7 +329,7 @@ async def harness(
     logger = RecordingLogger()
     account = account_client(server, logger=logger, credentials=config.credentials())
     provider = account.get_instrument_provider(
-        config=InstrumentProviderConfig(load_ids=frozenset({US100_ID})),
+        config=InstrumentProviderConfig(load_ids=frozenset(instruments)),
         asset_class_overrides={},
         fail_on_instrument_error=False,
         logger=logger,
@@ -414,14 +427,19 @@ async def push(h: Harness, *messages: Message) -> None:
     await sync(h)
 
 
-async def push_spot(h: Harness, bid: int, ask: int, *, timestamp: int | None = None) -> None:
-    """A spot of `US100.cash`, in the venue's integer price units (1/100000).
+async def push_spot(
+    h: Harness,
+    bid: int,
+    ask: int,
+    *,
+    timestamp: int | None = None,
+    symbol_id: int = US100_SYMBOL_ID,
+) -> None:
+    """A spot of `US100.cash`, or of `symbol_id`, in the venue's integer price units (1/100000).
 
     `timestamp` is the broker's time of the spot, in ms.
     """
-    spot = oa.ProtoOASpotEvent(
-        ctidTraderAccountId=ACCOUNT_ID, symbolId=US100_SYMBOL_ID, bid=bid, ask=ask
-    )
+    spot = oa.ProtoOASpotEvent(ctidTraderAccountId=ACCOUNT_ID, symbolId=symbol_id, bid=bid, ask=ask)
     if timestamp is not None:
         spot.timestamp = timestamp
     await push(h, spot)
@@ -437,10 +455,11 @@ def bracket(
     quantity: str = "1.00",
     stop_price: str = "85197.20",
     target_price: str = "85387.22",
+    instrument_id: InstrumentId = US100_ID,
 ) -> OrderList:
     """A market bracket whose ids are the ones `tests.execution_replay.as_ours` writes."""
     return h.factory.bracket(
-        instrument_id=US100_ID,
+        instrument_id=instrument_id,
         order_side=side,
         quantity=Quantity.from_str(quantity),
         sl_trigger_price=Price.from_str(stop_price),

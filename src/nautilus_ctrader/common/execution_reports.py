@@ -50,6 +50,7 @@ from nautilus_trader.model.objects import (
     Price,
     Quantity,
 )
+from nautilus_trader.model.orders import Order
 
 from nautilus_ctrader.activity import CTraderAccountActivity
 from nautilus_ctrader.common.reconciliation import Reconciliation
@@ -60,6 +61,8 @@ from nautilus_ctrader.common.venue_records import (
     ExternalOrder,
     ExternalType,
     Fill,
+    OrderEvent,
+    OrderEventKind,
     ReportedOrder,
     ReportedPosition,
 )
@@ -191,6 +194,63 @@ def fill_report(
         ts_init=ts_init,
         client_order_id=None if client_order_id is None else ClientOrderId(client_order_id),
         venue_position_id=PositionId(fill.venue_position_id),
+    )
+
+
+_ENDED_STATUS = {
+    OrderEventKind.CANCELED: OrderStatus.CANCELED,
+    OrderEventKind.EXPIRED: OrderStatus.EXPIRED,
+    OrderEventKind.REJECTED: OrderStatus.REJECTED,
+}
+
+
+def held_order_report(
+    order: Order,
+    record: OrderEvent,
+    instrument: Instrument,
+    account_id: AccountId,
+    ts_init: int,
+) -> OrderStatusReport:
+    """An external order Nautilus holds, as `record` leaves it; not for a fill.
+
+    What the record does not change is taken from `order`, its fills included: they reach
+    Nautilus as their own reports, so a filled quantity above Nautilus's would make it infer one.
+    """
+    if record.kind == OrderEventKind.FILLED:
+        raise ValueError("a fill is reported by `fill_report()`")
+    filled = order.filled_qty
+    if record.kind in _ENDED_STATUS:
+        status = _ENDED_STATUS[record.kind]
+    else:
+        status = OrderStatus.PARTIALLY_FILLED if filled.as_decimal() > 0 else OrderStatus.ACCEPTED
+    held_price = getattr(order, "price", None)
+    held_trigger = getattr(order, "trigger_price", None)
+    return OrderStatusReport(
+        account_id=account_id,
+        instrument_id=instrument.id,
+        client_order_id=order.client_order_id,
+        venue_order_id=order.venue_order_id,
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=status,
+        quantity=order.quantity
+        if record.quantity is None
+        else quantity(record.quantity, instrument),
+        filled_qty=filled,
+        report_id=UUID4(),
+        ts_accepted=order.ts_accepted,
+        ts_last=nanos(record.ts_ms),
+        ts_init=ts_init,
+        expire_time=getattr(order, "expire_time", None),
+        price=held_price if record.price is None else price(record.price, instrument),
+        trigger_price=held_trigger
+        if record.trigger_price is None
+        else price(record.trigger_price, instrument),
+        trigger_type=getattr(order, "trigger_type", TriggerType.NO_TRIGGER),
+        avg_px=None if filled.as_decimal() == 0 else Decimal(str(order.avg_px)),
+        cancel_reason=record.reason,
+        reduce_only=order.is_reduce_only,
     )
 
 

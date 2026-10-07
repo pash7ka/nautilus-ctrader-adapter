@@ -67,17 +67,23 @@ async def test_the_recorded_session_reaches_nautilus_as_the_venue_told_it() -> N
         assert status(h, STOP) == OrderStatus.FILLED
         assert status(h, TARGET) == OrderStatus.CANCELED
         assert h.cache.position(PositionId(str(FIRST))).is_closed
-        # Every other order is reported once, as it stood before any fill, then followed.
+        # Every other order is reported as it stood before any fill, then each fill and each
+        # later change as a report of its own.
         assert [(type(r).__name__, r.venue_order_id.value) for r in h.reports] == [
             ("OrderStatusReport", "6000003"),
+            ("FillReport", "6000003"),
             ("OrderStatusReport", "6000004"),
+            ("FillReport", "6000004"),
             ("OrderStatusReport", "6000005"),
             ("FillReport", "6000005"),
             ("OrderStatusReport", "6000006"),
+            ("OrderStatusReport", "6000006"),
         ]
-        reported = {
-            r.venue_order_id.value: r for r in h.reports if isinstance(r, OrderStatusReport)
-        }
+        assert h.reports[-1].order_status == OrderStatus.CANCELED
+        reported = {}
+        for r in h.reports:
+            if isinstance(r, OrderStatusReport):
+                reported.setdefault(r.venue_order_id.value, r)
         assert reported["6000004"].order_type == OrderType.MARKET
         assert not reported["6000004"].reduce_only
         target = reported["6000005"]

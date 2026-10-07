@@ -19,6 +19,7 @@ from nautilus_trader.execution.messages import (
     QueryAccount,
     SubmitOrder,
 )
+from nautilus_trader.execution.reports import FillReport, OrderStatusReport
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.events import (
@@ -361,11 +362,18 @@ async def test_the_first_recorded_position_reaches_nautilus_step_by_step() -> No
         (stop_fill,) = [e for e in h.events_of(STOP) if isinstance(e, OrderFilled)]
         assert stop_fill.venue_order_id == VenueOrderId("6000001-SL")
         assert stop_fill.last_px == Price.from_str("85205.58")
-        # The trader's partial close: reported as an external closing order, then filled.
-        (report,) = h.reports
+        # The trader's partial close: reported as an external closing order, then its fill.
+        report, fill = h.reports
+        assert isinstance(report, OrderStatusReport)
         assert report.venue_order_id == VenueOrderId("6000003")
         assert report.reduce_only
         assert report.order_status == OrderStatus.ACCEPTED
+        assert isinstance(fill, FillReport)
+        assert fill.venue_order_id == VenueOrderId("6000003")
+        assert not any(
+            isinstance(e, OrderFilled) and e.venue_order_id == VenueOrderId("6000003")
+            for e in h.events
+        )
         external = h.cache.order(h.cache.client_order_id(VenueOrderId("6000003")))
         assert external.status == OrderStatus.FILLED
         assert external.is_reduce_only
@@ -1289,6 +1297,8 @@ async def test_a_bracket_whose_position_closed_before_its_correction_is_dropped(
 
         await push(h, FIRST_EVENTS[1], closed_by_hand())
         await wait_until(lambda: "OrderModifyRejected" in h.kinds_of(STOP))
+        # The legs' cancels come behind the trader's close, which waits for the entry's fill.
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
 
         assert len(h.client._brackets) == 0
         (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]
