@@ -77,6 +77,15 @@ def _refreshes(server: FakeCTraderServer) -> list[oa.ProtoOARefreshTokenReq]:
     return [m for m in server.received if isinstance(m, oa.ProtoOARefreshTokenReq)]
 
 
+def _due_after_ready(monkeypatch: pytest.MonkeyPatch) -> float:
+    """An expiry whose proactive refresh falls due about a second after bring-up.
+
+    A refresh already due at bring-up runs before account auth instead of in the loop.
+    """
+    monkeypatch.setattr("nautilus_ctrader.common.session.TOKEN_REFRESH_MARGIN_SECS", 1.0)
+    return time.time() + 2.0
+
+
 async def test_refresh_replaces_both_tokens_and_fires_the_callback() -> None:
     server = _server()
     await server.start()
@@ -163,11 +172,150 @@ async def test_refresh_without_a_refresh_token_raises() -> None:
         await server.stop()
 
 
-async def test_an_imminent_expiry_refreshes_and_reauthenticates_with_the_new_token() -> None:
+async def test_a_refresh_due_at_bring_up_runs_before_account_auth() -> None:
+    # Refreshed once ready, the venue would end the session and fail the requests in flight.
     server = _server()
     await server.start()
-    # An expiry already inside the refresh margin must refresh as soon as the session is up.
     session = _session(server, expires_at_secs=time.time() + 1.0)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+        # Long enough for a refresh loop that wrongly fires again to reach the server.
+        await asyncio.sleep(0.3)
+
+        assert len(_refreshes(server)) == 1
+        assert [m.accessToken for m in _account_auths(server)] == ["new-access"]
+        assert server.connection_count == 1
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_rejected_refresh_at_bring_up_authenticates_with_the_current_token() -> None:
+    server = _server()
+    server.on(
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOAErrorRes(errorCode="ACCESS_DENIED"),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(server, logger=logger, expires_at_secs=time.time() + 1.0)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert [m.accessToken for m in _account_auths(server)] == ["old-access"]
+        assert any("Token refresh rejected: ACCESS_DENIED" in m for m in logger.errors())
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_an_unanswered_refresh_at_bring_up_authenticates_with_the_current_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.LATE_REFRESH_WAIT_SECS", 0.1)
+    server = _server()
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(
+        server,
+        logger=logger,
+        expires_at_secs=time.time() + 1.0,
+        request_timeout_secs=0.2,
+    )
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert [m.accessToken for m in _account_auths(server)] == ["old-access"]
+        assert any("got no reply" in m for m in logger.warnings())
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_account_events_after_a_refresh_before_account_auth_are_ignored() -> None:
+    # They name the token the refresh just replaced; no account is authenticated to end yet.
+    server = _server()
+    pushes: list[asyncio.Task] = []
+
+    async def invalidate_then_answer(request: oa.ProtoOARefreshTokenReq, msg_id: str) -> None:
+        await server.push(
+            oa.ProtoOAAccountsTokenInvalidatedEvent(ctidTraderAccountIds=[ACCOUNT_ID])
+        )
+        await server.push(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
+        await server.push(_refresh_response(request), client_msg_id=msg_id)
+
+    def refresh(request: oa.ProtoOARefreshTokenReq) -> None:
+        msg_id = server.received_client_msg_ids[-1]
+        pushes.append(asyncio.create_task(invalidate_then_answer(request, msg_id)))
+
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, refresh)
+    await server.start()
+    session = _session(server, expires_at_secs=time.time() + 1.0)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert [m.accessToken for m in _account_auths(server)] == ["new-access"]
+        assert server.connection_count == 1
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_late_pair_adopted_while_account_auth_is_in_flight_is_used_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The refresh before account auth gets no reply in time, so auth goes out with the old
+    # token; the venue then answers the refresh and rejects the auth, in that order. The
+    # adopted pair works, so the bring-up must not fail.
+    monkeypatch.setattr("nautilus_ctrader.common.session.LATE_REFRESH_WAIT_SECS", 0.1)
+    server = _server()
+    held = HeldReplies(server, oa_model.PROTO_OA_REFRESH_TOKEN_REQ, _refresh_response)
+    pushes: list[asyncio.Task] = []
+
+    async def answer_refresh_then_reject(msg_id: str) -> None:
+        await held.release()
+        await server.push(
+            oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID"),
+            client_msg_id=msg_id,
+        )
+
+    def account_auth(request: oa.ProtoOAAccountAuthReq) -> oa.ProtoOAAccountAuthRes | None:
+        if request.accessToken == "new-access":
+            return oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID)
+        msg_id = server.received_client_msg_ids[-1]
+        pushes.append(asyncio.create_task(answer_refresh_then_reject(msg_id)))
+        return None
+
+    server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, account_auth)
+    await server.start()
+    session = _session(
+        server,
+        expires_at_secs=time.time() + 1.0,
+        request_timeout_secs=0.2,
+    )
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert len(_refreshes(server)) == 1
+        assert [m.accessToken for m in _account_auths(server)] == ["old-access", "new-access"]
+        assert server.connection_count == 1
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_refresh_due_once_ready_reauthenticates_with_the_new_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _server()
+    await server.start()
+    session = _session(server, expires_at_secs=_due_after_ready(monkeypatch))
     try:
         await session.start()
         await wait_until(lambda: server.connection_count >= 2)
@@ -766,7 +914,9 @@ async def test_a_token_rejection_refreshes_again_once_the_interval_has_passed(
         await server.stop()
 
 
-async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_on() -> None:
+async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The refresh succeeded, so the session must keep working on the new tokens - but the
     # operator must hear that they were not saved, without the tokens reaching the log.
     server = _server()
@@ -784,7 +934,7 @@ async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_
         account_id=ACCOUNT_ID,
         access_token="old-access",
         refresh_token="old-refresh",
-        expires_at_secs=time.time() + 1.0,
+        expires_at_secs=_due_after_ready(monkeypatch),
         on_tokens_refreshed=explode,
         logger=logger,
         tls=False,
@@ -802,7 +952,9 @@ async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_
         await server.stop()
 
 
-async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged() -> None:
+async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # A malformed frame rejects the pending refresh with a protocol error - neither an auth
     # nor a connection error - and that must still be logged rather than end the loop silently.
     server = _server()
@@ -817,7 +969,7 @@ async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged() -> None:
         account_id=ACCOUNT_ID,
         access_token="old-access",
         refresh_token="old-refresh",
-        expires_at_secs=time.time() + 1.0,
+        expires_at_secs=_due_after_ready(monkeypatch),
         logger=logger,
         tls=False,
         backoff_base_secs=0.05,
@@ -856,7 +1008,7 @@ async def test_a_proactive_refresh_that_will_be_retried_before_expiry_is_a_warni
         account_id=ACCOUNT_ID,
         access_token="old-access",
         refresh_token="old-refresh",
-        expires_at_secs=time.time() + 10.0,
+        expires_at_secs=_due_after_ready(monkeypatch),
         logger=logger,
         tls=False,
         backoff_base_secs=0.05,
@@ -891,7 +1043,9 @@ async def test_a_proactive_refresh_that_times_out_is_retried(
     server = _server()
     server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
     await server.start()
-    session = _session(server, expires_at_secs=time.time() + 1.0, request_timeout_secs=0.3)
+    session = _session(
+        server, expires_at_secs=_due_after_ready(monkeypatch), request_timeout_secs=0.3
+    )
     try:
         await session.start()
         await wait_until(
@@ -903,7 +1057,9 @@ async def test_a_proactive_refresh_that_times_out_is_retried(
         await server.stop()
 
 
-async def test_a_proactive_reauth_is_not_treated_as_a_failed_session() -> None:
+async def test_a_proactive_reauth_is_not_treated_as_a_failed_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # A proactive refresh forces re-authentication with the new token by design; that must be
     # recognised as recovery, not counted as a session that failed soon after becoming ready.
     server = _server()
@@ -917,7 +1073,7 @@ async def test_a_proactive_reauth_is_not_treated_as_a_failed_session() -> None:
         account_id=ACCOUNT_ID,
         access_token="old-access",
         refresh_token="old-refresh",
-        expires_at_secs=time.time() + 1.0,
+        expires_at_secs=_due_after_ready(monkeypatch),
         logger=logger,
         tls=False,
         backoff_base_secs=5.0,
@@ -930,7 +1086,8 @@ async def test_a_proactive_reauth_is_not_treated_as_a_failed_session() -> None:
         await session.wait_ready(timeout_secs=2.0)
         elapsed = loop.time() - started
 
-        assert elapsed < 2.0, f"re-authentication took {elapsed:.2f}s, a backoff appears to apply"
+        # About a second until the refresh is due; a backoff would add at least five.
+        assert elapsed < 4.0, f"re-authentication took {elapsed:.2f}s, a backoff appears to apply"
         assert not any("soon after becoming ready" in message for _level, message in logger.lines)
         assert ("info", "Re-authenticating with the refreshed token") in logger.lines
     finally:
@@ -954,7 +1111,7 @@ async def test_a_loss_during_a_proactive_refresh_keeps_its_backoff(
         account_id=ACCOUNT_ID,
         access_token="old-access",
         refresh_token="old-refresh",
-        expires_at_secs=time.time() + 1.0,
+        expires_at_secs=_due_after_ready(monkeypatch),
         logger=logger,
         tls=False,
         backoff_base_secs=0.05,

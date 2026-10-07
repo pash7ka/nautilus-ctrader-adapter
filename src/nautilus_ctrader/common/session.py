@@ -135,6 +135,7 @@ class CTraderSession:
         self._awaiting_refresh_reply = False
         self._pair_taken = asyncio.Event()
         self._reauth_requested = False
+        self._account_auth_sent = False
         self._stopping = False
         # Set while no `stop()` is running; `start()` waits on it.
         self._stop_idle = asyncio.Event()
@@ -331,6 +332,7 @@ class CTraderSession:
         self._loss_cause = None
         self._ready.clear()
         self._failed_restores.clear()
+        self._account_auth_sent = False
         self._bring_up_generation += 1
         self._state = SessionState.CONNECTING
         await self._connection.connect()
@@ -440,27 +442,63 @@ class CTraderSession:
         except CTraderRequestError as e:
             raise CTraderAuthError(f"application auth rejected: {e.error_code}") from e
 
+        delay = self._refresh_delay()
+        if delay is not None and delay <= 0:
+            await self._refresh_before_account_auth()
+
+        token = self._access_token
         try:
             await self._authenticate_account()
         except CTraderRequestError as e:
-            if not self._may_refresh_for(e):
+            if self._access_token != token and e.error_code in TOKEN_ERROR_CODES:
+                # A late refresh reply was adopted while this auth was in flight, and the venue
+                # had already retired the token it carried. The adopted one is untried.
+                self._log.warning(f"Account auth rejected ({e.error_code}), using the new token")
+            elif not self._may_refresh_for(e):
                 raise CTraderAuthError(f"account auth rejected: {e.error_code}") from e
-            # The access token may simply have expired. Refresh, then retry once; a second
-            # rejection is a real authentication failure.
-            # The venue accepts a refresh on a connection authenticated only at application
-            # level (confirmed live).
-            self._log.warning(f"Account auth rejected ({e.error_code}), refreshing token")
-            self._pair_taken.clear()
-            try:
-                await self.refresh_tokens()
-            except CTraderTimeoutError as timed_out:
-                await self._wait_for_late_pair(timed_out)
+            else:
+                await self._refresh_for_rejection(e)
             try:
                 await self._authenticate_account()
             except CTraderRequestError as retry_error:
                 raise CTraderAuthError(
                     f"account auth rejected after refresh: {retry_error.error_code}",
                 ) from retry_error
+
+    async def _refresh_for_rejection(self, e: CTraderRequestError) -> None:
+        # The access token may simply have expired. Refresh, then retry once; a second
+        # rejection is a real authentication failure.
+        # The venue accepts a refresh on a connection authenticated only at application
+        # level (confirmed live).
+        self._log.warning(f"Account auth rejected ({e.error_code}), refreshing token")
+        self._pair_taken.clear()
+        try:
+            await self.refresh_tokens()
+        except CTraderTimeoutError as timed_out:
+            await self._wait_for_late_pair(timed_out)
+
+    async def _refresh_before_account_auth(self) -> None:
+        """Refresh a token that is due before the account authenticates with it.
+
+        Refreshed once the session is ready, the venue would end the session authenticated with
+        the old token, failing any request then in flight - at start-up, the account's own
+        bring-up. A failed refresh does not fail authentication: the current token may still work,
+        and the proactive loop retries after the minimum interval.
+        """
+        self._log.info("Access token is due for refresh, refreshing before account auth")
+        self._pair_taken.clear()
+        try:
+            await self.refresh_tokens()
+        except CTraderAuthError:
+            # Logged by `refresh_tokens()`.
+            return
+        except CTraderTimeoutError as timed_out:
+            try:
+                await self._wait_for_late_pair(timed_out)
+            except CTraderTimeoutError:
+                self._log.warning(
+                    "Token refresh got no reply, authenticating with the current token"
+                )
 
     async def _wait_for_late_pair(self, timed_out: CTraderTimeoutError) -> None:
         """Wait for `_on_late_refresh_reply()` to adopt the reply to a refresh that timed out.
@@ -560,6 +598,7 @@ class CTraderSession:
                 )
 
     async def _authenticate_account(self) -> None:
+        self._account_auth_sent = True
         await self._connection.request(
             oa.ProtoOAAccountAuthReq(
                 ctidTraderAccountId=self._account_id,
@@ -580,15 +619,21 @@ class CTraderSession:
             return True
         return time.time() - self._last_refresh_at >= MIN_TOKEN_REFRESH_INTERVAL_SECS
 
+    def _refresh_delay(self) -> float | None:
+        """Seconds until a proactive refresh is due (zero or less: due now); None if never."""
+        if self._expires_at_secs is None or self._refresh_token is None:
+            return None
+        now = time.time()
+        delay = self._expires_at_secs - TOKEN_REFRESH_MARGIN_SECS - now
+        if self._last_refresh_at is not None:
+            # A live venue grants 30 days (confirmed). A lifetime shorter than this interval
+            # would leave the session without a valid token until the interval passes - chosen
+            # over a tight refresh loop.
+            delay = max(delay, self._last_refresh_at + MIN_TOKEN_REFRESH_INTERVAL_SECS - now)
+        return delay
+
     async def _refresh_loop(self) -> None:
-        while self._expires_at_secs is not None and self._refresh_token is not None:
-            now = time.time()
-            delay = self._expires_at_secs - TOKEN_REFRESH_MARGIN_SECS - now
-            if self._last_refresh_at is not None:
-                # A live venue grants 30 days (confirmed). A lifetime shorter than this interval
-                # would leave the session without a valid token until the interval passes -
-                # chosen over a tight refresh loop.
-                delay = max(delay, self._last_refresh_at + MIN_TOKEN_REFRESH_INTERVAL_SECS - now)
+        while (delay := self._refresh_delay()) is not None:
             if delay > 0:
                 await asyncio.sleep(delay)
                 # A refresh made elsewhere may have moved the expiry while this slept.
@@ -612,12 +657,13 @@ class CTraderSession:
                     self._log.error(f"Proactive token refresh failed: {e!r}")
                 continue
             if self._lost.is_set():
-                # A real loss landed while the refresh completed; it keeps its backoff.
+                # A loss landed while the refresh completed, and keeps its backoff. The venue's
+                # own end of the old session lands here too: it answers our refresh with a token
+                # invalidation and an account disconnect (confirmed live), which can be handled
+                # before this line runs.
                 continue
             # Re-authenticate with the new token through the ordinary reconnect path, rather
             # than relying on the venue to end the old session.
-            # TODO(verify): whether the venue also sends ProtoOAAccountsTokenInvalidatedEvent
-            # after our own refresh; if it does, that costs one extra, harmless reconnect.
             # _loss_cause stays None: no loss has happened since the last bring-up cleared it,
             # and this loop only refreshes while ready.
             self._reauth_requested = True
@@ -639,8 +685,9 @@ class CTraderSession:
         self._log.warning("Adopted a late token refresh reply")
         self._take_pair(response)
         if self._state is SessionState.READY and not self._lost.is_set():
-            # As after a proactive refresh: re-authenticate with the adopted token. Otherwise
-            # a bring-up is under way or due, and authenticates with it anyway.
+            # As after a proactive refresh: re-authenticate with the adopted token. During a
+            # bring-up, an account auth still to come uses it, one it made the venue reject is
+            # retried with it, and one the venue accepted is ended by the venue itself.
             self._reauth_requested = True
             self._lost.set()
 
@@ -656,6 +703,12 @@ class CTraderSession:
             reason = payload.reason or "no reason given"
             self._log.error(f"Venue cancelled the application connection: {reason}")
             return True
+        if not self._account_auth_sent:
+            # No account authentication on this connection to end yet; an invalidation here
+            # names the token a refresh before account auth just replaced.
+            # TODO(verify): whether the venue sends account events to a connection that has not
+            # authenticated the account.
+            return False
         if isinstance(payload, oa.ProtoOAAccountDisconnectEvent):
             if payload.ctidTraderAccountId != self._account_id:
                 return False

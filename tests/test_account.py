@@ -207,6 +207,39 @@ async def test_auto_refreshes_a_rejected_token_once_and_notifies_listeners() -> 
         await server.stop()
 
 
+async def test_a_token_due_for_refresh_at_start_up_is_refreshed_before_the_session_is_ready() -> (
+    None
+):
+    # Refreshed once the session is ready, the venue would drop it while the bring-up still
+    # has requests in flight, and the first `connect()` would fail.
+    server = venue()
+    server.on(
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOARefreshTokenRes(
+            accessToken="new-access",
+            tokenType="bearer",
+            expiresIn=2_592_000,
+            refreshToken="new-refresh",
+        ),
+    )
+    await server.start()
+    client = account_client(server, credentials=credentials(token_expires_at=time.time() + 600))
+    notified = []
+    client.add_token_listener(lambda a, r, e: notified.append((a, r)))
+    try:
+        await client.connect()
+
+        assert notified == [("new-access", "new-refresh")]
+        assert [m.accessToken for m in received(server, oa.ProtoOAAccountAuthReq)] == [
+            "new-access",
+        ]
+        # The pre-connection and one session connection: no re-authentication.
+        assert server.connection_count == 2
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_a_refresh_reply_that_misses_its_timeout_at_start_up_is_adopted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
