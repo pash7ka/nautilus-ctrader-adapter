@@ -128,6 +128,10 @@ class CTraderSession:
         self._supervisor: asyncio.Task | None = None
         self._refresh_task: asyncio.Task | None = None
         self._last_refresh_at: float | None = None
+        # Token pairs taken from the venue, and that count when a refresh request still without
+        # a reply was sent; see `_on_late_refresh_reply()`.
+        self._pairs_taken = 0
+        self._unanswered_refresh: int | None = None
         self._reauth_requested = False
         self._stopping = False
         # Set while no `stop()` is running; `start()` waits on it.
@@ -476,12 +480,14 @@ class CTraderSession:
         of activity.
 
         It does not re-authenticate by itself: the new access token takes effect at the next
-        account authentication, which the proactive loop forces.
+        account authentication, which the proactive loop forces. A reply that misses the
+        request's timeout is still adopted when it arrives; see `_on_late_refresh_reply()`.
         """
         if self._refresh_token is None:
             raise CTraderAuthError("no refresh token available")
 
         self._last_refresh_at = time.time()
+        pairs_taken = self._pairs_taken
         try:
             response = await self._connection.request(
                 oa.ProtoOARefreshTokenReq(refreshToken=self._refresh_token),
@@ -489,12 +495,18 @@ class CTraderSession:
         except CTraderRequestError as e:
             self._log.error(f"Token refresh rejected: {e.error_code}")
             raise CTraderAuthError(f"token refresh rejected: {e.error_code}") from e
+        except BaseException:
+            # Unanswered: its reply can still arrive as an event.
+            self._unanswered_refresh = pairs_taken
+            raise
+        self._log.info("Access token refreshed")
+        self._take_pair(response)
 
+    def _take_pair(self, response: oa.ProtoOARefreshTokenRes) -> None:
         self._access_token = response.accessToken
         self._refresh_token = response.refreshToken
         self._expires_at_secs = time.time() + response.expiresIn
-        self._log.info("Access token refreshed")
-
+        self._pairs_taken += 1
         if self._on_tokens_refreshed is not None:
             try:
                 self._on_tokens_refreshed(
@@ -574,6 +586,29 @@ class CTraderSession:
             self._reauth_requested = True
             self._lost.set()
 
+    def _on_late_refresh_reply(self, response: oa.ProtoOARefreshTokenRes) -> None:
+        """Adopt the reply to a refresh request that got none in time, as if it had.
+
+        A refresh token is single-use (confirmed live), so once such a request reached the venue
+        its reply holds the only working pair. It is adopted only while no pair has been taken
+        since that request was sent: the venue keeps only the newest grant's chain, and a pair
+        taken later answers a later request.
+        """
+        if self._unanswered_refresh is None or self._unanswered_refresh != self._pairs_taken:
+            self._log.debug(
+                "Ignored a late token refresh reply: no refresh awaits one, or a newer pair "
+                "was taken since",
+            )
+            return
+        self._unanswered_refresh = None
+        self._log.warning("Adopted a late token refresh reply")
+        self._take_pair(response)
+        if self._state is SessionState.READY and not self._lost.is_set():
+            # As after a proactive refresh: re-authenticate with the adopted token. Otherwise
+            # a bring-up is under way or due, and authenticates with it anyway.
+            self._reauth_requested = True
+            self._lost.set()
+
     def _ends_our_authentication(self, payload: Message) -> bool:
         """Whether the venue has dropped this session's authentication on a live socket.
 
@@ -602,11 +637,8 @@ class CTraderSession:
 
     def _on_event(self, payload: Message) -> None:
         if isinstance(payload, oa.ProtoOARefreshTokenRes):
-            # A refresh reply that arrived after its request timed out. It carries a token pair,
-            # which must never travel to the application's event handler.
-            # TODO: a refresh token is single-use (confirmed live), so the pair in a late reply
-            # is the only valid one and should be adopted, not dropped.
-            self._log.warning("Dropped a late token refresh response")
+            # It carries a token pair, which must never travel to the application's handlers.
+            self._on_late_refresh_reply(payload)
             return
         # `not self._stopping` is defensive here too, for the same reason as in `_on_disconnect`.
         if self._ends_our_authentication(payload) and not self._stopping:

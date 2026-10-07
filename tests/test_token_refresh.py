@@ -3,15 +3,21 @@
 import asyncio
 import struct
 import time
+from collections.abc import Callable
 
 import pytest
 from nautilus_trader.common.component import Logger
 
-from nautilus_ctrader.common.errors import CTraderAuthError, CTraderConnectionError
+from nautilus_ctrader.common.errors import (
+    CTraderAuthError,
+    CTraderConnectionError,
+    CTraderTimeoutError,
+)
 from nautilus_ctrader.common.session import CTraderSession, SessionState
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
+from tests.account_venue import HeldReplies
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
@@ -330,6 +336,112 @@ async def test_a_late_refresh_reply_never_reaches_the_event_handler() -> None:
         )
 
         assert not any(isinstance(m, oa.ProtoOARefreshTokenRes) for m in seen)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+def _pair_reply(access: str, refresh: str) -> Callable[[object], oa.ProtoOARefreshTokenRes]:
+    return lambda _request: oa.ProtoOARefreshTokenRes(
+        accessToken=access,
+        tokenType="bearer",
+        expiresIn=2_592_000,
+        refreshToken=refresh,
+    )
+
+
+_TOKENS = ("old-access", "old-refresh", "late-access", "late-refresh", "new-access", "new-refresh")
+
+
+def _lines_with_a_token(logger: RecordingLogger) -> list[str]:
+    return [message for _, message in logger.lines if any(t in message for t in _TOKENS)]
+
+
+async def test_a_refresh_reply_that_misses_its_timeout_is_adopted() -> None:
+    # A refresh token is single-use, so once the request reached the venue the late reply holds
+    # the only pair that still works.
+    server = _server()
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        _pair_reply("late-access", "late-refresh"),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(
+        server,
+        logger,
+        request_timeout_secs=0.2,
+        backoff_base_secs=0.05,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        with pytest.raises(CTraderTimeoutError):
+            await session.refresh_tokens()
+
+        before = time.time()
+        await held.stop_holding()
+        await wait_until(lambda: bool(persisted), description="the late pair being adopted")
+        # Put to use at once, as after any proactive refresh.
+        await wait_until(
+            lambda: _account_auths(server)[-1].accessToken == "late-access",
+            description="re-authentication with the adopted token",
+        )
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
+        assert persisted[0][2] >= before + 2_592_000
+        assert any("late token refresh reply" in m for m in logger.warnings())
+        await session.refresh_tokens()
+        assert _refreshes(server)[-1].refreshToken == "late-refresh"
+        assert not _lines_with_a_token(logger)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_late_refresh_reply_after_a_newer_pair_is_ignored() -> None:
+    # The venue keeps only the newest grant's chain, so a pair taken since the late reply's
+    # request was sent is the one to keep.
+    server = _server()
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        _pair_reply("late-access", "late-refresh"),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(
+        server,
+        logger,
+        request_timeout_secs=0.2,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        with pytest.raises(CTraderTimeoutError):
+            await session.refresh_tokens()
+        server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, _pair_reply("new-access", "new-refresh"))
+        await session.refresh_tokens()
+
+        await held.release()
+        await wait_until(
+            lambda: any(
+                level == "debug" and "late token refresh reply" in message
+                for level, message in logger.lines
+            ),
+            description="the late reply being ignored",
+        )
+
+        assert [(a, r) for a, r, _ in persisted] == [("new-access", "new-refresh")]
+        await session.refresh_tokens()
+        assert _refreshes(server)[-1].refreshToken == "new-refresh"
+        assert not _lines_with_a_token(logger)
     finally:
         await session.stop()
         await server.stop()

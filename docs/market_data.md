@@ -192,8 +192,9 @@ a missing instrument is a nuisance or a disaster.
 ## Persisting refreshed tokens
 
 The adapter refreshes the access token over the socket while it runs, and a refresh rotates the
-refresh token as well: the old one may stop working. The new pair exists only in memory unless
-the application stores it, and losing it means the next process start has nothing valid to
+refresh token as well: a refresh token is single-use, so the old one stops working (confirmed;
+see [protocol.md](protocol.md) section 5). The new pair exists only in memory unless the
+application stores it, and losing it means the next process start has nothing valid to
 authenticate with.
 
 One connection per account does the refreshing, so the listener has to be registered on that
