@@ -395,6 +395,241 @@ def test_item_7_reports_the_prices_that_do_not_fit_the_symbols_digits() -> None:
     assert "1 of 100" in detail[0]
 
 
+def _edge_observation(**overrides) -> v.WindowEdgeObservation:
+    values = {
+        "symbol": EURUSD,
+        "searched": "the last 30 minutes",
+        "bar_secs": 1_700_000_040,
+        "edge_open_secs": (1_700_000_040, 1_700_000_100),
+        "control_open_secs": (),
+    }
+    values.update(overrides)
+    return v.WindowEdgeObservation(**values)
+
+
+def test_item_8_confirms_both_edges_inclusive() -> None:
+    status, detail = v.decide_window_edges(_edge_observation())
+    assert status == OK
+    text = "\n".join(detail)
+    assert "fromTimestamp: inclusive" in text
+    assert "toTimestamp: inclusive" in text
+    # The boundaries come out as UTC times, never as an account detail.
+    assert "2023-11-14 22:14Z" in text and "2023-11-14 22:15Z" in text
+
+
+@pytest.mark.parametrize(
+    ("served", "from_word", "to_word"),
+    [
+        ((1_700_000_100,), "exclusive", "inclusive"),
+        ((1_700_000_040,), "inclusive", "exclusive"),
+        ((), "exclusive", "exclusive"),
+    ],
+)
+def test_item_8_names_each_edge_separately(served, from_word, to_word) -> None:
+    status, detail = v.decide_window_edges(_edge_observation(edge_open_secs=served))
+    assert status == OK
+    text = "\n".join(detail)
+    assert f"fromTimestamp: {from_word}" in text
+    assert f"toTimestamp: {to_word}" in text
+
+
+@pytest.mark.parametrize("edge_bar", [1_700_000_040, 1_700_000_100])
+def test_item_8_differs_when_the_control_window_still_returns_an_edge_bar(edge_bar) -> None:
+    """A venue that compares something other than the open time makes both verdicts moot."""
+    status, detail = v.decide_window_edges(_edge_observation(control_open_secs=(edge_bar,)))
+    assert status == DIFFERS
+    text = "\n".join(detail)
+    assert "other than the bar's open time" in text
+    assert "control" in text
+
+
+def test_item_8_lists_a_clean_control_in_its_detail() -> None:
+    _, detail = v.decide_window_edges(_edge_observation())
+    assert any("control" in line and "no bars" in line for line in detail)
+
+
+def test_item_8_without_a_pair_of_bars_is_unknown_with_the_reason() -> None:
+    status, detail = v.decide_window_edges(
+        _edge_observation(bar_secs=None, edge_open_secs=(), searched="the last 3 days"),
+    )
+    assert status == UNKNOWN
+    assert "the last 3 days" in detail[0]
+    assert "consecutive" in detail[0]
+
+
+def test_item_8_carries_the_error_code_of_a_refused_search() -> None:
+    status, detail = v.decide_window_edges(
+        _edge_observation(bar_secs=None, searched="the last 3 days", error_code="NO_QUOTES"),
+    )
+    assert status == UNKNOWN
+    assert "NO_QUOTES" in detail[0]
+
+
+@pytest.mark.parametrize(
+    ("opens", "expected"),
+    [
+        # The newest bar may still be forming, so the pair is the two before it.
+        ([0, 60, 120, 180], 60),
+        # Order and duplicates in the response do not matter.
+        ([180, 60, 0, 120, 120], 60),
+        # A gap before the newest bar: the newest consecutive pair is further back.
+        ([0, 60, 240, 300], 0),
+        ([0, 60, 120, 600], 60),
+        # Nothing consecutive, too few bars, or only the forming bar.
+        ([0, 120, 240], None),
+        ([0, 60], None),
+        ([60], None),
+        ([], None),
+    ],
+)
+def test_the_pair_is_the_newest_consecutive_closed_bars(opens, expected) -> None:
+    assert v.find_consecutive_closed_pair(opens) == expected
+
+
+_NOW = 1_700_000_030
+_END = _NOW // 60 * 60
+_SYMBOL_ID = 7
+_DAY = 86_400
+
+
+def _bars(*open_secs: int) -> oa.ProtoOAGetTrendbarsRes:
+    return oa.ProtoOAGetTrendbarsRes(
+        trendbar=[
+            om.ProtoOATrendbar(utcTimestampInMinutes=s // 60, low=110_000, volume=10)
+            for s in open_secs
+        ],
+    )
+
+
+def _edge_verifier(replies: list[object], monkeypatch) -> tuple[v.Verifier, _StubConnection]:
+    monkeypatch.setattr(time, "time", lambda: _NOW)
+    connection = _StubConnection(replies)
+    requester = v.ReadOnlyRequester(connection, history_budget=10)
+    verifier = v.Verifier(requester, settings(), account_venue.ACCOUNT_ID)
+    verifier._symbol_ids = {EURUSD: _SYMBOL_ID}
+    return verifier, connection
+
+
+def _windows(connection: _StubConnection) -> list[tuple[int, int]]:
+    return [(p.fromTimestamp, p.toTimestamp) for p in connection.sent]
+
+
+async def test_item_8_asks_the_exact_millisecond_windows_and_nothing_but_history(
+    monkeypatch,
+) -> None:
+    bar = _END - 180
+    verifier, connection = _edge_verifier(
+        [
+            _bars(_END - 300, _END - 240, bar, _END - 120, _END - 60),
+            _bars(bar, bar + 60),
+            _bars(),
+        ],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == OK
+    assert {type(p) for p in connection.sent} == {oa.ProtoOAGetTrendbarsReq}
+    assert oa.ProtoOAGetTrendbarsReq in v.READ_ONLY_REQUESTS
+    assert connection.buckets == [BUCKET_HISTORICAL] * 3
+    assert all(p.symbolId == _SYMBOL_ID and p.period == om.M1 for p in connection.sent)
+    assert all(p.ctidTraderAccountId == account_venue.ACCOUNT_ID for p in connection.sent)
+    assert _windows(connection) == [
+        ((_END - 1800) * 1000, _END * 1000),
+        (bar * 1000, (bar + 60) * 1000),
+        (bar * 1000 + 1, (bar + 60) * 1000 - 1),
+    ]
+    assert "fromTimestamp: inclusive" in "\n".join(detail)
+    assert "toTimestamp: inclusive" in "\n".join(detail)
+
+
+async def test_item_8_never_uses_the_newest_bar_as_an_edge_bar(monkeypatch) -> None:
+    """The newest bar returned may be forming, so a pair ending on it is not used."""
+    verifier, connection = _edge_verifier([_bars(_END - 120, _END - 60), _bars()], monkeypatch)
+
+    status, _ = await verifier._probe_window_edges()
+
+    # Both windows held at most one closed bar; the search widened once, then gave up.
+    assert status == UNKNOWN
+    assert _windows(connection) == [
+        ((_END - 1800) * 1000, _END * 1000),
+        ((_END - 3 * _DAY) * 1000, _END * 1000),
+    ]
+
+
+async def test_item_8_widens_once_when_the_market_is_closed(monkeypatch) -> None:
+    shut = _END - 2 * _DAY
+    bar = shut - 120
+    verifier, connection = _edge_verifier(
+        [_bars(), _bars(bar, bar + 60, shut), _bars(bar + 60), _bars()],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == OK
+    assert _windows(connection) == [
+        ((_END - 1800) * 1000, _END * 1000),
+        ((_END - 3 * _DAY) * 1000, _END * 1000),
+        (bar * 1000, (bar + 60) * 1000),
+        (bar * 1000 + 1, (bar + 60) * 1000 - 1),
+    ]
+    text = "\n".join(detail)
+    assert "fromTimestamp: exclusive" in text
+    assert "toTimestamp: inclusive" in text
+
+
+async def test_item_8_gives_up_after_one_widening(monkeypatch) -> None:
+    verifier, connection = _edge_verifier([_bars(), _bars()], monkeypatch)
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == UNKNOWN
+    assert len(connection.sent) == 2
+    assert "the last 3 days" in detail[0]
+
+
+async def test_item_8_widens_when_the_narrow_window_is_refused(monkeypatch) -> None:
+    shut = _END - _DAY
+    verifier, connection = _edge_verifier(
+        [
+            CTraderRequestError("NO_QUOTES"),
+            _bars(shut - 120, shut - 60, shut),
+            _bars(shut - 120, shut - 60),
+            _bars(),
+        ],
+        monkeypatch,
+    )
+
+    status, _ = await verifier._probe_window_edges()
+
+    assert status == OK
+    assert len(connection.sent) == 4
+
+
+async def test_item_8_reports_the_code_when_every_search_is_refused(monkeypatch) -> None:
+    verifier, _ = _edge_verifier(
+        [CTraderRequestError("NO_QUOTES"), CTraderRequestError("NO_QUOTES")],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == UNKNOWN
+    assert "NO_QUOTES" in detail[0]
+
+
+async def test_item_8_without_a_symbol_is_unknown(monkeypatch) -> None:
+    verifier, connection = _edge_verifier([], monkeypatch)
+    verifier._symbol_ids = {}
+
+    status, _ = await verifier._probe_window_edges()
+
+    assert status == UNKNOWN
+    assert connection.sent == []
+
+
 # -- The report -----------------------------------------------------------------------------
 
 
@@ -550,7 +785,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -
         await server.stop()
 
     by_item = {f.item: f for f in findings}
-    assert sorted(by_item) == ["0", "1", "2", "3", "4", "5a", "5b", "6", "7"]
+    assert sorted(by_item) == ["0", "1", "2", "3", "4", "5a", "5b", "6", "7", "8"]
     assert by_item["0"].status == OK
     assert by_item["1"].status == OK
     assert by_item["2"].status == OK
@@ -559,6 +794,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -
     assert by_item["5b"].status == OK
     assert by_item["6"].status == OK
     assert by_item["7"].status == OK
+    assert by_item["8"].status == OK
     # No M1 bar can close inside a window this short, and that is an UNKNOWN, not a failure.
     assert by_item["4"].status == UNKNOWN
 
@@ -596,6 +832,7 @@ async def test_a_venue_that_refuses_history_leaves_the_other_items_decided() -> 
     assert by_item["3"].status == UNKNOWN
     assert by_item["5a"].status == UNKNOWN
     assert by_item["5b"].status == DIFFERS  # rejected, but with the wrong code
+    assert by_item["8"].status == UNKNOWN
     assert by_item["1"].status == OK
     assert by_item["6"].status == OK
     assert "NO_QUOTES" in report

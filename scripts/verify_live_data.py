@@ -9,6 +9,10 @@ refuses any payload class outside `READ_ONLY_REQUESTS`; that set holds authentic
 history and subscription requests only, and no order request type is imported or named
 anywhere in this module. Subscriptions taken here are released before the connection closes.
 
+One item settles whether a trendbar window's `fromTimestamp` and `toTimestamp` include a bar
+that opens exactly on them. It asks two consecutive closed M1 bars of the first symbol for
+exact one-minute windows, plus a control window just inside both edges.
+
 Run from the repository root, while the symbols' market is open:
 
     uv run python scripts/verify_live_data.py --trader-login <login> --minutes 5
@@ -129,6 +133,12 @@ _REQUIRED_COUNT = 500
 # Item 5b: far wider than any documented per-period range.
 _WIDE_WINDOW_SECS = 400 * 86_400
 
+# Item 8: the windows searched for two consecutive closed M1 bars, narrowest first. The wide one
+# is for a closed market, where the newest bars are days old.
+_EDGE_SEARCH_WINDOWS = ((1800, "the last 30 minutes"), (3 * 86_400, "the last 3 days"))
+# Item 8: a one-minute window holds at most two bars, so this never limits what is served.
+_EDGE_PROBE_COUNT = 10
+
 _MAX_LISTED_DETAILS = 8
 
 # The spot window plus room for authentication, the history probes and the release of every
@@ -136,6 +146,7 @@ _MAX_LISTED_DETAILS = 8
 _RUN_OVERHEAD_SECS = 300.0
 _RESOLVE_ACCOUNT_TIMEOUT_SECS = 60.0
 
+_M1_SECS = PERIOD_SECS[om.M1]
 _SECS_PER_HOUR = 3600
 _SECS_PER_DAY = 86_400
 
@@ -203,6 +214,23 @@ class CountProbe:
     count: int
     returned: int | None
     has_more: bool = False
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class WindowEdgeObservation:
+    """What history served for exact-edge windows around one closed M1 bar.
+
+    `bar_secs` is the open time of the earlier bar of the pair, `None` when the search found
+    no pair. The edge window is `[bar, bar + 1 min]`, the control window is the same one
+    narrowed by 1 ms at each end.
+    """
+
+    symbol: str
+    searched: str
+    bar_secs: int | None = None
+    edge_open_secs: tuple[int, ...] = ()
+    control_open_secs: tuple[int, ...] = ()
     error_code: str | None = None
 
 
@@ -481,6 +509,71 @@ def decide_price_digits(checked: int, failures: Sequence[str]) -> Decision:
     return DIFFERS, tuple(detail)
 
 
+def find_consecutive_closed_pair(open_secs: Sequence[int]) -> int | None:
+    """The open time of the earlier bar of the newest two consecutive M1 bars, or `None`.
+
+    The newest bar served may still be forming, so a pair is only taken if its later bar is
+    older than the newest one.
+    """
+    opens = set(open_secs)
+    if not opens:
+        return None
+    newest = max(opens)
+    return next(
+        (b for b in sorted(opens, reverse=True) if b + _M1_SECS < newest and b + _M1_SECS in opens),
+        None,
+    )
+
+
+def decide_window_edges(observation: WindowEdgeObservation) -> Decision:
+    """Whether `fromTimestamp` and `toTimestamp` each include a bar opening exactly on them.
+
+    The control window sits 1 ms inside both edges, so neither edge bar may appear in it if the
+    venue compares the edges to the bar's open time. If one does, the two verdicts above say
+    nothing about the open time.
+    """
+    if observation.bar_secs is None:
+        reason = (
+            f"{observation.error_code}"
+            if observation.error_code
+            else "the venue served no such pair"
+        )
+        return UNKNOWN, (
+            f"no two consecutive closed M1 bars of {observation.symbol} found in "
+            f"{observation.searched}: {reason}",
+        )
+    first = observation.bar_secs
+    second = first + _M1_SECS
+    from_inclusive = first in observation.edge_open_secs
+    to_inclusive = second in observation.edge_open_secs
+    detail = [
+        f"{observation.symbol} M1, window {_utc_stamp(first)} to {_utc_stamp(second)} exactly: "
+        f"{_opens_text(observation.edge_open_secs)}",
+        f"fromTimestamp: {'inclusive' if from_inclusive else 'exclusive'}, the bar opening "
+        f"at {_utc_stamp(first)} is {'served' if from_inclusive else 'not served'}",
+        f"toTimestamp: {'inclusive' if to_inclusive else 'exclusive'}, the bar opening "
+        f"at {_utc_stamp(second)} is {'served' if to_inclusive else 'not served'}",
+        f"control, 1 ms inside both edges: {_opens_text(observation.control_open_secs)}",
+    ]
+    if {first, second} & set(observation.control_open_secs):
+        detail.append(
+            "the control window returned an edge bar, so the venue compares the window "
+            "to something other than the bar's open time",
+        )
+        return DIFFERS, tuple(detail)
+    return OK, tuple(detail)
+
+
+def _opens_text(open_secs: Sequence[int]) -> str:
+    if not open_secs:
+        return "no bars"
+    return "bars opening at " + ", ".join(_utc_stamp(s) for s in sorted(open_secs))
+
+
+def _utc_stamp(epoch_secs: int) -> str:
+    return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(epoch_secs))
+
+
 def _utc_hhmm(epoch_secs: int) -> str:
     return time.strftime("%H:%MZ", time.gmtime(epoch_secs))
 
@@ -533,6 +626,11 @@ class Verifier:
             "6",
             f"{self._settings.symbol_batch} symbol ids in one request",
             self._probe_symbol_batch,
+        )
+        await self._item(
+            "8",
+            "trendbar window edges: are fromTimestamp and toTimestamp inclusive",
+            self._probe_window_edges,
         )
         await self._run_spot_window()
 
@@ -726,6 +824,61 @@ class Verifier:
             return decide_symbol_batch(wanted, len(batch), None, e.error_code)
         returned = len(response.symbol) + len(response.archivedSymbol)
         return decide_symbol_batch(wanted, len(batch), returned, None)
+
+    async def _probe_window_edges(self) -> Decision:
+        """Item 8."""
+        first = self._first_symbol
+        if first is None:
+            return UNKNOWN, ("none of the requested symbols is offered",)
+        name, symbol_id = first
+        end_secs = int(time.time()) // _M1_SECS * _M1_SECS
+        bar_secs: int | None = None
+        error_code: str | None = None
+        searched = ""
+        for window_secs, label in _EDGE_SEARCH_WINDOWS:
+            searched = label
+            try:
+                response = await self._trendbars(
+                    symbol_id,
+                    om.M1,
+                    from_secs=end_secs - window_secs,
+                    to_secs=end_secs,
+                    count=_REQUIRED_COUNT,
+                )
+            except CTraderRequestError as e:
+                # A refused window is not the end of the search: the wider one may be served.
+                error_code = e.error_code
+                continue
+            error_code = None
+            bar_secs = find_consecutive_closed_pair(_open_secs(response))
+            if bar_secs is not None:
+                break
+        if bar_secs is None:
+            return decide_window_edges(WindowEdgeObservation(name, searched, error_code=error_code))
+
+        edge = await self._trendbars_ms(
+            symbol_id,
+            om.M1,
+            from_ms=bar_secs * 1000,
+            to_ms=(bar_secs + _M1_SECS) * 1000,
+            count=_EDGE_PROBE_COUNT,
+        )
+        control = await self._trendbars_ms(
+            symbol_id,
+            om.M1,
+            from_ms=bar_secs * 1000 + 1,
+            to_ms=(bar_secs + _M1_SECS) * 1000 - 1,
+            count=_EDGE_PROBE_COUNT,
+        )
+        return decide_window_edges(
+            WindowEdgeObservation(
+                name,
+                searched,
+                bar_secs=bar_secs,
+                edge_open_secs=_open_secs(edge),
+                control_open_secs=_open_secs(control),
+            ),
+        )
 
     # -- The spot window: items 2, 4 and 7 --------------------------------------------------
 
@@ -955,18 +1108,39 @@ class Verifier:
         to_secs: int,
         count: int,
     ) -> oa.ProtoOAGetTrendbarsRes:
+        return await self._trendbars_ms(
+            symbol_id,
+            period,
+            from_ms=from_secs * 1_000,
+            to_ms=to_secs * 1_000,
+            count=count,
+        )
+
+    async def _trendbars_ms(
+        self,
+        symbol_id: int,
+        period: int,
+        *,
+        from_ms: int,
+        to_ms: int,
+        count: int,
+    ) -> oa.ProtoOAGetTrendbarsRes:
         return await self._request(
             oa.ProtoOAGetTrendbarsReq(
                 ctidTraderAccountId=self._account_id,
                 symbolId=symbol_id,
                 period=period,
-                fromTimestamp=from_secs * 1_000,
-                toTimestamp=to_secs * 1_000,
+                fromTimestamp=from_ms,
+                toTimestamp=to_ms,
                 count=count,
             ),
             bucket=BUCKET_HISTORICAL,
             timeout_secs=_HISTORY_REQUEST_TIMEOUT_SECS,
         )
+
+
+def _open_secs(response: oa.ProtoOAGetTrendbarsRes) -> tuple[int, ...]:
+    return tuple(t.utcTimestampInMinutes * 60 for t in response.trendbar)
 
 
 def _item_sort_key(finding: Finding) -> tuple[int, str]:
