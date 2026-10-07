@@ -11,7 +11,8 @@ anywhere in this module. Subscriptions taken here are released before the connec
 
 One item settles whether a trendbar window's `fromTimestamp` and `toTimestamp` include a bar
 that opens exactly on them. It asks two consecutive closed M1 bars of the first symbol for
-exact one-minute windows, plus a control window just inside both edges.
+exact one-minute windows, plus two controls: a window just inside both edges, which must serve
+neither bar, and one just outside, which must serve both.
 
 Run from the repository root, while the symbols' market is open:
 
@@ -222,8 +223,9 @@ class WindowEdgeObservation:
     """What history served for exact-edge windows around one closed M1 bar.
 
     `bar_secs` is the open time of the earlier bar of the pair, `None` when the search found
-    no pair. The edge window is `[bar, bar + 1 min]`, the control window is the same one
-    narrowed by 1 ms at each end.
+    no pair. The edge window is `[bar, bar + 1 min]`; the control window is the same one
+    narrowed by 1 ms at each end, the positive control widened by 1 ms at each end.
+    `error_code` is the venue's refusal of the search, the `*_error` fields of a control.
     """
 
     symbol: str
@@ -231,6 +233,9 @@ class WindowEdgeObservation:
     bar_secs: int | None = None
     edge_open_secs: tuple[int, ...] = ()
     control_open_secs: tuple[int, ...] = ()
+    control_error: str | None = None
+    positive_open_secs: tuple[int, ...] = ()
+    positive_error: str | None = None
     error_code: str | None = None
 
 
@@ -528,39 +533,58 @@ def find_consecutive_closed_pair(open_secs: Sequence[int]) -> int | None:
 def decide_window_edges(observation: WindowEdgeObservation) -> Decision:
     """Whether `fromTimestamp` and `toTimestamp` each include a bar opening exactly on them.
 
-    The control window sits 1 ms inside both edges, so neither edge bar may appear in it if the
-    venue compares the edges to the bar's open time. If one does, the two verdicts above say
-    nothing about the open time.
+    Two controls keep the verdicts honest. The negative one sits 1 ms inside both edges and must
+    serve nothing if the venue compares the edges to the bar's open time. The positive one sits
+    1 ms outside both edges and must serve both bars; without that, an empty answer to the exact
+    window could just be a venue that serves nothing for a window this narrow.
     """
     if observation.bar_secs is None:
-        reason = (
-            f"{observation.error_code}"
-            if observation.error_code
-            else "the venue served no such pair"
-        )
+        reason = observation.error_code or "the venue served no such pair"
         return UNKNOWN, (
             f"no two consecutive closed M1 bars of {observation.symbol} found in "
             f"{observation.searched}: {reason}",
         )
     first = observation.bar_secs
     second = first + _M1_SECS
-    from_inclusive = first in observation.edge_open_secs
-    to_inclusive = second in observation.edge_open_secs
+    served = observation.edge_open_secs
+    from_inclusive = first in served
+    to_inclusive = second in served
     detail = [
         f"{observation.symbol} M1, window {_utc_stamp(first)} to {_utc_stamp(second)} exactly: "
-        f"{_opens_text(observation.edge_open_secs)}",
+        f"{_opens_text(served)}",
         f"fromTimestamp: {'inclusive' if from_inclusive else 'exclusive'}, the bar opening "
         f"at {_utc_stamp(first)} is {'served' if from_inclusive else 'not served'}",
         f"toTimestamp: {'inclusive' if to_inclusive else 'exclusive'}, the bar opening "
         f"at {_utc_stamp(second)} is {'served' if to_inclusive else 'not served'}",
-        f"control, 1 ms inside both edges: {_opens_text(observation.control_open_secs)}",
+        (
+            f"control refused: {observation.control_error}"
+            if observation.control_error
+            else "control, 1 ms inside both edges: " + _opens_text(observation.control_open_secs)
+        ),
+        (
+            f"positive control refused: {observation.positive_error}"
+            if observation.positive_error
+            else "positive control, 1 ms outside both edges: "
+            + _opens_text(observation.positive_open_secs)
+        ),
     ]
-    if {first, second} & set(observation.control_open_secs):
-        detail.append(
-            "the control window returned an edge bar, so the venue compares the window "
-            "to something other than the bar's open time",
+    if not {first, second} <= set(observation.positive_open_secs):
+        detail.append("the venue did not return a window that surely holds both bars")
+        return UNKNOWN, tuple(detail)
+    anomalies = []
+    if observation.control_open_secs:
+        anomalies.append(
+            f"the control window returned {_opens_text(observation.control_open_secs)}, so the "
+            "venue compares the window to something other than the bar's open time",
         )
-        return DIFFERS, tuple(detail)
+    outside = sorted(set(served) - {first, second})
+    if outside:
+        anomalies.append(
+            f"the exact window returned {_opens_text(outside)}, outside its edges, so it does "
+            "not select bars by open time",
+        )
+    if anomalies:
+        return DIFFERS, (*detail, *anomalies)
     return OK, tuple(detail)
 
 
@@ -856,6 +880,8 @@ class Verifier:
         if bar_secs is None:
             return decide_window_edges(WindowEdgeObservation(name, searched, error_code=error_code))
 
+        # An edge window that fails leaves nothing to decide, so it propagates; a failed
+        # control only withdraws its own evidence.
         edge = await self._trendbars_ms(
             symbol_id,
             om.M1,
@@ -863,12 +889,15 @@ class Verifier:
             to_ms=(bar_secs + _M1_SECS) * 1000,
             count=_EDGE_PROBE_COUNT,
         )
-        control = await self._trendbars_ms(
+        control, control_error = await self._control_window(
             symbol_id,
-            om.M1,
             from_ms=bar_secs * 1000 + 1,
             to_ms=(bar_secs + _M1_SECS) * 1000 - 1,
-            count=_EDGE_PROBE_COUNT,
+        )
+        positive, positive_error = await self._control_window(
+            symbol_id,
+            from_ms=bar_secs * 1000 - 1,
+            to_ms=(bar_secs + _M1_SECS) * 1000 + 1,
         )
         return decide_window_edges(
             WindowEdgeObservation(
@@ -876,9 +905,32 @@ class Verifier:
                 searched,
                 bar_secs=bar_secs,
                 edge_open_secs=_open_secs(edge),
-                control_open_secs=_open_secs(control),
+                control_open_secs=control,
+                control_error=control_error,
+                positive_open_secs=positive,
+                positive_error=positive_error,
             ),
         )
+
+    async def _control_window(
+        self,
+        symbol_id: int,
+        *,
+        from_ms: int,
+        to_ms: int,
+    ) -> tuple[tuple[int, ...], str | None]:
+        """M1 open times served for a control window, or the venue's refusal code."""
+        try:
+            response = await self._trendbars_ms(
+                symbol_id,
+                om.M1,
+                from_ms=from_ms,
+                to_ms=to_ms,
+                count=_EDGE_PROBE_COUNT,
+            )
+        except CTraderRequestError as e:
+            return (), e.error_code
+        return _open_secs(response), None
 
     # -- The spot window: items 2, 4 and 7 --------------------------------------------------
 
