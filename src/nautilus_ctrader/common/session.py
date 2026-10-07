@@ -530,8 +530,9 @@ class CTraderSession:
             )
         except CTraderRequestError as e:
             # Answered. An earlier refresh still without a reply stays adoptable: this refusal
-            # may be the venue saying that one already spent the refresh token.
-            self._awaiting_refresh_reply = earlier
+            # may be the venue saying that one already spent the refresh token - unless a pair
+            # was taken meanwhile, which cleared the flag.
+            self._awaiting_refresh_reply = earlier and self._awaiting_refresh_reply
             self._log.error(f"Token refresh rejected: {e.error_code}")
             raise CTraderAuthError(f"token refresh rejected: {e.error_code}") from e
         self._log.info("Access token refreshed")

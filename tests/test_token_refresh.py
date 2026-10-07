@@ -11,6 +11,7 @@ from nautilus_trader.common.component import Logger
 from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
+    CTraderRequestError,
     CTraderTimeoutError,
 )
 from nautilus_ctrader.common.session import CTraderSession, SessionState
@@ -428,6 +429,51 @@ async def test_a_refresh_reply_dispatched_as_its_request_times_out_is_adopted(
         with pytest.raises(CTraderTimeoutError):
             await session.refresh_tokens()
 
+        assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_refusal_after_the_earlier_reply_was_adopted_leaves_nothing_awaited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first refresh times out; while the second is in flight the first one's reply is
+    # adopted; then the second is refused. Nothing is outstanding any more.
+    server = _server()
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(
+        server,
+        logger,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    send = session._connection.request
+    attempts = 0
+
+    async def time_out_then_adopt_and_refuse(payload, **kwargs):
+        nonlocal attempts
+        if not isinstance(payload, oa.ProtoOARefreshTokenReq):
+            return await send(payload, **kwargs)
+        attempts += 1
+        if attempts == 1:
+            raise CTraderTimeoutError("no response in time")
+        session._on_event(_pair_reply("late-access", "late-refresh")(payload))
+        raise CTraderRequestError("CH_ACCESS_TOKEN_INVALID")
+
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        monkeypatch.setattr(session._connection, "request", time_out_then_adopt_and_refuse)
+        with pytest.raises(CTraderTimeoutError):
+            await session.refresh_tokens()
+        with pytest.raises(CTraderAuthError):
+            await session.refresh_tokens()
+
+        assert not session._awaiting_refresh_reply
+        # So a stray reply now is not adopted.
+        session._on_event(_pair_reply("stray-access", "stray-refresh")(None))
         assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
     finally:
         await session.stop()
