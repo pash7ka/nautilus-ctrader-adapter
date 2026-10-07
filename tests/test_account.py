@@ -1511,3 +1511,62 @@ async def test_the_account_list_helper_returns_the_records_and_scope_without_the
         ),
     ]
     assert "access-token" not in repr(result)
+
+
+async def test_last_connect_error_is_none_before_any_connect() -> None:
+    server = venue()
+    assert account_client(server).last_connect_error is None
+
+
+async def test_last_connect_error_holds_an_auth_failure_and_a_success_clears_it() -> None:
+    server = venue(logins=())
+    await server.start()
+    client = account_client(server)
+    try:
+        with pytest.raises(CTraderAuthError) as info:
+            await client.connect()
+        assert client.last_connect_error is info.value
+        assert isinstance(client.last_connect_error, CTraderAuthError)
+
+        server.on(
+            oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+            lambda _r: account_list(is_live=True),
+        )
+        await client.connect()
+        assert client.last_connect_error is None
+        await client.disconnect()
+    finally:
+        await server.stop()
+
+
+async def test_last_connect_error_holds_a_failure_that_is_not_an_auth_error() -> None:
+    server = venue()
+    server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, lambda _r: None)
+    await server.start()
+    client = account_client(server, environment="demo", connect_timeout_secs=0.6)
+    try:
+        with pytest.raises(CTraderTimeoutError) as info:
+            await client.connect()
+    finally:
+        await server.stop()
+
+    assert client.last_connect_error is info.value
+    assert not isinstance(client.last_connect_error, CTraderAuthError)
+
+
+async def test_last_connect_error_holds_a_later_users_failed_wait() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server, connect_timeout_secs=0.6)
+    try:
+        await client.connect()
+        server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, lambda _r: None)
+        await server.drop_connections()
+        await wait_until(lambda: not client.session.is_ready, description="session lost")
+
+        with pytest.raises(CTraderTimeoutError) as info:
+            await client.connect()
+        assert client.last_connect_error is info.value
+    finally:
+        await client.disconnect()
+        await server.stop()

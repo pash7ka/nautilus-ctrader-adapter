@@ -214,6 +214,7 @@ class CTraderAccountClient:
         self._tls = tls
 
         self.session: CTraderSession | None = None
+        self._last_connect_error: CTraderError | None = None
         self._token_listeners: list[TokenListener] = []
         self._reload_listeners: list[ReloadListener] = []
         self._reload_tasks: set[asyncio.Task] = set()
@@ -244,6 +245,18 @@ class CTraderAccountClient:
         if self._account_id is None:
             raise CTraderConnectionError("account id not resolved yet; connect() first")
         return self._account_id
+
+    @property
+    def last_connect_error(self) -> CTraderError | None:
+        """The error the last failed `connect()` raised; `None` before one and after a success.
+
+        Nautilus logs a client's connect error at node start and carries on, so an application
+        that shares this client through `account_client_from_config()` reads it here to tell a
+        `CTraderAuthError` (a token rejected with no usable refresh, an account refused or
+        disabled) from other failures. A failure that is not a `CTraderError`, such as a
+        cancellation, leaves it unchanged.
+        """
+        return self._last_connect_error
 
     @property
     def deposit_asset(self) -> om.ProtoOAAsset:
@@ -342,17 +355,21 @@ class CTraderAccountClient:
         stops what it started and leaves the user count unchanged.
         """
         async with self._lifecycle_lock:
-            if self._users > 0:
-                # Waited on under the lock, so the session cannot be stopped or replaced
-                # meanwhile. Its own reconnect never takes this lock.
-                if not self.session.is_ready:
-                    await self._join(self.session)
+            try:
+                if self._users > 0:
+                    # Waited on under the lock, so the session cannot be stopped or replaced
+                    # meanwhile. Its own reconnect never takes this lock.
+                    if not self.session.is_ready:
+                        await self._join(self.session)
+                else:
+                    await self._bring_up()
+                # No await between a successful bring-up and this, so a cancellation cannot
+                # leave a running session without a user.
                 self._users += 1
-                return
-            await self._bring_up()
-            # No await between a successful bring-up and this, so a cancellation cannot leave
-            # a running session without a user.
-            self._users += 1
+            except CTraderError as e:
+                self._last_connect_error = e
+                raise
+            self._last_connect_error = None
 
     async def disconnect(self) -> None:
         """Release one user; the last one stops the session."""
