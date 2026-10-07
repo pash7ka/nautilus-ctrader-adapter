@@ -121,14 +121,18 @@ How tokens behave was checked on a live connection, on the account's own (live) 
   `ProtoOAApplicationAuthReq` and nothing more — the state the reactive refresh runs in, since
   account authentication has just been rejected.
 - **A refresh token is single-use** (confirmed). Sending one that was already used is refused
-  with `CH_ACCESS_TOKEN_INVALID`, and that refused replay revoked no other grant. Once a
-  refresh request reaches the venue, the pair it answers with is the only valid one, so this
-  adapter adopts a reply that arrives after its request timed out, unless a newer pair has
-  been taken since that request was sent. A refresh made while a connection is being brought
-  up — on the short pre-connection that resolves the account's host, or after account
-  authentication was rejected — keeps that connection open up to ten seconds more for the
-  reply. That wait is part of the bring-up, so it counts against the account's
-  `connect_timeout_secs` rather than adding to it.
+  with `CH_ACCESS_TOKEN_INVALID`, and that refused replay revoked no other grant. So once a
+  refresh request reaches the venue, the old refresh token stops working, and its reply must
+  not be lost. This adapter adopts a reply that arrives after its request timed out, unless a
+  newer pair has been taken since that request was sent. A refresh made while a connection is
+  being brought up — on the short pre-connection that resolves the account's host, or after
+  account authentication was rejected — keeps that connection open up to ten seconds more for
+  the reply, and gives up at once if the connection is lost. Within the first `connect()`, or a
+  later user's wait to join, that time counts against the account's `connect_timeout_secs`; a
+  value under about 15 seconds (the 5-second request timeout plus this wait) cuts the wait
+  short, and a pair arriving after that is lost. A bring-up the session runs on its own after a
+  connection loss has no such bound, and there the wait delays the reconnect backoff by up to
+  ten seconds.
 - **A refreshed access token expires 30 days after it is issued** (confirmed).
 - **Each authorization is an independent grant** (confirmed). Authorizing the same application
   twice for one cTrader ID gave two token pairs; neither the second authorization nor a

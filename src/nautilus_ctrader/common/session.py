@@ -130,10 +130,9 @@ class CTraderSession:
         self._supervisor: asyncio.Task | None = None
         self._refresh_task: asyncio.Task | None = None
         self._last_refresh_at: float | None = None
-        # Token pairs taken from the venue, and that count when a refresh request still without
-        # a reply was sent; see `_on_late_refresh_reply()`.
-        self._pairs_taken = 0
-        self._unanswered_refresh: int | None = None
+        # Whether a refresh request was sent and no pair has been taken since; see
+        # `_on_late_refresh_reply()`.
+        self._awaiting_refresh_reply = False
         self._pair_taken = asyncio.Event()
         self._reauth_requested = False
         self._stopping = False
@@ -454,19 +453,41 @@ class CTraderSession:
             self._pair_taken.clear()
             try:
                 await self.refresh_tokens()
-            except CTraderTimeoutError as timeout:
-                # Tearing the connection down now would lose a late reply, which holds the
-                # only working pair; `_on_late_refresh_reply()` adopts it if it comes.
-                try:
-                    await asyncio.wait_for(self._pair_taken.wait(), LATE_REFRESH_WAIT_SECS)
-                except TimeoutError:
-                    raise timeout from None
+            except CTraderTimeoutError as timed_out:
+                await self._wait_for_late_pair(timed_out)
             try:
                 await self._authenticate_account()
             except CTraderRequestError as retry_error:
                 raise CTraderAuthError(
                     f"account auth rejected after refresh: {retry_error.error_code}",
                 ) from retry_error
+
+    async def _wait_for_late_pair(self, timed_out: CTraderTimeoutError) -> None:
+        """Wait for `_on_late_refresh_reply()` to adopt the reply to a refresh that timed out.
+
+        Tearing the connection down at once would lose that reply, and with it the only working
+        pair. Raises `timed_out` after `LATE_REFRESH_WAIT_SECS`, and a connection error at once
+        if the connection is lost meanwhile, since no reply can come on it then.
+        """
+        taken = asyncio.ensure_future(self._pair_taken.wait())
+        lost = asyncio.ensure_future(self._lost.wait())
+        try:
+            await asyncio.wait(
+                {taken, lost},
+                timeout=LATE_REFRESH_WAIT_SECS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            taken.cancel()
+            lost.cancel()
+        if self._pair_taken.is_set():
+            return
+        if self._lost.is_set():
+            cause = self._loss_cause
+            raise CTraderConnectionError(
+                f"connection lost while waiting for a late token refresh reply: {cause}",
+            ) from cause
+        raise timed_out
 
     async def _teardown_connection(self) -> None:
         self._state = SessionState.CONNECTING
@@ -499,18 +520,20 @@ class CTraderSession:
             raise CTraderAuthError("no refresh token available")
 
         self._last_refresh_at = time.time()
-        pairs_taken = self._pairs_taken
+        # Recorded before sending: after a timeout, the reply can reach the event path before
+        # this call resumes.
+        earlier = self._awaiting_refresh_reply
+        self._awaiting_refresh_reply = True
         try:
             response = await self._connection.request(
                 oa.ProtoOARefreshTokenReq(refreshToken=self._refresh_token),
             )
         except CTraderRequestError as e:
+            # Answered. An earlier refresh still without a reply stays adoptable: this refusal
+            # may be the venue saying that one already spent the refresh token.
+            self._awaiting_refresh_reply = earlier
             self._log.error(f"Token refresh rejected: {e.error_code}")
             raise CTraderAuthError(f"token refresh rejected: {e.error_code}") from e
-        except BaseException:
-            # Unanswered: its reply can still arrive as an event.
-            self._unanswered_refresh = pairs_taken
-            raise
         self._log.info("Access token refreshed")
         self._take_pair(response)
 
@@ -518,7 +541,7 @@ class CTraderSession:
         self._access_token = response.accessToken
         self._refresh_token = response.refreshToken
         self._expires_at_secs = time.time() + response.expiresIn
-        self._pairs_taken += 1
+        self._awaiting_refresh_reply = False
         self._pair_taken.set()
         if self._on_tokens_refreshed is not None:
             try:
@@ -603,17 +626,15 @@ class CTraderSession:
         """Adopt the reply to a refresh request that got none in time, as if it had.
 
         A refresh token is single-use (confirmed live), so once such a request reached the venue
-        its reply holds the only working pair. It is adopted only while no pair has been taken
-        since that request was sent: the venue keeps only the newest grant's chain, and a pair
-        taken later answers a later request.
+        the old refresh token no longer works. The reply is adopted only while no pair has been
+        taken since that request was sent: a pair taken later answers a later request.
         """
-        if self._unanswered_refresh is None or self._unanswered_refresh != self._pairs_taken:
+        if not self._awaiting_refresh_reply:
             self._log.debug(
                 "Ignored a late token refresh reply: no refresh awaits one, or a newer pair "
                 "was taken since",
             )
             return
-        self._unanswered_refresh = None
         self._log.warning("Adopted a late token refresh reply")
         self._take_pair(response)
         if self._state is SessionState.READY and not self._lost.is_set():
