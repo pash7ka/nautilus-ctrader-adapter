@@ -23,12 +23,15 @@ import ssl
 import sys
 import tempfile
 import webbrowser
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from nautilus_ctrader import oauth
-from nautilus_ctrader.common.connection import CTraderConnection
+from nautilus_ctrader.common.account import (
+    AccountRecord,  # noqa: F401 - re-exported: `AccountsResult.accounts` holds these
+    AccountsResult,
+    list_granted_accounts,
+)
 from nautilus_ctrader.common.errors import (
     CTraderAuthorizationDenied,
     CTraderAuthorizationTimeout,
@@ -37,7 +40,6 @@ from nautilus_ctrader.common.errors import (
     CTraderTokenExchangeError,
 )
 from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
-from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 
 # Kept here so the tests can point `main()` at a local token endpoint.
@@ -48,39 +50,6 @@ CLIENT_SECRET_KEY = "CTRADER_CLIENT_SECRET"
 ACCESS_TOKEN_KEY = "CTRADER_ACCESS_TOKEN"
 REFRESH_TOKEN_KEY = "CTRADER_REFRESH_TOKEN"
 TOKEN_EXPIRES_AT_KEY = "CTRADER_TOKEN_EXPIRES_AT"
-
-
-@dataclass(frozen=True)
-class AccountRecord:
-    ctid_trader_account_id: int
-    is_live: bool | None
-    trader_login: int | None
-    broker_title_short: str | None
-
-
-@dataclass(frozen=True)
-class AccountsResult:
-    permission_scope: int
-    accounts: list[AccountRecord]
-
-
-class _NullLogger:
-    """Discards everything. Used when a caller of `list_accounts` has no logger to hand it."""
-
-    def debug(self, message: str) -> None:
-        pass
-
-    def info(self, message: str) -> None:
-        pass
-
-    def warning(self, message: str) -> None:
-        pass
-
-    def error(self, message: str) -> None:
-        pass
-
-    def exception(self, message: str, ex: BaseException) -> None:
-        pass
 
 
 class _PrintLogger:
@@ -193,40 +162,19 @@ async def list_accounts(
     tls: bool | ssl.SSLContext = True,
     logger: object | None = None,
 ) -> AccountsResult:
-    """Authenticate the application, then list the accounts the access token grants.
+    """Authenticate the application on `host`, then list the accounts the access token grants.
 
-    `ProtoOAGetAccountListByAccessTokenRes` echoes the access token back; only the account
-    records and the permission scope are returned, never the token itself.
+    Only the account records and the permission scope are returned, never the token itself.
     """
-    connection = CTraderConnection(
-        host,
-        port,
-        logger=logger if logger is not None else _NullLogger(),
+    return await list_granted_accounts(
+        client_id,
+        client_secret,
+        access_token,
+        host=host,
+        port=port,
         tls=tls,
+        logger=logger,
     )
-    await connection.connect()
-    try:
-        await connection.request(
-            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
-        )
-        response = await connection.request(
-            oa.ProtoOAGetAccountListByAccessTokenReq(accessToken=access_token),
-        )
-    finally:
-        await connection.close()
-
-    accounts = [
-        AccountRecord(
-            ctid_trader_account_id=account.ctidTraderAccountId,
-            is_live=account.isLive if account.HasField("isLive") else None,
-            trader_login=account.traderLogin if account.HasField("traderLogin") else None,
-            broker_title_short=(
-                account.brokerTitleShort if account.HasField("brokerTitleShort") else None
-            ),
-        )
-        for account in response.ctidTraderAccount
-    ]
-    return AccountsResult(permission_scope=response.permissionScope, accounts=accounts)
 
 
 def _print_accounts(result: AccountsResult, *, live: bool) -> None:

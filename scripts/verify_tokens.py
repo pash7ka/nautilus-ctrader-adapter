@@ -85,6 +85,7 @@ from datetime import UTC, datetime
 from google.protobuf.message import Message
 
 from nautilus_ctrader import oauth
+from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderAuthorizationDenied, CTraderRequestError
 from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
@@ -774,7 +775,7 @@ class Runner:
         if len(matched) != 1:
             return False
         entry = matched[0]
-        host = self._live_host if entry.isLive else self._demo_host
+        host = account_host(entry.isLive, demo_host=self._demo_host, live_host=self._live_host)
         self._account = (host, entry.ctidTraderAccountId)
         self._token_host = host
         return True

@@ -57,6 +57,110 @@ _RESTORE_RETRY_ERROR_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
+class AccountRecord:
+    """One entry of the account list an access token grants; absent fields are `None`."""
+
+    ctid_trader_account_id: int
+    is_live: bool | None
+    trader_login: int | None
+    broker_title_short: str | None
+
+
+@dataclass(frozen=True)
+class AccountsResult:
+    permission_scope: int
+    accounts: list[AccountRecord]
+
+
+class NullLogger:
+    """Discards everything; for callers of the helpers here that have no logger to give."""
+
+    def debug(self, message: str, color=None) -> None:
+        pass
+
+    def info(self, message: str, color=None) -> None:
+        pass
+
+    def warning(self, message: str, color=None) -> None:
+        pass
+
+    def error(self, message: str, color=None) -> None:
+        pass
+
+    def exception(self, message: str, ex: BaseException) -> None:
+        pass
+
+
+def account_host(
+    is_live: bool | None,
+    *,
+    demo_host: str = DEMO_HOST,
+    live_host: str = LIVE_HOST,
+) -> str:
+    """The host an account authenticates on: `live_host` for a live account, else `demo_host`.
+
+    An unknown flag goes to `demo_host`.
+    """
+    return live_host if is_live else demo_host
+
+
+async def request_granted_accounts(
+    connection: CTraderConnection,
+    access_token: str,
+) -> AccountsResult:
+    """The accounts `access_token` grants, over an application-authenticated `connection`.
+
+    Raises the venue's `CTraderRequestError` as it is. The response echoes the access token;
+    only the records and the permission scope are kept.
+    """
+    response = await connection.request(
+        oa.ProtoOAGetAccountListByAccessTokenReq(accessToken=access_token),
+    )
+    accounts = [
+        AccountRecord(
+            ctid_trader_account_id=entry.ctidTraderAccountId,
+            is_live=entry.isLive if entry.HasField("isLive") else None,
+            trader_login=entry.traderLogin if entry.HasField("traderLogin") else None,
+            broker_title_short=(
+                entry.brokerTitleShort if entry.HasField("brokerTitleShort") else None
+            ),
+        )
+        for entry in response.ctidTraderAccount
+    ]
+    return AccountsResult(permission_scope=response.permissionScope, accounts=accounts)
+
+
+async def list_granted_accounts(
+    client_id: str,
+    client_secret: str,
+    access_token: str,
+    *,
+    host: str,
+    port: int = PROTOBUF_PORT,
+    tls: ssl.SSLContext | bool = True,
+    logger: Logger | None = None,
+) -> AccountsResult:
+    """Authenticate the application on `host`, then list the accounts `access_token` grants.
+
+    The list is served on either host. A venue rejection is raised as its `CTraderRequestError`.
+    """
+    connection = CTraderConnection(
+        host,
+        port,
+        logger=NullLogger() if logger is None else logger,
+        tls=tls,
+    )
+    await connection.connect()
+    try:
+        await connection.request(
+            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
+        )
+        return await request_granted_accounts(connection, access_token)
+    finally:
+        await connection.close()
+
+
+@dataclass(frozen=True)
 class AccountCredentials:
     client_id: str
     client_secret: str = field(repr=False)
@@ -406,11 +510,7 @@ class CTraderAccountClient:
         # The list also carries logins and broker names; this module does not log them.
         # TODO(verify): the venue populates `traderLogin` on every listed account. An entry
         # without it can never be matched, and this reports it as a login not granted.
-        matched = [
-            entry
-            for entry in accounts.ctidTraderAccount
-            if entry.HasField("traderLogin") and entry.traderLogin == self.trader_login
-        ]
+        matched = [entry for entry in accounts.accounts if entry.trader_login == self.trader_login]
         if not matched:
             raise CTraderAuthError("no account with that trader login is granted to this token")
         if len(matched) > 1:
@@ -420,23 +520,16 @@ class CTraderAccountClient:
                 "more than one granted account has that trader login; the account is ambiguous",
             )
         entry = matched[0]
-        self._account_id = entry.ctidTraderAccountId
+        self._account_id = entry.ctid_trader_account_id
         if self._environment == "demo":
             return self._demo_host
         if self._environment == "live":
             return self._live_host
-        return self._live_host if entry.isLive else self._demo_host
+        return account_host(entry.is_live, demo_host=self._demo_host, live_host=self._live_host)
 
-    async def _list_accounts(
-        self,
-        connection: CTraderConnection,
-    ) -> oa.ProtoOAGetAccountListByAccessTokenRes:
+    async def _list_accounts(self, connection: CTraderConnection) -> AccountsResult:
         try:
-            return await connection.request(
-                oa.ProtoOAGetAccountListByAccessTokenReq(
-                    accessToken=self._credentials.access_token,
-                ),
-            )
+            return await request_granted_accounts(connection, self._credentials.access_token)
         except CTraderRequestError as e:
             if e.error_code not in TOKEN_ERROR_CODES:
                 raise CTraderAuthError(f"account list rejected: {e.error_code}") from e
@@ -448,11 +541,7 @@ class CTraderAccountClient:
 
         await self._refresh_over(connection)
         try:
-            return await connection.request(
-                oa.ProtoOAGetAccountListByAccessTokenReq(
-                    accessToken=self._credentials.access_token,
-                ),
-            )
+            return await request_granted_accounts(connection, self._credentials.access_token)
         except CTraderRequestError as e:
             raise CTraderAuthError(f"account list rejected after refresh: {e.error_code}") from e
 
@@ -627,13 +716,19 @@ class CTraderAccountClient:
                     self._log.error(f"Restore {key!r} still failing after {attempts} retries")
 
 
-def _is_cant_route(error: BaseException) -> bool:
+def request_error_code(error: BaseException) -> str | None:
+    """The venue's error code behind `error`: that of the first `CTraderRequestError` in its
+    `__cause__` chain, or `None` if there is none."""
     cause: BaseException | None = error
     while cause is not None:
-        if isinstance(cause, CTraderRequestError) and cause.error_code == "CANT_ROUTE_REQUEST":
-            return True
+        if isinstance(cause, CTraderRequestError):
+            return cause.error_code
         cause = cause.__cause__
-    return False
+    return None
+
+
+def _is_cant_route(error: BaseException) -> bool:
+    return request_error_code(error) == "CANT_ROUTE_REQUEST"
 
 
 # The credentials are kept beside the client so a later call is compared with what the
