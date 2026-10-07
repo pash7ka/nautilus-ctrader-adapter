@@ -309,7 +309,7 @@ def wait_for_authorization_code(
     return outcome["code"]
 
 
-def _is_clean_token(value: object) -> bool:
+def is_clean_token(value: object) -> bool:
     """True for a non-empty `str` with no CR or LF - what an access/refresh token must be to
     be written into an env file line and never split it or smuggle a second assignment."""
     return isinstance(value, str) and bool(value) and "\r" not in value and "\n" not in value
@@ -370,9 +370,9 @@ def exchange_code(
 
     access_token = data.get("accessToken")
     refresh_token = data.get("refreshToken")
-    if not _is_clean_token(access_token):
+    if not is_clean_token(access_token):
         raise TokenExchangeError("token endpoint response has an invalid accessToken")
-    if not _is_clean_token(refresh_token):
+    if not is_clean_token(refresh_token):
         raise TokenExchangeError("token endpoint response has an invalid refreshToken")
 
     expires_in = data.get("expiresIn")
@@ -522,6 +522,34 @@ def _print_accounts(result: AccountsResult, *, live: bool) -> None:
             )
 
 
+def parse_redirect_uri(redirect_uri: str) -> tuple[int, str]:
+    """The callback port and path of `redirect_uri`.
+
+    Raises `ValueError`, its message saying why, unless it is plain http on a loopback host.
+    """
+    redirect = urllib.parse.urlsplit(redirect_uri)
+    # '@' shifts host parsing to whatever follows it (userinfo@host), and a backslash is
+    # treated as a literal netloc character by urlsplit but as a path/host separator by some
+    # browsers; either lets a netloc like "evil.com\@localhost" parse as host "localhost" while
+    # actually addressing something else. Reject both before trusting `.hostname` at all.
+    if "@" in redirect.netloc or "\\" in redirect.netloc:
+        raise ValueError(
+            f"Refusing --redirect-uri {redirect_uri!r}: host must not contain '@' or '\\'.",
+        )
+    if redirect.scheme != "http" or redirect.hostname not in _LOOPBACK_HOSTNAMES:
+        raise ValueError(
+            f"Refusing --redirect-uri {redirect_uri!r}: scheme must be http and host "
+            "must be localhost or 127.0.0.1.",
+        )
+    try:
+        port = redirect.port
+    except ValueError:
+        raise ValueError(f"Refusing --redirect-uri {redirect_uri!r}: invalid port.") from None
+    if port == 0:
+        raise ValueError(f"Refusing --redirect-uri {redirect_uri!r}: port must not be 0.")
+    return port or 80, redirect.path or "/"
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Perform the one-time cTrader OAuth flow and list the granted accounts.",
@@ -550,40 +578,11 @@ def main(argv: list[str] | None = None) -> int:
     client_id = env[CLIENT_ID_KEY]
     client_secret = env[CLIENT_SECRET_KEY]
 
-    redirect = urllib.parse.urlsplit(args.redirect_uri)
-    # '@' shifts host parsing to whatever follows it (userinfo@host), and a backslash is
-    # treated as a literal netloc character by urlsplit but as a path/host separator by some
-    # browsers; either lets a netloc like "evil.com\@localhost" parse as host "localhost" while
-    # actually addressing something else. Reject both before trusting `.hostname` at all.
-    if "@" in redirect.netloc or "\\" in redirect.netloc:
-        print(
-            f"Refusing --redirect-uri {args.redirect_uri!r}: host must not contain '@' or '\\'.",
-            file=sys.stderr,
-        )
-        return 2
-    if redirect.scheme != "http" or redirect.hostname not in _LOOPBACK_HOSTNAMES:
-        print(
-            f"Refusing --redirect-uri {args.redirect_uri!r}: scheme must be http and host "
-            "must be localhost or 127.0.0.1.",
-            file=sys.stderr,
-        )
-        return 2
     try:
-        redirect_port = redirect.port
-    except ValueError:
-        print(
-            f"Refusing --redirect-uri {args.redirect_uri!r}: invalid port.",
-            file=sys.stderr,
-        )
+        redirect_port, redirect_path = parse_redirect_uri(args.redirect_uri)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
         return 2
-    if redirect_port == 0:
-        print(
-            f"Refusing --redirect-uri {args.redirect_uri!r}: port must not be 0.",
-            file=sys.stderr,
-        )
-        return 2
-    redirect_port = redirect_port or 80
-    redirect_path = redirect.path or "/"
 
     state = secrets.token_urlsafe(32)
     auth_url = build_authorization_url(client_id, args.redirect_uri, state)
