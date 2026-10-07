@@ -885,24 +885,23 @@ async def test_when_b_is_a_handed_back_items_1a_and_1b_say_so_and_a_is_not_refre
     assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
 
 
-async def test_a_second_pair_from_another_ctrader_id_decides_nothing_and_is_never_kept(
+async def test_a_second_pair_from_another_ctrader_id_decides_nothing_and_is_never_used(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # A reusable refresh token makes the replay produce B'', the newest pair of all.
     venue = TokenVenue(browser_grants_other_account=True, refresh_single_use=False)
     runner, logger, env_file = await run_against(venue, tmp_path)
 
     assert statuses(runner) == {"1a": UNKNOWN, "1b": UNKNOWN, "2": UNKNOWN, "3": OK}
     assert "may come from another cTrader ID" in runner.report()
-    assert runner.pairs[-1].label == "B''"
+    # Neither refreshed nor replayed: with another cTrader ID's pair that could only do harm.
+    assert venue.refreshes_of(venue.issued[3]) == 0
+    assert [p.label for p in runner.pairs] == ["A", "B", "A'"]
     assert runner.kept is not None and runner.kept.label == "A'"
     assert v.get_tokens.load_env(env_file)["CTRADER_ACCESS_TOKEN"] == runner.kept.access_token
     captured = capsys.readouterr()
-    # No B pair reached the env file, not even for a moment.
+    # B never reached the env file, not even for a moment.
     assert "pair B written" not in captured.out
-    assert "pair B' written" not in captured.out
-    assert "pair B'' written" not in captured.out
     assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
 
 
@@ -1132,6 +1131,11 @@ async def test_a_whole_main_run_prints_no_secret(
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert "stop every node or process that uses these tokens" in output
+    assert "may make the venue revoke EVERY pair of this cTrader ID" in output
+    assert "scripts/get_tokens.py would then be needed" in output
+    assert "until the report shows those pairs survived" in output
+    # The warning comes before the run, which the prompt starts.
+    assert output.index("revoke EVERY pair") < output.index("step 1")
     assert "Kept pair A'" in output
     for secret in [*venue.issued, CLIENT_ID, CLIENT_SECRET]:
         assert secret not in output, secret
@@ -1153,3 +1157,72 @@ def test_main_does_not_start_when_the_prompt_is_not_answered(
     monkeypatch.setattr(v, "Runner", lambda *_a, **_k: pytest.fail("a run was built"))
 
     assert v.main(["--rotate-tokens", "--env-file", str(env_file)]) == 2
+
+
+def test_2_reports_the_other_grant_after_the_replay() -> None:
+    decision = v.decide_refresh_token_reuse(
+        accepted,
+        refused("CH_ACCESS_TOKEN_INVALID"),
+        after_replay=accepted,
+        other_after_replay=refused("CH_ACCESS_TOKEN_INVALID"),
+    )
+    assert decision[0] == OK
+    assert "pair A' (the other grant) after the replay: access token refused" in joined(decision)
+    assert "every grant of this cTrader ID" in joined(decision)
+
+
+async def test_a_run_reports_the_other_grant_after_the_replay(tmp_path: pathlib.Path) -> None:
+    venue = TokenVenue()
+    runner, _logger, _env_file = await run_against(venue, tmp_path)
+
+    assert "pair A' (the other grant) after the replay: access token accepted" in runner.report()
+    # A' is looked at after the replay was sent.
+    received = venue.server.received
+    replay_at = [i for i, m in enumerate(received) if isinstance(m, oa.ProtoOARefreshTokenReq)][2]
+    a_prime = runner.pairs[[p.label for p in runner.pairs].index("A'")].access_token
+    assert any(
+        isinstance(m, oa.ProtoOAGetAccountListByAccessTokenReq) and m.accessToken == a_prime
+        for m in received[replay_at:]
+    )
+
+
+async def test_a_run_cut_right_after_bs_refresh_leaves_b_prime_not_the_spent_b(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    venue = TokenVenue()
+    env_file = tmp_path / ".env"
+    write_env(env_file, *venue.issue())
+    await venue.server.start()
+    runner = v.Runner(
+        v.settings_from_env(v.get_tokens.load_env(env_file)),
+        env_file=env_file,
+        authorise=venue.authorise,
+        logger=RecordingLogger(),
+        listen_secs=0.05,
+        demo_host=venue.server.host,
+        live_host=venue.server.host,
+        port=venue.server.port,
+        tls=False,
+    )
+    real_check = runner._check
+
+    async def cut_at_the_first_check_of_b_prime(pair, step):
+        if pair.label == "B'":
+            raise RuntimeError("cut short")
+        return await real_check(pair, step)
+
+    monkeypatch.setattr(runner, "_check", cut_at_the_first_check_of_b_prime)
+    try:
+        with pytest.raises(RuntimeError):
+            await runner.run()
+    finally:
+        await venue.server.stop()
+
+    b_prime = runner.pairs[-1]
+    assert b_prime.label == "B'"
+    env = v.get_tokens.load_env(env_file)
+    assert (env["CTRADER_ACCESS_TOKEN"], env["CTRADER_REFRESH_TOKEN"]) == (
+        b_prime.access_token,
+        b_prime.refresh_token,
+    )

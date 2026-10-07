@@ -17,7 +17,7 @@ The steps, each recorded, the run going on wherever it safely can:
 2. pair B: the browser authorisation again; B's and then A's access tokens are checked;
 3. B is refreshed into B';
 4. A's access token is checked again, and A is refreshed into A';
-5. B's used refresh token is replayed, and B' checked again;
+5. B's used refresh token is replayed, and B' and A' are checked again;
 6. the newest working pair that grants the `CTRADER_TRADER_LOGIN` account is kept;
 7. with it, two connections authorise that account, listen for disconnect events, then each
    reads the trader;
@@ -29,20 +29,29 @@ the user, when a spent refresh token is replayed, and that must not be read as a
 second authorisation.
 
 1a, 1b and 2 are only decided when pair B grants the configured account (so it comes from the
-same cTrader ID), and 1a and 1b only when B is not simply pair A handed back again.
+same cTrader ID), and 1a and 1b only when B is not simply pair A handed back again. A pair B that
+does not grant the account is never refreshed or replayed: that could only do harm.
 
-Every new pair is checked as soon as it is obtained and, if it is then the best pair to keep,
-written to the env file at once, as an application persists a refreshed pair; an interrupted run
-leaves the newest pair there rather than a spent one. This means pair B replaces A in the file at
-step 2, before A is rotated: A stays in memory for the rest of the run, and B is a fresh pair
-whose refresh token is unused, so the file holds a working pair at every point.
+New pairs reach the env file as an application persists a refreshed pair, so the file never holds
+a spent refresh token while a newer pair exists, except between a refresh's answer and its write:
+
+- a pair refreshed from the pair the file holds inherits that grant and is written at once, before
+  it is checked, because its parent's refresh token is now spent;
+- any other new pair - B, a new grant, or one refreshed from a pair not in the file - is checked
+  first and written only if it is then the best pair to keep.
+
+So pair B replaces A in the file at step 2, before A is rotated. That is acceptable: A stays in
+memory for the rest of the run, and B, once checked, is a working pair whose refresh token is
+unused.
 
 What is measured is the application-only path: the account list and `ProtoOARefreshTokenReq` on
 a connection authenticated at application level only, which is how the adapter refreshes when it
 starts or when an account authentication is rejected. Its proactive refresh runs over an
 account-authenticated connection instead, which this script does not exercise. Token requests go
 to the account's own host, by its `isLive` flag, once an account list has shown it; the first
-list goes to the demo host, which serves the list for either.
+list goes to the demo host, which serves the list for either. The adapter's start-up refresh goes
+to the demo host instead (`CTraderAccountClient`, not yet verified live), so a result here holds
+for the account's own host only.
 
 **Read-only towards trading by construction.** Every request goes through `TokenRequester`,
 which refuses any payload class outside `ALLOWED_REQUESTS`; no order request is named anywhere in
@@ -364,10 +373,12 @@ def decide_refresh_token_reuse(
     *,
     second_problem: str | None = None,
     after_replay: Outcome | None = None,
+    other_after_replay: Outcome | None = None,
 ) -> Decision:
     """Item 2, from B's first refresh and the replay of the same refresh token.
 
-    `after_replay` is the check of pair B' after the replay; it is reported, not judged.
+    `after_replay` and `other_after_replay` are the checks of pairs B' and A' after the replay;
+    they are reported, not judged.
     """
     if second_problem is not None:
         return UNKNOWN, (second_problem,)
@@ -384,6 +395,12 @@ def decide_refresh_token_reuse(
         detail.append(f"pair B' after the replay: access token {after_replay.text}")
         if after_replay.status == REFUSED:
             detail.append("so the replay revoked the pair it had already been refreshed into")
+    if other_after_replay is not None:
+        detail.append(
+            f"pair A' (the other grant) after the replay: access token {other_after_replay.text}",
+        )
+        if other_after_replay.status == REFUSED:
+            detail.append("so the replay may revoke every grant of this cTrader ID")
     return (OK if reuse.status == REFUSED else DIFFERS), tuple(detail)
 
 
@@ -584,6 +601,7 @@ class Runner:
         before = await self._check(a, "step 1  pair A")
 
         b = await self._authorise_again()
+        second_problem = self._second_problem(b)
         after_authorisation = None
         same_pair = False
         if b is not None:
@@ -593,21 +611,23 @@ class Runner:
             after_authorisation = await self._check(a, "step 2  pair A, after B's authorisation")
 
         b_refresh = b_new = None
-        if b is not None:
+        if b is not None and second_problem is not None:
+            self._say("step 3  pair B is not refreshed: it does not fit the configured account")
+        elif b is not None:
             b_refresh, b_new = await self._refresh(b, "B'", "step 3", "refresh of pair B")
             if same_pair:
                 # A's refresh token may be the one just sent; never send it a second time here.
                 a.refresh_used = True
 
-        after_refresh = a_refresh = None
+        after_refresh = a_refresh = a_new = None
         if a.refresh_used:
             self._say("step 4  pair A is not refreshed: B is the same pair, so it may be spent")
         else:
             if b_refresh is not None and b_refresh.ok:
                 after_refresh = await self._check(a, "step 4  pair A, after B's refresh")
-            a_refresh, _a_new = await self._refresh(a, "A'", "step 4", "refresh of pair A")
+            a_refresh, a_new = await self._refresh(a, "A'", "step 4", "refresh of pair A")
 
-        reuse = after_replay = None
+        reuse = after_replay = other_after_replay = None
         if b is not None and b_refresh is not None and b_refresh.ok:
             reuse, _b_again = await self._refresh(
                 b,
@@ -617,8 +637,9 @@ class Runner:
             )
             if b_new is not None:
                 after_replay = await self._check(b_new, "step 5  pair B', after the replay")
+            if a_new is not None:
+                other_after_replay = await self._check(a_new, "step 5  pair A', after the replay")
 
-        second_problem = self._second_problem(b)
         pair_problem = second_problem
         if pair_problem is None and same_pair:
             pair_problem = "the second authorisation returned the same pair"
@@ -646,6 +667,7 @@ class Runner:
                 reuse,
                 second_problem=second_problem,
                 after_replay=after_replay,
+                other_after_replay=other_after_replay,
             ),
         )
 
@@ -818,12 +840,18 @@ class Runner:
         return outcome, new
 
     async def _obtained(self, pair: TokenPair, step: str) -> None:
-        """Record a new pair, check it, and write it if it is now the best pair to keep.
+        """Record a new pair, check it, and put it in the env file as the module docstring says.
 
-        Written at once rather than at the end, so an interrupted run leaves it in the env file;
-        but only once checked, so a pair from another cTrader ID never replaces one that fits.
+        A pair refreshed from the held pair is written before its check, since the held pair's
+        refresh token is now spent; any other pair only once checked, so a pair from another
+        cTrader ID never replaces one that fits.
         """
+        held = self.held
         self.pairs.append(pair)
+        if held is not None and pair.parent == held.label:
+            await self._write(pair)
+            await self._check(pair, f"{step}  pair {pair.label}")
+            return
         await self._check(pair, f"{step}  pair {pair.label}")
         best = keep_order(self.pairs)
         if best and best[0] is pair:
@@ -1093,6 +1121,14 @@ def plan(env_file: pathlib.Path, *, timeout_secs: float, listen_secs: float) -> 
             "Before starting, stop every node or process that uses these tokens: a refresh made "
             "elsewhere during the run would spend the tokens under it, and its connections may "
             "be dropped.",
+            "",
+            "RISK: the second authorisation, or the replay of a spent refresh token, may make the "
+            "venue revoke EVERY pair of this cTrader ID, including the token sets of other nodes, "
+            "processes and applications.",
+            "The run may then end with no working pair; a new browser login through "
+            "scripts/get_tokens.py would then be needed.",
+            "Do not restart the stopped nodes on their old pairs until the report shows those "
+            "pairs survived.",
             "",
         ],
     )
