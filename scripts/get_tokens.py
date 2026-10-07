@@ -309,7 +309,7 @@ def wait_for_authorization_code(
     return outcome["code"]
 
 
-def _is_clean_token(value: object) -> bool:
+def is_clean_token(value: object) -> bool:
     """True for a non-empty `str` with no CR or LF - what an access/refresh token must be to
     be written into an env file line and never split it or smuggle a second assignment."""
     return isinstance(value, str) and bool(value) and "\r" not in value and "\n" not in value
@@ -370,9 +370,9 @@ def exchange_code(
 
     access_token = data.get("accessToken")
     refresh_token = data.get("refreshToken")
-    if not _is_clean_token(access_token):
+    if not is_clean_token(access_token):
         raise TokenExchangeError("token endpoint response has an invalid accessToken")
-    if not _is_clean_token(refresh_token):
+    if not is_clean_token(refresh_token):
         raise TokenExchangeError("token endpoint response has an invalid refreshToken")
 
     expires_in = data.get("expiresIn")

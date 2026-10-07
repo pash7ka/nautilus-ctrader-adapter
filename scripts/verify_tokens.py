@@ -15,19 +15,34 @@ The steps, each recorded, the run going on wherever it safely can:
 
 1. pair A, the one in the env file: its access token lists the granted accounts, or is refused;
 2. pair B: the browser authorisation again; B's and then A's access tokens are checked;
-3. B is refreshed into B'; B's used refresh token is then tried once more;
+3. B is refreshed into B';
 4. A's access token is checked again, and A is refreshed into A';
-5. the newest pair whose access token still works is kept;
-6. with it, two connections authorise the account `CTRADER_TRADER_LOGIN` names, listen for
-   disconnect events, then each reads the trader.
+5. B's used refresh token is replayed, and B' checked again;
+6. the newest working pair that grants the `CTRADER_TRADER_LOGIN` account is kept;
+7. with it, two connections authorise that account, listen for disconnect events, then each
+   reads the trader;
+8. if step 7 saw anything but a clean answer, the kept pair is checked again and replaced by the
+   next working pair if it no longer works.
 
-Every new pair is written to the env file as soon as it is obtained, as an application persists a
-refreshed pair, so an interrupted run leaves the newest pair there rather than a spent one.
+The replay comes last among the token steps: a venue may revoke a whole grant, or every grant of
+the user, when a spent refresh token is replayed, and that must not be read as an effect of the
+second authorisation.
 
-Tokens are checked and refreshed the way the adapter does it: the account list and
-`ProtoOARefreshTokenReq` on a connection authenticated at application level only. Those go to
-the account's own host, by its `isLive` flag, once an account list has shown it; the first list
-goes to the demo host, which serves the list for either.
+1a, 1b and 2 are only decided when pair B grants the configured account (so it comes from the
+same cTrader ID), and 1a and 1b only when B is not simply pair A handed back again.
+
+Every new pair is checked as soon as it is obtained and, if it is then the best pair to keep,
+written to the env file at once, as an application persists a refreshed pair; an interrupted run
+leaves the newest pair there rather than a spent one. This means pair B replaces A in the file at
+step 2, before A is rotated: A stays in memory for the rest of the run, and B is a fresh pair
+whose refresh token is unused, so the file holds a working pair at every point.
+
+What is measured is the application-only path: the account list and `ProtoOARefreshTokenReq` on
+a connection authenticated at application level only, which is how the adapter refreshes when it
+starts or when an account authentication is rejected. Its proactive refresh runs over an
+account-authenticated connection instead, which this script does not exercise. Token requests go
+to the account's own host, by its `isLive` flag, once an account list has shown it; the first
+list goes to the demo host, which serves the list for either.
 
 **Read-only towards trading by construction.** Every request goes through `TokenRequester`,
 which refuses any payload class outside `ALLOWED_REQUESTS`; no order request is named anywhere in
@@ -36,8 +51,8 @@ refusal is reported by its error code only, never by the venue's description.
 
     uv run python scripts/verify_tokens.py --rotate-tokens
 
-Exit code: 2 if it refused to start; 1 if an item is `DIFFERS`, no working pair is left, or the
-run failed; 0 otherwise.
+Exit code: 2 if it refused or was not started; 1 if an item is `DIFFERS`, no working pair is
+left, a pair could not be written, or the run failed; 0 otherwise.
 """
 
 from __future__ import annotations
@@ -109,13 +124,17 @@ _REQUIRED_KEYS = (
 
 _OPERATION_TIMEOUT_SECS = 60.0
 
-# Messages that tell a connection it lost the account, or an error no request asked for.
+# `os.replace` on Windows fails with PermissionError while another process holds the file open.
+_WRITE_ATTEMPTS = 4
+_WRITE_RETRY_DELAY_SECS = 0.5
+
+# Events that tell a connection it lost the account. An uncorrelated error is not one: it is
+# most likely the late answer to a request that already timed out.
 _LOSS_SIGNALS = frozenset(
     {
         "ProtoOAAccountDisconnectEvent",
         "ProtoOAClientDisconnectEvent",
         "ProtoOAAccountsTokenInvalidatedEvent",
-        "ProtoOAErrorRes",
     },
 )
 
@@ -189,8 +208,9 @@ class Finding:
 class TokenPair:
     """One access/refresh pair as the run knows it. Its repr never shows the tokens.
 
-    `refresh_used` is set once the refresh token was sent, whatever the answer: a refresh that
-    got no answer may still have spent it.
+    - `refresh_used` is set once the refresh token was sent, whatever the answer: a refresh that
+      got no answer may still have spent it.
+    - `parent` is the label of the pair whose refresh produced this one.
     """
 
     label: str
@@ -200,6 +220,14 @@ class TokenPair:
     refresh_used: bool = False
     last_check: Outcome | None = None
     grants_account: bool = False
+    parent: str | None = None
+
+    def same_as(self, other: TokenPair) -> bool:
+        """Whether either token equals `other`'s, compared in memory only."""
+        return secrets.compare_digest(
+            self.access_token.encode(),
+            other.access_token.encode(),
+        ) or secrets.compare_digest(self.refresh_token.encode(), other.refresh_token.encode())
 
 
 @dataclass(frozen=True)
@@ -273,13 +301,16 @@ def _describe(outcome: Outcome | None) -> str:
 def decide_access_after_second_authorisation(
     before: Outcome | None,
     *,
-    second_authorised: bool,
+    second_problem: str | None,
     after_authorisation: Outcome | None,
     after_refresh: Outcome | None,
 ) -> Decision:
-    """Item 1a, from A's access-token checks before and after B's authorisation and refresh."""
-    if not second_authorised:
-        return UNKNOWN, ("no second authorisation was made",)
+    """Item 1a, from A's access-token checks before and after B's authorisation and refresh.
+
+    `second_problem` says why pair B cannot answer the question; `None` when it can.
+    """
+    if second_problem is not None:
+        return UNKNOWN, (second_problem,)
     if before is None or not before.ok:
         return UNKNOWN, (f"A's access token did not work to begin with: {_describe(before)}",)
     if after_authorisation is None or after_authorisation.status == FAILED:
@@ -290,26 +321,26 @@ def decide_access_after_second_authorisation(
         return DIFFERS, (
             f"A's access token was {after_authorisation.text} after the second authorisation",
         )
-    detail = ["A's access token still works after the second authorisation"]
-    if after_refresh is None:
-        detail.append("B was not refreshed, so A's access token after that was not checked")
-    elif after_refresh.status == REFUSED:
-        detail.append(f"but it was {after_refresh.text} after B's refresh")
-        return DIFFERS, tuple(detail)
-    else:
-        detail.append(f"A's access token after B's refresh: {after_refresh.text}")
-    return OK, tuple(detail)
+    worked = "A's access token still works after the second authorisation"
+    if after_refresh is None or after_refresh.status == FAILED:
+        return UNKNOWN, (
+            worked,
+            f"after B's refresh it was {_describe(after_refresh)}, so that half is not decided",
+        )
+    if after_refresh.status == REFUSED:
+        return DIFFERS, (worked, f"but it was {after_refresh.text} after B's refresh")
+    return OK, (worked, "and after B's refresh")
 
 
 def decide_refresh_after_second_authorisation(
     *,
-    second_authorised: bool,
+    second_problem: str | None,
     second_refreshed: bool,
     first_refresh: Outcome | None,
 ) -> Decision:
     """Item 1b, from A's refresh after B's authorisation and, if it happened, B's refresh."""
-    if not second_authorised:
-        return UNKNOWN, ("no second authorisation was made",)
+    if second_problem is not None:
+        return UNKNOWN, (second_problem,)
     if first_refresh is None or first_refresh.status == FAILED:
         return UNKNOWN, (f"A's refresh: {_describe(first_refresh)}",)
     after = "the second authorisation" + (" and B's refresh" if second_refreshed else "")
@@ -327,18 +358,37 @@ def decide_refresh_after_second_authorisation(
     )
 
 
-def decide_refresh_token_reuse(first: Outcome | None, reuse: Outcome | None) -> Decision:
-    """Item 2, from B's first refresh and the second use of the same refresh token."""
+def decide_refresh_token_reuse(
+    first: Outcome | None,
+    reuse: Outcome | None,
+    *,
+    second_problem: str | None = None,
+    after_replay: Outcome | None = None,
+) -> Decision:
+    """Item 2, from B's first refresh and the replay of the same refresh token.
+
+    `after_replay` is the check of pair B' after the replay; it is reported, not judged.
+    """
+    if second_problem is not None:
+        return UNKNOWN, (second_problem,)
     if first is None or not first.ok:
         return UNKNOWN, (f"B's first refresh: {_describe(first)}",)
     if reuse is None or reuse.status == FAILED:
-        return UNKNOWN, (f"the second use of B's refresh token: {_describe(reuse)}",)
-    if reuse.status == REFUSED:
-        return OK, (f"B's used refresh token was {reuse.text}",)
-    return DIFFERS, ("B's used refresh token was accepted a second time",)
+        return UNKNOWN, (f"the replay of B's used refresh token: {_describe(reuse)}",)
+    detail = (
+        [f"B's used refresh token, replayed after every other token step, was {reuse.text}"]
+        if reuse.status == REFUSED
+        else ["B's used refresh token, replayed after every other token step, was accepted"]
+    )
+    if after_replay is not None:
+        detail.append(f"pair B' after the replay: access token {after_replay.text}")
+        if after_replay.status == REFUSED:
+            detail.append("so the replay revoked the pair it had already been refreshed into")
+    return (OK if reuse.status == REFUSED else DIFFERS), tuple(detail)
 
 
 def _signalled(observation: ConnectionObservation) -> bool:
+    """A refused request or a loss event; a request that got no answer is not a signal."""
     refused = [
         o
         for o in (observation.account_auth, observation.trader_read)
@@ -390,12 +440,20 @@ def decide_same_account_twice(
 
 
 def keep_order(pairs: Sequence[TokenPair]) -> list[TokenPair]:
-    """The pairs worth keeping, newest first: refresh token never sent, access token not refused."""
-    return [
+    """The pairs worth keeping, best first.
+
+    - Only pairs whose refresh token was never sent and whose access token was not refused.
+    - If any of those grants the configured account, only those: a pair that may belong to
+      another cTrader ID must never replace one that is known to fit.
+    - Newest first within that.
+    """
+    usable = [
         p
         for p in reversed(pairs)
         if not p.refresh_used and (p.last_check is None or p.last_check.status != REFUSED)
     ]
+    granting = [p for p in usable if p.grants_account]
+    return granting or usable
 
 
 async def _in_daemon_thread(function: Callable[[], object]) -> object:
@@ -515,6 +573,8 @@ class Runner:
         self.findings: list[Finding] = []
         self.kept: TokenPair | None = None
         self.written: TokenPair | None = None
+        self.notes: list[str] = []
+        self.write_failed = False
 
     async def run(self) -> None:
         settings = self._settings
@@ -525,31 +585,48 @@ class Runner:
 
         b = await self._authorise_again()
         after_authorisation = None
+        same_pair = False
         if b is not None:
-            await self._check(b, "step 2  pair B")
+            same_pair = b.same_as(a)
+            if same_pair:
+                self._say("step 2  pair B is pair A handed back again")
             after_authorisation = await self._check(a, "step 2  pair A, after B's authorisation")
 
-        b_refresh = reuse = None
+        b_refresh = b_new = None
         if b is not None:
-            b_refresh, b_new = await self._refresh(b, "B'", "step 3  refresh of pair B")
+            b_refresh, b_new = await self._refresh(b, "B'", "step 3", "refresh of pair B")
+            if same_pair:
+                # A's refresh token may be the one just sent; never send it a second time here.
+                a.refresh_used = True
+
+        after_refresh = a_refresh = None
+        if a.refresh_used:
+            self._say("step 4  pair A is not refreshed: B is the same pair, so it may be spent")
+        else:
+            if b_refresh is not None and b_refresh.ok:
+                after_refresh = await self._check(a, "step 4  pair A, after B's refresh")
+            a_refresh, _a_new = await self._refresh(a, "A'", "step 4", "refresh of pair A")
+
+        reuse = after_replay = None
+        if b is not None and b_refresh is not None and b_refresh.ok:
+            reuse, _b_again = await self._refresh(
+                b,
+                "B''",
+                "step 5",
+                "replay of B's used refresh token",
+            )
             if b_new is not None:
-                await self._check(b_new, "step 3  pair B'")
-            reuse, b_again = await self._refresh(b, "B''", "step 3  B's used refresh token")
-            if b_again is not None:
-                await self._check(b_again, "step 3  pair B''")
+                after_replay = await self._check(b_new, "step 5  pair B', after the replay")
 
-        after_refresh = None
-        if b_refresh is not None and b_refresh.ok:
-            after_refresh = await self._check(a, "step 4  pair A, after B's refresh")
-        a_refresh, a_new = await self._refresh(a, "A'", "step 4  refresh of pair A")
-        if a_new is not None:
-            await self._check(a_new, "step 4  pair A'")
-
+        second_problem = self._second_problem(b)
+        pair_problem = second_problem
+        if pair_problem is None and same_pair:
+            pair_problem = "the second authorisation returned the same pair"
         self._add(
             "1a",
             decide_access_after_second_authorisation(
                 before,
-                second_authorised=b is not None,
+                second_problem=pair_problem,
                 after_authorisation=after_authorisation,
                 after_refresh=after_refresh,
             ),
@@ -557,16 +634,50 @@ class Runner:
         self._add(
             "1b",
             decide_refresh_after_second_authorisation(
-                second_authorised=b is not None,
+                second_problem=pair_problem,
                 second_refreshed=b_refresh is not None and b_refresh.ok,
                 first_refresh=a_refresh,
             ),
         )
-        self._add("2", decide_refresh_token_reuse(b_refresh, reuse))
+        self._add(
+            "2",
+            decide_refresh_token_reuse(
+                b_refresh,
+                reuse,
+                second_problem=second_problem,
+                after_replay=after_replay,
+            ),
+        )
 
-        self.kept = await self._keep()
-        self._add("3", await self._same_account_twice(self.kept))
+        self.kept = await self._keep("step 6")
+        decision = await self._same_account_twice(self.kept)
+        self._add("3", decision)
+        if decision[0] != OK and self.kept is not None:
+            await self._confirm_kept()
         self._finished = True
+
+    def _second_problem(self, b: TokenPair | None) -> str | None:
+        """Why pair B cannot answer items 1a, 1b and 2, or `None` when it can."""
+        if b is None:
+            return "no second authorisation was made"
+        if not b.grants_account:
+            return (
+                f"pair B was not shown to grant the {_TRADER_LOGIN_KEY} account, so it may "
+                "come from another cTrader ID"
+            )
+        return None
+
+    async def _confirm_kept(self) -> None:
+        """Step 8: after an unclean step 7, re-check the kept pair and replace it if it is dead."""
+        previous = self.kept
+        outcome = await self._check(previous, f"step 8  pair {previous.label}, after step 7")
+        if outcome.status != REFUSED:
+            return
+        self.kept = await self._keep("step 8")
+        replacement = "no other pair works" if self.kept is None else f"kept {self.kept.label}"
+        self.notes.append(
+            f"Pair {previous.label}'s access token was refused after step 7; {replacement}.",
+        )
 
     def _add(self, item: str, decision: Decision) -> None:
         status, detail = decision
@@ -665,8 +776,8 @@ class Runner:
             response.refresh_token,
             time.time() + response.expires_in,
         )
-        self._obtained(pair)
         self._say("step 2  browser authorisation: pair B obtained")
+        await self._obtained(pair, "step 2")
         return pair
 
     async def _refresh(
@@ -674,6 +785,7 @@ class Runner:
         pair: TokenPair,
         label: str,
         step: str,
+        what: str,
     ) -> tuple[Outcome, TokenPair | None]:
         """Refresh `pair` into a new pair called `label`, as the adapter does it."""
         obtained: list[TokenPair] = []
@@ -682,57 +794,98 @@ class Runner:
             response = await requester.request(
                 oa.ProtoOARefreshTokenReq(refreshToken=pair.refresh_token),
             )
-            if not response.accessToken or not response.refreshToken:
-                raise ValueError("the refresh response carries an empty token")
+            if not (
+                get_tokens.is_clean_token(response.accessToken)
+                and get_tokens.is_clean_token(response.refreshToken)
+            ):
+                raise ValueError("the refresh response carries an unusable token")
             obtained.append(
                 TokenPair(
                     label,
                     response.accessToken,
                     response.refreshToken,
                     time.time() + response.expiresIn,
+                    parent=pair.label,
                 ),
             )
 
         pair.refresh_used = True
         outcome = await self._token_operation(refresh)
-        self._say(f"{step}: {outcome.text}")
+        self._say(f"{step}  {what}: {outcome.text}")
         new = obtained[0] if obtained and outcome.ok else None
         if new is not None:
-            self._obtained(new)
+            await self._obtained(new, step)
         return outcome, new
 
-    def _obtained(self, pair: TokenPair) -> None:
+    async def _obtained(self, pair: TokenPair, step: str) -> None:
+        """Record a new pair, check it, and write it if it is now the best pair to keep.
+
+        Written at once rather than at the end, so an interrupted run leaves it in the env file;
+        but only once checked, so a pair from another cTrader ID never replaces one that fits.
+        """
         self.pairs.append(pair)
-        self._write(pair)
+        await self._check(pair, f"{step}  pair {pair.label}")
+        best = keep_order(self.pairs)
+        if best and best[0] is pair:
+            await self._write(pair)
 
-    def _write(self, pair: TokenPair) -> None:
+    @property
+    def held(self) -> TokenPair | None:
+        """The pair the env file holds now: the last one written, else the original."""
+        if self.written is not None:
+            return self.written
+        return self.pairs[0] if self.pairs else None
+
+    async def _write(self, pair: TokenPair) -> bool:
+        """Write `pair` to the env file; on failure tell the owner what is lost, naming no token."""
         expires = "" if pair.expires_at_secs is None else str(int(pair.expires_at_secs))
-        get_tokens.update_env_file(
-            self._env_file,
-            {
-                get_tokens.ACCESS_TOKEN_KEY: pair.access_token,
-                get_tokens.REFRESH_TOKEN_KEY: pair.refresh_token,
-                get_tokens.TOKEN_EXPIRES_AT_KEY: expires,
-            },
-        )
-        self.written = pair
-        self._say(f"        pair {pair.label} written to {self._env_file.name}")
-
-    async def _keep(self) -> TokenPair | None:
-        """Step 5: the newest pair whose access token works right now, in the env file."""
-        for pair in keep_order(self.pairs):
-            if not (await self._check(pair, f"step 5  pair {pair.label}, to keep it")).ok:
+        updates = {
+            get_tokens.ACCESS_TOKEN_KEY: pair.access_token,
+            get_tokens.REFRESH_TOKEN_KEY: pair.refresh_token,
+            get_tokens.TOKEN_EXPIRES_AT_KEY: expires,
+        }
+        error: OSError | None = None
+        for attempt in range(_WRITE_ATTEMPTS):
+            try:
+                get_tokens.update_env_file(self._env_file, updates)
+            except PermissionError as e:
+                error = e
+                if attempt + 1 < _WRITE_ATTEMPTS:
+                    await asyncio.sleep(_WRITE_RETRY_DELAY_SECS)
                 continue
-            # The original pair is in the env file until another one is written over it.
-            if pair is not self.written and not (self.written is None and pair is self.pairs[0]):
-                self._write(pair)
-            self._say(f"step 5  keeping pair {pair.label}")
+            except OSError as e:
+                error = e
+                break
+            self.written = pair
+            self._say(f"        pair {pair.label} written to {self._env_file.name}")
+            return True
+
+        message = (
+            f"pair {pair.label} could NOT be written to {self._env_file.name} "
+            f"({type(error).__name__}): it exists only in this run's memory and is lost when the "
+            "run ends"
+        )
+        if pair.parent is not None:
+            message += f"; pair {pair.parent}'s refresh token, which produced it, is spent"
+        print(f"warning: {message}.", file=sys.stderr, flush=True)
+        self.notes.append(f"Warning: {message}.")
+        self.write_failed = True
+        return False
+
+    async def _keep(self, step: str) -> TokenPair | None:
+        """The best working pair by `keep_order`, checked right now and put in the env file."""
+        for pair in keep_order(self.pairs):
+            if not (await self._check(pair, f"{step}  pair {pair.label}, to keep it")).ok:
+                continue
+            if pair is not self.held and not await self._write(pair):
+                continue
+            self._say(f"{step}  keeping pair {pair.label}")
             return pair
-        self._say("step 5  no pair works any more")
+        self._say(f"{step}  no pair can be kept")
         return None
 
     async def _same_account_twice(self, pair: TokenPair | None) -> Decision:
-        """Step 6: two connections authorise the same account with one access token."""
+        """Step 7: two connections authorise the same account with one access token."""
         if pair is None:
             return decide_same_account_twice((), skipped="no working pair is left to test with")
         if self._account is None or not pair.grants_account:
@@ -751,17 +904,17 @@ class Runner:
                     account_id,
                     pair.access_token,
                 )
-                self._say(f"step 6  connection {name} account auth: {watch.account_auth.text}")
+                self._say(f"step 7  connection {name} account auth: {watch.account_auth.text}")
                 if not watches[0].account_auth.ok:
                     break
             if watches[0].account_auth.ok:
-                self._say(f"step 6  listening {self._listen_secs:g} s for disconnect events")
+                self._say(f"step 7  listening {self._listen_secs:g} s for disconnect events")
                 await asyncio.sleep(self._listen_secs)
                 for watch in watches:
                     if watch.account_auth.ok:
                         watch.trader_read = await self._read_trader(watch, account_id)
                         read = watch.trader_read.text
-                        self._say(f"step 6  connection {watch.name} trader read: {read}")
+                        self._say(f"step 7  connection {watch.name} trader read: {read}")
         finally:
             for watch in watches:
                 await watch.connection.close()
@@ -800,6 +953,7 @@ class Runner:
             "",
             f"{OK} {counts[OK]}, {DIFFERS} {counts[DIFFERS]}, {UNKNOWN} {counts[UNKNOWN]}",
             "",
+            *self.notes,
             self._kept_line(),
         ]
         return "\n".join(lines)
@@ -814,21 +968,33 @@ class Runner:
                 + datetime.fromtimestamp(self.kept.expires_at_secs, tz=UTC).isoformat()
             )
             return f"Kept pair {self.kept.label}: {env_name} holds it{expiry}."
-        if not self._finished:
-            held = (
-                "is unchanged"
-                if self.written is None
-                else f"holds pair {self.written.label}, the newest obtained"
-            )
-            return f"The run did not finish; {env_name} {held}."
-        held = (
-            "is unchanged"
-            if self.written is None
-            else f"holds pair {self.written.label}, the last one written"
+        held = self.held
+        if held is None:
+            return f"The run did not start; {env_name} is unchanged."
+        spent = (
+            " Its refresh token was already sent, so it cannot be refreshed again: issue a new "
+            "pair with scripts/get_tokens.py before its access token expires."
+            if held.refresh_used
+            else ""
         )
+        if not self._finished:
+            return f"The run did not finish; {env_name} holds pair {held.label}.{spent}"
+        check = held.last_check
+        if check is not None and check.status == REFUSED:
+            return (
+                f"No working pair: {env_name} holds pair {held.label}, whose access token was "
+                f"{check.text} at its last check. Issue a new pair with scripts/get_tokens.py."
+            )
+        if check is not None and check.status == FAILED:
+            return (
+                f"No pair could be confirmed working: {env_name} holds pair {held.label}, whose "
+                f"last check {check.text} without a refusal, so it may still work; check the "
+                f"connection before replacing it.{spent}"
+            )
+        state = "never checked" if check is None else "accepted at its last check"
         return (
-            f"No working pair: no access token was accepted at the end, and {env_name} {held}. "
-            "Issue a new pair with scripts/get_tokens.py."
+            f"No pair could be kept: {env_name} holds pair {held.label}, whose access token was "
+            f"{state}.{spent}"
         )
 
 
@@ -912,15 +1078,21 @@ def plan(env_file: pathlib.Path, *, timeout_secs: float, listen_secs: float) -> 
             "  2. open the cTrader authorisation page in your browser: log in with the same "
             "cTrader ID and grant the same account(s) as before (pair B); it waits up to "
             f"{timeout_secs:g} s;",
-            "  3. refresh pair B, then try B's used refresh token once more;",
+            "  3. refresh pair B;",
             "  4. check pair A again, then refresh it;",
-            "  5. keep the newest pair that still works;",
-            f"  6. with it, authorise the {_TRADER_LOGIN_KEY} account on two connections at "
-            f"once, listen {listen_secs:g} s, and read the account's trader record on each.",
+            "  5. replay B's used refresh token once;",
+            f"  6. keep the newest working pair that grants the {_TRADER_LOGIN_KEY} account;",
+            "  7. with it, authorise that account on two connections at once, listen "
+            f"{listen_secs:g} s, and read the account's trader record on each;",
+            "  8. if step 7 was not clean, check the kept pair again and replace it if it died.",
             f"The token lines of {env_file.name} (access, refresh, expiry) are rewritten each "
             "time a new pair is obtained, and end holding the kept pair.",
             "No order is sent: the only requests are authentication, the account list, token "
             "refresh and the trader read.",
+            "",
+            "Before starting, stop every node or process that uses these tokens: a refresh made "
+            "elsewhere during the run would spend the tokens under it, and its connections may "
+            "be dropped.",
             "",
         ],
     )
@@ -988,6 +1160,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(plan(args.env_file, timeout_secs=args.timeout_secs, listen_secs=args.listen_secs))
+    try:
+        input("Press Enter to start, or Ctrl+C to stop: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\nNot started. Nothing was sent and the env file is unchanged.", file=sys.stderr)
+        return 2
     runner = Runner(
         settings,
         env_file=args.env_file,
@@ -1013,7 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
         failed = True
     print()
     print(runner.report())
-    if failed or runner.kept is None:
+    if failed or runner.kept is None or runner.write_failed:
         return 1
     return 1 if any(f.status == DIFFERS for f in runner.findings) else 0
 

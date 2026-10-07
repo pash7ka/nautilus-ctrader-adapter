@@ -70,7 +70,7 @@ def test_an_outcome_reads_as_its_status_and_reason() -> None:
 def test_1a_without_a_second_authorisation_is_unknown() -> None:
     status, _ = v.decide_access_after_second_authorisation(
         accepted,
-        second_authorised=False,
+        second_problem="no second authorisation was made",
         after_authorisation=None,
         after_refresh=None,
     )
@@ -80,7 +80,7 @@ def test_1a_without_a_second_authorisation_is_unknown() -> None:
 def test_1a_is_unknown_when_the_first_access_token_did_not_work_to_begin_with() -> None:
     decision = v.decide_access_after_second_authorisation(
         refused("OA_AUTH_TOKEN_EXPIRED"),
-        second_authorised=True,
+        second_problem=None,
         after_authorisation=refused("OA_AUTH_TOKEN_EXPIRED"),
         after_refresh=None,
     )
@@ -91,7 +91,7 @@ def test_1a_is_unknown_when_the_first_access_token_did_not_work_to_begin_with() 
 def test_1a_differs_when_the_second_authorisation_revokes_the_first_access_token() -> None:
     decision = v.decide_access_after_second_authorisation(
         accepted,
-        second_authorised=True,
+        second_problem=None,
         after_authorisation=refused("CH_ACCESS_TOKEN_INVALID"),
         after_refresh=None,
     )
@@ -102,7 +102,7 @@ def test_1a_differs_when_the_second_authorisation_revokes_the_first_access_token
 def test_1a_differs_when_the_second_pairs_refresh_revokes_the_first_access_token() -> None:
     decision = v.decide_access_after_second_authorisation(
         accepted,
-        second_authorised=True,
+        second_problem=None,
         after_authorisation=accepted,
         after_refresh=refused("CH_ACCESS_TOKEN_INVALID"),
     )
@@ -114,28 +114,57 @@ def test_1a_differs_when_the_second_pairs_refresh_revokes_the_first_access_token
 def test_1a_is_ok_when_the_first_access_token_survives_both() -> None:
     status, _ = v.decide_access_after_second_authorisation(
         accepted,
-        second_authorised=True,
+        second_problem=None,
         after_authorisation=accepted,
         after_refresh=accepted,
     )
     assert status == OK
 
 
-def test_1a_is_ok_but_says_so_when_the_second_pair_was_never_refreshed() -> None:
+@pytest.mark.parametrize("after_refresh", [None, failed()])
+def test_1a_is_unknown_and_names_the_missing_half_when_the_after_refresh_check_is_missing(
+    after_refresh,
+) -> None:
     decision = v.decide_access_after_second_authorisation(
         accepted,
-        second_authorised=True,
+        second_problem=None,
         after_authorisation=accepted,
-        after_refresh=None,
+        after_refresh=after_refresh,
     )
-    assert decision[0] == OK
-    assert "not checked" in joined(decision)
+    assert decision[0] == UNKNOWN
+    assert "after B's refresh" in joined(decision)
+    assert "not decided" in joined(decision)
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "the second authorisation returned the same pair",
+        "pair B was not shown to grant the CTRADER_TRADER_LOGIN account",
+    ],
+)
+def test_1a_1b_and_2_are_unknown_when_pair_b_cannot_answer(problem) -> None:
+    decisions = [
+        v.decide_access_after_second_authorisation(
+            accepted,
+            second_problem=problem,
+            after_authorisation=refused(),
+            after_refresh=refused(),
+        ),
+        v.decide_refresh_after_second_authorisation(
+            second_problem=problem,
+            second_refreshed=True,
+            first_refresh=refused(),
+        ),
+        v.decide_refresh_token_reuse(accepted, accepted, second_problem=problem),
+    ]
+    assert decisions == [(UNKNOWN, (problem,))] * 3
 
 
 def test_1a_is_unknown_when_the_check_itself_failed() -> None:
     status, _ = v.decide_access_after_second_authorisation(
         accepted,
-        second_authorised=True,
+        second_problem=None,
         after_authorisation=failed(),
         after_refresh=None,
     )
@@ -147,7 +176,7 @@ def test_1a_is_unknown_when_the_check_itself_failed() -> None:
 
 def test_1b_without_a_second_authorisation_is_unknown() -> None:
     status, _ = v.decide_refresh_after_second_authorisation(
-        second_authorised=False,
+        second_problem="no second authorisation was made",
         second_refreshed=False,
         first_refresh=accepted,
     )
@@ -156,7 +185,7 @@ def test_1b_without_a_second_authorisation_is_unknown() -> None:
 
 def test_1b_is_ok_when_the_first_refresh_token_still_works() -> None:
     status, _ = v.decide_refresh_after_second_authorisation(
-        second_authorised=True,
+        second_problem=None,
         second_refreshed=True,
         first_refresh=accepted,
     )
@@ -165,7 +194,7 @@ def test_1b_is_ok_when_the_first_refresh_token_still_works() -> None:
 
 def test_1b_is_ok_but_narrower_when_the_second_pair_was_never_refreshed() -> None:
     decision = v.decide_refresh_after_second_authorisation(
-        second_authorised=True,
+        second_problem=None,
         second_refreshed=False,
         first_refresh=accepted,
     )
@@ -175,7 +204,7 @@ def test_1b_is_ok_but_narrower_when_the_second_pair_was_never_refreshed() -> Non
 
 def test_1b_differs_when_the_first_refresh_token_is_refused() -> None:
     decision = v.decide_refresh_after_second_authorisation(
-        second_authorised=True,
+        second_problem=None,
         second_refreshed=True,
         first_refresh=refused("CH_ACCESS_TOKEN_INVALID"),
     )
@@ -186,7 +215,7 @@ def test_1b_differs_when_the_first_refresh_token_is_refused() -> None:
 @pytest.mark.parametrize("first_refresh", [None, failed()])
 def test_1b_is_unknown_when_the_refresh_was_not_answered(first_refresh) -> None:
     status, _ = v.decide_refresh_after_second_authorisation(
-        second_authorised=True,
+        second_problem=None,
         second_refreshed=True,
         first_refresh=first_refresh,
     )
@@ -200,6 +229,17 @@ def test_2_is_ok_when_the_used_refresh_token_is_refused() -> None:
     decision = v.decide_refresh_token_reuse(accepted, refused("CH_ACCESS_TOKEN_INVALID"))
     assert decision[0] == OK
     assert "CH_ACCESS_TOKEN_INVALID" in joined(decision)
+    assert "replayed after every other token step" in joined(decision)
+
+
+def test_2_reports_a_pair_the_replay_revoked_without_changing_the_verdict() -> None:
+    decision = v.decide_refresh_token_reuse(
+        accepted,
+        refused("CH_ACCESS_TOKEN_INVALID"),
+        after_replay=refused("CH_ACCESS_TOKEN_INVALID"),
+    )
+    assert decision[0] == OK
+    assert "revoked" in joined(decision)
 
 
 def test_2_differs_when_the_used_refresh_token_is_accepted_again() -> None:
@@ -256,7 +296,11 @@ def test_3_differs_when_the_second_authorisation_is_refused() -> None:
 
 @pytest.mark.parametrize(
     "event",
-    ["ProtoOAAccountDisconnectEvent", "ProtoOAClientDisconnectEvent", "ProtoOAErrorRes"],
+    [
+        "ProtoOAAccountDisconnectEvent",
+        "ProtoOAClientDisconnectEvent",
+        "ProtoOAAccountsTokenInvalidatedEvent",
+    ],
 )
 def test_3_differs_when_a_connection_is_told_it_lost_the_account(event) -> None:
     decision = v.decide_same_account_twice((watched("1", events=(event,)), watched("2")))
@@ -277,6 +321,13 @@ def test_3_is_unknown_when_a_connection_drops_without_a_venue_signal() -> None:
         (watched("1", lost="CTraderConnectionError", trader_read=failed()), watched("2")),
     )
     assert decision[0] == UNKNOWN
+
+
+def test_3_does_not_count_a_late_error_with_no_request_waiting_for_it() -> None:
+    decision = v.decide_same_account_twice(
+        (watched("1", events=("ProtoOAErrorRes",)), watched("2"))
+    )
+    assert decision[0] == OK
 
 
 def test_3_lists_an_unrelated_event_without_counting_it() -> None:
@@ -413,44 +464,73 @@ class TokenVenue:
     """A venue that issues and checks tokens by a stated policy.
 
     - `reauthorisation_revokes`: a new browser authorisation revokes every earlier pair.
+    - `reauthorisation_returns_same`: a new browser authorisation hands back the first pair.
+    - `browser_grants_other_account`: pairs from the browser, and their refreshes, grant only
+      another account, as a pair from another cTrader ID would.
     - `refresh_single_use`: a refresh token works once.
+    - `refuse_browser_refresh`: the refresh token from the browser is refused.
+    - `refuse_all_refresh`: every refresh is refused.
     - `refuse_second_account_auth`: the second account authorisation of a run is refused.
+    - `revoke_on_second_account_auth`: the second account authorisation revokes the access token
+      it uses, after which every trader read is refused.
     """
+
+    OTHER_LOGIN = 5550001
 
     def __init__(
         self,
         *,
         reauthorisation_revokes: bool = False,
+        reauthorisation_returns_same: bool = False,
+        browser_grants_other_account: bool = False,
         refresh_single_use: bool = True,
+        refuse_browser_refresh: bool = False,
+        refuse_all_refresh: bool = False,
         refuse_second_account_auth: bool = False,
+        revoke_on_second_account_auth: bool = False,
     ) -> None:
         self.reauthorisation_revokes = reauthorisation_revokes
+        self.reauthorisation_returns_same = reauthorisation_returns_same
+        self.browser_grants_other_account = browser_grants_other_account
         self.refresh_single_use = refresh_single_use
+        self.refuse_browser_refresh = refuse_browser_refresh
+        self.refuse_all_refresh = refuse_all_refresh
         self.refuse_second_account_auth = refuse_second_account_auth
+        self.revoke_on_second_account_auth = revoke_on_second_account_auth
         self.issued: list[str] = []
         self.access: set[str] = set()
         self.refresh: dict[str, str] = {}
+        self.foreign: set[str] = set()
+        self.browser_refresh: set[str] = set()
         self.account_auths = 0
+        self.revoked = False
         self._serial = itertools.count(1)
 
         self.server: FakeCTraderServer = account_venue.venue(is_live=True)
         self.server.on(oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, self._list)
         self.server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, self._refresh)
         self.server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, self._account_auth)
+        self.server.on(oa_model.PROTO_OA_TRADER_REQ, self._trader)
 
-    def issue(self) -> tuple[str, str]:
+    def issue(self, *, foreign: bool = False) -> tuple[str, str]:
         n = next(self._serial)
         access, refresh = f"tok-access-SECRET-{n:04d}", f"tok-refresh-SECRET-{n:04d}"
         self.issued += [access, refresh]
         self.access.add(access)
         self.refresh[refresh] = access
+        if foreign:
+            self.foreign.add(access)
         return access, refresh
 
     def authorise(self):
-        if self.reauthorisation_revokes:
-            self.access.clear()
-            self.refresh.clear()
-        access, refresh = self.issue()
+        if self.reauthorisation_returns_same:
+            access, refresh = self.issued[0], self.issued[1]
+        else:
+            if self.reauthorisation_revokes:
+                self.access.clear()
+                self.refresh.clear()
+            access, refresh = self.issue(foreign=self.browser_grants_other_account)
+        self.browser_refresh.add(refresh)
         return v.get_tokens.TokenResponse(access, refresh, 2_628_000, "bearer")
 
     @staticmethod
@@ -460,15 +540,28 @@ class TokenVenue:
     def _list(self, request):
         if request.accessToken not in self.access:
             return self._error("CH_ACCESS_TOKEN_INVALID", request.accessToken)
+        if request.accessToken in self.foreign:
+            return account_venue.account_list(is_live=True, logins=(self.OTHER_LOGIN,))
         return account_venue.account_list(is_live=True)
 
+    def refreshes_of(self, token: str) -> int:
+        return sum(
+            1
+            for m in self.server.received
+            if isinstance(m, oa.ProtoOARefreshTokenReq) and m.refreshToken == token
+        )
+
     def _refresh(self, request):
-        old_access = self.refresh.get(request.refreshToken)
-        if old_access is None:
-            return self._error("CH_ACCESS_TOKEN_INVALID", request.refreshToken)
+        token = request.refreshToken
+        old_access = self.refresh.get(token)
+        refused = self.refuse_all_refresh or (
+            self.refuse_browser_refresh and token in self.browser_refresh
+        )
+        if old_access is None or refused:
+            return self._error("CH_ACCESS_TOKEN_INVALID", token)
         if self.refresh_single_use:
-            del self.refresh[request.refreshToken]
-        access, refresh = self.issue()
+            del self.refresh[token]
+        access, refresh = self.issue(foreign=old_access in self.foreign)
         return oa.ProtoOARefreshTokenRes(
             accessToken=access,
             tokenType="bearer",
@@ -482,7 +575,18 @@ class TokenVenue:
             return self._error("CH_ACCESS_TOKEN_INVALID", request.accessToken)
         if self.refuse_second_account_auth and self.account_auths == 2:
             return self._error("ALREADY_LOGGED_IN", request.accessToken)
+        if self.revoke_on_second_account_auth and self.account_auths == 2:
+            self.access.discard(request.accessToken)
+            self.revoked = True
         return oa.ProtoOAAccountAuthRes(ctidTraderAccountId=request.ctidTraderAccountId)
+
+    def _trader(self, request):
+        if self.revoked:
+            return self._error("CH_ACCESS_TOKEN_INVALID", "revoked")
+        return account_venue.for_account(
+            account_venue.RECORDED["trader"][0],
+            request.ctidTraderAccountId,
+        )
 
 
 def write_env(path: pathlib.Path, access: str, refresh: str) -> None:
@@ -589,22 +693,33 @@ async def test_a_reauthorisation_that_revokes_the_first_pair_keeps_the_second(
     assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
 
 
-async def test_a_reusable_refresh_token_is_reported(tmp_path: pathlib.Path) -> None:
+async def test_a_reusable_refresh_token_is_reported(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     venue = TokenVenue(refresh_single_use=False)
-    runner, _logger, _env_file = await run_against(venue, tmp_path)
+    runner, logger, _env_file = await run_against(venue, tmp_path)
 
     assert statuses(runner)["2"] == DIFFERS
-    assert runner.kept is not None and runner.kept.label == "A'"
+    # The replay's own pair is the newest one, and it works.
+    assert runner.kept is not None and runner.kept.label == "B''"
+    captured = capsys.readouterr()
+    assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
 
 
 async def test_a_refused_second_authorisation_of_the_account_is_reported(
     tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     venue = TokenVenue(refuse_second_account_auth=True)
-    runner, _logger, _env_file = await run_against(venue, tmp_path)
+    runner, logger, _env_file = await run_against(venue, tmp_path)
 
     assert statuses(runner)["3"] == DIFFERS
     assert "ALREADY_LOGGED_IN" in runner.report()
+    # Step 8 found the kept pair still working, so it stays.
+    assert runner.kept is not None and runner.kept.label == "A'"
+    captured = capsys.readouterr()
+    assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
 
 
 async def test_a_failed_browser_authorisation_still_rotates_and_keeps_the_first_pair(
@@ -727,3 +842,314 @@ def test_the_browser_step_fails_at_once_without_a_browser_and_never_prints_the_u
     assert time.monotonic() - started < 5.0
     captured = capsys.readouterr()
     assert CLIENT_ID not in captured.out + captured.err
+
+
+# -- Review fixes: inferences that could otherwise be wrong without a sign -----------------
+
+
+def test_a_pair_that_may_belong_to_another_ctrader_id_never_displaces_one_that_fits() -> None:
+    pairs = [
+        pair("A", refresh_used=True, grants_account=True),
+        pair("A'", grants_account=True, last_check=failed()),
+        pair("B''", grants_account=False, last_check=accepted),
+    ]
+    assert [p.label for p in v.keep_order(pairs)] == ["A'"]
+
+
+def test_without_any_pair_that_fits_the_newest_working_pair_is_still_kept() -> None:
+    pairs = [pair("A", refresh_used=True), pair("B'", last_check=accepted)]
+    assert [p.label for p in v.keep_order(pairs)] == ["B'"]
+
+
+def test_two_pairs_are_the_same_if_either_token_matches() -> None:
+    a = v.TokenPair("A", "x-access", "x-refresh", None)
+    assert v.TokenPair("B", "x-access", "other", None).same_as(a)
+    assert v.TokenPair("B", "other", "x-refresh", None).same_as(a)
+    assert not v.TokenPair("B", "other", "another", None).same_as(a)
+
+
+async def test_when_b_is_a_handed_back_items_1a_and_1b_say_so_and_a_is_not_refreshed_twice(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    venue = TokenVenue(reauthorisation_returns_same=True)
+    runner, logger, env_file = await run_against(venue, tmp_path)
+
+    assert statuses(runner) == {"1a": UNKNOWN, "1b": UNKNOWN, "2": OK, "3": OK}
+    assert "the second authorisation returned the same pair" in runner.report()
+    # Sent once as B's refresh and once as the replay, never a third time as A's.
+    assert venue.refreshes_of(venue.issued[1]) == 2
+    assert runner.kept is not None and runner.kept.label == "B'"
+    assert v.get_tokens.load_env(env_file)["CTRADER_ACCESS_TOKEN"] == runner.kept.access_token
+    captured = capsys.readouterr()
+    assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
+
+
+async def test_a_second_pair_from_another_ctrader_id_decides_nothing_and_is_never_kept(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A reusable refresh token makes the replay produce B'', the newest pair of all.
+    venue = TokenVenue(browser_grants_other_account=True, refresh_single_use=False)
+    runner, logger, env_file = await run_against(venue, tmp_path)
+
+    assert statuses(runner) == {"1a": UNKNOWN, "1b": UNKNOWN, "2": UNKNOWN, "3": OK}
+    assert "may come from another cTrader ID" in runner.report()
+    assert runner.pairs[-1].label == "B''"
+    assert runner.kept is not None and runner.kept.label == "A'"
+    assert v.get_tokens.load_env(env_file)["CTRADER_ACCESS_TOKEN"] == runner.kept.access_token
+    captured = capsys.readouterr()
+    # No B pair reached the env file, not even for a moment.
+    assert "pair B written" not in captured.out
+    assert "pair B' written" not in captured.out
+    assert "pair B'' written" not in captured.out
+    assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
+
+
+async def test_the_replay_comes_after_every_look_at_pair_a(tmp_path: pathlib.Path) -> None:
+    venue = TokenVenue()
+    await run_against(venue, tmp_path)
+
+    refreshes = [
+        m.refreshToken for m in venue.server.received if isinstance(m, oa.ProtoOARefreshTokenReq)
+    ]
+    a_refresh, b_refresh = venue.issued[1], venue.issued[3]
+    assert refreshes == [b_refresh, a_refresh, b_refresh]
+    lists = [
+        m.accessToken
+        for m in venue.server.received
+        if isinstance(m, oa.ProtoOAGetAccountListByAccessTokenReq)
+    ]
+    # A's access token is never looked at once the replay was sent.
+    replay_at = [
+        i for i, m in enumerate(venue.server.received) if isinstance(m, oa.ProtoOARefreshTokenReq)
+    ][2]
+    later = venue.server.received[replay_at:]
+    assert venue.issued[0] in lists
+    assert not any(
+        isinstance(m, oa.ProtoOAGetAccountListByAccessTokenReq) and m.accessToken == venue.issued[0]
+        for m in later
+    )
+
+
+async def test_when_b_cannot_be_refreshed_a_prime_is_kept(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    venue = TokenVenue(refuse_browser_refresh=True)
+    runner, logger, env_file = await run_against(venue, tmp_path)
+
+    assert statuses(runner) == {"1a": UNKNOWN, "1b": OK, "2": UNKNOWN, "3": OK}
+    assert runner.kept is not None and runner.kept.label == "A'"
+    assert v.get_tokens.load_env(env_file)["CTRADER_ACCESS_TOKEN"] == runner.kept.access_token
+    captured = capsys.readouterr()
+    assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
+
+
+async def test_when_every_refresh_fails_the_env_file_keeps_b_and_the_report_says_why(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    venue = TokenVenue(refuse_all_refresh=True)
+    runner, logger, env_file = await run_against(venue, tmp_path)
+
+    assert runner.kept is None
+    b = runner.pairs[1]
+    env = v.get_tokens.load_env(env_file)
+    assert (env["CTRADER_ACCESS_TOKEN"], env["CTRADER_REFRESH_TOKEN"]) == (
+        b.access_token,
+        b.refresh_token,
+    )
+    report = runner.report()
+    assert "holds pair B, whose access token was accepted at its last check" in report
+    assert "refresh token was already sent" in report
+    captured = capsys.readouterr()
+    assert_nothing_secret_shown(venue, captured.out + captured.err + report, logger)
+
+
+async def test_a_kept_pair_that_dies_in_step_7_is_replaced_by_the_next_working_pair(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    venue = TokenVenue(revoke_on_second_account_auth=True)
+    runner, logger, env_file = await run_against(venue, tmp_path)
+
+    assert statuses(runner)["3"] == DIFFERS
+    assert runner.kept is not None and runner.kept.label == "B'"
+    assert v.get_tokens.load_env(env_file)["CTRADER_ACCESS_TOKEN"] == runner.kept.access_token
+    assert "Pair A''s access token was refused after step 7; kept B'." in runner.report()
+    captured = capsys.readouterr()
+    assert_nothing_secret_shown(venue, captured.out + captured.err + runner.report(), logger)
+
+
+def _offline_runner(env_file: pathlib.Path) -> v.Runner:
+    return v.Runner(
+        v.Settings(CLIENT_ID, CLIENT_SECRET, "access", "refresh", None, 1),
+        env_file=env_file,
+        authorise=lambda: None,
+        logger=RecordingLogger(),
+        listen_secs=0.05,
+    )
+
+
+def test_a_finished_run_whose_last_check_only_failed_does_not_send_the_owner_to_get_tokens(
+    tmp_path: pathlib.Path,
+) -> None:
+    runner = _offline_runner(tmp_path / ".env")
+    runner.pairs.append(pair("A", last_check=failed("CTraderConnectionError")))
+    runner._finished = True
+
+    line = runner.report().splitlines()[-1]
+    assert "may still work" in line
+    assert "get_tokens.py" not in line
+
+
+def test_a_finished_run_whose_pair_was_refused_sends_the_owner_to_get_tokens(
+    tmp_path: pathlib.Path,
+) -> None:
+    runner = _offline_runner(tmp_path / ".env")
+    runner.pairs.append(pair("A", last_check=refused(), refresh_used=True))
+    runner._finished = True
+
+    line = runner.report().splitlines()[-1]
+    assert "No working pair" in line
+    assert "get_tokens.py" in line
+
+
+def test_a_cut_short_run_says_when_the_pair_it_left_has_a_spent_refresh_token(
+    tmp_path: pathlib.Path,
+) -> None:
+    runner = _offline_runner(tmp_path / ".env")
+    runner.pairs.append(pair("A"))
+    runner.pairs.append(pair("B", refresh_used=True))
+    runner.written = runner.pairs[1]
+
+    line = runner.report().splitlines()[-1]
+    assert "did not finish" in line
+    assert "pair B" in line
+    assert "refresh token was already sent" in line
+
+
+async def test_a_refresh_response_with_an_unusable_token_is_not_kept(
+    tmp_path: pathlib.Path,
+) -> None:
+    venue = TokenVenue()
+    venue.server.on(
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOARefreshTokenRes(
+            accessToken="tok-access-SECRET-bad\nCTRADER_CLIENT_ID=x",
+            tokenType="bearer",
+            expiresIn=1,
+            refreshToken="tok-refresh-SECRET-bad",
+        ),
+    )
+    runner, _logger, env_file = await run_against(venue, tmp_path)
+
+    assert [p.label for p in runner.pairs] == ["A", "B"]
+    assert v.get_tokens.load_env(env_file)["CTRADER_CLIENT_ID"] == CLIENT_ID
+
+
+async def test_an_env_write_refused_by_windows_is_retried(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    write_env(env_file, "tok-access-SECRET-old", "tok-refresh-SECRET-old")
+    real_update = v.get_tokens.update_env_file
+    failures = iter([PermissionError(13, "in use"), PermissionError(13, "in use")])
+
+    def flaky_update(path, updates):
+        error = next(failures, None)
+        if error is not None:
+            raise error
+        real_update(path, updates)
+
+    monkeypatch.setattr(v.get_tokens, "update_env_file", flaky_update)
+    monkeypatch.setattr(v, "_WRITE_RETRY_DELAY_SECS", 0.0)
+    runner = _offline_runner(env_file)
+    new = v.TokenPair("A'", "tok-access-SECRET-new", "tok-refresh-SECRET-new", None, parent="A")
+
+    assert await runner._write(new)
+    assert v.get_tokens.load_env(env_file)["CTRADER_ACCESS_TOKEN"] == "tok-access-SECRET-new"
+    assert not runner.write_failed
+
+
+async def test_an_env_write_that_keeps_failing_tells_the_owner_what_is_lost(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def always_in_use(_path, _updates):
+        raise PermissionError(13, "in use")
+
+    monkeypatch.setattr(v.get_tokens, "update_env_file", always_in_use)
+    monkeypatch.setattr(v, "_WRITE_RETRY_DELAY_SECS", 0.0)
+    runner = _offline_runner(tmp_path / ".env")
+    new = v.TokenPair("A'", "tok-access-SECRET-new", "tok-refresh-SECRET-new", None, parent="A")
+
+    assert not await runner._write(new)
+
+    assert runner.write_failed
+    err = capsys.readouterr().err
+    assert "pair A' could NOT be written" in err
+    assert "pair A's refresh token, which produced it, is spent" in err
+    assert "tok-" not in err + runner.report()
+    assert "could NOT be written" in runner.report()
+
+
+async def test_a_whole_main_run_prints_no_secret(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    venue = TokenVenue()
+    env_file = tmp_path / ".env"
+    write_env(env_file, *venue.issue())
+    await venue.server.start()
+    real_runner = v.Runner
+
+    def runner_against_the_fake_venue(settings, **kwargs):
+        kwargs.update(
+            authorise=venue.authorise,
+            demo_host=venue.server.host,
+            live_host=venue.server.host,
+            port=venue.server.port,
+            tls=False,
+        )
+        return real_runner(settings, **kwargs)
+
+    monkeypatch.setattr(v, "Runner", runner_against_the_fake_venue)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    try:
+        rc = await asyncio.to_thread(
+            v.main,
+            ["--rotate-tokens", "--env-file", str(env_file), "--listen-secs", "0.05"],
+        )
+    finally:
+        await venue.server.stop()
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "stop every node or process that uses these tokens" in output
+    assert "Kept pair A'" in output
+    for secret in [*venue.issued, CLIENT_ID, CLIENT_SECRET]:
+        assert secret not in output, secret
+    for identifier in (account_venue.ACCOUNT_ID, account_venue.TRADER_LOGIN):
+        assert str(identifier) not in output
+
+
+def test_main_does_not_start_when_the_prompt_is_not_answered(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    write_env(env_file, "tok-access-SECRET-x", "tok-refresh-SECRET-x")
+
+    def no_answer(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", no_answer)
+    monkeypatch.setattr(v, "Runner", lambda *_a, **_k: pytest.fail("a run was built"))
+
+    assert v.main(["--rotate-tokens", "--env-file", str(env_file)]) == 2
