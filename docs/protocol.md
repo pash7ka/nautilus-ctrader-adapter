@@ -113,6 +113,29 @@ can be persisted; if that callback raises, the failure is logged at ERROR (the n
 usable for the rest of the session, but only in memory — losing them here means the next
 process restart falls back to the old, now-invalid refresh token).
 
+How tokens behave was checked on a live connection, on the account's own (live) host, on
+2026-10-07:
+
+- **A refresh works over a connection authenticated at application level only** (confirmed).
+  Every refresh went through `ProtoOARefreshTokenReq` on a connection that had passed
+  `ProtoOAApplicationAuthReq` and nothing more — the state the reactive refresh runs in, since
+  account authentication has just been rejected.
+- **A refresh token is single-use** (confirmed). Sending one that was already used is refused
+  with `CH_ACCESS_TOKEN_INVALID`, and that refused replay revoked no other grant. Once a
+  refresh request reaches the venue, the pair it answers with is the only valid one.
+- **A refreshed access token expires 30 days after it is issued** (confirmed).
+- **Each authorization is an independent grant** (confirmed). Authorizing the same application
+  twice for one cTrader ID gave two token pairs; neither the second authorization nor a
+  refresh of the second pair affected the first pair's access or refresh token.
+- **One access token can authenticate the same account on two connections at once**
+  (confirmed). Neither connection received a disconnect or token-invalidation event within
+  15 seconds, and a trader read succeeded on each.
+
+**Unconfirmed**: a refresh for a live account's token over the short pre-connection to the
+demo host that resolves the account's host (Section 1). This adapter refreshes there at
+start-up when the account list rejects the access token it was given; every refresh confirmed
+so far went through the account's own host.
+
 **Authentication lost on a live socket.** The venue can drop authentication without closing
 the connection, through three events:
 

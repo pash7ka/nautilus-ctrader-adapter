@@ -441,8 +441,8 @@ class CTraderSession:
                 raise CTraderAuthError(f"account auth rejected: {e.error_code}") from e
             # The access token may simply have expired. Refresh, then retry once; a second
             # rejection is a real authentication failure.
-            # TODO(verify): that the venue accepts a refresh on a connection authenticated only
-            # at application level.
+            # The venue accepts a refresh on a connection authenticated only at application
+            # level (confirmed live).
             self._log.warning(f"Account auth rejected ({e.error_code}), refreshing token")
             await self.refresh_tokens()
             try:
@@ -536,8 +536,8 @@ class CTraderSession:
             now = time.time()
             delay = self._expires_at_secs - TOKEN_REFRESH_MARGIN_SECS - now
             if self._last_refresh_at is not None:
-                # TODO(verify): the lifetime a live venue grants. A lifetime shorter than this
-                # interval leaves the session without a valid token until the interval passes -
+                # A live venue grants 30 days (confirmed). A lifetime shorter than this interval
+                # would leave the session without a valid token until the interval passes -
                 # chosen over a tight refresh loop.
                 delay = max(delay, self._last_refresh_at + MIN_TOKEN_REFRESH_INTERVAL_SECS - now)
             if delay > 0:
@@ -604,8 +604,8 @@ class CTraderSession:
         if isinstance(payload, oa.ProtoOARefreshTokenRes):
             # A refresh reply that arrived after its request timed out. It carries a token pair,
             # which must never travel to the application's event handler.
-            # TODO(verify): whether the venue invalidates a refresh token once used; if it does,
-            # the pair in a late reply is the only valid one and should be adopted, not dropped.
+            # TODO: a refresh token is single-use (confirmed live), so the pair in a late reply
+            # is the only valid one and should be adopted, not dropped.
             self._log.warning("Dropped a late token refresh response")
             return
         # `not self._stopping` is defensive here too, for the same reason as in `_on_disconnect`.
