@@ -363,6 +363,25 @@ async def test_missing_token_expiry_logs_a_warning() -> None:
         await server.stop()
 
 
+async def test_missing_token_expiry_is_not_reported_without_a_refresh_token() -> None:
+    """Nothing could be refreshed without a refresh token, so a missing expiry changes nothing."""
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(
+        server,
+        logger=logger,
+        credentials=credentials(refresh_token=None, token_expires_at=None),
+    )
+    try:
+        await client.connect()
+
+        assert logger.warnings() == []
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_account_details_never_reach_the_log() -> None:
     server = venue()
     await server.start()
@@ -756,14 +775,15 @@ async def test_an_exception_in_the_retry_loop_is_logged_and_the_loop_continues()
 
 def test_credentials_repr_hides_secrets() -> None:
     sample = credentials(
+        client_id="client-id-value",
         client_secret="secret-value",
         access_token="access-value",
         refresh_token="refresh-value",
     )
 
-    text = repr(sample)
+    text = repr(sample) + str(sample)
 
-    for secret in ("secret-value", "access-value", "refresh-value"):
+    for secret in ("client-id-value", "secret-value", "access-value", "refresh-value"):
         assert secret not in text
 
 
@@ -1476,6 +1496,97 @@ async def test_a_symbol_change_before_a_later_bring_up_is_ready_is_not_lost() ->
 
         await wait_until(lambda: notified, description="the change handled")
         assert [i.id for i in notified] == [GER40_ID]
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+@pytest.mark.parametrize(("is_live", "host"), [(True, "live"), (False, "demo"), (None, "demo")])
+def test_the_host_rule_sends_an_unknown_live_flag_to_demo(is_live: bool | None, host: str) -> None:
+    assert account_module.account_host(is_live, demo_host="demo", live_host="live") == host
+
+
+async def test_the_account_list_helper_returns_the_records_and_scope_without_the_token() -> None:
+    server = venue(logins=(TRADER_LOGIN,))
+    await server.start()
+    try:
+        result = await account_module.list_granted_accounts(
+            "client-id",
+            "client-secret",
+            "access-token",
+            host=server.host,
+            port=server.port,
+            tls=False,
+        )
+    finally:
+        await server.stop()
+
+    assert result.permission_scope == RECORDED["account_list"][0].permissionScope
+    assert result.accounts == [
+        account_module.AccountRecord(
+            ctid_trader_account_id=ACCOUNT_ID,
+            is_live=True,
+            trader_login=TRADER_LOGIN,
+            broker_title_short=None,
+        ),
+    ]
+    assert "access-token" not in repr(result)
+
+
+async def test_last_connect_error_is_none_before_any_connect() -> None:
+    server = venue()
+    assert account_client(server).last_connect_error is None
+
+
+async def test_last_connect_error_holds_an_auth_failure_and_a_success_clears_it() -> None:
+    server = venue(logins=())
+    await server.start()
+    client = account_client(server)
+    try:
+        with pytest.raises(CTraderAuthError) as info:
+            await client.connect()
+        assert client.last_connect_error is info.value
+        assert isinstance(client.last_connect_error, CTraderAuthError)
+
+        server.on(
+            oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+            lambda _r: account_list(is_live=True),
+        )
+        await client.connect()
+        assert client.last_connect_error is None
+        await client.disconnect()
+    finally:
+        await server.stop()
+
+
+async def test_last_connect_error_holds_a_failure_that_is_not_an_auth_error() -> None:
+    server = venue()
+    server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, lambda _r: None)
+    await server.start()
+    client = account_client(server, environment="demo", connect_timeout_secs=0.6)
+    try:
+        with pytest.raises(CTraderTimeoutError) as info:
+            await client.connect()
+    finally:
+        await server.stop()
+
+    assert client.last_connect_error is info.value
+    assert not isinstance(client.last_connect_error, CTraderAuthError)
+
+
+async def test_last_connect_error_holds_a_later_users_failed_wait() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server, connect_timeout_secs=0.6)
+    try:
+        await client.connect()
+        server.on(oa_model.PROTO_OA_ACCOUNT_AUTH_REQ, lambda _r: None)
+        await server.drop_connections()
+        await wait_until(lambda: not client.session.is_ready, description="session lost")
+
+        with pytest.raises(CTraderTimeoutError) as info:
+            await client.connect()
+        assert client.last_connect_error is info.value
     finally:
         await client.disconnect()
         await server.stop()

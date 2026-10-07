@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 
 from google.protobuf.message import Message
 
+from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
 from nautilus_ctrader.common.parsing import bar_boundary_secs, price_from_raw
@@ -1372,7 +1373,8 @@ async def _resolve_account(trader_login: int, credentials: Credentials) -> tuple
     if len(matched) > 1:
         raise RuntimeError("more than one granted account has that trader login")
     account = matched[0]
-    return (LIVE_HOST if account.isLive else DEMO_HOST), account.ctidTraderAccountId
+    host = account_host(account.isLive, demo_host=DEMO_HOST, live_host=LIVE_HOST)
+    return host, account.ctidTraderAccountId
 
 
 def parse_symbols(text: str) -> tuple[str, ...]:

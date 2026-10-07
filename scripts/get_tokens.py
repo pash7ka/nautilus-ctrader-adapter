@@ -16,102 +16,40 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import html
-import http.server
-import json
-import math
 import os
 import re
 import secrets
-import socketserver
 import ssl
 import sys
 import tempfile
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import webbrowser
-from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from nautilus_ctrader.common.connection import CTraderConnection
-from nautilus_ctrader.common.errors import CTraderError, CTraderRequestError
+from nautilus_ctrader import oauth
+from nautilus_ctrader.common.account import (
+    AccountRecord,  # noqa: F401 - re-exported: `AccountsResult.accounts` holds these
+    AccountsResult,
+    list_granted_accounts,
+)
+from nautilus_ctrader.common.errors import (
+    CTraderAuthorizationDenied,
+    CTraderAuthorizationTimeout,
+    CTraderError,
+    CTraderRequestError,
+    CTraderTokenExchangeError,
+)
 from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
-from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 
-# The documented authorization page (help.ctrader.com/open-api/account-authentication). The
-# official SDK uses openapi.ctrader.com/apps/auth instead; the documented one is preferred.
-AUTHORIZATION_URL = "https://id.ctrader.com/my/settings/openapi/grantingaccess/"
-TOKEN_URL = "https://openapi.ctrader.com/apps/token"
+# Kept here so the tests can point `main()` at a local token endpoint.
+TOKEN_URL = oauth.TOKEN_URL
 
 CLIENT_ID_KEY = "CTRADER_CLIENT_ID"
 CLIENT_SECRET_KEY = "CTRADER_CLIENT_SECRET"
 ACCESS_TOKEN_KEY = "CTRADER_ACCESS_TOKEN"
 REFRESH_TOKEN_KEY = "CTRADER_REFRESH_TOKEN"
 TOKEN_EXPIRES_AT_KEY = "CTRADER_TOKEN_EXPIRES_AT"
-
-# The callback server always binds IPv4 127.0.0.1 regardless of the redirect host, so only
-# these are accepted as --redirect-uri hosts: a wider host could bind and expose the callback
-# port, and "::1" would parse as loopback but never actually receive the redirect.
-_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1"})
-
-
-class AuthorizationError(RuntimeError):
-    """The redirect carried `?error=...` instead of a code."""
-
-
-class TokenExchangeError(RuntimeError):
-    """The token endpoint rejected the exchange, or its response was unusable.
-
-    The message carries only the endpoint's own error fields or the bare HTTP status -
-    never the client secret, the code, or a token value.
-    """
-
-
-@dataclass(frozen=True)
-class TokenResponse:
-    access_token: str
-    refresh_token: str
-    expires_in: int
-    token_type: str | None
-
-
-@dataclass(frozen=True)
-class AccountRecord:
-    ctid_trader_account_id: int
-    is_live: bool | None
-    trader_login: int | None
-    broker_title_short: str | None
-
-
-@dataclass(frozen=True)
-class AccountsResult:
-    permission_scope: int
-    accounts: list[AccountRecord]
-
-
-class _NullLogger:
-    """Discards everything. Used when a caller of `list_accounts` has no logger to hand it."""
-
-    def debug(self, message: str) -> None:
-        pass
-
-    def info(self, message: str) -> None:
-        pass
-
-    def warning(self, message: str) -> None:
-        pass
-
-    def error(self, message: str) -> None:
-        pass
-
-    def exception(self, message: str, ex: BaseException) -> None:
-        pass
 
 
 class _PrintLogger:
@@ -162,234 +100,6 @@ def load_env(path: Path) -> dict[str, str]:
             continue
         env[match.group(1).strip()] = _strip_matching_quotes(match.group(2).strip())
     return env
-
-
-def build_authorization_url(client_id: str, redirect_uri: str, state: str) -> str:
-    """The one-time authorization page URL. Carries the client id, so it is only ever
-    printed with `--print-url`."""
-    query = urllib.parse.urlencode(
-        {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "scope": "trading",
-            "product": "web",
-            "state": state,
-        },
-    )
-    return f"{AUTHORIZATION_URL}?{query}"
-
-
-def _sanitize_for_terminal(value: str, *, max_len: int = 200) -> str:
-    """Strip non-printable characters and cap the length, so a redirect's `error` value can't
-    smuggle control sequences or an unbounded blob into terminal output."""
-    return "".join(ch for ch in value if ch.isprintable())[:max_len]
-
-
-class _CallbackServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """Serves each connection on its own daemon thread, so one idle or slow-drip connection can
-    never hold up the real redirect behind it."""
-
-    daemon_threads = True
-    # HTTPServer defaults this on; on Windows SO_REUSEADDR lets another process share or steal
-    # the port instead of just permitting reuse of one still in TIME_WAIT.
-    allow_reuse_address = sys.platform != "win32"
-
-
-def wait_for_authorization_code(
-    host: str,
-    port: int,
-    path: str,
-    timeout_secs: float,
-    *,
-    state: str,
-    on_listening: Callable[[], None] | None = None,
-) -> str:
-    """Serve exactly `path` until the redirect carries a code, an error, or the timeout ends.
-
-    Every connection is handled on its own daemon thread (`_CallbackServer`), so an idle
-    connection (a browser's speculative preconnect) or a slow-drip client can never delay the
-    real redirect that arrives alongside it; `timeout_secs` is therefore an exact deadline
-    measured from this call, not stretched by whatever a concurrent connection is doing.
-
-    A request to any other path gets 404 and does not end the wait: browsers probe things
-    like `/favicon.ico` on their own. So does a request whose `state` is missing or does not
-    match `state` exactly (compared in constant time) - it could be a stray page rather than
-    the real redirect, and must not be able to inject a code or abort the run. `on_listening`,
-    if given, runs once the socket is bound and listening - the caller's cue to open the
-    browser (or, in a test, to drive a request).
-
-    TODO(verify): that the authorization endpoint echoes `state` back on the redirect; if it
-    doesn't, every real callback will be rejected as a state mismatch.
-    """
-    outcome: dict[str, str] = {}
-    outcome_lock = threading.Lock()
-    outcome_ready = threading.Event()
-
-    class _Handler(http.server.BaseHTTPRequestHandler):
-        # A connection that opens and sends nothing, or trickles bytes in slowly - browsers do
-        # the former for speculative preconnects - would otherwise block its handler thread
-        # forever, since the base class leaves this as None. Each connection now has its own
-        # thread, so this only ends that one thread; it never affects the deadline below.
-        timeout = 5
-
-        def do_GET(self) -> None:
-            parsed = urllib.parse.urlsplit(self.path)
-            if parsed.path != path:
-                self.send_response(404)
-                self.end_headers()
-                return
-            params = urllib.parse.parse_qs(parsed.query)
-            request_state = params.get("state", [""])[0]
-            # `compare_digest` requires both arguments to be either `str` restricted to ASCII
-            # or `bytes`; encoding both sides first accepts any `request_state` (a stray
-            # non-ASCII value must compare as a mismatch, not raise) while keeping the
-            # comparison constant-time.
-            if not secrets.compare_digest(request_state.encode(), state.encode()):
-                self.send_response(400)
-                self.end_headers()
-                return
-            if "code" in params:
-                # Record before answering the browser: `_respond` writes to the socket, and if
-                # that write fails (peer gone, RST, a full send window against the 5s socket
-                # timeout), the code must already be captured so the caller gets it instead of
-                # timing out.
-                self._record(code=params["code"][0])
-                self._respond("Authorization received. You can close this tab.")
-            elif "error" in params:
-                error = _sanitize_for_terminal(params["error"][0])
-                self._record(error=error)
-                self._respond(f"Authorization failed: {html.escape(error)}")
-            else:
-                self.send_response(400)
-                self.end_headers()
-
-        def _record(self, **result: str) -> None:
-            # The first valid result wins; a later or concurrent connection must not overwrite
-            # it, so the caller's return value can't be raced.
-            with outcome_lock:
-                if not outcome:
-                    outcome.update(result)
-                    outcome_ready.set()
-
-        def _respond(self, message: str) -> None:
-            body = f"<html><body>{message}</body></html>".encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, format: str, *args: object) -> None:
-            pass  # the default access log would echo the redirect's query string
-
-    server = _CallbackServer((host, port), _Handler)
-    # A short poll_interval keeps shutdown() (and so the deadline below) precise; the default
-    # 0.5s would otherwise let a pending accept-loop iteration add up to half a second of its
-    # own on top of timeout_secs.
-    server_thread = threading.Thread(
-        target=server.serve_forever,
-        kwargs={"poll_interval": 0.1},
-        daemon=True,
-    )
-    try:
-        server_thread.start()
-        if on_listening is not None:
-            on_listening()
-        deadline = time.monotonic() + timeout_secs
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or not outcome_ready.wait(remaining):
-            raise TimeoutError(f"no authorization redirect received within {timeout_secs:g}s")
-    finally:
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=5)
-
-    if "error" in outcome:
-        raise AuthorizationError(outcome["error"])
-    return outcome["code"]
-
-
-def is_clean_token(value: object) -> bool:
-    """True for a non-empty `str` with no CR or LF - what an access/refresh token must be to
-    be written into an env file line and never split it or smuggle a second assignment."""
-    return isinstance(value, str) and bool(value) and "\r" not in value and "\n" not in value
-
-
-def exchange_code(
-    code: str,
-    *,
-    client_id: str,
-    client_secret: str,
-    redirect_uri: str,
-    token_url: str = TOKEN_URL,
-    timeout_secs: float = 30.0,
-) -> TokenResponse:
-    """Exchange an authorization code for an access/refresh token pair.
-
-    GET with query parameters, as documented (help.ctrader.com/open-api/account-authentication)
-    and as Spotware's own SDK does it; the documented response fields are `accessToken`,
-    `tokenType`, `expiresIn`, `refreshToken`, `errorCode` and `description`.
-    TODO(verify): not yet exercised against the live endpoint.
-    """
-    query = urllib.parse.urlencode(
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
-    )
-    try:
-        with urllib.request.urlopen(f"{token_url}?{query}", timeout=timeout_secs) as response:
-            body = response.read()
-    except urllib.error.HTTPError as e:
-        # e.url carries the full request URL, client secret included; chaining from it would
-        # put that in any traceback.
-        raise TokenExchangeError(f"token endpoint returned HTTP {e.code}") from None
-    except urllib.error.URLError as e:
-        raise TokenExchangeError(f"token endpoint request failed: {e.reason}") from None
-
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as e:
-        raise TokenExchangeError("token endpoint returned an unparsable response") from e
-    if not isinstance(data, dict):
-        raise TokenExchangeError("token endpoint response is not a JSON object")
-
-    error_code = data.get("errorCode")
-    if error_code:
-        description = data.get("description")
-        safe_code = _sanitize_for_terminal(str(error_code))
-        safe_description = (
-            _sanitize_for_terminal(str(description)) if description is not None else None
-        )
-        raise TokenExchangeError(
-            f"token endpoint rejected the code: {safe_code}: {safe_description}",
-        )
-
-    access_token = data.get("accessToken")
-    refresh_token = data.get("refreshToken")
-    if not is_clean_token(access_token):
-        raise TokenExchangeError("token endpoint response has an invalid accessToken")
-    if not is_clean_token(refresh_token):
-        raise TokenExchangeError("token endpoint response has an invalid refreshToken")
-
-    expires_in = data.get("expiresIn")
-    if (
-        not isinstance(expires_in, int | float)
-        or isinstance(expires_in, bool)
-        or not math.isfinite(expires_in)
-        or expires_in < 1
-    ):
-        raise TokenExchangeError("token endpoint response has an invalid expiresIn")
-
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_in=int(expires_in),
-        token_type=data.get("tokenType"),
-    )
 
 
 _ENV_ASSIGNMENT_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
@@ -452,40 +162,19 @@ async def list_accounts(
     tls: bool | ssl.SSLContext = True,
     logger: object | None = None,
 ) -> AccountsResult:
-    """Authenticate the application, then list the accounts the access token grants.
+    """Authenticate the application on `host`, then list the accounts the access token grants.
 
-    `ProtoOAGetAccountListByAccessTokenRes` echoes the access token back; only the account
-    records and the permission scope are returned, never the token itself.
+    Only the account records and the permission scope are returned, never the token itself.
     """
-    connection = CTraderConnection(
-        host,
-        port,
-        logger=logger if logger is not None else _NullLogger(),
+    return await list_granted_accounts(
+        client_id,
+        client_secret,
+        access_token,
+        host=host,
+        port=port,
         tls=tls,
+        logger=logger,
     )
-    await connection.connect()
-    try:
-        await connection.request(
-            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
-        )
-        response = await connection.request(
-            oa.ProtoOAGetAccountListByAccessTokenReq(accessToken=access_token),
-        )
-    finally:
-        await connection.close()
-
-    accounts = [
-        AccountRecord(
-            ctid_trader_account_id=account.ctidTraderAccountId,
-            is_live=account.isLive if account.HasField("isLive") else None,
-            trader_login=account.traderLogin if account.HasField("traderLogin") else None,
-            broker_title_short=(
-                account.brokerTitleShort if account.HasField("brokerTitleShort") else None
-            ),
-        )
-        for account in response.ctidTraderAccount
-    ]
-    return AccountsResult(permission_scope=response.permissionScope, accounts=accounts)
 
 
 def _print_accounts(result: AccountsResult, *, live: bool) -> None:
@@ -527,27 +216,10 @@ def parse_redirect_uri(redirect_uri: str) -> tuple[int, str]:
 
     Raises `ValueError`, its message saying why, unless it is plain http on a loopback host.
     """
-    redirect = urllib.parse.urlsplit(redirect_uri)
-    # '@' shifts host parsing to whatever follows it (userinfo@host), and a backslash is
-    # treated as a literal netloc character by urlsplit but as a path/host separator by some
-    # browsers; either lets a netloc like "evil.com\@localhost" parse as host "localhost" while
-    # actually addressing something else. Reject both before trusting `.hostname` at all.
-    if "@" in redirect.netloc or "\\" in redirect.netloc:
-        raise ValueError(
-            f"Refusing --redirect-uri {redirect_uri!r}: host must not contain '@' or '\\'.",
-        )
-    if redirect.scheme != "http" or redirect.hostname not in _LOOPBACK_HOSTNAMES:
-        raise ValueError(
-            f"Refusing --redirect-uri {redirect_uri!r}: scheme must be http and host "
-            "must be localhost or 127.0.0.1.",
-        )
     try:
-        port = redirect.port
-    except ValueError:
-        raise ValueError(f"Refusing --redirect-uri {redirect_uri!r}: invalid port.") from None
-    if port == 0:
-        raise ValueError(f"Refusing --redirect-uri {redirect_uri!r}: port must not be 0.")
-    return port or 80, redirect.path or "/"
+        return oauth.parse_redirect_uri(redirect_uri)
+    except oauth.RedirectUriError as e:
+        raise ValueError(f"Refusing --redirect-uri {redirect_uri!r}: {e.reason}") from None
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -579,13 +251,13 @@ def main(argv: list[str] | None = None) -> int:
     client_secret = env[CLIENT_SECRET_KEY]
 
     try:
-        redirect_port, redirect_path = parse_redirect_uri(args.redirect_uri)
+        redirect_port, _ = parse_redirect_uri(args.redirect_uri)
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
 
     state = secrets.token_urlsafe(32)
-    auth_url = build_authorization_url(client_id, args.redirect_uri, state)
+    auth_url = oauth.build_authorization_url(client_id, args.redirect_uri, state)
     if args.print_url:
         print(auth_url)
 
@@ -602,12 +274,10 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     try:
-        code = wait_for_authorization_code(
-            "127.0.0.1",
-            redirect_port,
-            redirect_path,
+        code = oauth.wait_for_authorization_code(
+            args.redirect_uri,
+            state,
             args.timeout_secs,
-            state=state,
             on_listening=_open_browser,
         )
     except OSError:
@@ -616,26 +286,28 @@ def main(argv: list[str] | None = None) -> int:
         # port number and a fixed message are enough to act on.
         print(f"callback port {redirect_port} is already in use", file=sys.stderr)
         return 2
-    except AuthorizationError as e:
-        print(f"Authorization was not granted: {e}", file=sys.stderr)
+    except CTraderAuthorizationDenied as e:
+        print(f"Authorization was not granted: {e.error_code}", file=sys.stderr)
         return 1
-    except TimeoutError as e:
+    except CTraderAuthorizationTimeout as e:
         print(str(e), file=sys.stderr)
         return 1
 
     try:
-        tokens = exchange_code(
+        tokens = oauth.exchange_code(
+            client_id,
+            client_secret,
             code,
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=args.redirect_uri,
+            args.redirect_uri,
             token_url=TOKEN_URL,
         )
-    except TokenExchangeError as e:
-        print(str(e), file=sys.stderr)
+    except CTraderTokenExchangeError as e:
+        # A refusal's description is a field, outside the exception's fixed message.
+        detail = f": {e.description}" if e.error_code is not None else ""
+        print(f"{e}{detail}", file=sys.stderr)
         return 1
 
-    expires_at = int(time.time()) + tokens.expires_in
+    expires_at = int(tokens.expires_at)
     update_env_file(
         args.env_file,
         {

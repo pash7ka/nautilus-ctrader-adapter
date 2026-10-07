@@ -64,6 +64,7 @@ from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message
 
 from nautilus_ctrader.common import codec
+from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderError, CTraderRequestError
 from nautilus_ctrader.common.rate_limit import RateLimiter
@@ -1896,7 +1897,7 @@ async def _resolve_account(
     finally:
         await connection.close()
     account = _match_account(listed.ctidTraderAccount, trader_login)
-    host = LIVE_HOST if account.isLive else DEMO_HOST
+    host = account_host(account.isLive, demo_host=DEMO_HOST, live_host=LIVE_HOST)
     return host, account.ctidTraderAccountId, account.brokerTitleShort
 
 

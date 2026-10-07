@@ -40,6 +40,7 @@ from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message
 
 from nautilus_ctrader.common import codec
+from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderRequestError
 from nautilus_ctrader.common.rate_limit import RateLimiter
@@ -403,7 +404,7 @@ async def record(trader_login: int, env: dict[str, str]) -> RecordResult:
     target = matched[0]
     account_id = target.ctidTraderAccountId
     real_login = target.traderLogin
-    host = LIVE_HOST if target.isLive else DEMO_HOST
+    host = account_host(target.isLive, demo_host=DEMO_HOST, live_host=LIVE_HOST)
     _verify_scrubs_cleanly(account_list_res, account_id, real_login)
 
     recorded: dict[str, list[Message]] = {

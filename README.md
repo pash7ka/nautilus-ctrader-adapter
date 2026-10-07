@@ -39,7 +39,7 @@ what to trade or when.
 | Component | What it does |
 |---|---|
 | Transport | asyncio TLS client for the Open API protobuf protocol: framing, request/response correlation, heartbeat, reconnect with backoff, outbound rate limiting |
-| Authentication | Application-level and account-level auth; access-token refresh over the socket (the one-time authorization-code exchange stays with the host application — see Credentials) |
+| Authentication | Application-level and account-level auth; access-token refresh over the socket; functions for the one-time authorization-code flow and read-only account and symbol discovery, which the host application runs — see Credentials |
 | Instrument provider | Builds Nautilus `Instrument` objects from broker symbol specifications (precision, lot size, volume step and limits) |
 | Data client | Live trendbar (OHLC) and spot (bid/ask) subscriptions, plus historical trendbar requests |
 | Execution client | Market orders and market brackets on hedging accounts; translation between the Nautilus order model and the cTrader position model (stop-loss and take-profit are levels on a position); execution reports and a full mass status at start and on every reconnect; answers to order queries; account state; a balance checkpoint and the account's activity on instruments the node has not loaded, for the application to read — see [docs/execution.md](docs/execution.md) |
@@ -74,9 +74,13 @@ Open API application:
    `refreshToken` pair; the access token is refreshed from the refresh token before it
    expires.
 
-Steps 2 and 3 are one-time steps you run yourself — step 2 needs a browser and a redirect
-URI — and the adapter performs neither. The adapter refreshes the access token while running
-and hands the new pair back to your application to persist.
+Steps 2 and 3 are one-time steps, run once by your application or by you. A running client
+never performs them; it refreshes the access token while running and hands the new pair back
+to your application to persist. The package provides both steps as functions
+(`build_authorization_url`, `wait_for_authorization_code`, `exchange_code`), along with
+read-only `list_accounts` and `list_symbols` to pick the account and look up the broker's
+symbol names. [docs/setup.md](docs/setup.md) shows the first-time flow, the flow with a pasted
+code, and how to tell why a client failed to connect (`last_connect_error`).
 
 `scripts/get_tokens.py` performs steps 2 and 3 locally: run `uv run python scripts/get_tokens.py`.
 It reads `CTRADER_CLIENT_ID` and `CTRADER_CLIENT_SECRET` from a `.env` file (ignored by git),
