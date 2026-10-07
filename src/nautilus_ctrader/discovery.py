@@ -9,7 +9,9 @@ account to configure, by its trader login, and `list_symbols()` looks the broker
   pair back. A rejected access token raises `CTraderAuthError` instead; refresh the pair through
   a connected account client (or authorise again) and retry.
 - Every connection is short-lived, closed before returning, and bounded by the connect and
-  request timeouts. No token or secret reaches a log line or an error message.
+  request timeouts.
+- No token or secret reaches a log line or an error. A venue's error is reported by its code
+  only, with no cause attached: its free-text description may echo what it was sent.
 """
 
 from __future__ import annotations
@@ -31,11 +33,21 @@ from nautilus_ctrader.common.account import (
     request_granted_accounts,
 )
 from nautilus_ctrader.common.connection import CTraderConnection
-from nautilus_ctrader.common.errors import CTraderAuthError, CTraderRequestError
+from nautilus_ctrader.common.errors import (
+    CTraderAuthError,
+    CTraderConnectionError,
+    CTraderError,
+    CTraderRequestError,
+    CTraderTimeoutError,
+)
 from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT, TOKEN_ERROR_CODES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+
+# A `refusal` for an account whose host could not be reached, or did not answer in time.
+_UNREACHABLE = "unreachable"
+_TIMEOUT = "timeout"
 
 
 @dataclass(frozen=True)
@@ -44,7 +56,8 @@ class GrantedAccount:
 
     - `is_live`: the venue's flag; `None` when it sent none. It decides the host.
     - `deposit_currency`: the deposit asset's name, or `None` when it could not be read.
-    - `refusal`: why it could not be read: the venue's error code, or a short reason.
+    - `refusal`: why it could not be read: the venue's error code, `"unreachable"`,
+      `"timeout"`, or a short reason.
     """
 
     trader_login: int | None
@@ -81,6 +94,32 @@ def _token_rejected(error_code: str) -> CTraderAuthError:
     )
 
 
+def _without_venue_text(error: CTraderError) -> CTraderError:
+    """`error` rebuilt with no cause and no venue description, keeping the venue's error code."""
+    error_code = request_error_code(error)
+    if error_code in TOKEN_ERROR_CODES:
+        return _token_rejected(error_code)
+    if isinstance(error, CTraderRequestError):
+        return CTraderRequestError(error.error_code)
+    # Every other adapter error's message is composed by the adapter, with codes only.
+    return type(error)(str(error))
+
+
+async def _authenticate_application(
+    connection: CTraderConnection,
+    client_id: str,
+    client_secret: str,
+) -> str | None:
+    """The venue's error code if it refuses the application, else `None`."""
+    try:
+        await connection.request(
+            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
+        )
+    except CTraderRequestError as e:
+        return e.error_code
+    return None
+
+
 async def list_accounts(
     client_id: str,
     client_secret: str,
@@ -96,45 +135,74 @@ async def list_accounts(
 
     The list is read on `demo_host`, which serves it for either environment. Each account is
     then authenticated on the host its live flag names (an unknown flag means demo) to read its
-    deposit asset. An account that refuses keeps its row, with `refusal` saying why.
+    deposit asset. An account that cannot be read keeps its row, with `refusal` set to:
 
-    The host, port and TLS arguments exist for tests. Raises `CTraderAuthError` if the
-    application or the access token is rejected, and `CTraderConnectionError` or
-    `CTraderTimeoutError` if a host cannot be reached.
+    - the venue's error code, when it refuses the account, or the application on that host;
+    - `"unreachable"`, when that host cannot be reached or its connection is lost;
+    - `"timeout"`, when a request about the account goes unanswered.
+
+    A host that failed is not tried again for later accounts. The host, port and TLS arguments
+    exist for tests. Raises, when the list itself cannot be read:
+
+    - `CTraderAuthError` if the application or the access token is rejected;
+    - `CTraderConnectionError` or `CTraderTimeoutError` if `demo_host` fails.
     """
     log = NullLogger() if logger is None else logger
     connections: dict[str, CTraderConnection] = {}
+    failed_hosts: dict[str, str] = {}
 
-    async def connection_to(host: str) -> CTraderConnection:
-        connection = connections.get(host)
-        if connection is None:
-            connection = CTraderConnection(host, port, logger=log, tls=tls)
-            connections[host] = connection
+    async def reach(host: str) -> CTraderConnection | None:
+        """The host's authenticated connection, or `None` once the host has failed."""
+        if host in failed_hosts:
+            return None
+        if host in connections:
+            return connections[host]
+        connection = CTraderConnection(host, port, logger=log, tls=tls)
+        connections[host] = connection
+        try:
             await connection.connect()
-            try:
-                await connection.request(
-                    oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
-                )
-            except CTraderRequestError as e:
-                raise CTraderAuthError(f"application auth rejected: {e.error_code}") from e
-        return connection
+            refused = await _authenticate_application(connection, client_id, client_secret)
+        except CTraderTimeoutError:
+            refused = _TIMEOUT
+        except CTraderConnectionError:
+            refused = _UNREACHABLE
+        if refused is None:
+            return connection
+        failed_hosts[host] = refused
+        del connections[host]
+        await connection.close()
+        return None
 
     try:
+        list_connection = CTraderConnection(demo_host, port, logger=log, tls=tls)
+        connections[demo_host] = list_connection
+        await list_connection.connect()
+        refused = await _authenticate_application(list_connection, client_id, client_secret)
+        if refused is not None:
+            raise CTraderAuthError(f"application auth rejected: {refused}")
         try:
-            granted = await request_granted_accounts(await connection_to(demo_host), access_token)
+            granted = await request_granted_accounts(list_connection, access_token)
         except CTraderRequestError as e:
-            if e.error_code in TOKEN_ERROR_CODES:
-                raise _token_rejected(e.error_code) from None
-            raise CTraderAuthError(f"account list rejected: {e.error_code}") from e
+            refused = e.error_code
+        if refused in TOKEN_ERROR_CODES:
+            raise _token_rejected(refused)
+        if refused is not None:
+            raise CTraderAuthError(f"account list rejected: {refused}")
 
         accounts = []
         for record in granted.accounts:
             host = account_host(record.is_live, demo_host=demo_host, live_host=live_host)
-            deposit_currency, refusal = await _read_deposit_currency(
-                await connection_to(host),
-                record.ctid_trader_account_id,
-                access_token,
-            )
+            connection = await reach(host)
+            if connection is None:
+                deposit_currency, refusal = None, failed_hosts[host]
+            else:
+                deposit_currency, refusal = await _read_deposit_currency(
+                    connection,
+                    record.ctid_trader_account_id,
+                    access_token,
+                )
+                if refusal == _UNREACHABLE:
+                    failed_hosts[host] = _UNREACHABLE
             accounts.append(
                 GrantedAccount(
                     trader_login=record.trader_login,
@@ -169,6 +237,10 @@ async def _read_deposit_currency(
         )
     except CTraderRequestError as e:
         return None, e.error_code
+    except CTraderTimeoutError:
+        return None, _TIMEOUT
+    except CTraderConnectionError:
+        return None, _UNREACHABLE
     for asset in asset_list.asset:
         if asset.assetId == trader.depositAssetId:
             return asset.name, None
@@ -194,10 +266,17 @@ async def list_symbols(
     its name, id and enabled flag only. With `names`, only those symbols are returned, with
     digits, volumes and asset names filled in; a name the broker does not list is absent.
 
-    The refresh token and expiry in `credentials` are ignored, so nothing is ever refreshed: a
-    rejected access token raises `CTraderAuthError` saying to refresh or authorise first. The
-    host, port and TLS arguments exist for tests.
+    The refresh token and expiry in `credentials` are ignored, so nothing is ever refreshed. The
+    host, port and TLS arguments exist for tests. Raises:
+
+    - `TypeError` if `names` is a single `str`;
+    - `CTraderAuthError` if the application, the token or the trader login is rejected; for a
+      rejected token, saying to refresh or authorise first;
+    - `CTraderConnectionError`, `CTraderTimeoutError`, `CTraderRequestError` or
+      `CTraderProtocolError` if the account cannot be read.
     """
+    if isinstance(names, str):
+        raise TypeError("names must be an iterable of symbol names, not a single str")
     client = CTraderAccountClient(
         trader_login=trader_login,
         credentials=dataclasses.replace(credentials, refresh_token=None, token_expires_at=None),
@@ -208,29 +287,37 @@ async def list_symbols(
         port=port,
         tls=tls,
     )
+    # Raised outside its `except`, so the venue's description is in neither cause nor context.
+    failure: CTraderError | None = None
     try:
         try:
             await client.connect()
-        except CTraderAuthError as e:
-            error_code = request_error_code(e)
-            if error_code in TOKEN_ERROR_CODES:
-                raise _token_rejected(error_code) from None
-            raise
-
-        light_symbols = client.light_symbols
-        if names is None:
-            return {
-                name: SymbolInfo(name, light.symbolId, light.enabled, *(None,) * 6)
-                for name, light in light_symbols.items()
-            }
-        wanted = [light_symbols[name] for name in dict.fromkeys(names) if name in light_symbols]
-        specs = await client.symbol_specs([light.symbolId for light in wanted])
-        return {
-            light.symbolName: _symbol_info(light, specs.get(light.symbolId), client.assets)
-            for light in wanted
-        }
+            symbols = await _read_symbols(client, names)
+        except CTraderError as e:
+            failure = _without_venue_text(e)
+        if failure is not None:
+            raise failure
+        return symbols
     finally:
         await client.disconnect()
+
+
+async def _read_symbols(
+    client: CTraderAccountClient,
+    names: Iterable[str] | None,
+) -> dict[str, SymbolInfo]:
+    light_symbols = client.light_symbols
+    if names is None:
+        return {
+            name: SymbolInfo(name, light.symbolId, light.enabled, *(None,) * 6)
+            for name, light in light_symbols.items()
+        }
+    wanted = [light_symbols[name] for name in dict.fromkeys(names) if name in light_symbols]
+    specs = await client.symbol_specs([light.symbolId for light in wanted])
+    return {
+        light.symbolName: _symbol_info(light, specs.get(light.symbolId), client.assets)
+        for light in wanted
+    }
 
 
 def _symbol_info(

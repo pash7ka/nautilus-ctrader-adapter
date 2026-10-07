@@ -12,6 +12,7 @@ allow-list, and that the script's own source never names an order request at all
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib.util
 import pathlib
 import sys
@@ -19,12 +20,13 @@ import time
 
 import pytest
 
-from nautilus_ctrader.common.account import AccountRecord
+from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderRequestError
 from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL, SYMBOL_BY_ID_BATCH
 from nautilus_ctrader.enums import PERIOD_SECS
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests import account_venue
 from tests.fake_server import FakeCTraderServer
@@ -249,14 +251,14 @@ def _aligned(symbol: str, period_name: str, period_secs: int, *, offset: int = 0
 
 def test_an_account_id_mistaken_for_a_login_is_named_as_such() -> None:
     """The two identifiers look alike, so the bare refusal reads as a token problem."""
-    granted = [AccountRecord(111, None, 222, None)]
+    granted = [oa_model.ProtoOACtidTraderAccount(ctidTraderAccountId=111, traderLogin=222)]
     message = v._no_such_account_message(granted, 111)
     assert "traderLogin" in message and "ctidTraderAccountId" in message
     assert "111" not in message and "222" not in message
 
 
 def test_a_login_the_token_does_not_grant_is_reported_without_it() -> None:
-    granted = [AccountRecord(111, None, 222, None)]
+    granted = [oa_model.ProtoOACtidTraderAccount(ctidTraderAccountId=111, traderLogin=222)]
     message = v._no_such_account_message(granted, 999)
     assert "999" not in message and "111" not in message and "222" not in message
 
@@ -1024,3 +1026,35 @@ async def test_a_whole_run_reports_how_the_venue_answered_a_window(
     assert item.status == status
     assert last_line in item.detail[-1]
     assert last_line in report
+
+
+@pytest.mark.parametrize("is_live", [True, False], ids=["live", "demo"])
+async def test_resolving_the_account_waits_out_a_rate_limit_block(
+    monkeypatch: pytest.MonkeyPatch,
+    is_live: bool,
+) -> None:
+    """The lookup goes through the read-only requester, so a `BLOCKED_PAYLOAD_TYPE` on the
+    account list is waited out and retried instead of failing the run."""
+    server = account_venue.venue(is_live=is_live)
+    answers = iter(
+        [
+            oa.ProtoOAErrorRes(errorCode="BLOCKED_PAYLOAD_TYPE", retryAfter=0),
+            account_venue.account_list(is_live=is_live),
+        ],
+    )
+    server.on(oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, lambda _r: next(answers))
+    await server.start()
+    monkeypatch.setattr(v, "DEMO_HOST", server.host)
+    monkeypatch.setattr(v, "PROTOBUF_PORT", server.port)
+    monkeypatch.setattr(v, "CTraderConnection", functools.partial(CTraderConnection, tls=False))
+    try:
+        resolved = await v._resolve_account(
+            account_venue.TRADER_LOGIN,
+            v.Credentials("client-id", "client-secret", "access-token"),
+        )
+    finally:
+        await server.stop()
+
+    host = v.LIVE_HOST if is_live else server.host
+    assert resolved == (host, account_venue.ACCOUNT_ID)
+    assert len(account_venue.received(server, oa.ProtoOAGetAccountListByAccessTokenReq)) == 2

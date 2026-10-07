@@ -17,6 +17,7 @@ No token, code, client id or secret appears in any message, repr or exception ar
 from __future__ import annotations
 
 import html
+import http.client
 import http.server
 import json
 import math
@@ -106,8 +107,11 @@ def parse_redirect_uri(redirect_uri: str) -> tuple[int, str]:
         )
     try:
         port = redirect.port
+        valid_port = True
     except ValueError:
-        raise RedirectUriError(redirect_uri, "invalid port.") from None
+        valid_port = False
+    if not valid_port:
+        raise RedirectUriError(redirect_uri, "invalid port.")
     if port == 0:
         raise RedirectUriError(redirect_uri, "port must not be 0.")
     return port or 80, redirect.path or "/"
@@ -121,10 +125,21 @@ def _sanitize_for_terminal(
 ) -> str:
     """Strip non-printable characters and cap the length, so a venue-supplied value can't
     smuggle control sequences or an unbounded blob into terminal output. Every non-empty
-    string in `redact` is masked first, in case the venue echoes a request value back."""
-    for secret in redact:
-        if isinstance(secret, str) and secret:
-            value = value.replace(secret, "***")
+    string in `redact` is masked first, as is and URL-encoded, in case the venue echoes a
+    request value back."""
+    forms = {
+        form
+        for secret in redact
+        if isinstance(secret, str) and secret
+        for form in (
+            secret,
+            urllib.parse.quote_plus(secret),
+            urllib.parse.quote(secret, safe=""),
+        )
+    }
+    # Longest first, so a shorter form never leaves part of a longer one behind.
+    for form in sorted(forms, key=len, reverse=True):
+        value = value.replace(form, "***")
     return "".join(ch for ch in value if ch.isprintable())[:max_len]
 
 
@@ -136,6 +151,11 @@ class _CallbackServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     # HTTPServer defaults this on; on Windows SO_REUSEADDR lets another process share or steal
     # the port instead of just permitting reuse of one still in TIME_WAIT.
     allow_reuse_address = sys.platform != "win32"
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        # The default prints a traceback to stderr; a failed request only ever ends that one
+        # connection, and the wait goes on.
+        pass
 
 
 def wait_for_authorization_code(
@@ -290,25 +310,34 @@ def exchange_code(
             "client_secret": client_secret,
         },
     )
+    # Every failure below is raised outside its `except`, so the error keeps no cause and no
+    # context: an `HTTPError` holds the request URL with the secret, and a read or decode error
+    # can hold the body with the tokens.
+    failure: CTraderTokenExchangeError | None = None
     try:
         with urllib.request.urlopen(f"{token_url}?{query}", timeout=timeout_secs) as response:
             body = response.read()
     except urllib.error.HTTPError as e:
-        # e.url carries the full request URL, client secret included; chaining from it would
-        # put that in any traceback.
-        raise CTraderTokenExchangeError(
+        failure = CTraderTokenExchangeError(
             f"token endpoint returned HTTP {e.code}",
             http_status=e.code,
-        ) from None
+        )
     except urllib.error.URLError as e:
         reason = _sanitize_for_terminal(str(e.reason), redact=request_values)
-        raise CTraderTokenExchangeError(f"token endpoint request failed: {reason}") from None
+        failure = CTraderTokenExchangeError(f"token endpoint request failed: {reason}")
+    except (OSError, http.client.HTTPException) as e:
+        # Not wrapped by urllib: a read timeout, a dropped connection, a truncated body.
+        failure = CTraderTokenExchangeError(f"token endpoint request failed: {type(e).__name__}")
+    if failure is not None:
+        raise failure
 
-    # Not chained: the decode error keeps the body, which may hold tokens.
     try:
         data = json.loads(body)
-    except json.JSONDecodeError:
-        raise CTraderTokenExchangeError("token endpoint returned an unparsable response") from None
+        parsed = True
+    except (ValueError, RecursionError):
+        parsed = False
+    if not parsed:
+        raise CTraderTokenExchangeError("token endpoint returned an unparsable response")
     if not isinstance(data, dict):
         raise CTraderTokenExchangeError("token endpoint response is not a JSON object")
 

@@ -29,5 +29,10 @@ def test_the_setup_api_is_importable_from_the_package_root() -> None:
         "CTraderAuthorizationDenied",
         "CTraderAuthorizationTimeout",
         "CTraderTokenExchangeError",
+        "CTraderConnectionError",
+        "CTraderTimeoutError",
+        "CTraderRequestError",
+        "CTraderProtocolError",
+        "RedirectUriError",
     }
     assert setup_names <= set(nautilus_ctrader.__all__)

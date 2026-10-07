@@ -162,7 +162,7 @@ async def list_granted_accounts(
 
 @dataclass(frozen=True)
 class AccountCredentials:
-    client_id: str
+    client_id: str = field(repr=False)
     client_secret: str = field(repr=False)
     access_token: str = field(repr=False)
     refresh_token: str | None = field(repr=False)
@@ -616,7 +616,7 @@ class CTraderAccountClient:
 
     def _build_session(self, host: str) -> CTraderSession:
         credentials = self._credentials
-        if credentials.token_expires_at is None:
+        if credentials.token_expires_at is None and credentials.refresh_token is not None:
             self._log.warning("token_expires_at not set: proactive token refresh is disabled")
         return CTraderSession(
             host=host,

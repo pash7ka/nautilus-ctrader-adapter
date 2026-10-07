@@ -47,33 +47,39 @@ for account in asyncio.run(list_accounts(client_id, client_secret, tokens.access
     print(account.trader_login, account.is_live, account.broker_name, account.deposit_currency)
 ```
 
-`wait_for_authorization_code` prints nothing. It ignores requests to other paths and redirects
-whose `state` does not match, and it raises:
-
-- `CTraderAuthorizationDenied` when the redirect carries an error instead of a code. The
-  redirect's error value is in `error_code`.
-- `CTraderAuthorizationTimeout` when no redirect arrives in time.
-- `OSError` when the callback port cannot be bound.
-
-`exchange_code` raises `CTraderTokenExchangeError` when the token endpoint refuses the code, cannot
-be reached, or answers with anything but a usable pair. A refusal's `error_code` and
-`description` are fields of the error. All three errors are `CTraderAuthError`s. Their messages
-are fixed and never contain the code, a token, the client id or the secret. `TokenPair`'s repr
-masks both tokens.
+`wait_for_authorization_code` prints nothing, not even for a request that fails. It ignores
+requests to other paths and redirects whose `state` does not match. `TokenPair`'s repr masks
+both tokens.
 
 `list_accounts` returns one `GrantedAccount` per granted account, in the venue's order. A client
 is configured with its `trader_login`. Each account's deposit currency is read on the host its
-live flag names, where an unknown flag means demo. An account that refuses is kept, with
-`deposit_currency=None` and the reason in `refusal`.
+live flag names, where an unknown flag means demo. An account whose deposit currency cannot be
+read is kept, with `deposit_currency=None` and `refusal` set to:
+
+- the venue's error code, when it refuses the account (or the application on that host);
+- `"unreachable"`, when that host cannot be reached or its connection is lost;
+- `"timeout"`, when a request about the account goes unanswered.
+
+A host that failed is not tried again for the accounts after it. Only a failure to read the
+list itself, on the demo host, raises.
 
 ## A pasted code
 
 When the redirect cannot reach the machine running the application, the user can open the URL
-from `build_authorization_url` anywhere, copy the `code` parameter from the address the browser
-is sent to, and paste it in. The exchange is then the same:
+from `build_authorization_url` anywhere, and paste back the address the browser is sent to.
+Check its `state` against the one the URL was built with before using its code, as the callback
+server does, so that a code from some other authorization is never exchanged:
 
 ```python
-tokens = exchange_code(client_id, client_secret, pasted_code, REDIRECT_URI)
+import secrets
+import urllib.parse
+
+params = urllib.parse.parse_qs(urllib.parse.urlsplit(pasted_redirect_url).query)
+if not secrets.compare_digest(params.get("state", [""])[0].encode(), state.encode()):
+    raise ValueError("the pasted address does not belong to this authorization")
+if "code" not in params:
+    raise ValueError(f"authorization not granted: {params.get('error', ['no code'])[0]}")
+tokens = exchange_code(client_id, client_secret, params["code"][0], REDIRECT_URI)
 ```
 
 `REDIRECT_URI` must be the one the authorization URL was built with.
@@ -104,14 +110,31 @@ client does it. `environment` (default `"auto"`) has the same meaning as in the 
 ## Discovery never refreshes a token
 
 A refresh token works once. A refresh would replace the stored pair, and discovery has no way to
-hand the new pair back. So `list_accounts` and `list_symbols` ignore the refresh token and the
-expiry in what they are given and never refresh. A rejected or expired access token raises
-`CTraderAuthError` with the venue's error code, saying to refresh the pair or authorise again
-first. A connected account client refreshes the pair on its own and reports it through
+hand the new pair back. So discovery never refreshes: `list_accounts` takes the access token
+only, and `list_symbols` ignores the refresh token and the expiry in its credentials. A rejected
+or expired access token raises `CTraderAuthError` with the venue's error code, saying to refresh
+the pair or authorise again first. A connected account client refreshes the pair on its own and reports it through
 `add_token_listener()` (see [Persisting refreshed tokens](market_data.md#persisting-refreshed-tokens)).
 
 Discovery sends only authentication, account list, trader, asset and symbol requests. Each
 connection is short-lived and closed before the call returns.
+
+## What each function raises
+
+No error carries a token, the code, the client id or the secret, in its message, its arguments
+or its fields. A venue's refusal is reported by its error code only, with no cause attached: the
+venue's free-text description may echo what it was sent.
+
+| Function | Raises |
+|---|---|
+| `build_authorization_url` | nothing |
+| `wait_for_authorization_code` | `RedirectUriError` (a `ValueError`): the redirect URI is not plain `http` on `localhost` or `127.0.0.1`; `reason` says why. `OSError`: the callback port cannot be bound. `CTraderAuthorizationDenied`: the redirect carries an error; the redirect's error value is in `error_code`. `CTraderAuthorizationTimeout`: no redirect in time. |
+| `exchange_code` | `CTraderTokenExchangeError`: the token endpoint refuses the code (`error_code`, `description`), answers with an HTTP error (`http_status`), cannot be reached, or answers with anything but a usable pair. |
+| `list_accounts` | `CTraderAuthError`: the application or the access token is rejected. `CTraderConnectionError` or `CTraderTimeoutError`: the demo host, which serves the list, fails. |
+| `list_symbols` | `TypeError`: `names` is a single `str`. `ValueError`: an unknown `environment`. `CTraderAuthError`: the application, the token or the trader login is rejected. `CTraderConnectionError`, `CTraderTimeoutError`, `CTraderRequestError` or `CTraderProtocolError`: the account cannot be read. |
+
+`CTraderAuthorizationDenied`, `CTraderAuthorizationTimeout` and `CTraderTokenExchangeError` are
+`CTraderAuthError`s, and every `CTrader...Error` is a `CTraderError`.
 
 ## Why a connect failed
 

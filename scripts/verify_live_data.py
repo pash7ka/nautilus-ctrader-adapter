@@ -4,12 +4,10 @@ Connects to the account's own host, asks history a bounded number of times, subs
 and live M1 trendbars for a few minutes, and prints one `OK` / `DIFFERS` / `UNKNOWN` line per
 assumption with the values it actually observed.
 
-**Read-only by construction.** The account lookup uses the package's account-list helper,
-which sends only application authentication and the list. Every other request goes through
-`ReadOnlyRequester.request`, which refuses any payload class outside `READ_ONLY_REQUESTS`; that
-set holds authentication, symbol, history and subscription requests only, and no order request
-type is imported or named anywhere in this module. Subscriptions taken here are released before
-the connection closes.
+**Read-only by construction.** Every request goes through `ReadOnlyRequester.request`, which
+refuses any payload class outside `READ_ONLY_REQUESTS`; that set holds authentication, symbol,
+history and subscription requests only, and no order request type is imported or named
+anywhere in this module. Subscriptions taken here are released before the connection closes.
 
 One item checks how history answers a trendbar window: with up to `count` bars counted back
 from `toTimestamp` by open time, a bar opening exactly on it included, and `fromTimestamp` not
@@ -44,7 +42,7 @@ from dataclasses import dataclass, field
 
 from google.protobuf.message import Message
 
-from nautilus_ctrader.common.account import AccountRecord, account_host, list_granted_accounts
+from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
 from nautilus_ctrader.common.parsing import bar_boundary_secs, price_from_raw
@@ -1328,14 +1326,14 @@ async def verify(
     return verifier.findings, report
 
 
-def _no_such_account_message(granted: Sequence[AccountRecord], trader_login: int) -> str:
+def _no_such_account_message(granted, trader_login: int) -> str:
     """Why the account was not found, naming no identifier.
 
     The two identifiers are of similar length, and only the login is the account number the
     interface shows, so giving the other one is easy and the bare refusal reads as a token
     problem.
     """
-    if any(a.ctid_trader_account_id == trader_login for a in granted):
+    if any(a.ctidTraderAccountId == trader_login for a in granted):
         return (
             "the value given is a ctidTraderAccountId, not a traderLogin; expected is the "
             "account number the cTrader interface shows, which this script resolves itself"
@@ -1349,23 +1347,34 @@ async def _resolve_account(trader_login: int, credentials: Credentials) -> tuple
     The account list is served on either host; it maps the login to the id, and its `isLive`
     flag decides where the account itself can be authenticated.
     """
-    async with asyncio.timeout(_RESOLVE_ACCOUNT_TIMEOUT_SECS):
-        listed = await list_granted_accounts(
-            credentials.client_id,
-            credentials.client_secret,
-            credentials.access_token,
-            host=DEMO_HOST,
-            port=PROTOBUF_PORT,
-            logger=QuietLogger(),
-        )
-    matched = [a for a in listed.accounts if a.trader_login == trader_login]
+    connection = CTraderConnection(DEMO_HOST, PROTOBUF_PORT, logger=QuietLogger())
+    requester = ReadOnlyRequester(connection, history_budget=0)
+    await connection.connect()
+    try:
+        async with asyncio.timeout(_RESOLVE_ACCOUNT_TIMEOUT_SECS):
+            await requester.request(
+                oa.ProtoOAApplicationAuthReq(
+                    clientId=credentials.client_id,
+                    clientSecret=credentials.client_secret,
+                ),
+            )
+            listed = await requester.request(
+                oa.ProtoOAGetAccountListByAccessTokenReq(accessToken=credentials.access_token),
+            )
+    finally:
+        await connection.close()
+    matched = [
+        a
+        for a in listed.ctidTraderAccount
+        if a.HasField("traderLogin") and a.traderLogin == trader_login
+    ]
     if not matched:
-        raise RuntimeError(_no_such_account_message(listed.accounts, trader_login))
+        raise RuntimeError(_no_such_account_message(listed.ctidTraderAccount, trader_login))
     if len(matched) > 1:
         raise RuntimeError("more than one granted account has that trader login")
     account = matched[0]
-    host = account_host(account.is_live, demo_host=DEMO_HOST, live_host=LIVE_HOST)
-    return host, account.ctid_trader_account_id
+    host = account_host(account.isLive, demo_host=DEMO_HOST, live_host=LIVE_HOST)
+    return host, account.ctidTraderAccountId
 
 
 def parse_symbols(text: str) -> tuple[str, ...]:

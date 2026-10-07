@@ -10,13 +10,26 @@ from google.protobuf.message import Message
 
 from nautilus_ctrader import discovery
 from nautilus_ctrader.common.connection import CTraderConnection
-from nautilus_ctrader.common.errors import CTraderAuthError
+from nautilus_ctrader.common.errors import (
+    CTraderAuthError,
+    CTraderConnectionError,
+    CTraderRequestError,
+)
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
-from tests.account_venue import ACCOUNT_ID, TRADER_LOGIN, credentials, received, venue
+from tests.account_venue import (
+    ACCOUNT_ID,
+    RECORDED,
+    TRADER_LOGIN,
+    credentials,
+    for_account,
+    received,
+    venue,
+)
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
+from tests.secrecy import assert_secret_free
 
 ACCESS_TOKEN = "the-access-token"
 REFRESH_TOKEN = "the-refresh-token"
@@ -67,18 +80,38 @@ def _four_accounts() -> Message:
     )
 
 
-def _route_by_host(monkeypatch: pytest.MonkeyPatch, server: FakeCTraderServer) -> list:
+def _route_by_host(
+    monkeypatch: pytest.MonkeyPatch,
+    server: FakeCTraderServer,
+    *,
+    dead_hosts: frozenset[str] = frozenset(),
+    request_timeout_secs: float = 5.0,
+    connects: list[str] | None = None,
+) -> list:
     """Point every discovery connection at `server`, recording `(host, payload)` per request.
 
     The hosts named to discovery are never resolved, so the recording is the only evidence of
-    which host a request was meant for.
+    which host a request was meant for. A connection to one of `dead_hosts` fails to connect;
+    every connection attempt's host is appended to `connects`.
     """
     sent: list[tuple[str, Message]] = []
 
     class _Routed(CTraderConnection):
         def __init__(self, host: str, port: int, **kwargs) -> None:
-            super().__init__(server.host, port, **kwargs)
+            super().__init__(
+                server.host,
+                port,
+                request_timeout_secs=request_timeout_secs,
+                **kwargs,
+            )
             self.requested_host = host
+
+        async def connect(self) -> None:
+            if connects is not None:
+                connects.append(self.requested_host)
+            if self.requested_host in dead_hosts:
+                raise CTraderConnectionError("cannot connect")
+            await super().connect()
 
         async def request(self, payload: Message, **kwargs) -> Message:
             sent.append((self.requested_host, payload))
@@ -203,9 +236,8 @@ async def test_list_accounts_never_refreshes_a_rejected_token(code: str) -> None
     finally:
         await server.stop()
 
-    message = str(info.value)
-    assert code in message
-    assert ACCESS_TOKEN not in message
+    assert code in str(info.value)
+    assert_secret_free(info.value, ACCESS_TOKEN, CLIENT_SECRET)
     assert not received(server, oa.ProtoOARefreshTokenReq)
     assert all(ACCESS_TOKEN not in line for _level, line in logger.lines)
 
@@ -359,7 +391,10 @@ async def test_list_symbols_never_refreshes_a_rejected_token(rejected: int) -> N
     server = venue()
     server.on(
         rejected,
-        lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID"),
+        lambda _r: oa.ProtoOAErrorRes(
+            errorCode="CH_ACCESS_TOKEN_INVALID",
+            description=f"token {ACCESS_TOKEN} is not valid",
+        ),
     )
     logger = RecordingLogger()
     await server.start()
@@ -372,6 +407,146 @@ async def test_list_symbols_never_refreshes_a_rejected_token(rejected: int) -> N
 
     assert "CH_ACCESS_TOKEN_INVALID" in str(info.value)
     assert not received(server, oa.ProtoOARefreshTokenReq)
+    assert_secret_free(info.value, ACCESS_TOKEN, REFRESH_TOKEN, CLIENT_SECRET)
     for secret in (ACCESS_TOKEN, REFRESH_TOKEN, CLIENT_SECRET):
-        assert secret not in str(info.value)
         assert all(secret not in line for _level, line in logger.lines)
+
+
+def _echoing(code: str) -> oa.ProtoOAErrorRes:
+    """A refusal whose free-text description echoes what the venue was sent."""
+    return oa.ProtoOAErrorRes(
+        errorCode=code,
+        description=f"refused {ACCESS_TOKEN} {CLIENT_SECRET} {REFRESH_TOKEN}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("rejected", "message"),
+    [
+        (oa_model.PROTO_OA_APPLICATION_AUTH_REQ, "application auth rejected: CH_CLIENT_AUTH"),
+        (
+            oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+            "account list rejected: CH_CLIENT_AUTH",
+        ),
+    ],
+)
+async def test_list_accounts_reports_a_rejection_by_its_code_only(
+    rejected: int,
+    message: str,
+) -> None:
+    server = venue()
+    server.on(rejected, lambda _r: _echoing("CH_CLIENT_AUTH"))
+    await server.start()
+    try:
+        with pytest.raises(CTraderAuthError) as info:
+            await _list_accounts(server, demo_host=server.host, live_host=server.host)
+    finally:
+        await server.stop()
+
+    assert str(info.value) == message
+    assert_secret_free(info.value, ACCESS_TOKEN, CLIENT_SECRET, REFRESH_TOKEN)
+
+
+async def test_list_accounts_marks_the_accounts_of_an_unreachable_host_and_tries_it_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    server.on(oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, lambda _r: _four_accounts())
+    connects: list[str] = []
+    _route_by_host(
+        monkeypatch,
+        server,
+        dead_hosts=frozenset({"live.invalid"}),
+        connects=connects,
+    )
+    await server.start()
+    try:
+        accounts = await _list_accounts(server)
+    finally:
+        await server.stop()
+
+    assert [(a.ctid_trader_account_id, a.deposit_currency, a.refusal) for a in accounts] == [
+        (LIVE_ID, None, "unreachable"),
+        (DEMO_ID, "USD", None),
+        (UNKNOWN_ID, "USD", None),
+        (REFUSED_ID, None, "unreachable"),
+    ]
+    assert connects.count("live.invalid") == 1
+
+
+async def test_list_accounts_marks_an_account_whose_request_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    server.on(oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, lambda _r: _four_accounts())
+    server.on(
+        oa_model.PROTO_OA_TRADER_REQ,
+        lambda r: (
+            None
+            if r.ctidTraderAccountId == DEMO_ID
+            else for_account(RECORDED["trader"][0], r.ctidTraderAccountId)
+        ),
+    )
+    _route_by_host(monkeypatch, server, request_timeout_secs=0.3)
+    await server.start()
+    try:
+        accounts = await _list_accounts(server)
+    finally:
+        await server.stop()
+
+    refusals = {a.ctid_trader_account_id: a.refusal for a in accounts}
+    assert refusals == {LIVE_ID: None, DEMO_ID: "timeout", UNKNOWN_ID: None, REFUSED_ID: None}
+
+
+async def test_list_accounts_raises_when_the_host_serving_the_list_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    _route_by_host(monkeypatch, server, dead_hosts=frozenset({"demo.invalid"}))
+    await server.start()
+    try:
+        with pytest.raises(CTraderConnectionError):
+            await _list_accounts(server)
+    finally:
+        await server.stop()
+
+
+@pytest.mark.parametrize(
+    ("rejected", "expected"),
+    [
+        (oa_model.PROTO_OA_APPLICATION_AUTH_REQ, CTraderAuthError),
+        (oa_model.PROTO_OA_TRADER_REQ, CTraderRequestError),
+    ],
+)
+async def test_list_symbols_reports_a_rejection_by_its_code_only(
+    rejected: int,
+    expected: type[Exception],
+) -> None:
+    server = venue()
+    server.on(rejected, lambda _r: _echoing("SOME_REFUSAL"))
+    await server.start()
+    try:
+        with pytest.raises(expected) as info:
+            await _list_symbols(server)
+    finally:
+        await server.stop()
+
+    assert "SOME_REFUSAL" in str(info.value)
+    assert_secret_free(info.value, ACCESS_TOKEN, CLIENT_SECRET, REFRESH_TOKEN)
+
+
+async def test_list_symbols_gives_its_caller_no_warning() -> None:
+    server = venue()
+    logger = RecordingLogger()
+    await server.start()
+    try:
+        await _list_symbols(server, names=["EURUSD"], logger=logger)
+    finally:
+        await server.stop()
+
+    assert logger.warnings() == []
+
+
+async def test_list_symbols_refuses_a_single_str_for_names() -> None:
+    with pytest.raises(TypeError, match="single str"):
+        await discovery.list_symbols(credentials(), TRADER_LOGIN, names="EURUSD")

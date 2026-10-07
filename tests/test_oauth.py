@@ -25,6 +25,7 @@ from nautilus_ctrader.common.errors import (
     CTraderAuthorizationTimeout,
     CTraderTokenExchangeError,
 )
+from tests.secrecy import assert_secret_free
 
 
 def _free_port() -> int:
@@ -55,8 +56,8 @@ def _wait(
     )
 
 
-def _texts(error: BaseException) -> str:
-    """Everything an exception shows: its message, its repr, and its arguments."""
+def _shown(error: BaseException) -> str:
+    """What an exception shows of itself: its message, its repr, and its arguments."""
     return " ".join([str(error), repr(error), *map(repr, error.args)])
 
 
@@ -336,7 +337,7 @@ def test_wait_for_authorization_code_sanitizes_the_error_code() -> None:
     error_code = exc_info.value.error_code
     assert all(ch.isprintable() for ch in error_code)
     assert len(error_code) <= 200
-    assert all(ch.isprintable() for ch in _texts(exc_info.value))
+    assert all(ch.isprintable() for ch in _shown(exc_info.value))
 
 
 def test_the_denied_and_timeout_errors_carry_no_state_or_code() -> None:
@@ -353,8 +354,8 @@ def test_the_denied_and_timeout_errors_carry_no_state_or_code() -> None:
         _wait(_free_port(), 0.1, state="the-secret-state")
 
     for error in (denied.value, timed_out.value):
-        assert "the-secret-state" not in _texts(error)
-    assert "access_denied" not in _texts(denied.value)
+        assert_secret_free(error, "the-secret-state")
+    assert "access_denied" not in _shown(denied.value)
 
 
 def test_wait_for_authorization_code_survives_an_idle_connection() -> None:
@@ -583,14 +584,17 @@ def test_wait_for_authorization_code_raises_os_error_when_the_port_is_taken() ->
 class _StubTokenHandler(http.server.BaseHTTPRequestHandler):
     response_status = 200
     response_body = b"{}"
+    # Declared instead of the body's real length, to cut a response short.
+    content_length: int | None = None
     captured_path: str | None = None
 
     def do_GET(self) -> None:
         type(self).captured_path = self.path
         body = type(self).response_body
+        length = type(self).content_length
         self.send_response(type(self).response_status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(body) if length is None else length))
         self.end_headers()
         self.wfile.write(body)
 
@@ -602,6 +606,7 @@ class _StubTokenHandler(http.server.BaseHTTPRequestHandler):
 def token_url():
     _StubTokenHandler.response_status = 200
     _StubTokenHandler.response_body = b"{}"
+    _StubTokenHandler.content_length = None
     _StubTokenHandler.captured_path = None
     server = http.server.HTTPServer(("127.0.0.1", 0), _StubTokenHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -682,9 +687,13 @@ def test_exchange_code_raises_on_error_code(token_url: str) -> None:
     assert error.error_code == "INVALID_GRANT"
     assert error.description == "code expired"
     assert "INVALID_GRANT" in str(error)
-    texts = _texts(error)
-    for secret in ("csecret", "AT-should-not-appear", "RT-should-not-appear", "the-code-should"):
-        assert secret not in texts
+    assert_secret_free(
+        error,
+        "csecret",
+        "AT-should-not-appear",
+        "RT-should-not-appear",
+        "the-code-should",
+    )
 
 
 def test_exchange_code_raises_on_http_error(token_url: str) -> None:
@@ -695,20 +704,19 @@ def test_exchange_code_raises_on_http_error(token_url: str) -> None:
 
     assert exc_info.value.http_status == 400
     assert "400" in str(exc_info.value)
-    assert "SHOULD_NOT_APPEAR" not in _texts(exc_info.value)
-    assert "csecret" not in _texts(exc_info.value)
+    assert_secret_free(exc_info.value, "SHOULD_NOT_APPEAR", "csecret", "the-code")
 
 
-def test_exchange_code_chains_from_none_on_http_error(token_url: str) -> None:
-    """`HTTPError` carries the full request URL, secret included, in `.url`; chaining from it
-    would put that URL in any traceback."""
+def test_exchange_code_keeps_no_link_to_an_http_error(token_url: str) -> None:
+    """`HTTPError` carries the full request URL, secret included, in `.url`; a cause or a
+    context pointing at it would put that URL in any traceback."""
     _respond(b"{}", status=500)
 
     with pytest.raises(CTraderTokenExchangeError) as exc_info:
         _exchange(token_url)
 
     assert exc_info.value.__cause__ is None
-    assert exc_info.value.__suppress_context__ is True
+    assert exc_info.value.__context__ is None
 
 
 def test_exchange_code_raises_on_connection_failure() -> None:
@@ -719,9 +727,9 @@ def test_exchange_code_raises_on_connection_failure() -> None:
     with pytest.raises(CTraderTokenExchangeError) as exc_info:
         _exchange(f"http://127.0.0.1:{closed_port}/apps/token")
 
-    assert "csecret" not in _texts(exc_info.value)
+    assert_secret_free(exc_info.value, "csecret", "the-code")
     assert exc_info.value.__cause__ is None
-    assert exc_info.value.__suppress_context__ is True
+    assert exc_info.value.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -747,11 +755,9 @@ def test_exchange_code_raises_on_an_unusable_body(token_url: str, body: object) 
     with pytest.raises(CTraderTokenExchangeError) as exc_info:
         _exchange(token_url)
 
-    texts = _texts(exc_info.value)
-    assert "AT" not in texts
-    assert "Injected" not in texts
+    assert_secret_free(exc_info.value, "AT", "Injected", "csecret", "the-code")
     assert exc_info.value.error_code is None
-    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 def test_exchange_code_sanitizes_error_code_and_description(token_url: str) -> None:
@@ -779,7 +785,69 @@ def test_exchange_code_masks_request_values_the_endpoint_echoes(token_url: str) 
     with pytest.raises(CTraderTokenExchangeError) as exc_info:
         _exchange(token_url)
 
-    error = exc_info.value
-    texts = " ".join([_texts(error), error.error_code, error.description])
-    for secret in ("the-code", "csecret", "cid", "AT-echo"):
-        assert secret not in texts
+    assert_secret_free(exc_info.value, "the-code", "csecret", "cid", "AT-echo")
+
+
+def test_exchange_code_masks_url_encoded_echoes_of_request_values(token_url: str) -> None:
+    secret = "se cret/+&="
+    encoded = (urllib.parse.quote_plus(secret), urllib.parse.quote(secret, safe=""))
+    _respond({"errorCode": f"BAD {encoded[0]}", "description": f"saw {encoded[1]}"})
+
+    with pytest.raises(CTraderTokenExchangeError) as exc_info:
+        oauth.exchange_code("cid", secret, "the-code", "http://localhost/cb", token_url=token_url)
+
+    assert_secret_free(exc_info.value, secret, *encoded)
+
+
+def test_exchange_code_wraps_an_undecodable_body_without_keeping_it(token_url: str) -> None:
+    """Decoding fails with a `UnicodeDecodeError`, which holds the whole body."""
+    _respond(b'{"accessToken": "AT-in-the-body", "bad": "' + bytes([0xFF]) + b'"}')
+
+    with pytest.raises(CTraderTokenExchangeError) as exc_info:
+        _exchange(token_url)
+
+    assert_secret_free(exc_info.value, "AT-in-the-body", "csecret", "the-code")
+    assert exc_info.value.__context__ is None
+
+
+def test_exchange_code_wraps_a_truncated_read_without_keeping_the_partial_body(
+    token_url: str,
+) -> None:
+    """`IncompleteRead`, which urllib does not wrap, holds the part of the body that arrived."""
+    _respond({"accessToken": "AT-partial-body", "refreshToken": "RT", "expiresIn": 3600})
+    _StubTokenHandler.content_length = len(_StubTokenHandler.response_body) + 100
+
+    with pytest.raises(CTraderTokenExchangeError) as exc_info:
+        _exchange(token_url)
+
+    assert_secret_free(exc_info.value, "AT-partial-body", "csecret", "the-code")
+    assert exc_info.value.__context__ is None
+
+
+def test_parse_redirect_uri_keeps_no_context_for_a_bad_port() -> None:
+    with pytest.raises(oauth.RedirectUriError) as info:
+        oauth.parse_redirect_uri("http://localhost:99999/callback")
+
+    assert info.value.__context__ is None
+
+
+def test_the_callback_server_prints_nothing_when_a_request_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A request that fails inside its handler must not print `socketserver`'s traceback."""
+    port = _free_port()
+    _break_response_writes(monkeypatch)
+
+    def on_listening() -> None:
+        threading.Thread(
+            target=_get_ignoring_the_broken_response,
+            args=(f"http://127.0.0.1:{port}/callback?code=the-code&state=s",),
+        ).start()
+
+    assert _wait(port, 2.0, on_listening) == "the-code"
+    # The handler thread reports its failure after the code is recorded.
+    time.sleep(0.5)
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert_secret_free(None, "the-code", stderr=captured.err + captured.out)

@@ -363,6 +363,25 @@ async def test_missing_token_expiry_logs_a_warning() -> None:
         await server.stop()
 
 
+async def test_missing_token_expiry_is_not_reported_without_a_refresh_token() -> None:
+    """Nothing could be refreshed without a refresh token, so a missing expiry changes nothing."""
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(
+        server,
+        logger=logger,
+        credentials=credentials(refresh_token=None, token_expires_at=None),
+    )
+    try:
+        await client.connect()
+
+        assert logger.warnings() == []
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_account_details_never_reach_the_log() -> None:
     server = venue()
     await server.start()
@@ -756,14 +775,15 @@ async def test_an_exception_in_the_retry_loop_is_logged_and_the_loop_continues()
 
 def test_credentials_repr_hides_secrets() -> None:
     sample = credentials(
+        client_id="client-id-value",
         client_secret="secret-value",
         access_token="access-value",
         refresh_token="refresh-value",
     )
 
-    text = repr(sample)
+    text = repr(sample) + str(sample)
 
-    for secret in ("secret-value", "access-value", "refresh-value"):
+    for secret in ("client-id-value", "secret-value", "access-value", "refresh-value"):
         assert secret not in text
 
 

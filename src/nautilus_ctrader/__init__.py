@@ -16,7 +16,11 @@ from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderAuthorizationDenied,
     CTraderAuthorizationTimeout,
+    CTraderConnectionError,
     CTraderError,
+    CTraderProtocolError,
+    CTraderRequestError,
+    CTraderTimeoutError,
     CTraderTokenExchangeError,
 )
 from nautilus_ctrader.config import CTraderDataClientConfig, CTraderExecClientConfig
@@ -26,6 +30,7 @@ from nautilus_ctrader.discovery import GrantedAccount, SymbolInfo, list_accounts
 from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.factories import CTraderLiveDataClientFactory, CTraderLiveExecClientFactory
 from nautilus_ctrader.oauth import (
+    RedirectUriError,
     TokenPair,
     build_authorization_url,
     exchange_code,
@@ -50,6 +55,7 @@ __all__ = [
     "CTraderAuthError",
     "CTraderAuthorizationDenied",
     "CTraderAuthorizationTimeout",
+    "CTraderConnectionError",
     "CTraderDataClient",
     "CTraderDataClientConfig",
     "CTraderError",
@@ -58,10 +64,14 @@ __all__ = [
     "CTraderInstrumentProvider",
     "CTraderLiveDataClientFactory",
     "CTraderLiveExecClientFactory",
+    "CTraderProtocolError",
+    "CTraderRequestError",
+    "CTraderTimeoutError",
     "CTraderTokenExchangeError",
     "GrantedAccount",
     "InstrumentLoadError",
     "InstrumentLoadFailure",
+    "RedirectUriError",
     "SymbolInfo",
     "TokenPair",
     "__version__",
