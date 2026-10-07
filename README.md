@@ -179,9 +179,11 @@ tokens the adapter refreshes while it runs, see [docs/market_data.md](docs/marke
 Protobuf message definitions come from Spotware's MIT-licensed
 [openapi-proto-messages](https://github.com/spotware/openapi-proto-messages); the Python
 bindings are generated from them by `scripts/gen_protobuf.py` and committed, so installing
-needs no protoc toolchain. This package does **not** depend on the official
-`ctrader-open-api` SDK at runtime: it is built on Twisted, while NautilusTrader is asyncio,
-and it hard-pins `protobuf==3.20.1`, which conflicts with the rest of a modern stack.
+needs no protoc toolchain. They require protobuf 7.35.1 or newer within 7.x, so the package
+cannot share an environment with a nautilus-trader extra that pins protobuf 5.x.
+This package does **not** depend on the official `ctrader-open-api` SDK at runtime: it is
+built on Twisted, while NautilusTrader is asyncio, and it hard-pins `protobuf==3.20.1`, which
+conflicts with the rest of a modern stack.
 
 [docs/protocol.md](docs/protocol.md) documents the wire protocol in full, marking each fact as
 confirmed against a live connection or still unconfirmed.

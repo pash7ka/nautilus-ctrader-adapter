@@ -473,7 +473,7 @@ def _paired_fields(
     """
     for descriptor, value in original.ListFields():
         name = descriptor.name
-        repeated = descriptor.label == FieldDescriptor.LABEL_REPEATED
+        repeated = descriptor.is_repeated
         if descriptor.type != FieldDescriptor.TYPE_MESSAGE:
             if not repeated:
                 yield original, scrubbed, name, value
@@ -563,10 +563,10 @@ def _scrub_in_place(
         if name in _CLEARED_MESSAGES:
             message.ClearField(name)
         elif descriptor.type == FieldDescriptor.TYPE_MESSAGE:
-            items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+            items = value if descriptor.is_repeated else (value,)
             for item in items:
                 _scrub_in_place(item, ids, shift_ms, clean)
-        elif descriptor.label == FieldDescriptor.LABEL_REPEATED:
+        elif descriptor.is_repeated:
             if name in _ACCOUNT_ID_LISTS:
                 # Cut to the one fake id: how many accounts the owner has is theirs to tell.
                 message.ClearField(name)
@@ -1081,7 +1081,7 @@ def _nested(message: Message, type_name: str) -> Iterable[Message]:
         yield message
     for descriptor, value in message.ListFields():
         if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
-            items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+            items = value if descriptor.is_repeated else (value,)
             for item in items:
                 yield from _nested(item, type_name)
 
@@ -1089,7 +1089,7 @@ def _nested(message: Message, type_name: str) -> Iterable[Message]:
 def _strings(message: Message) -> Iterable[str]:
     """Every text field of `message`, at any depth."""
     for descriptor, value in message.ListFields():
-        items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+        items = value if descriptor.is_repeated else (value,)
         if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
             for item in items:
                 yield from _strings(item)
@@ -1144,7 +1144,7 @@ def _holds_a_real_account_id(message: Message) -> bool:
     """Whether any account id in `message` is other than the fake one scrubbing leaves."""
     fake = record_fixtures.FAKE_ACCOUNT_ID
     for descriptor, value in message.ListFields():
-        items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+        items = value if descriptor.is_repeated else (value,)
         if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
             real = any(_holds_a_real_account_id(item) for item in items)
         elif descriptor.name == "ctidTraderAccountId" or descriptor.name in _ACCOUNT_ID_LISTS:
@@ -1227,14 +1227,10 @@ def _position_ids(message: Message) -> set[int]:
     found: set[int] = set()
     for descriptor, value in message.ListFields():
         if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
-            items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+            items = value if descriptor.is_repeated else (value,)
             for item in items:
                 found |= _position_ids(item)
-        elif (
-            descriptor.name == "positionId"
-            and descriptor.label != FieldDescriptor.LABEL_REPEATED
-            and value > 0
-        ):
+        elif descriptor.name == "positionId" and not descriptor.is_repeated and value > 0:
             found.add(value)
     return found
 

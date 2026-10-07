@@ -9,9 +9,10 @@ exactly those lines to package-absolute imports, and refuses to finish if the nu
 differs from the number the schema declares - a change in protoc's output format must stop
 generation, not ship broken bindings.
 
-The toolchain version matters too. Protobuf refuses generated code newer than the runtime,
-and nautilus-trader pins protobuf==5.29.6 under its `ib` extra, so `grpcio-tools` is pinned
-to the 1.68 line in pyproject.toml. This script refuses to run against anything else.
+The toolchain version matters too. The bundled protoc of the pinned `grpcio-tools` stamps
+its protobuf version into the generated files, and protobuf refuses to load generated code
+newer than the runtime. This script refuses to finish if the stamp is newer than the
+`protobuf` floor in pyproject.toml - raise the floor with the pin.
 """
 
 from __future__ import annotations
@@ -19,29 +20,47 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MESSAGES_DIR = ROOT / "src" / "nautilus_ctrader" / "messages"
 PACKAGE = "nautilus_ctrader.messages"
-# Changes together with the grpcio-tools pin in pyproject.toml.
-REQUIRED_PROTOBUF_MAJOR_MINOR = (5, 29)
 
 _PROTO_IMPORT = re.compile(r'^import "(OpenApi\w+)\.proto";', re.MULTILINE)
 _BARE_PYTHON_IMPORT = re.compile(r"^import (OpenApi\w+_pb2) as (\w+)$", re.MULTILINE)
+_RUNTIME_CHECK = re.compile(
+    r"ValidateProtobufRuntimeVersion\(\s*_runtime_version\.Domain\.PUBLIC,\s*(\d+),\s*(\d+),\s*(\d+),"
+)
+_PROTOBUF_REQUIREMENT = re.compile(r"protobuf>=([\d.]+),<(\d+)")
 
 
-def _check_toolchain() -> str | None:
-    from google.protobuf import __version__ as runtime_version
+def generated_version(generated: Path) -> tuple[int, int, int] | None:
+    """The protobuf version a generated module requires of the runtime, or None if unreadable."""
+    found = _RUNTIME_CHECK.search(generated.read_text(encoding="utf-8"))
+    return tuple(int(part) for part in found.groups()) if found else None
 
-    parts = tuple(int(p) for p in runtime_version.split(".")[:2])
-    if parts != REQUIRED_PROTOBUF_MAJOR_MINOR:
-        wanted = ".".join(str(p) for p in REQUIRED_PROTOBUF_MAJOR_MINOR)
-        return (
-            f"protobuf runtime is {runtime_version}, expected {wanted}.x. "
-            "Generated code must not be newer than the runtime any user will have; "
-            "check the grpcio-tools pin in pyproject.toml."
-        )
+
+def declared_protobuf() -> tuple[tuple[int, ...], int]:
+    """The `protobuf` floor and major-version ceiling (exclusive) declared in pyproject.toml."""
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    for requirement in pyproject["project"]["dependencies"]:
+        found = _PROTOBUF_REQUIREMENT.fullmatch(requirement)
+        if found:
+            floor, ceiling = found.groups()
+            return tuple(int(part) for part in floor.split(".")), int(ceiling)
+    raise ValueError("pyproject.toml declares no `protobuf>=X.Y.Z,<N` requirement")
+
+
+def _check_versions() -> str | None:
+    floor, _ = declared_protobuf()
+    for generated in sorted(MESSAGES_DIR.glob("*_pb2.py")):
+        version = generated_version(generated)
+        if version is None:
+            return f"{generated.name}: no runtime version check; protoc's output may have changed"
+        if version > floor:
+            wanted = ".".join(str(part) for part in version)
+            return f"{generated.name} requires protobuf {wanted}; raise the floor in pyproject.toml"
     return None
 
 
@@ -61,11 +80,6 @@ def _rewrite_imports() -> int:
 
 
 def main() -> int:
-    problem = _check_toolchain()
-    if problem:
-        print(problem, file=sys.stderr)
-        return 1
-
     protos = sorted(MESSAGES_DIR.glob("*.proto"))
     if not protos:
         print(f"no .proto files found in {MESSAGES_DIR}", file=sys.stderr)
@@ -94,6 +108,11 @@ def main() -> int:
         )
         return 1
     print(f"rewrote {rewritten} import(s) to {PACKAGE}")
+
+    problem = _check_versions()
+    if problem:
+        print(problem, file=sys.stderr)
+        return 1
     return 0
 
 

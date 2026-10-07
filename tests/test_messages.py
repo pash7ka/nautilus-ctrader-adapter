@@ -1,9 +1,19 @@
 """The vendored schema generates importable bindings with the payload types we rely on."""
 
+import importlib.util
+import pathlib
+import sys
+
 from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiCommonModelMessages_pb2 as common_model
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
+
+_SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "gen_protobuf.py"
+_SPEC = importlib.util.spec_from_file_location("gen_protobuf", _SCRIPT_PATH)
+gen_protobuf = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = gen_protobuf
+_SPEC.loader.exec_module(gen_protobuf)
 
 
 def test_envelope_round_trips() -> None:
@@ -37,3 +47,20 @@ def test_error_response_carries_retry_after() -> None:
     # which is one reason bindings are generated here rather than imported.
     error = oa.ProtoOAErrorRes(errorCode="BLOCKED_PAYLOAD_TYPE", retryAfter=7)
     assert oa.ProtoOAErrorRes.FromString(error.SerializeToString()).retryAfter == 7
+
+
+def test_protobuf_floor_covers_every_generated_module() -> None:
+    floor, ceiling = gen_protobuf.declared_protobuf()
+    generated = sorted(gen_protobuf.MESSAGES_DIR.glob("*_pb2.py"))
+    assert generated
+    for path in generated:
+        version = gen_protobuf.generated_version(path)
+        assert version is not None, path.name
+        assert version <= floor, path.name
+    # Policy, not a protobuf rule: a new major may drop APIs, as 7 dropped FieldDescriptor.label.
+    assert ceiling == floor[0] + 1
+
+
+def test_generator_refuses_a_floor_older_than_the_generated_code(monkeypatch) -> None:
+    monkeypatch.setattr(gen_protobuf, "declared_protobuf", lambda: ((7, 0, 0), 8))
+    assert "raise the floor" in gen_protobuf._check_versions()
