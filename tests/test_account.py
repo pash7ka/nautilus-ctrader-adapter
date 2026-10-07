@@ -207,6 +207,74 @@ async def test_auto_refreshes_a_rejected_token_once_and_notifies_listeners() -> 
         await server.stop()
 
 
+async def test_a_refresh_reply_that_misses_its_timeout_at_start_up_is_adopted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The refresh token is spent once the request reaches the venue, so dropping the late
+    # reply with the pre-connection would leave no working pair at all.
+    monkeypatch.setattr(account_module, "DEFAULT_REQUEST_TIMEOUT_SECS", 0.1)
+    server = venue()
+    server.on(
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda r: (
+            oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID")
+            if r.accessToken == "access-token"
+            else account_list(is_live=True)
+        ),
+    )
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOARefreshTokenRes(
+            accessToken="new-access",
+            tokenType="bearer",
+            expiresIn=3600,
+            refreshToken="new-refresh",
+        ),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    notified = []
+    client.add_token_listener(lambda a, r, e: notified.append((a, r)))
+    connecting = asyncio.create_task(client.connect())
+    try:
+        await held.arrived.wait()
+        # Well past the request's own timeout.
+        await asyncio.sleep(0.3)
+        await held.stop_holding()
+        await asyncio.wait_for(connecting, 5.0)
+
+        assert notified == [("new-access", "new-refresh")]
+        assert received(server, oa.ProtoOAAccountAuthReq)[0].accessToken == "new-access"
+        assert any("late token refresh reply" in m for m in logger.warnings())
+        assert not any("new-access" in m or "new-refresh" in m for _, m in logger.lines)
+    finally:
+        connecting.cancel()
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_start_up_refresh_that_is_never_answered_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(account_module, "DEFAULT_REQUEST_TIMEOUT_SECS", 0.1)
+    monkeypatch.setattr(account_module, "LATE_REFRESH_WAIT_SECS", 0.1)
+    server = venue()
+    server.on(
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID"),
+    )
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    client = account_client(server)
+    try:
+        with pytest.raises(CTraderTimeoutError):
+            await client.connect()
+    finally:
+        await server.stop()
+
+
 async def test_auto_without_a_refresh_token_fails_on_a_rejected_token() -> None:
     server = venue()
     server.on(

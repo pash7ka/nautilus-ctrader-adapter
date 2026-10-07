@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -829,7 +830,8 @@ class CTraderDataClient(LiveMarketDataClient):
         served = await self._page_trendbars(
             instrument.info["symbol_id"],
             period,
-            start_secs=None if request.start is None else int(request.start.timestamp()),
+            # Rounded up, so a fractional start never lets in the bar opening just before it.
+            start_secs=None if request.start is None else math.ceil(request.start.timestamp()),
             end_secs=now_secs if request.end is None else int(request.end.timestamp()),
             limit=request.limit or None,
             closed_secs=now_secs,
@@ -838,6 +840,9 @@ class CTraderDataClient(LiveMarketDataClient):
         closed = [raw for raw in served if raw.boundary_secs + period_secs <= now_secs]
         if request.limit:
             closed = closed[-request.limit :]
+        elif request.start is None:
+            # One page of the newest bars, although a page asks the venue for two more.
+            closed = closed[-self._page_size() :]
 
         sub = self._bars.get(bar_type)
         if sub is not None and closed:
@@ -867,18 +872,21 @@ class CTraderDataClient(LiveMarketDataClient):
         limit: int | None,
         closed_secs: int,
     ) -> list[RawBar]:
-        """Bars opening before `end_secs`, ascending, paging backwards from it.
+        """Bars opening in `[start_secs, end_secs)`, ascending, paging backwards from the end.
 
         `limit` counts only bars closed by `closed_secs`, so the forming bar history also
         serves never takes a closed bar's place. With neither a `start_secs` nor a `limit`
         exactly one page is asked for: the caller wanted the most recent bars, not the whole
         history.
 
+        The venue counts a page's bars back from its `toTimestamp` without stopping at its
+        `fromTimestamp`, so a page can reach past `start_secs`; those bars are dropped here.
+
         Only an empty page proves a window holds nothing: whenever one comes back non-empty,
         the next window ends at the oldest boundary it served rather than at the start of the
         window asked for. A venue that cut the page short - whether it says so through
-        `hasMore` or not - therefore skips nothing, and a full page changes nothing, since its
-        oldest boundary is the window's own start.
+        `hasMore` or not - therefore skips nothing, and a full page changes nothing, since it
+        reaches back to the window's own start.
         """
         period_secs = PERIOD_SECS[period]
         span = self._page_size() * period_secs
@@ -893,11 +901,17 @@ class CTraderDataClient(LiveMarketDataClient):
                 period,
                 from_secs=from_secs,
                 to_secs=to_secs,
-                count=self._page_size() + 1,
+                # Two more than the page: one for the bar the venue repeats at `toTimestamp` or
+                # the forming bar, and one for an answer a bar short of `count`, which the venue
+                # gives at times.
+                count=self._page_size() + 2,
             )
             for raw in page:
-                # An inclusive `toTimestamp` would otherwise carry a bar past the end in.
-                if raw.boundary_secs < end_secs:
+                # The venue includes a bar opening on `toTimestamp`, and serves bars before
+                # `fromTimestamp`.
+                if raw.boundary_secs < end_secs and (
+                    start_secs is None or raw.boundary_secs >= start_secs
+                ):
                     bars.setdefault(raw.boundary_secs, raw)
             oldest = min((raw.boundary_secs for raw in page), default=None)
             if oldest is None:
@@ -940,8 +954,8 @@ class CTraderDataClient(LiveMarketDataClient):
             period,
             from_secs=boundary_secs,
             to_secs=boundary_secs + period_secs,
-            # Two for a one-bar window: the venue counts `count` back from `toTimestamp`, so
-            # asking for one could hand back a bar at the far edge instead of the one wanted.
+            # Two for a one-bar window: the venue counts `count` back from `toTimestamp` and
+            # includes a bar opening on it, so asking for one would hand back the next bar.
             count=2,
         )
         return next((raw for raw in bars if raw.boundary_secs == boundary_secs), None)
@@ -973,13 +987,16 @@ class CTraderDataClient(LiveMarketDataClient):
         session = self._session
         if session is None:
             raise CTraderConnectionError("data client is not connected")
-        # TODO(verify): whether fromTimestamp and toTimestamp are inclusive. An inclusive
-        # `toTimestamp` only repeats a boundary the caller dedupes, but an *exclusive*
-        # `fromTimestamp` would lose the bar at every window's start, so this is the
-        # assumption to check first. The venue's caps on `count` and on a window's span are
-        # unknown but harmless here: a live run served 5000 bars for one request and
-        # truncated a 400-day window without an error, and both look like a page that did
-        # not reach its window's start, which the paging continues from.
+        # Confirmed live: the venue serves up to `count` bars counted back from `toTimestamp`
+        # by open time, including a bar opening on it, and `fromTimestamp` did not bound the
+        # answer - a one-minute window came back with ten bars. The window's start is still
+        # sent: the schema makes it optional, but leaving it out is untested, and a venue that
+        # did honour it would only serve less per page, which the paging continues from.
+        # TODO(verify): whether `fromTimestamp` bounds the answer in any case the live probe
+        # did not cover; it had plenty of history behind its window. Nothing relies on it.
+        # The venue's caps on `count` and on a window's span are unknown but harmless here: a
+        # live run served 5000 bars for one request and truncated a 400-day window without an
+        # error, and both look like a page that did not reach its window's start.
         response = await session.request(
             oa.ProtoOAGetTrendbarsReq(
                 ctidTraderAccountId=self._account.account_id,

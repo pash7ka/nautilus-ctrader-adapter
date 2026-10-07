@@ -9,10 +9,10 @@ refuses any payload class outside `READ_ONLY_REQUESTS`; that set holds authentic
 history and subscription requests only, and no order request type is imported or named
 anywhere in this module. Subscriptions taken here are released before the connection closes.
 
-One item settles whether a trendbar window's `fromTimestamp` and `toTimestamp` include a bar
-that opens exactly on them. It asks two consecutive closed M1 bars of the first symbol for
-exact one-minute windows, plus two controls: a window just inside both edges, which must serve
-neither bar, and one just outside, which must serve both.
+One item checks how history answers a trendbar window: with up to `count` bars counted back
+from `toTimestamp` by open time, a bar opening exactly on it included, and `fromTimestamp` not
+bounding the answer. It asks for the exact one-minute window of two consecutive closed M1 bars
+of the first symbol, plus the same window narrowed and widened by 1 ms at each end.
 
 Run from the repository root, while the symbols' market is open:
 
@@ -137,7 +137,8 @@ _WIDE_WINDOW_SECS = 400 * 86_400
 # Item 8: the windows searched for two consecutive closed M1 bars, narrowest first. The wide one
 # is for a closed market, where the newest bars are days old.
 _EDGE_SEARCH_WINDOWS = ((1800, "the last 30 minutes"), (3 * 86_400, "the last 3 days"))
-# Item 8: a one-minute window holds at most two bars, so this never limits what is served.
+# Item 8: more than a one-minute window holds, so an answer that reaches back past the window's
+# start shows that `fromTimestamp` does not bound it.
 _EDGE_PROBE_COUNT = 10
 
 _MAX_LISTED_DETAILS = 8
@@ -223,14 +224,16 @@ class WindowEdgeObservation:
     """What history served for exact-edge windows around one closed M1 bar.
 
     `bar_secs` is the open time of the earlier bar of the pair, `None` when the search found
-    no pair. The edge window is `[bar, bar + 1 min]`; the control window is the same one
-    narrowed by 1 ms at each end, the positive control widened by 1 ms at each end.
-    `error_code` is the venue's refusal of the search, the `*_error` fields of a control.
+    no pair, and `searched_open_secs` what the search that found it served. The edge window is
+    `[bar, bar + 1 min]`; the control window is the same one narrowed by 1 ms at each end, the
+    positive control widened by 1 ms at each end. `error_code` is the venue's refusal of the
+    search, the `*_error` fields of a control.
     """
 
     symbol: str
     searched: str
     bar_secs: int | None = None
+    searched_open_secs: tuple[int, ...] = ()
     edge_open_secs: tuple[int, ...] = ()
     control_open_secs: tuple[int, ...] = ()
     control_error: str | None = None
@@ -531,12 +534,16 @@ def find_consecutive_closed_pair(open_secs: Sequence[int]) -> int | None:
 
 
 def decide_window_edges(observation: WindowEdgeObservation) -> Decision:
-    """Whether `fromTimestamp` and `toTimestamp` each include a bar opening exactly on them.
+    """Whether history answers a window with `count` bars counted back from `toTimestamp`.
 
-    Two controls keep the verdicts honest. The negative one sits 1 ms inside both edges and must
-    serve nothing if the venue compares the edges to the bar's open time. The positive one sits
-    1 ms outside both edges and must serve both bars; without that, an empty answer to the exact
-    window could just be a venue that serves nothing for a window this narrow.
+    That is the behaviour confirmed live: bars are selected by open time, one opening exactly
+    on `toTimestamp` is served, and `fromTimestamp` does not bound the answer. Each window's
+    answer is compared with the newest `count` bars at or before its `toTimestamp` among every
+    bar the run saw, so a bar after `toTimestamp`, a bar skipped, or fewer bars than `count`
+    while older ones exist is `DIFFERS` - except an answer missing only the oldest bar, since
+    `count = N` answered with `N - 1` bars has been seen before and is noted instead. A refused
+    control only withdraws its own evidence. If no answer reaches back past its
+    `fromTimestamp`, nothing shows the venue ignores it, and the verdict is `UNKNOWN`.
     """
     if observation.bar_secs is None:
         reason = observation.error_code or "the venue served no such pair"
@@ -546,45 +553,64 @@ def decide_window_edges(observation: WindowEdgeObservation) -> Decision:
         )
     first = observation.bar_secs
     second = first + _M1_SECS
-    served = observation.edge_open_secs
-    from_inclusive = first in served
-    to_inclusive = second in served
+    windows = (
+        ("exact window", "exact window", 0, observation.edge_open_secs, None),
+        (
+            "control",
+            "control, 1 ms inside both edges",
+            1,
+            observation.control_open_secs,
+            observation.control_error,
+        ),
+        (
+            "positive control",
+            "positive control, 1 ms outside both edges",
+            -1,
+            observation.positive_open_secs,
+            observation.positive_error,
+        ),
+    )
+    seen = set(observation.searched_open_secs)
+    for _, _, _, served, _ in windows:
+        seen.update(served)
     detail = [
-        f"{observation.symbol} M1, window {_utc_stamp(first)} to {_utc_stamp(second)} exactly: "
-        f"{_opens_text(served)}",
-        f"fromTimestamp: {'inclusive' if from_inclusive else 'exclusive'}, the bar opening "
-        f"at {_utc_stamp(first)} is {'served' if from_inclusive else 'not served'}",
-        f"toTimestamp: {'inclusive' if to_inclusive else 'exclusive'}, the bar opening "
-        f"at {_utc_stamp(second)} is {'served' if to_inclusive else 'not served'}",
-        (
-            f"control refused: {observation.control_error}"
-            if observation.control_error
-            else "control, 1 ms inside both edges: " + _opens_text(observation.control_open_secs)
-        ),
-        (
-            f"positive control refused: {observation.positive_error}"
-            if observation.positive_error
-            else "positive control, 1 ms outside both edges: "
-            + _opens_text(observation.positive_open_secs)
-        ),
+        f"{observation.symbol} M1, count={_EDGE_PROBE_COUNT}, exact window "
+        f"{_utc_stamp(first)} to {_utc_stamp(second)}",
     ]
-    if not {first, second} <= set(observation.positive_open_secs):
-        detail.append("the venue did not return a window that surely holds both bars")
-        return UNKNOWN, tuple(detail)
     anomalies = []
-    if observation.control_open_secs:
-        anomalies.append(
-            f"the control window returned {_opens_text(observation.control_open_secs)}, so the "
-            "venue compares the window to something other than the bar's open time",
-        )
-    outside = sorted(set(served) - {first, second})
-    if outside:
-        anomalies.append(
-            f"the exact window returned {_opens_text(outside)}, outside its edges, so it does "
-            "not select bars by open time",
-        )
+    reaches_back = False
+    for name, label, inset_ms, served, error in windows:
+        if error:
+            detail.append(f"{name} refused: {error}")
+            continue
+        detail.append(f"{label}: {_opens_text(served)}")
+        from_ms = first * 1000 + inset_ms
+        to_ms = second * 1000 - inset_ms
+        expected = sorted(b for b in seen if b * 1000 <= to_ms)[-_EDGE_PROBE_COUNT:]
+        answered = sorted(set(served))
+        if len(expected) == _EDGE_PROBE_COUNT and answered == expected[1:]:
+            detail.append(
+                f"the {name} returned one bar fewer than count, missing only the oldest; "
+                "answers of count - 1 bars are a known habit of the venue",
+            )
+        elif answered != expected:
+            anomalies.append(
+                f"the {name} returned {_opens_text(served)}, where {_EDGE_PROBE_COUNT} bars "
+                f"counted back from its toTimestamp by open time are {_opens_text(expected)}",
+            )
+        reaches_back = reaches_back or any(b * 1000 < from_ms for b in served)
     if anomalies:
         return DIFFERS, (*detail, *anomalies)
+    if not reaches_back:
+        detail.append(
+            "no answer reached back past its fromTimestamp, so whether fromTimestamp bounds the "
+            "answer or history held no older bar cannot be told",
+        )
+        return UNKNOWN, tuple(detail)
+    detail.append(
+        "answers count bars back from toTimestamp by open time, inclusive; fromTimestamp does "
+        "not bound the answer",
+    )
     return OK, tuple(detail)
 
 
@@ -653,7 +679,7 @@ class Verifier:
         )
         await self._item(
             "8",
-            "trendbar window edges: are fromTimestamp and toTimestamp inclusive",
+            "trendbar window: count bars back from toTimestamp, fromTimestamp not bounding",
             self._probe_window_edges,
         )
         await self._run_spot_window()
@@ -857,6 +883,7 @@ class Verifier:
         name, symbol_id = first
         end_secs = int(time.time()) // _M1_SECS * _M1_SECS
         bar_secs: int | None = None
+        searched_opens: tuple[int, ...] = ()
         error_code: str | None = None
         searched = ""
         for window_secs, label in _EDGE_SEARCH_WINDOWS:
@@ -874,7 +901,8 @@ class Verifier:
                 error_code = e.error_code
                 continue
             error_code = None
-            bar_secs = find_consecutive_closed_pair(_open_secs(response))
+            searched_opens = _open_secs(response)
+            bar_secs = find_consecutive_closed_pair(searched_opens)
             if bar_secs is not None:
                 break
         if bar_secs is None:
@@ -904,6 +932,7 @@ class Verifier:
                 name,
                 searched,
                 bar_secs=bar_secs,
+                searched_open_secs=searched_opens,
                 edge_open_secs=_open_secs(edge),
                 control_open_secs=control,
                 control_error=control_error,

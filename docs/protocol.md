@@ -113,6 +113,39 @@ can be persisted; if that callback raises, the failure is logged at ERROR (the n
 usable for the rest of the session, but only in memory — losing them here means the next
 process restart falls back to the old, now-invalid refresh token).
 
+How tokens behave was checked on a live connection, on the account's own (live) host, on
+2026-10-07:
+
+- **A refresh works over a connection authenticated at application level only** (confirmed).
+  Every refresh went through `ProtoOARefreshTokenReq` on a connection that had passed
+  `ProtoOAApplicationAuthReq` and nothing more — the state the reactive refresh runs in, since
+  account authentication has just been rejected.
+- **A refresh token is single-use** (confirmed). Sending one that was already used is refused
+  with `CH_ACCESS_TOKEN_INVALID`, and that refused replay revoked no other grant. So once a
+  refresh request reaches the venue, the old refresh token stops working, and its reply must
+  not be lost. This adapter adopts a reply that arrives after its request timed out, unless a
+  newer pair has been taken since that request was sent. A refresh made while a connection is
+  being brought up — on the short pre-connection that resolves the account's host, or after
+  account authentication was rejected — keeps that connection open up to ten seconds more for
+  the reply, and gives up at once if the connection is lost. Within the first `connect()`, or a
+  later user's wait to join, that time counts against the account's `connect_timeout_secs`; a
+  value under about 15 seconds (the 5-second request timeout plus this wait) cuts the wait
+  short, and a pair arriving after that is lost. A bring-up the session runs on its own after a
+  connection loss has no such bound, and there the wait delays the reconnect backoff by up to
+  ten seconds.
+- **A refreshed access token expires 30 days after it is issued** (confirmed).
+- **Each authorization is an independent grant** (confirmed). Authorizing the same application
+  twice for one cTrader ID gave two token pairs; neither the second authorization nor a
+  refresh of the second pair affected the first pair's access or refresh token.
+- **One access token can authenticate the same account on two connections at once**
+  (confirmed). Neither connection received a disconnect or token-invalidation event within
+  15 seconds, and a trader read succeeded on each.
+
+**Unconfirmed**: a refresh for a live account's token over the short pre-connection to the
+demo host that resolves the account's host (Section 1). This adapter refreshes there at
+start-up when the account list rejects the access token it was given; every refresh confirmed
+so far went through the account's own host.
+
 **Authentication lost on a live socket.** The venue can drop authentication without closing
 the connection, through three events:
 
@@ -255,11 +288,20 @@ milliseconds and a `count`, and pages backwards: `count` is counted back from `t
   the period to find a boundary is therefore correct up to H1 and wrong from H4 up; take the
   open time the venue sends instead, and derive a boundary from an observed bar rather than
   from the epoch.
+- **`fromTimestamp` did not bound the answer** (confirmed for a one-minute M1 window with
+  `count = 10`). The venue served up to `count` bars counted back from `toTimestamp`, selecting
+  by open time and including a bar that opens exactly on `toTimestamp`. Asked with
+  `count = 10` for the one-minute M1 window from 11:33:00.000 to 11:34:00.000, the venue
+  served ten bars opening 11:25 to 11:34. The same window narrowed by 1 ms at each end was
+  served bars opening 11:24 to 11:33, and widened by 1 ms at each end, 11:25 to 11:34 again.
+  So a page reaches back past its window's start whenever `count` allows: this adapter drops
+  every bar opening before the start a request asked for, and every bar opening at or after
+  its end, and de-duplicates the boundary each page repeats at its `toTimestamp`.
 
-**Unconfirmed**: whether `fromTimestamp` and `toTimestamp` are inclusive. The paging absorbs
-an inclusive `toTimestamp` harmlessly, since a repeated boundary is de-duplicated. An
-*exclusive* `fromTimestamp` would not be absorbed — the bar at each window's start would be
-lost on every page — which is why this is the first thing to check on a live connection.
+**Unconfirmed**: whether `fromTimestamp` bounds the answer in any case the probe did not
+cover; its window had plenty of history behind it. This adapter still sends the window's
+start, which the schema makes optional, and relies on it for nothing: a venue that honoured it
+would only serve less per page, and the paging continues from the oldest bar a page served.
 
 **Unconfirmed**: the venue's maximum `count` per request, and whether a maximum span exists at
 all. Neither limit has been reached: 5000 was served in full, and the 400-day window was

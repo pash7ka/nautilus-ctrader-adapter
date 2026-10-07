@@ -3,15 +3,22 @@
 import asyncio
 import struct
 import time
+from collections.abc import Callable
 
 import pytest
 from nautilus_trader.common.component import Logger
 
-from nautilus_ctrader.common.errors import CTraderAuthError, CTraderConnectionError
+from nautilus_ctrader.common.errors import (
+    CTraderAuthError,
+    CTraderConnectionError,
+    CTraderRequestError,
+    CTraderTimeoutError,
+)
 from nautilus_ctrader.common.session import CTraderSession, SessionState
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
+from tests.account_venue import HeldReplies
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
@@ -330,6 +337,355 @@ async def test_a_late_refresh_reply_never_reaches_the_event_handler() -> None:
         )
 
         assert not any(isinstance(m, oa.ProtoOARefreshTokenRes) for m in seen)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+def _pair_reply(access: str, refresh: str) -> Callable[[object], oa.ProtoOARefreshTokenRes]:
+    return lambda _request: oa.ProtoOARefreshTokenRes(
+        accessToken=access,
+        tokenType="bearer",
+        expiresIn=2_592_000,
+        refreshToken=refresh,
+    )
+
+
+_TOKENS = ("old-access", "old-refresh", "late-access", "late-refresh", "new-access", "new-refresh")
+
+
+def _lines_with_a_token(logger: RecordingLogger) -> list[str]:
+    return [message for _, message in logger.lines if any(t in message for t in _TOKENS)]
+
+
+async def test_a_refresh_reply_that_misses_its_timeout_is_adopted() -> None:
+    # A refresh token is single-use, so once the request reached the venue the late reply holds
+    # the only pair that still works.
+    server = _server()
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        _pair_reply("late-access", "late-refresh"),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(
+        server,
+        logger,
+        request_timeout_secs=0.2,
+        backoff_base_secs=0.05,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        with pytest.raises(CTraderTimeoutError):
+            await session.refresh_tokens()
+
+        before = time.time()
+        await held.stop_holding()
+        await wait_until(lambda: bool(persisted), description="the late pair being adopted")
+        # Put to use at once, as after any proactive refresh.
+        await wait_until(
+            lambda: _account_auths(server)[-1].accessToken == "late-access",
+            description="re-authentication with the adopted token",
+        )
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
+        assert persisted[0][2] >= before + 2_592_000
+        assert any("late token refresh reply" in m for m in logger.warnings())
+        await session.refresh_tokens()
+        assert _refreshes(server)[-1].refreshToken == "late-refresh"
+        assert not _lines_with_a_token(logger)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_refresh_reply_dispatched_as_its_request_times_out_is_adopted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On a timeout the reply can reach the event path before the requester resumes, while the
+    # request is still on its way out of `refresh_tokens()`.
+    server = _server()
+    await server.start()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(server, on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)))
+    send = session._connection.request
+
+    async def reply_then_time_out(payload, **kwargs):
+        if isinstance(payload, oa.ProtoOARefreshTokenReq):
+            session._on_event(_pair_reply("late-access", "late-refresh")(payload))
+            raise CTraderTimeoutError("no response in time")
+        return await send(payload, **kwargs)
+
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        monkeypatch.setattr(session._connection, "request", reply_then_time_out)
+
+        with pytest.raises(CTraderTimeoutError):
+            await session.refresh_tokens()
+
+        assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_refusal_after_the_earlier_reply_was_adopted_leaves_nothing_awaited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first refresh times out; while the second is in flight the first one's reply is
+    # adopted; then the second is refused. Nothing is outstanding any more.
+    server = _server()
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(
+        server,
+        logger,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    send = session._connection.request
+    attempts = 0
+
+    async def time_out_then_adopt_and_refuse(payload, **kwargs):
+        nonlocal attempts
+        if not isinstance(payload, oa.ProtoOARefreshTokenReq):
+            return await send(payload, **kwargs)
+        attempts += 1
+        if attempts == 1:
+            raise CTraderTimeoutError("no response in time")
+        session._on_event(_pair_reply("late-access", "late-refresh")(payload))
+        raise CTraderRequestError("CH_ACCESS_TOKEN_INVALID")
+
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        monkeypatch.setattr(session._connection, "request", time_out_then_adopt_and_refuse)
+        with pytest.raises(CTraderTimeoutError):
+            await session.refresh_tokens()
+        with pytest.raises(CTraderAuthError):
+            await session.refresh_tokens()
+
+        assert not session._awaiting_refresh_reply
+        # So a stray reply now is not adopted.
+        session._on_event(_pair_reply("stray-access", "stray-refresh")(None))
+        assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_refused_refresh_leaves_an_earlier_unanswered_one_adoptable() -> None:
+    # Both carry the same refresh token, so the refusal can be the venue saying the earlier
+    # request already spent it - whose reply is then the only one worth having.
+    server = _server()
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        _pair_reply("late-access", "late-refresh"),
+    )
+    await server.start()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(
+        server,
+        request_timeout_secs=0.2,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        with pytest.raises(CTraderTimeoutError):
+            await session.refresh_tokens()
+        pending = held.pending
+        held.pending = []
+        server.on(
+            oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+            lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID"),
+        )
+        with pytest.raises(CTraderAuthError):
+            await session.refresh_tokens()
+
+        for client_msg_id, request in pending:
+            await server.push(
+                _pair_reply("late-access", "late-refresh")(request),
+                client_msg_id=client_msg_id,
+            )
+        await wait_until(lambda: bool(persisted), description="the late pair being adopted")
+
+        assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_late_refresh_reply_after_a_newer_pair_is_ignored() -> None:
+    # The venue keeps only the newest grant's chain, so a pair taken since the late reply's
+    # request was sent is the one to keep.
+    server = _server()
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        _pair_reply("late-access", "late-refresh"),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(
+        server,
+        logger,
+        request_timeout_secs=0.2,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        with pytest.raises(CTraderTimeoutError):
+            await session.refresh_tokens()
+        server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, _pair_reply("new-access", "new-refresh"))
+        await session.refresh_tokens()
+
+        await held.release()
+        await wait_until(
+            lambda: any(
+                level == "debug" and "late token refresh reply" in message
+                for level, message in logger.lines
+            ),
+            description="the late reply being ignored",
+        )
+
+        assert [(a, r) for a, r, _ in persisted] == [("new-access", "new-refresh")]
+        await session.refresh_tokens()
+        assert _refreshes(server)[-1].refreshToken == "new-refresh"
+        assert not _lines_with_a_token(logger)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+def _server_rejecting(access_token: str) -> FakeCTraderServer:
+    """A venue that refuses account authentication with `access_token` as expired."""
+    server = _server()
+    server.on(
+        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
+        lambda request: (
+            oa.ProtoOAErrorRes(errorCode="OA_AUTH_TOKEN_EXPIRED", description="expired")
+            if request.accessToken == access_token
+            else oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID)
+        ),
+    )
+    return server
+
+
+async def test_a_late_refresh_reply_during_bring_up_is_adopted_and_the_bring_up_goes_on() -> None:
+    server = _server_rejecting("old-access")
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        _pair_reply("late-access", "late-refresh"),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    # A reconnect would only come after the backoff, far beyond this test.
+    session = _session(
+        server,
+        logger,
+        request_timeout_secs=0.2,
+        backoff_base_secs=30.0,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    try:
+        await session.start()
+        await held.arrived.wait()
+        # Well past the refresh request's own timeout.
+        await asyncio.sleep(0.4)
+        await held.stop_holding()
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert server.connection_count == 1
+        assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
+        assert [m.accessToken for m in _account_auths(server)] == ["old-access", "late-access"]
+        assert any("late token refresh reply" in m for m in logger.warnings())
+        server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, _pair_reply("new-access", "new-refresh"))
+        await session.refresh_tokens()
+        assert _refreshes(server)[-1].refreshToken == "late-refresh"
+        assert not _lines_with_a_token(logger)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_bring_up_refresh_that_is_never_answered_fails_the_bring_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.LATE_REFRESH_WAIT_SECS", 0.2)
+    server = _server_rejecting("old-access")
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(server, logger, request_timeout_secs=0.2, backoff_base_secs=30.0)
+    try:
+        await session.start()
+        await wait_until(
+            lambda: any("Session bring-up failed" in m for m in logger.warnings()),
+            description="the bring-up failing",
+        )
+
+        assert isinstance(session.last_error, CTraderTimeoutError)
+        assert session.state is not SessionState.READY
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_connection_lost_during_the_wait_for_a_late_reply_fails_the_bring_up_at_once() -> (
+    None
+):
+    server = _server_rejecting("old-access")
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(server, logger, request_timeout_secs=0.2, backoff_base_secs=30.0)
+    try:
+        await session.start()
+        await wait_until(lambda: bool(_refreshes(server)), description="the refresh request")
+        # Past the request's timeout, so inside the wait for a late reply.
+        await asyncio.sleep(0.4)
+
+        await server.drop_connections()
+        # Far sooner than the wait's own bound.
+        await wait_until(
+            lambda: any("Session bring-up failed" in m for m in logger.warnings()),
+            timeout_secs=2.0,
+            description="the bring-up failing",
+        )
+
+        assert isinstance(session.last_error, CTraderConnectionError)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_stop_during_the_wait_for_a_late_refresh_reply_is_prompt() -> None:
+    server = _server_rejecting("old-access")
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    session = _session(server, request_timeout_secs=0.2)
+    try:
+        await session.start()
+        await wait_until(lambda: bool(_refreshes(server)), description="the refresh request")
+        # Past the request's timeout, so inside the wait for a late reply.
+        await asyncio.sleep(0.4)
+
+        started = time.monotonic()
+        await asyncio.wait_for(session.stop(), 2.0)
+
+        assert time.monotonic() - started < 1.0
     finally:
         await session.stop()
         await server.stop()

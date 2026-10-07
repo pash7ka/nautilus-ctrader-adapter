@@ -34,7 +34,9 @@ from nautilus_ctrader.common.errors import (
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.common.subscriptions import SubscriptionRegistry
 from nautilus_ctrader.constants import (
+    DEFAULT_REQUEST_TIMEOUT_SECS,
     DEMO_HOST,
+    LATE_REFRESH_WAIT_SECS,
     LIVE_HOST,
     PROTOBUF_PORT,
     SYMBOL_BY_ID_BATCH,
@@ -457,14 +459,32 @@ class CTraderAccountClient:
     async def _refresh_over(self, connection: CTraderConnection) -> None:
         # TODO(verify): ProtoOARefreshTokenReq over an app-only-authenticated pre-connection on
         # the demo host works for a live account's token.
+        late: asyncio.Future[oa.ProtoOARefreshTokenRes] = asyncio.get_running_loop().create_future()
+
+        def catch_late_reply(payload: Message) -> None:
+            if isinstance(payload, oa.ProtoOARefreshTokenRes) and not late.done():
+                late.set_result(payload)
+
+        # Set before the request, so a reply that misses its timeout is still caught.
+        connection.set_event_handler(catch_late_reply)
         try:
             response = await connection.request(
                 oa.ProtoOARefreshTokenReq(refreshToken=self._credentials.refresh_token),
+                timeout_secs=DEFAULT_REQUEST_TIMEOUT_SECS,
             )
         except CTraderRequestError as e:
             self._log.error(f"Token refresh rejected: {e.error_code}")
             raise CTraderAuthError(f"token refresh rejected: {e.error_code}") from e
-        self._log.info("Access token refreshed")
+        except CTraderTimeoutError as timeout:
+            # A refresh token is single-use, so once the request has reached the venue a late
+            # reply holds the only working pair; closing this connection now would lose it.
+            try:
+                response = await asyncio.wait_for(late, LATE_REFRESH_WAIT_SECS)
+            except TimeoutError:
+                raise timeout from None
+            self._log.warning("Adopted a late token refresh reply")
+        else:
+            self._log.info("Access token refreshed")
         self._on_tokens_refreshed(
             response.accessToken,
             response.refreshToken,
