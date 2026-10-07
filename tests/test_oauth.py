@@ -851,3 +851,21 @@ def test_the_callback_server_prints_nothing_when_a_request_fails(
     captured = capsys.readouterr()
     assert captured.err == ""
     assert_secret_free(None, "the-code", stderr=captured.err + captured.out)
+
+
+@pytest.mark.parametrize("path", ["no-scheme.invalid/apps/token", "/apps/töken"])
+def test_exchange_code_wraps_a_malformed_token_url_without_keeping_the_request(
+    token_url: str,
+    path: str,
+) -> None:
+    """`urlopen` rejects a URL without a scheme with a `ValueError` naming the whole URL, and a
+    non-ASCII path with a `UnicodeEncodeError` holding the request line; both carry the query."""
+    url = token_url.replace("/apps/token", path) if path.startswith("/") else path
+
+    with pytest.raises(CTraderTokenExchangeError) as exc_info:
+        oauth.exchange_code(
+            "cid-value", "csecret", "the-code", "http://localhost/cb", token_url=url
+        )
+
+    assert_secret_free(exc_info.value, "csecret", "the-code", "cid-value")
+    assert exc_info.value.__context__ is None

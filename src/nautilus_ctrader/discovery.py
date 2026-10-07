@@ -34,9 +34,11 @@ from nautilus_ctrader.common.account import (
 )
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
+    CTraderAccountError,
     CTraderAuthError,
     CTraderConnectionError,
     CTraderError,
+    CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
 )
@@ -45,9 +47,11 @@ from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT, TOKE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
-# A `refusal` for an account whose host could not be reached, or did not answer in time.
+# A `refusal` for an account whose host could not be reached, did not answer in time, or
+# answered with something undecodable.
 _UNREACHABLE = "unreachable"
 _TIMEOUT = "timeout"
+_PROTOCOL_ERROR = "protocol error"
 
 
 @dataclass(frozen=True)
@@ -57,7 +61,7 @@ class GrantedAccount:
     - `is_live`: the venue's flag; `None` when it sent none. It decides the host.
     - `deposit_currency`: the deposit asset's name, or `None` when it could not be read.
     - `refusal`: why it could not be read: the venue's error code, `"unreachable"`,
-      `"timeout"`, or a short reason.
+      `"timeout"`, `"protocol error"`, or a short reason.
     """
 
     trader_login: int | None
@@ -94,15 +98,35 @@ def _token_rejected(error_code: str) -> CTraderAuthError:
     )
 
 
+# Rebuilt as the first of these it is an instance of; each takes a message alone.
+_REBUILT_KINDS: tuple[type[CTraderError], ...] = (
+    CTraderAuthError,
+    CTraderConnectionError,
+    CTraderTimeoutError,
+    CTraderProtocolError,
+    CTraderAccountError,
+)
+
+
 def _without_venue_text(error: CTraderError) -> CTraderError:
-    """`error` rebuilt with no cause and no venue description, keeping the venue's error code."""
+    """`error` rebuilt with no cause and no venue description.
+
+    A venue refusal keeps its error code and its numbers. Any other error keeps its message,
+    which the adapter composes with codes only, and the most specific kind it can be rebuilt as.
+    """
     error_code = request_error_code(error)
     if error_code in TOKEN_ERROR_CODES:
         return _token_rejected(error_code)
     if isinstance(error, CTraderRequestError):
-        return CTraderRequestError(error.error_code)
-    # Every other adapter error's message is composed by the adapter, with codes only.
-    return type(error)(str(error))
+        return CTraderRequestError(
+            error.error_code,
+            maintenance_end_secs=error.maintenance_end_secs,
+            retry_after_secs=error.retry_after_secs,
+        )
+    for kind in _REBUILT_KINDS:
+        if isinstance(error, kind):
+            return kind(str(error))
+    return CTraderError(str(error))
 
 
 async def _authenticate_application(
@@ -139,13 +163,17 @@ async def list_accounts(
 
     - the venue's error code, when it refuses the account, or the application on that host;
     - `"unreachable"`, when that host cannot be reached or its connection is lost;
-    - `"timeout"`, when a request about the account goes unanswered.
+    - `"timeout"`, when a request about the account goes unanswered;
+    - `"protocol error"`, when an answer about the account cannot be decoded;
+    - `"deposit asset missing from the asset list"`.
 
-    A host that failed is not tried again for later accounts. The host, port and TLS arguments
-    exist for tests. Raises, when the list itself cannot be read:
+    A host that failed, or whose connection was lost, is not tried again for later accounts.
+    The host, port and TLS arguments exist for tests. Raises, only when the list itself cannot
+    be read on `demo_host`:
 
     - `CTraderAuthError` if the application or the access token is rejected;
-    - `CTraderConnectionError` or `CTraderTimeoutError` if `demo_host` fails.
+    - `CTraderConnectionError`, `CTraderTimeoutError` or `CTraderProtocolError` if the host
+      cannot be reached, does not answer, or answers with something undecodable.
     """
     log = NullLogger() if logger is None else logger
     connections: dict[str, CTraderConnection] = {}
@@ -166,6 +194,8 @@ async def list_accounts(
             refused = _TIMEOUT
         except CTraderConnectionError:
             refused = _UNREACHABLE
+        except CTraderProtocolError:
+            refused = _PROTOCOL_ERROR
         if refused is None:
             return connection
         failed_hosts[host] = refused
@@ -201,8 +231,8 @@ async def list_accounts(
                     record.ctid_trader_account_id,
                     access_token,
                 )
-                if refusal == _UNREACHABLE:
-                    failed_hosts[host] = _UNREACHABLE
+                if not connection.is_connected:
+                    failed_hosts[host] = refusal
             accounts.append(
                 GrantedAccount(
                     trader_login=record.trader_login,
@@ -241,6 +271,8 @@ async def _read_deposit_currency(
         return None, _TIMEOUT
     except CTraderConnectionError:
         return None, _UNREACHABLE
+    except CTraderProtocolError:
+        return None, _PROTOCOL_ERROR
     for asset in asset_list.asset:
         if asset.assetId == trader.depositAssetId:
             return asset.name, None

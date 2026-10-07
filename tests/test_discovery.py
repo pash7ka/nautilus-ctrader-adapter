@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
@@ -11,9 +12,13 @@ from google.protobuf.message import Message
 from nautilus_ctrader import discovery
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
+    CTraderAccountError,
     CTraderAuthError,
     CTraderConnectionError,
+    CTraderError,
+    CTraderProtocolError,
     CTraderRequestError,
+    CTraderTimeoutError,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -85,6 +90,7 @@ def _route_by_host(
     server: FakeCTraderServer,
     *,
     dead_hosts: frozenset[str] = frozenset(),
+    garbled: Callable[[str, Message], bool] = lambda _host, _payload: False,
     request_timeout_secs: float = 5.0,
     connects: list[str] | None = None,
 ) -> list:
@@ -92,7 +98,8 @@ def _route_by_host(
 
     The hosts named to discovery are never resolved, so the recording is the only evidence of
     which host a request was meant for. A connection to one of `dead_hosts` fails to connect;
-    every connection attempt's host is appended to `connects`.
+    every connection attempt's host is appended to `connects`. A request `garbled` picks
+    fails with a `CTraderProtocolError`, as an undecodable answer would.
     """
     sent: list[tuple[str, Message]] = []
 
@@ -115,6 +122,8 @@ def _route_by_host(
 
         async def request(self, payload: Message, **kwargs) -> Message:
             sent.append((self.requested_host, payload))
+            if garbled(self.requested_host, payload):
+                raise CTraderProtocolError("undecodable payload")
             return await super().request(payload, **kwargs)
 
     monkeypatch.setattr(discovery, "CTraderConnection", _Routed)
@@ -213,7 +222,7 @@ async def test_list_accounts_reports_a_rejected_application_without_secrets() ->
     finally:
         await server.stop()
 
-    assert CLIENT_SECRET not in str(info.value)
+    assert_secret_free(info.value, CLIENT_SECRET, ACCESS_TOKEN)
 
 
 @pytest.mark.parametrize("code", ["CH_ACCESS_TOKEN_INVALID", "OA_AUTH_TOKEN_EXPIRED"])
@@ -550,3 +559,114 @@ async def test_list_symbols_gives_its_caller_no_warning() -> None:
 async def test_list_symbols_refuses_a_single_str_for_names() -> None:
     with pytest.raises(TypeError, match="single str"):
         await discovery.list_symbols(credentials(), TRADER_LOGIN, names="EURUSD")
+
+
+async def test_list_accounts_marks_an_account_whose_answer_is_undecodable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    server.on(oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, lambda _r: _four_accounts())
+    _route_by_host(
+        monkeypatch,
+        server,
+        garbled=lambda _host, payload: (
+            isinstance(payload, oa.ProtoOATraderReq) and payload.ctidTraderAccountId == LIVE_ID
+        ),
+    )
+    await server.start()
+    try:
+        accounts = await _list_accounts(server)
+    finally:
+        await server.stop()
+
+    refusals = {a.ctid_trader_account_id: a.refusal for a in accounts}
+    assert refusals == {
+        LIVE_ID: "protocol error",
+        DEMO_ID: None,
+        UNKNOWN_ID: None,
+        REFUSED_ID: None,
+    }
+
+
+async def test_list_accounts_marks_every_account_of_a_host_that_garbles_its_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    server.on(oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, lambda _r: _four_accounts())
+    connects: list[str] = []
+    _route_by_host(
+        monkeypatch,
+        server,
+        connects=connects,
+        garbled=lambda host, payload: (
+            host == "live.invalid" and isinstance(payload, oa.ProtoOAApplicationAuthReq)
+        ),
+    )
+    await server.start()
+    try:
+        accounts = await _list_accounts(server)
+    finally:
+        await server.stop()
+
+    refusals = {a.ctid_trader_account_id: a.refusal for a in accounts}
+    assert refusals == {
+        LIVE_ID: "protocol error",
+        DEMO_ID: None,
+        UNKNOWN_ID: None,
+        REFUSED_ID: "protocol error",
+    }
+    assert connects.count("live.invalid") == 1
+
+
+def test_a_rebuilt_request_error_keeps_its_numbers_but_not_its_description() -> None:
+    original = CTraderRequestError(
+        "BLOCKED_PAYLOAD_TYPE",
+        f"echo {ACCESS_TOKEN}",
+        maintenance_end_secs=1_700_000_000,
+        retry_after_secs=3,
+    )
+
+    rebuilt = discovery._without_venue_text(original)
+
+    assert isinstance(rebuilt, CTraderRequestError)
+    assert rebuilt.error_code == "BLOCKED_PAYLOAD_TYPE"
+    assert rebuilt.retry_after_secs == 3
+    assert rebuilt.maintenance_end_secs == 1_700_000_000
+    assert_secret_free(rebuilt, ACCESS_TOKEN)
+
+
+class _NoMessageAuthError(CTraderAuthError):
+    def __init__(self) -> None:
+        super().__init__("refused for a fixed reason")
+
+
+class _NoMessageError(CTraderError):
+    def __init__(self) -> None:
+        super().__init__("failed for a fixed reason")
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (CTraderAuthError("account auth rejected: CODE"), CTraderAuthError),
+        (CTraderConnectionError("connection closed"), CTraderConnectionError),
+        (CTraderTimeoutError("no response"), CTraderTimeoutError),
+        (CTraderProtocolError("bad frame"), CTraderProtocolError),
+        (CTraderAccountError("not hedging"), CTraderAccountError),
+        (_NoMessageAuthError(), CTraderAuthError),
+        (_NoMessageError(), CTraderError),
+    ],
+)
+def test_a_rebuilt_error_keeps_its_kind_and_message_and_drops_its_chain(
+    original: CTraderError,
+    expected: type[CTraderError],
+) -> None:
+    try:
+        raise original from CTraderRequestError("CODE", f"echo {ACCESS_TOKEN}")
+    except CTraderError as e:
+        rebuilt = discovery._without_venue_text(e)
+
+    assert type(rebuilt) is expected
+    assert str(rebuilt) == str(original)
+    assert rebuilt.__cause__ is None
+    assert rebuilt.__context__ is None

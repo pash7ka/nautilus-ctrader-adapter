@@ -325,8 +325,9 @@ def exchange_code(
     except urllib.error.URLError as e:
         reason = _sanitize_for_terminal(str(e.reason), redact=request_values)
         failure = CTraderTokenExchangeError(f"token endpoint request failed: {reason}")
-    except (OSError, http.client.HTTPException) as e:
-        # Not wrapped by urllib: a read timeout, a dropped connection, a truncated body.
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        # Not wrapped by urllib: a read timeout, a dropped connection, a truncated body, or a
+        # malformed `token_url`, whose error names the whole URL or request line.
         failure = CTraderTokenExchangeError(f"token endpoint request failed: {type(e).__name__}")
     if failure is not None:
         raise failure

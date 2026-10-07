@@ -58,10 +58,12 @@ read is kept, with `deposit_currency=None` and `refusal` set to:
 
 - the venue's error code, when it refuses the account (or the application on that host);
 - `"unreachable"`, when that host cannot be reached or its connection is lost;
-- `"timeout"`, when a request about the account goes unanswered.
+- `"timeout"`, when a request about the account goes unanswered;
+- `"protocol error"`, when an answer about the account cannot be decoded;
+- `"deposit asset missing from the asset list"`, when the venue's asset list lacks it.
 
-A host that failed is not tried again for the accounts after it. Only a failure to read the
-list itself, on the demo host, raises.
+A host that failed, or whose connection was lost, is not tried again for the accounts after it.
+Only a failure to read the list itself, on the demo host, raises.
 
 ## A pasted code
 
@@ -113,8 +115,9 @@ A refresh token works once. A refresh would replace the stored pair, and discove
 hand the new pair back. So discovery never refreshes: `list_accounts` takes the access token
 only, and `list_symbols` ignores the refresh token and the expiry in its credentials. A rejected
 or expired access token raises `CTraderAuthError` with the venue's error code, saying to refresh
-the pair or authorise again first. A connected account client refreshes the pair on its own and reports it through
-`add_token_listener()` (see [Persisting refreshed tokens](market_data.md#persisting-refreshed-tokens)).
+the pair or authorise again first. A connected account client refreshes the pair on its own and
+reports it through `add_token_listener()` (see
+[Persisting refreshed tokens](market_data.md#persisting-refreshed-tokens)).
 
 Discovery sends only authentication, account list, trader, asset and symbol requests. Each
 connection is short-lived and closed before the call returns.
@@ -130,7 +133,7 @@ venue's free-text description may echo what it was sent.
 | `build_authorization_url` | nothing |
 | `wait_for_authorization_code` | `RedirectUriError` (a `ValueError`): the redirect URI is not plain `http` on `localhost` or `127.0.0.1`; `reason` says why. `OSError`: the callback port cannot be bound. `CTraderAuthorizationDenied`: the redirect carries an error; the redirect's error value is in `error_code`. `CTraderAuthorizationTimeout`: no redirect in time. |
 | `exchange_code` | `CTraderTokenExchangeError`: the token endpoint refuses the code (`error_code`, `description`), answers with an HTTP error (`http_status`), cannot be reached, or answers with anything but a usable pair. |
-| `list_accounts` | `CTraderAuthError`: the application or the access token is rejected. `CTraderConnectionError` or `CTraderTimeoutError`: the demo host, which serves the list, fails. |
+| `list_accounts` | Only while reading the list on the demo host: `CTraderAuthError` if the application or the access token is rejected; `CTraderConnectionError`, `CTraderTimeoutError` or `CTraderProtocolError` if the host cannot be reached, does not answer, or answers with something undecodable. A failure about one account is its row's `refusal` instead. |
 | `list_symbols` | `TypeError`: `names` is a single `str`. `ValueError`: an unknown `environment`. `CTraderAuthError`: the application, the token or the trader login is rejected. `CTraderConnectionError`, `CTraderTimeoutError`, `CTraderRequestError` or `CTraderProtocolError`: the account cannot be read. |
 
 `CTraderAuthorizationDenied`, `CTraderAuthorizationTimeout` and `CTraderTokenExchangeError` are
