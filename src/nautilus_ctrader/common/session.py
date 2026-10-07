@@ -22,6 +22,7 @@ from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
     CTraderRequestError,
+    CTraderTimeoutError,
 )
 from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.constants import (
@@ -37,6 +38,7 @@ from nautilus_ctrader.constants import (
     HISTORICAL_PAYLOAD_TYPES,
     HISTORICAL_RATE_LIMIT_PER_SEC,
     INBOUND_SILENCE_SECS,
+    LATE_REFRESH_WAIT_SECS,
     MIN_TOKEN_REFRESH_INTERVAL_SECS,
     RECONNECT_FAILURE_THRESHOLD,
     STABLE_SESSION_SECS,
@@ -132,6 +134,7 @@ class CTraderSession:
         # a reply was sent; see `_on_late_refresh_reply()`.
         self._pairs_taken = 0
         self._unanswered_refresh: int | None = None
+        self._pair_taken = asyncio.Event()
         self._reauth_requested = False
         self._stopping = False
         # Set while no `stop()` is running; `start()` waits on it.
@@ -448,7 +451,16 @@ class CTraderSession:
             # The venue accepts a refresh on a connection authenticated only at application
             # level (confirmed live).
             self._log.warning(f"Account auth rejected ({e.error_code}), refreshing token")
-            await self.refresh_tokens()
+            self._pair_taken.clear()
+            try:
+                await self.refresh_tokens()
+            except CTraderTimeoutError as timeout:
+                # Tearing the connection down now would lose a late reply, which holds the
+                # only working pair; `_on_late_refresh_reply()` adopts it if it comes.
+                try:
+                    await asyncio.wait_for(self._pair_taken.wait(), LATE_REFRESH_WAIT_SECS)
+                except TimeoutError:
+                    raise timeout from None
             try:
                 await self._authenticate_account()
             except CTraderRequestError as retry_error:
@@ -507,6 +519,7 @@ class CTraderSession:
         self._refresh_token = response.refreshToken
         self._expires_at_secs = time.time() + response.expiresIn
         self._pairs_taken += 1
+        self._pair_taken.set()
         if self._on_tokens_refreshed is not None:
             try:
                 self._on_tokens_refreshed(

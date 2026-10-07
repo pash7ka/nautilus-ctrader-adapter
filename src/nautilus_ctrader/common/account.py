@@ -36,6 +36,7 @@ from nautilus_ctrader.common.subscriptions import SubscriptionRegistry
 from nautilus_ctrader.constants import (
     DEFAULT_REQUEST_TIMEOUT_SECS,
     DEMO_HOST,
+    LATE_REFRESH_WAIT_SECS,
     LIVE_HOST,
     PROTOBUF_PORT,
     SYMBOL_BY_ID_BATCH,
@@ -53,9 +54,6 @@ ENVIRONMENTS: tuple[Environment, ...] = get_args(Environment)
 _READY_POLL_SECS = 0.5
 # A restore still failing after this many background retries is reported once at ERROR.
 _RESTORE_RETRY_ERROR_ATTEMPTS = 3
-# How long a start-up refresh that timed out still waits for its reply. Start-up is slower by
-# this much, but a reply lost here leaves the application with no working token pair.
-LATE_REFRESH_WAIT_SECS = 10.0
 
 
 @dataclass(frozen=True)

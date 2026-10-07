@@ -72,6 +72,11 @@ TOKEN_ERROR_CODES: frozenset[str] = frozenset({"OA_AUTH_TOKEN_EXPIRED", "CH_ACCE
 # revoked token as expired, or a very short granted lifetime, must not rotate tokens in a loop.
 MIN_TOKEN_REFRESH_INTERVAL_SECS: float = 300.0
 
+# How long a refresh that timed out still waits for its reply before its connection is closed.
+# A refresh token is single-use, so a reply lost that way leaves no working token pair; the
+# wait counts against the account's `connect_timeout_secs` like the rest of a bring-up.
+LATE_REFRESH_WAIT_SECS: float = 10.0
+
 # Reconnect backoff.
 BACKOFF_BASE_SECS: float = 1.0
 BACKOFF_MAX_SECS: float = 60.0

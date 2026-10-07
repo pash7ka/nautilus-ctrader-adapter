@@ -124,8 +124,11 @@ How tokens behave was checked on a live connection, on the account's own (live) 
   with `CH_ACCESS_TOKEN_INVALID`, and that refused replay revoked no other grant. Once a
   refresh request reaches the venue, the pair it answers with is the only valid one, so this
   adapter adopts a reply that arrives after its request timed out, unless a newer pair has
-  been taken since that request was sent. A refresh at start-up, on the short pre-connection
-  that resolves the account's host, keeps that connection open up to ten seconds more for it.
+  been taken since that request was sent. A refresh made while a connection is being brought
+  up — on the short pre-connection that resolves the account's host, or after account
+  authentication was rejected — keeps that connection open up to ten seconds more for the
+  reply. That wait is part of the bring-up, so it counts against the account's
+  `connect_timeout_secs` rather than adding to it.
 - **A refreshed access token expires 30 days after it is issued** (confirmed).
 - **Each authorization is an independent grant** (confirmed). Authorizing the same application
   twice for one cTrader ID gave two token pairs; neither the second authorization nor a

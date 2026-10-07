@@ -447,6 +447,102 @@ async def test_a_late_refresh_reply_after_a_newer_pair_is_ignored() -> None:
         await server.stop()
 
 
+def _server_rejecting(access_token: str) -> FakeCTraderServer:
+    """A venue that refuses account authentication with `access_token` as expired."""
+    server = _server()
+    server.on(
+        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
+        lambda request: (
+            oa.ProtoOAErrorRes(errorCode="OA_AUTH_TOKEN_EXPIRED", description="expired")
+            if request.accessToken == access_token
+            else oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID)
+        ),
+    )
+    return server
+
+
+async def test_a_late_refresh_reply_during_bring_up_is_adopted_and_the_bring_up_goes_on() -> None:
+    server = _server_rejecting("old-access")
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        _pair_reply("late-access", "late-refresh"),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    # A reconnect would only come after the backoff, far beyond this test.
+    session = _session(
+        server,
+        logger,
+        request_timeout_secs=0.2,
+        backoff_base_secs=30.0,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    try:
+        await session.start()
+        await held.arrived.wait()
+        # Well past the refresh request's own timeout.
+        await asyncio.sleep(0.4)
+        await held.stop_holding()
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert server.connection_count == 1
+        assert [(a, r) for a, r, _ in persisted] == [("late-access", "late-refresh")]
+        assert [m.accessToken for m in _account_auths(server)] == ["old-access", "late-access"]
+        assert any("late token refresh reply" in m for m in logger.warnings())
+        server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, _pair_reply("new-access", "new-refresh"))
+        await session.refresh_tokens()
+        assert _refreshes(server)[-1].refreshToken == "late-refresh"
+        assert not _lines_with_a_token(logger)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_bring_up_refresh_that_is_never_answered_fails_the_bring_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.LATE_REFRESH_WAIT_SECS", 0.2)
+    server = _server_rejecting("old-access")
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(server, logger, request_timeout_secs=0.2, backoff_base_secs=30.0)
+    try:
+        await session.start()
+        await wait_until(
+            lambda: any("Session bring-up failed" in m for m in logger.warnings()),
+            description="the bring-up failing",
+        )
+
+        assert isinstance(session.last_error, CTraderTimeoutError)
+        assert session.state is not SessionState.READY
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_stop_during_the_wait_for_a_late_refresh_reply_is_prompt() -> None:
+    server = _server_rejecting("old-access")
+    server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
+    await server.start()
+    session = _session(server, request_timeout_secs=0.2)
+    try:
+        await session.start()
+        await wait_until(lambda: bool(_refreshes(server)), description="the refresh request")
+        # Past the request's timeout, so inside the wait for a late reply.
+        await asyncio.sleep(0.4)
+
+        started = time.monotonic()
+        await asyncio.wait_for(session.stop(), 2.0)
+
+        assert time.monotonic() - started < 1.0
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_a_non_token_rejection_never_refreshes() -> None:
     # A new token cannot fix an unknown account; refreshing anyway would rotate tokens on
     # every retry.
