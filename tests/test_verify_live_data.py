@@ -395,6 +395,384 @@ def test_item_7_reports_the_prices_that_do_not_fit_the_symbols_digits() -> None:
     assert "1 of 100" in detail[0]
 
 
+def _edge_observation(**overrides) -> v.WindowEdgeObservation:
+    values = {
+        "symbol": EURUSD,
+        "searched": "the last 30 minutes",
+        "bar_secs": 1_700_000_040,
+        "edge_open_secs": (1_700_000_040, 1_700_000_100),
+        "control_open_secs": (),
+        "positive_open_secs": (1_700_000_040, 1_700_000_100),
+    }
+    values.update(overrides)
+    return v.WindowEdgeObservation(**values)
+
+
+def test_item_8_confirms_both_edges_inclusive() -> None:
+    status, detail = v.decide_window_edges(_edge_observation())
+    assert status == OK
+    text = "\n".join(detail)
+    assert "fromTimestamp: inclusive" in text
+    assert "toTimestamp: inclusive" in text
+    # The boundaries come out as UTC times, never as an account detail.
+    assert "2023-11-14 22:14Z" in text and "2023-11-14 22:15Z" in text
+
+
+@pytest.mark.parametrize(
+    ("served", "from_word", "to_word"),
+    [
+        ((1_700_000_100,), "exclusive", "inclusive"),
+        ((1_700_000_040,), "inclusive", "exclusive"),
+        ((), "exclusive", "exclusive"),
+    ],
+)
+def test_item_8_names_each_edge_separately(served, from_word, to_word) -> None:
+    status, detail = v.decide_window_edges(_edge_observation(edge_open_secs=served))
+    assert status == OK
+    text = "\n".join(detail)
+    assert f"fromTimestamp: {from_word}" in text
+    assert f"toTimestamp: {to_word}" in text
+
+
+@pytest.mark.parametrize(
+    ("bar", "named"),
+    [
+        (1_700_000_040, "2023-11-14 22:14Z"),
+        (1_700_000_100, "2023-11-14 22:15Z"),
+        # Any bar at all, not only an edge bar, means the window is not read by open time.
+        (1_700_000_070, "2023-11-14 22:14Z"),
+        (1_699_999_980, "2023-11-14 22:13Z"),
+    ],
+)
+def test_item_8_differs_when_the_control_window_returns_any_bar(bar, named) -> None:
+    """A venue that compares something other than the open time makes both verdicts moot."""
+    status, detail = v.decide_window_edges(_edge_observation(control_open_secs=(bar,)))
+    assert status == DIFFERS
+    text = "\n".join(detail)
+    assert "other than the bar's open time" in text
+    assert f"bars opening at {named}" in detail[-1]
+
+
+def test_item_8_differs_when_the_exact_window_returns_a_bar_outside_its_edges() -> None:
+    """Edge bars plus a neighbour would mean the window selects bars it merely overlaps."""
+    status, detail = v.decide_window_edges(
+        _edge_observation(edge_open_secs=(1_699_999_980, 1_700_000_040, 1_700_000_100)),
+    )
+    assert status == DIFFERS
+    assert "2023-11-14 22:13Z" in detail[-1]
+    assert "outside its edges" in detail[-1]
+
+
+def test_item_8_keeps_the_edge_verdicts_when_only_the_control_is_refused() -> None:
+    status, detail = v.decide_window_edges(
+        _edge_observation(control_open_secs=(), control_error="INVALID_REQUEST"),
+    )
+    assert status == OK
+    text = "\n".join(detail)
+    assert "control refused: INVALID_REQUEST" in text
+    assert "fromTimestamp: inclusive" in text
+    assert "toTimestamp: inclusive" in text
+
+
+@pytest.mark.parametrize(
+    "positive",
+    [(), (1_700_000_040,), (1_700_000_100,), (1_700_000_040, 1_700_000_160)],
+)
+def test_item_8_is_unknown_when_the_positive_control_misses_a_bar(positive) -> None:
+    """An empty exact window proves nothing if a window that surely holds the bars is empty too."""
+    status, detail = v.decide_window_edges(
+        _edge_observation(edge_open_secs=(), positive_open_secs=positive),
+    )
+    assert status == UNKNOWN
+    assert detail[-1] == "the venue did not return a window that surely holds both bars"
+    assert "exclusive" in "\n".join(detail)  # the raw observation is still listed
+
+
+def test_item_8_is_unknown_when_the_positive_control_is_refused() -> None:
+    status, detail = v.decide_window_edges(
+        _edge_observation(positive_open_secs=(), positive_error="INVALID_REQUEST"),
+    )
+    assert status == UNKNOWN
+    assert any("positive control refused: INVALID_REQUEST" in line for line in detail)
+
+
+def test_item_8_lets_a_failed_positive_control_outrank_a_control_anomaly() -> None:
+    status, _ = v.decide_window_edges(
+        _edge_observation(control_open_secs=(1_700_000_040,), positive_open_secs=()),
+    )
+    assert status == UNKNOWN
+
+
+def test_item_8_lists_a_clean_control_in_its_detail() -> None:
+    _, detail = v.decide_window_edges(_edge_observation())
+    assert any("control" in line and "no bars" in line for line in detail)
+
+
+def test_item_8_without_a_pair_of_bars_is_unknown_with_the_reason() -> None:
+    status, detail = v.decide_window_edges(
+        _edge_observation(bar_secs=None, edge_open_secs=(), searched="the last 3 days"),
+    )
+    assert status == UNKNOWN
+    assert "the last 3 days" in detail[0]
+    assert "consecutive" in detail[0]
+
+
+def test_item_8_carries_the_error_code_of_a_refused_search() -> None:
+    status, detail = v.decide_window_edges(
+        _edge_observation(bar_secs=None, searched="the last 3 days", error_code="NO_QUOTES"),
+    )
+    assert status == UNKNOWN
+    assert "NO_QUOTES" in detail[0]
+
+
+@pytest.mark.parametrize(
+    ("opens", "expected"),
+    [
+        # The newest bar may still be forming, so the pair is the two before it.
+        ([0, 60, 120, 180], 60),
+        # Order and duplicates in the response do not matter.
+        ([180, 60, 0, 120, 120], 60),
+        # A gap before the newest bar: the newest consecutive pair is further back.
+        ([0, 60, 240, 300], 0),
+        ([0, 60, 120, 600], 60),
+        # Nothing consecutive, too few bars, or only the forming bar.
+        ([0, 120, 240], None),
+        ([0, 60], None),
+        ([60], None),
+        ([], None),
+    ],
+)
+def test_the_pair_is_the_newest_consecutive_closed_bars(opens, expected) -> None:
+    assert v.find_consecutive_closed_pair(opens) == expected
+
+
+_NOW = 1_700_000_030
+_END = _NOW // 60 * 60
+_SYMBOL_ID = 7
+_DAY = 86_400
+
+
+def _bars(*open_secs: int) -> oa.ProtoOAGetTrendbarsRes:
+    return oa.ProtoOAGetTrendbarsRes(
+        trendbar=[
+            om.ProtoOATrendbar(utcTimestampInMinutes=s // 60, low=110_000, volume=10)
+            for s in open_secs
+        ],
+    )
+
+
+def _edge_verifier(replies: list[object], monkeypatch) -> tuple[v.Verifier, _StubConnection]:
+    monkeypatch.setattr(time, "time", lambda: _NOW)
+    connection = _StubConnection(replies)
+    requester = v.ReadOnlyRequester(connection, history_budget=10)
+    verifier = v.Verifier(requester, settings(), account_venue.ACCOUNT_ID)
+    verifier._symbol_ids = {EURUSD: _SYMBOL_ID}
+    return verifier, connection
+
+
+def _windows(connection: _StubConnection) -> list[tuple[int, int]]:
+    return [(p.fromTimestamp, p.toTimestamp) for p in connection.sent]
+
+
+async def test_item_8_asks_the_exact_millisecond_windows_and_nothing_but_history(
+    monkeypatch,
+) -> None:
+    bar = _END - 180
+    verifier, connection = _edge_verifier(
+        [
+            _bars(_END - 300, _END - 240, bar, _END - 120, _END - 60),
+            _bars(bar, bar + 60),
+            _bars(),
+            _bars(bar, bar + 60),
+        ],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == OK
+    assert {type(p) for p in connection.sent} == {oa.ProtoOAGetTrendbarsReq}
+    assert oa.ProtoOAGetTrendbarsReq in v.READ_ONLY_REQUESTS
+    assert connection.buckets == [BUCKET_HISTORICAL] * 4
+    assert all(p.symbolId == _SYMBOL_ID and p.period == om.M1 for p in connection.sent)
+    assert all(p.ctidTraderAccountId == account_venue.ACCOUNT_ID for p in connection.sent)
+    assert _windows(connection) == [
+        ((_END - 1800) * 1000, _END * 1000),
+        (bar * 1000, (bar + 60) * 1000),
+        (bar * 1000 + 1, (bar + 60) * 1000 - 1),
+        (bar * 1000 - 1, (bar + 60) * 1000 + 1),
+    ]
+    assert "fromTimestamp: inclusive" in "\n".join(detail)
+    assert "toTimestamp: inclusive" in "\n".join(detail)
+
+
+async def test_item_8_never_uses_the_newest_bar_as_an_edge_bar(monkeypatch) -> None:
+    """The newest bar returned may be forming, so a pair ending on it is not used."""
+    verifier, connection = _edge_verifier([_bars(_END - 120, _END - 60), _bars()], monkeypatch)
+
+    status, _ = await verifier._probe_window_edges()
+
+    # Both windows held at most one closed bar; the search widened once, then gave up.
+    assert status == UNKNOWN
+    assert _windows(connection) == [
+        ((_END - 1800) * 1000, _END * 1000),
+        ((_END - 3 * _DAY) * 1000, _END * 1000),
+    ]
+
+
+async def test_item_8_widens_once_when_the_market_is_closed(monkeypatch) -> None:
+    shut = _END - 2 * _DAY
+    bar = shut - 120
+    verifier, connection = _edge_verifier(
+        [_bars(), _bars(bar, bar + 60, shut), _bars(bar + 60), _bars(), _bars(bar, bar + 60)],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == OK
+    assert _windows(connection) == [
+        ((_END - 1800) * 1000, _END * 1000),
+        ((_END - 3 * _DAY) * 1000, _END * 1000),
+        (bar * 1000, (bar + 60) * 1000),
+        (bar * 1000 + 1, (bar + 60) * 1000 - 1),
+        (bar * 1000 - 1, (bar + 60) * 1000 + 1),
+    ]
+    text = "\n".join(detail)
+    assert "fromTimestamp: exclusive" in text
+    assert "toTimestamp: inclusive" in text
+
+
+async def test_item_8_gives_up_after_one_widening(monkeypatch) -> None:
+    verifier, connection = _edge_verifier([_bars(), _bars()], monkeypatch)
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == UNKNOWN
+    assert len(connection.sent) == 2
+    assert "the last 3 days" in detail[0]
+
+
+async def test_item_8_widens_when_the_narrow_window_is_refused(monkeypatch) -> None:
+    shut = _END - _DAY
+    verifier, connection = _edge_verifier(
+        [
+            CTraderRequestError("NO_QUOTES"),
+            _bars(shut - 120, shut - 60, shut),
+            _bars(shut - 120, shut - 60),
+            _bars(),
+            _bars(shut - 120, shut - 60),
+        ],
+        monkeypatch,
+    )
+
+    status, _ = await verifier._probe_window_edges()
+
+    assert status == OK
+    assert len(connection.sent) == 5
+
+
+async def test_item_8_reports_the_code_when_every_search_is_refused(monkeypatch) -> None:
+    verifier, _ = _edge_verifier(
+        [CTraderRequestError("NO_QUOTES"), CTraderRequestError("NO_QUOTES")],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == UNKNOWN
+    assert "NO_QUOTES" in detail[0]
+
+
+_PAIR_SEARCH = _bars(_END - 300, _END - 240, _END - 180, _END - 120, _END - 60)
+_PAIR = _END - 180
+
+
+async def test_item_8_reports_the_edge_verdicts_when_the_control_is_refused(monkeypatch) -> None:
+    verifier, connection = _edge_verifier(
+        [
+            _PAIR_SEARCH,
+            _bars(_PAIR),
+            CTraderRequestError("INVALID_REQUEST"),
+            _bars(_PAIR, _PAIR + 60),
+        ],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == OK
+    assert len(connection.sent) == 4
+    text = "\n".join(detail)
+    assert "control refused: INVALID_REQUEST" in text
+    assert "fromTimestamp: inclusive" in text
+    assert "toTimestamp: exclusive" in text
+
+
+async def test_item_8_is_unknown_with_the_code_when_the_edge_window_is_refused(
+    monkeypatch,
+) -> None:
+    verifier, connection = _edge_verifier(
+        [_PAIR_SEARCH, CTraderRequestError("INVALID_REQUEST")],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._safely(verifier._probe_window_edges)
+
+    assert status == UNKNOWN
+    assert "INVALID_REQUEST" in detail[0]
+    # Nothing is left to decide, so the controls are not asked.
+    assert len(connection.sent) == 2
+
+
+async def test_item_8_is_unknown_when_the_positive_control_does_not_return_both_bars(
+    monkeypatch,
+) -> None:
+    """An empty exact window must not read as both edges exclusive."""
+    verifier, _ = _edge_verifier(
+        [_PAIR_SEARCH, _bars(), _bars(), _bars(_PAIR)],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == UNKNOWN
+    assert "surely holds both bars" in detail[-1]
+
+
+async def test_item_8_probe_is_unknown_when_the_positive_control_is_refused(monkeypatch) -> None:
+    verifier, _ = _edge_verifier(
+        [_PAIR_SEARCH, _bars(_PAIR), _bars(), CTraderRequestError("INVALID_REQUEST")],
+        monkeypatch,
+    )
+
+    status, detail = await verifier._probe_window_edges()
+
+    assert status == UNKNOWN
+    assert any("positive control refused: INVALID_REQUEST" in line for line in detail)
+
+
+async def test_item_8_differs_when_the_negative_control_serves_a_bar(monkeypatch) -> None:
+    verifier, _ = _edge_verifier(
+        [_PAIR_SEARCH, _bars(_PAIR, _PAIR + 60), _bars(_PAIR + 60), _bars(_PAIR, _PAIR + 60)],
+        monkeypatch,
+    )
+
+    status, _ = await verifier._probe_window_edges()
+
+    assert status == DIFFERS
+
+
+async def test_item_8_without_a_symbol_is_unknown(monkeypatch) -> None:
+    verifier, connection = _edge_verifier([], monkeypatch)
+    verifier._symbol_ids = {}
+
+    status, _ = await verifier._probe_window_edges()
+
+    assert status == UNKNOWN
+    assert connection.sent == []
+
+
 # -- The report -----------------------------------------------------------------------------
 
 
@@ -470,8 +848,52 @@ def _trendbars(
     )
 
 
-def verify_venue(*, count_cap: int = 1000, max_window_days: int = 30) -> FakeCTraderServer:
+def _edge_window_bars(
+    request: oa.ProtoOAGetTrendbarsReq,
+    *,
+    from_inclusive: bool,
+    to_inclusive: bool,
+) -> oa.ProtoOAGetTrendbarsRes:
+    """M1 bars whose open time lies in the window, with the given edge semantics."""
+    first_minute = -(-request.fromTimestamp // 60_000)
+    last_minute = request.toTimestamp // 60_000
+    opens_ms = []
+    for minute in range(first_minute, last_minute + 1):
+        opened = minute * 60_000
+        after_from = opened > request.fromTimestamp or (
+            from_inclusive and opened == request.fromTimestamp
+        )
+        before_to = opened < request.toTimestamp or (to_inclusive and opened == request.toTimestamp)
+        if after_from and before_to:
+            opens_ms.append(opened)
+    return oa.ProtoOAGetTrendbarsRes(
+        ctidTraderAccountId=request.ctidTraderAccountId,
+        period=request.period,
+        trendbar=[
+            om.ProtoOATrendbar(
+                utcTimestampInMinutes=opened // 60_000,
+                low=110_000,
+                deltaOpen=1,
+                deltaHigh=2,
+                deltaClose=1,
+                volume=10,
+            )
+            for opened in reversed(opens_ms[-request.count :])
+        ],
+    )
+
+
+def verify_venue(
+    *,
+    count_cap: int = 1000,
+    max_window_days: int = 30,
+    edges_inclusive: tuple[bool, bool] = (True, False),
+) -> FakeCTraderServer:
     """The reference venue, plus history and subscriptions shaped like the live one.
+
+    A window of about a minute is served exactly as asked, with `edges_inclusive` giving
+    whether `fromTimestamp` and `toTimestamp` include a bar opening on them; wider windows are
+    served as in `_trendbars`.
 
     A live trendbar subscription is refused until spots are subscribed, which is the very
     thing item 1 exists to confirm.
@@ -502,10 +924,18 @@ def verify_venue(*, count_cap: int = 1000, max_window_days: int = 30) -> FakeCTr
             payload_type,
             lambda r, cls=response_class: cls(ctidTraderAccountId=r.ctidTraderAccountId),
         )
-    server.on(
-        om.PROTO_OA_GET_TRENDBARS_REQ,
-        lambda r: _trendbars(r, count_cap=count_cap, max_window_days=max_window_days),
-    )
+    from_inclusive, to_inclusive = edges_inclusive
+
+    def on_trendbars(request):
+        if request.toTimestamp - request.fromTimestamp <= 60_002:
+            return _edge_window_bars(
+                request,
+                from_inclusive=from_inclusive,
+                to_inclusive=to_inclusive,
+            )
+        return _trendbars(request, count_cap=count_cap, max_window_days=max_window_days)
+
+    server.on(om.PROTO_OA_GET_TRENDBARS_REQ, on_trendbars)
     return server
 
 
@@ -550,7 +980,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -
         await server.stop()
 
     by_item = {f.item: f for f in findings}
-    assert sorted(by_item) == ["0", "1", "2", "3", "4", "5a", "5b", "6", "7"]
+    assert sorted(by_item) == ["0", "1", "2", "3", "4", "5a", "5b", "6", "7", "8"]
     assert by_item["0"].status == OK
     assert by_item["1"].status == OK
     assert by_item["2"].status == OK
@@ -559,6 +989,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -
     assert by_item["5b"].status == OK
     assert by_item["6"].status == OK
     assert by_item["7"].status == OK
+    assert by_item["8"].status == OK
     # No M1 bar can close inside a window this short, and that is an UNKNOWN, not a failure.
     assert by_item["4"].status == UNKNOWN
 
@@ -566,6 +997,39 @@ async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -
     assert str(account_venue.TRADER_LOGIN) not in report
     assert "access-token" not in report
     assert "client-id" not in report
+
+
+@pytest.mark.parametrize(
+    ("edges_inclusive", "from_word", "to_word"),
+    [((True, False), "inclusive", "exclusive"), ((False, True), "exclusive", "inclusive")],
+)
+async def test_a_whole_run_reports_the_edge_verdicts_the_venue_gave(
+    edges_inclusive,
+    from_word,
+    to_word,
+) -> None:
+    server = verify_venue(edges_inclusive=edges_inclusive)
+    await server.start()
+    try:
+        findings, report = await v.verify(
+            server.host,
+            server.port,
+            tls=False,
+            credentials=v.Credentials("client-id", "client-secret", "access-token"),
+            settings=settings(symbols=(EURUSD,), minutes=0.005),
+            account_id=account_venue.ACCOUNT_ID,
+            rate_limiter=RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0}),
+        )
+    finally:
+        await server.stop()
+
+    item = next(f for f in findings if f.item == "8")
+    assert item.status == OK
+    text = "\n".join(item.detail)
+    assert f"fromTimestamp: {from_word}" in text
+    assert f"toTimestamp: {to_word}" in text
+    assert f"fromTimestamp: {from_word}" in report
+    assert f"toTimestamp: {to_word}" in report
 
 
 async def test_a_venue_that_refuses_history_leaves_the_other_items_decided() -> None:
@@ -596,6 +1060,7 @@ async def test_a_venue_that_refuses_history_leaves_the_other_items_decided() -> 
     assert by_item["3"].status == UNKNOWN
     assert by_item["5a"].status == UNKNOWN
     assert by_item["5b"].status == DIFFERS  # rejected, but with the wrong code
+    assert by_item["8"].status == UNKNOWN
     assert by_item["1"].status == OK
     assert by_item["6"].status == OK
     assert "NO_QUOTES" in report
