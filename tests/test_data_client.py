@@ -300,22 +300,21 @@ RECORDED_HISTORY: dict[tuple[int, int], dict[int, om.ProtoOATrendbar]] = {
 def _serve_trendbars(
     request: oa.ProtoOAGetTrendbarsReq,
     *,
-    inclusive_to: bool,
     chunk: int | None,
     announce_more: bool,
 ) -> oa.ProtoOAGetTrendbarsRes:
-    """Serve the recorded bars in the requested window, keeping the newest when capped.
+    """Serve recorded bars as the live venue does: `count` of them back from `toTimestamp`.
 
-    The three switches stand in for what the live endpoint has not settled: whether
-    `toTimestamp` is inclusive, a per-request cap below the asked-for `count`, and whether a
+    A bar is served when it opens at or before `toTimestamp`, and `fromTimestamp` is ignored,
+    so a window's answer reaches back past its start. The two switches stand in for what the
+    live endpoint has not settled: a per-request cap below the asked-for `count`, and whether a
     capped response says so through `hasMore`.
     """
     source = RECORDED_HISTORY.get((request.symbolId, request.period), {})
     bars = [
         trendbar
         for minute, trendbar in sorted(source.items())
-        if request.fromTimestamp <= minute * 60_000 <= request.toTimestamp
-        and (inclusive_to or minute * 60_000 != request.toTimestamp)
+        if minute * 60_000 <= request.toTimestamp
     ]
     cap = min(request.count or len(bars), len(bars) if chunk is None else chunk)
     truncated = len(bars) > cap
@@ -330,7 +329,6 @@ def _serve_trendbars(
 
 def trendbar_venue(
     *,
-    inclusive_to: bool = False,
     chunk: int | None = None,
     announce_more: bool = True,
 ) -> FakeCTraderServer:
@@ -346,12 +344,7 @@ def trendbar_venue(
         )
     server.on(
         om.PROTO_OA_GET_TRENDBARS_REQ,
-        functools.partial(
-            _serve_trendbars,
-            inclusive_to=inclusive_to,
-            chunk=chunk,
-            announce_more=announce_more,
-        ),
+        functools.partial(_serve_trendbars, chunk=chunk, announce_more=announce_more),
     )
     return server
 
@@ -1917,9 +1910,11 @@ async def test_request_bars_returns_the_last_closed_bars_ascending() -> None:
 
         bars = await request_bars(h, EURUSD_H1, limit=30, end=at_minute(LAST_H1_MINUTE + 60))
 
-        assert len(bars) == 30
-        assert [b.ts_event for b in bars] == sorted(b.ts_event for b in bars)
-        assert bars[-1].ts_event == close_ns(LAST_H1_MINUTE, 3600)
+        # The newest thirty, each once, although every page repeats the bar at its inclusive
+        # `toTimestamp` and reaches back past its `fromTimestamp`.
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(30))
+        ]
         assert all(b.bar_type == EURUSD_H1 for b in bars)
         # Twenty bars a page, so the thirtieth is only reached on the second one.
         assert len(received(h.server, oa.ProtoOAGetTrendbarsReq)) == 2
@@ -1932,7 +1927,10 @@ async def test_request_bars_without_a_start_or_a_limit_asks_for_one_page() -> No
         bars = await request_bars(h, EURUSD_H1, end=at_minute(LAST_H1_MINUTE + 60))
 
         assert len(received(h.server, oa.ProtoOAGetTrendbarsReq)) == 1
-        assert len(bars) == 20
+        # Everything that page served: the page size plus the one more it always asks for.
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(21))
+        ]
 
 
 async def test_request_bars_stops_at_the_requested_start() -> None:
@@ -1953,6 +1951,43 @@ async def test_request_bars_stops_at_the_requested_start() -> None:
         ]
 
 
+async def test_request_bars_with_a_start_delivers_no_bar_opening_before_it() -> None:
+    # One page covers the whole request, and the venue answers it with every bar back from its
+    # end, since it ignores `fromTimestamp`.
+    start = FIRST_H1_MINUTE + 600
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(start),
+            end=at_minute(LAST_H1_MINUTE + 60),
+        )
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(minute, 3600) for minute in range(start, LAST_H1_MINUTE + 1, 60)
+        ]
+
+
+async def test_request_bars_with_a_start_and_a_limit_keeps_the_newest_after_the_start() -> None:
+    start = LAST_H1_MINUTE - 240
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(start),
+            end=at_minute(LAST_H1_MINUTE + 60),
+            limit=10,
+        )
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(minute, 3600) for minute in range(start, LAST_H1_MINUTE + 1, 60)
+        ]
+
+
 async def test_request_bars_counts_only_closed_bars_towards_the_limit() -> None:
     async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
         await h.client._connect()
@@ -1963,18 +1998,6 @@ async def test_request_bars_counts_only_closed_bars_towards_the_limit() -> None:
 
         assert len(bars) == 20
         assert bars[-1].ts_event == close_ns(LAST_H1_MINUTE - 60, 3600)
-
-
-async def test_an_inclusive_to_timestamp_neither_duplicates_nor_skips_a_bar() -> None:
-    client_config = config(history_page_size=20)
-    async with harness(client_config=client_config, server=trendbar_venue(inclusive_to=True)) as h:
-        await h.client._connect()
-
-        bars = await request_bars(h, EURUSD_H1, limit=30, end=at_minute(LAST_H1_MINUTE + 60))
-
-        assert [b.ts_event for b in bars] == [
-            close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(30))
-        ]
 
 
 async def test_a_page_the_venue_cuts_short_is_continued_from_what_it_served() -> None:
@@ -2009,7 +2032,7 @@ async def test_a_page_cut_short_without_saying_so_skips_no_bar() -> None:
 
 async def test_the_bar_at_the_requested_start_survives_a_page_cut_short() -> None:
     client_config = config(history_page_size=20)
-    server = trendbar_venue(inclusive_to=True, chunk=1)
+    server = trendbar_venue(chunk=1)
     async with harness(client_config=client_config, server=server) as h:
         await h.client._connect()
 
@@ -2029,7 +2052,7 @@ async def test_the_bar_at_the_requested_start_survives_a_page_cut_short() -> Non
 
 async def test_a_one_bar_page_on_an_inclusive_edge_still_walks_backwards() -> None:
     client_config = config(history_page_size=20)
-    server = trendbar_venue(inclusive_to=True, chunk=1)
+    server = trendbar_venue(chunk=1)
     async with harness(client_config=client_config, server=server) as h:
         await h.client._connect()
 
@@ -2086,6 +2109,19 @@ async def test_a_history_bar_for_another_boundary_is_discarded() -> None:
         # The streamed state of the right minute, never the wrong bar history offered.
         assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE, 60)]
         assert float(h.bars()[0].volume) == float(SPOTS[2].trendbar[0].volume)
+
+
+async def test_the_newest_bar_is_fetched_before_its_successor_exists() -> None:
+    # The window's far edge holds no bar yet, so the two counted back are this one and the one
+    # before it.
+    newest = max(RECORDED_HISTORY[(EURUSD_SYMBOL_ID, M1)])
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        raw = await h.client._fetch_bar(EURUSD_SYMBOL_ID, M1, newest * 60)
+
+        assert raw is not None
+        assert raw.boundary_secs == newest * 60
 
 
 async def test_a_warm_up_request_is_not_repeated_by_the_stream() -> None:
@@ -2160,6 +2196,54 @@ async def test_a_reconnect_drops_the_partial_bar_and_backfills_what_was_missed(
             "ProtoOASubscribeLiveTrendbarReq",
             "ProtoOASubscribeLiveTrendbarReq",
             "ProtoOAGetTrendbarsReq",
+        ]
+
+
+async def test_a_reconnect_backfill_emits_each_bar_once_and_none_before_the_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+        assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE, 60)]
+
+        await h.server.drop_connections()
+        # The gap is the two bars after the one already emitted, which history serves too.
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await wait_until(
+            lambda: len(h.bars()) >= 3,
+            timeout_secs=10.0,
+            description="the missed bars were backfilled",
+        )
+
+        assert [b.ts_event for b in h.bars()] == [
+            close_ns(FIRST_M1_MINUTE, 60),
+            close_ns(FIRST_M1_MINUTE + 1, 60),
+            close_ns(FIRST_M1_MINUTE + 2, 60),
+        ]
+
+
+async def test_the_backfill_range_holds_no_bar_before_its_start() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        sub = h.client._bars[EURUSD_M1]
+
+        served = await h.client._fetch_bar_range(
+            sub,
+            (FIRST_M1_MINUTE + 1) * 60,
+            (FIRST_M1_MINUTE + 2) * 60,
+        )
+
+        assert [raw.boundary_secs for raw in served] == [
+            (FIRST_M1_MINUTE + 1) * 60,
+            (FIRST_M1_MINUTE + 2) * 60,
         ]
 
 

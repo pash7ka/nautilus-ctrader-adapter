@@ -109,9 +109,11 @@ calls belong to neither, and nothing reports them missing.
 Doing it this way is safe because the client remembers what a request delivered: the newest bar
 a request served is marked as emitted for that subscription, so the live stream will not send
 it a second time. A historical request is paged backwards from its end, and the forming bar the
-venue also serves is dropped, since it is not a bar yet. With neither a `start` nor a `limit`
-exactly one page is fetched: that call is asking for "the most recent bars", not for the whole
-history the venue holds.
+venue also serves is dropped, since it is not a bar yet. A request with a `start` delivers no
+bar opening before it, although the venue's pages reach back past it, and one with a `limit`
+delivers the newest `limit` closed bars. With neither a `start` nor a `limit` exactly one page
+is fetched: that call is asking for "the most recent bars", not for the whole history the venue
+holds.
 
 Historical requests are rate-limited separately from everything else and much more tightly, so
 a large warm-up cannot starve the subscriptions running beside it.

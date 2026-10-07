@@ -255,11 +255,20 @@ milliseconds and a `count`, and pages backwards: `count` is counted back from `t
   the period to find a boundary is therefore correct up to H1 and wrong from H4 up; take the
   open time the venue sends instead, and derive a boundary from an observed bar rather than
   from the epoch.
+- **A window is answered by `toTimestamp` and `count` alone** (confirmed). The venue serves up
+  to `count` bars counted back from `toTimestamp`, selecting by open time and including a bar
+  that opens exactly on `toTimestamp`; `fromTimestamp` does not bound the answer. Asked with
+  `count = 10` for the one-minute M1 window from 11:33:00.000 to 11:34:00.000, the venue
+  served ten bars opening 11:25 to 11:34. The same window narrowed by 1 ms at each end was
+  served bars opening 11:24 to 11:33, and widened by 1 ms at each end, 11:25 to 11:34 again.
+  So a page reaches back past its window's start whenever `count` allows: this adapter drops
+  every bar opening before the start a request asked for, and every bar opening at or after
+  its end, and de-duplicates the boundary each page repeats at its `toTimestamp`.
 
-**Unconfirmed**: whether `fromTimestamp` and `toTimestamp` are inclusive. The paging absorbs
-an inclusive `toTimestamp` harmlessly, since a repeated boundary is de-duplicated. An
-*exclusive* `fromTimestamp` would not be absorbed — the bar at each window's start would be
-lost on every page — which is why this is the first thing to check on a live connection.
+**Unconfirmed**: whether `fromTimestamp` bounds the answer in any case the probe did not
+cover; its window had plenty of history behind it. This adapter still sends the window's
+start, which the schema makes optional, and relies on it for nothing: a venue that honoured it
+would only serve less per page, and the paging continues from the oldest bar a page served.
 
 **Unconfirmed**: the venue's maximum `count` per request, and whether a maximum span exists at
 all. Neither limit has been reached: 5000 was served in full, and the 400-day window was
