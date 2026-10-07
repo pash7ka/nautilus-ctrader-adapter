@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -829,7 +830,8 @@ class CTraderDataClient(LiveMarketDataClient):
         served = await self._page_trendbars(
             instrument.info["symbol_id"],
             period,
-            start_secs=None if request.start is None else int(request.start.timestamp()),
+            # Rounded up, so a fractional start never lets in the bar opening just before it.
+            start_secs=None if request.start is None else math.ceil(request.start.timestamp()),
             end_secs=now_secs if request.end is None else int(request.end.timestamp()),
             limit=request.limit or None,
             closed_secs=now_secs,
@@ -839,7 +841,7 @@ class CTraderDataClient(LiveMarketDataClient):
         if request.limit:
             closed = closed[-request.limit :]
         elif request.start is None:
-            # One page of the newest bars, although a page asks the venue for one more.
+            # One page of the newest bars, although a page asks the venue for two more.
             closed = closed[-self._page_size() :]
 
         sub = self._bars.get(bar_type)
@@ -899,7 +901,10 @@ class CTraderDataClient(LiveMarketDataClient):
                 period,
                 from_secs=from_secs,
                 to_secs=to_secs,
-                count=self._page_size() + 1,
+                # Two more than the page: one for the bar the venue repeats at `toTimestamp` or
+                # the forming bar, and one for an answer a bar short of `count`, which the venue
+                # gives at times.
+                count=self._page_size() + 2,
             )
             for raw in page:
                 # The venue includes a bar opening on `toTimestamp`, and serves bars before
@@ -983,7 +988,7 @@ class CTraderDataClient(LiveMarketDataClient):
         if session is None:
             raise CTraderConnectionError("data client is not connected")
         # Confirmed live: the venue serves up to `count` bars counted back from `toTimestamp`
-        # by open time, including a bar opening on it, and `fromTimestamp` does not bound the
+        # by open time, including a bar opening on it, and `fromTimestamp` did not bound the
         # answer - a one-minute window came back with ten bars. The window's start is still
         # sent: the schema makes it optional, but leaving it out is untested, and a venue that
         # did honour it would only serve less per page, which the paging continues from.

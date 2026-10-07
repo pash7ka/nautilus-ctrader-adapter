@@ -460,6 +460,17 @@ def test_item_8_differs_when_an_answer_is_not_count_bars_back_from_its_end(
     assert "counted back from its toTimestamp by open time" in detail[-1]
 
 
+def test_item_8_accepts_an_answer_one_oldest_bar_short() -> None:
+    """`count = N` answered with `N - 1` bars is a recorded venue habit, not a contradiction."""
+    status, detail = v.decide_window_edges(
+        _edge_observation(edge_open_secs=_counted_back(_LIVE_SECOND, 9)),
+    )
+    assert status == OK
+    assert any(
+        line.startswith("the exact window returned one bar fewer than count") for line in detail
+    )
+
+
 def test_item_8_differs_when_from_timestamp_bounds_the_answer_while_older_bars_exist() -> None:
     """The answers the adapter used to assume, with the search showing history goes further."""
     status, detail = v.decide_window_edges(

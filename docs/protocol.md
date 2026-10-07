@@ -288,9 +288,9 @@ milliseconds and a `count`, and pages backwards: `count` is counted back from `t
   the period to find a boundary is therefore correct up to H1 and wrong from H4 up; take the
   open time the venue sends instead, and derive a boundary from an observed bar rather than
   from the epoch.
-- **A window is answered by `toTimestamp` and `count` alone** (confirmed). The venue serves up
-  to `count` bars counted back from `toTimestamp`, selecting by open time and including a bar
-  that opens exactly on `toTimestamp`; `fromTimestamp` does not bound the answer. Asked with
+- **`fromTimestamp` did not bound the answer** (confirmed for a one-minute M1 window with
+  `count = 10`). The venue served up to `count` bars counted back from `toTimestamp`, selecting
+  by open time and including a bar that opens exactly on `toTimestamp`. Asked with
   `count = 10` for the one-minute M1 window from 11:33:00.000 to 11:34:00.000, the venue
   served ten bars opening 11:25 to 11:34. The same window narrowed by 1 ms at each end was
   served bars opening 11:24 to 11:33, and widened by 1 ms at each end, 11:25 to 11:34 again.

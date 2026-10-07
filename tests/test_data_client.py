@@ -301,14 +301,16 @@ def _serve_trendbars(
     request: oa.ProtoOAGetTrendbarsReq,
     *,
     chunk: int | None,
+    short_by: int,
     announce_more: bool,
 ) -> oa.ProtoOAGetTrendbarsRes:
     """Serve recorded bars as the live venue does: `count` of them back from `toTimestamp`.
 
     A bar is served when it opens at or before `toTimestamp`, and `fromTimestamp` is ignored,
-    so a window's answer reaches back past its start. The two switches stand in for what the
-    live endpoint has not settled: a per-request cap below the asked-for `count`, and whether a
-    capped response says so through `hasMore`.
+    so a window's answer reaches back past its start. The switches stand in for what the live
+    endpoint has not settled: a per-request cap below the asked-for `count`, an answer some bars
+    short of it (live, `count = N` has come back with `N - 1`), and whether a capped response
+    says so through `hasMore`.
     """
     source = RECORDED_HISTORY.get((request.symbolId, request.period), {})
     bars = [
@@ -316,7 +318,7 @@ def _serve_trendbars(
         for minute, trendbar in sorted(source.items())
         if minute * 60_000 <= request.toTimestamp
     ]
-    cap = min(request.count or len(bars), len(bars) if chunk is None else chunk)
+    cap = min((request.count or len(bars)) - short_by, len(bars) if chunk is None else chunk)
     truncated = len(bars) > cap
     return oa.ProtoOAGetTrendbarsRes(
         ctidTraderAccountId=request.ctidTraderAccountId,
@@ -330,6 +332,7 @@ def _serve_trendbars(
 def trendbar_venue(
     *,
     chunk: int | None = None,
+    short_by: int = 0,
     announce_more: bool = True,
 ) -> FakeCTraderServer:
     """The data venue, also accepting live trendbar subscriptions and serving recorded history."""
@@ -344,7 +347,12 @@ def trendbar_venue(
         )
     server.on(
         om.PROTO_OA_GET_TRENDBARS_REQ,
-        functools.partial(_serve_trendbars, chunk=chunk, announce_more=announce_more),
+        functools.partial(
+            _serve_trendbars,
+            chunk=chunk,
+            short_by=short_by,
+            announce_more=announce_more,
+        ),
     )
     return server
 
@@ -1927,14 +1935,18 @@ async def test_request_bars_without_a_start_or_a_limit_asks_for_one_page() -> No
         bars = await request_bars(h, EURUSD_H1, end=at_minute(LAST_H1_MINUTE + 60))
 
         assert len(received(h.server, oa.ProtoOAGetTrendbarsReq)) == 1
-        # Exactly a page of the newest, although the page asks the venue for one more.
+        # Exactly a page of the newest, although the page asks the venue for two more.
         assert [b.ts_event for b in bars] == [
             close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(20))
         ]
 
 
-async def test_request_bars_without_a_start_or_a_limit_leaves_out_the_forming_bar() -> None:
-    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+@pytest.mark.parametrize("short_by", [0, 1], ids=["full answer", "one bar short"])
+async def test_request_bars_without_a_start_or_a_limit_leaves_out_the_forming_bar(
+    short_by: int,
+) -> None:
+    server = trendbar_venue(short_by=short_by)
+    async with harness(client_config=config(history_page_size=20), server=server) as h:
         await h.client._connect()
         # Half way into the bar opening at LAST_H1_MINUTE, which is therefore still forming.
         h.client._bar_clock = PinnedClock(LAST_H1_MINUTE * 60 + 1800)
@@ -1943,6 +1955,23 @@ async def test_request_bars_without_a_start_or_a_limit_leaves_out_the_forming_ba
 
         assert [b.ts_event for b in bars] == [
             close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(1, 21))
+        ]
+
+
+async def test_request_bars_with_a_fractional_start_delivers_no_bar_opening_before_it() -> None:
+    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=datetime.fromtimestamp((LAST_H1_MINUTE - 120) * 60 + 0.5, tz=UTC),
+            end=at_minute(LAST_H1_MINUTE + 60),
+        )
+
+        assert [b.ts_event for b in bars] == [
+            close_ns(LAST_H1_MINUTE - 60, 3600),
+            close_ns(LAST_H1_MINUTE, 3600),
         ]
 
 
@@ -2219,23 +2248,30 @@ async def test_a_reconnect_backfill_emits_each_bar_once_and_none_before_the_gap(
     monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
     async with harness(server=trendbar_venue()) as h:
         await h.client._connect()
-        clock = pin_clock(h, FIRST_M1_MINUTE)
+        # Subscribed a minute in, so history holds a bar from before the subscription too.
+        clock = pin_clock(h, FIRST_M1_MINUTE + 1)
         await subscribe_bars(h, EURUSD_M1)
-        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 2):
             await push_spot(h, event)
-        assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE, 60)]
+        assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE + 1, 60)]
 
-        await h.server.drop_connections()
-        # The gap is the two bars after the one already emitted, which history serves too.
+        # The gap is the one bar after the one emitted. History serves it together with that
+        # one and the one before the subscription, since it counts back from the gap's end.
         clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        connections = h.server.connection_count
+        await h.server.drop_connections()
         await wait_until(
-            lambda: len(h.bars()) >= 3,
-            timeout_secs=10.0,
-            description="the missed bars were backfilled",
+            lambda: h.server.connection_count > connections,
+            description="a reconnect",
+        )
+        await h.account.session.wait_ready(timeout_secs=10.0)
+        closer = h.client._bars[EURUSD_M1].closer
+        await wait_until(
+            lambda: not closer._holding and not closer._queue,
+            description="the backfill settled",
         )
 
         assert [b.ts_event for b in h.bars()] == [
-            close_ns(FIRST_M1_MINUTE, 60),
             close_ns(FIRST_M1_MINUTE + 1, 60),
             close_ns(FIRST_M1_MINUTE + 2, 60),
         ]

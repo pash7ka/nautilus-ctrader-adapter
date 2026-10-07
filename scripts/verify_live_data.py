@@ -540,9 +540,10 @@ def decide_window_edges(observation: WindowEdgeObservation) -> Decision:
     on `toTimestamp` is served, and `fromTimestamp` does not bound the answer. Each window's
     answer is compared with the newest `count` bars at or before its `toTimestamp` among every
     bar the run saw, so a bar after `toTimestamp`, a bar skipped, or fewer bars than `count`
-    while older ones exist is `DIFFERS`. A refused control only withdraws its own evidence. If
-    no answer reaches back past its `fromTimestamp`, nothing shows the venue ignores it, and
-    the verdict is `UNKNOWN`.
+    while older ones exist is `DIFFERS` - except an answer missing only the oldest bar, since
+    `count = N` answered with `N - 1` bars has been seen before and is noted instead. A refused
+    control only withdraws its own evidence. If no answer reaches back past its
+    `fromTimestamp`, nothing shows the venue ignores it, and the verdict is `UNKNOWN`.
     """
     if observation.bar_secs is None:
         reason = observation.error_code or "the venue served no such pair"
@@ -586,7 +587,13 @@ def decide_window_edges(observation: WindowEdgeObservation) -> Decision:
         from_ms = first * 1000 + inset_ms
         to_ms = second * 1000 - inset_ms
         expected = sorted(b for b in seen if b * 1000 <= to_ms)[-_EDGE_PROBE_COUNT:]
-        if sorted(set(served)) != expected:
+        answered = sorted(set(served))
+        if len(expected) == _EDGE_PROBE_COUNT and answered == expected[1:]:
+            detail.append(
+                f"the {name} returned one bar fewer than count, missing only the oldest; "
+                "answers of count - 1 bars are a known habit of the venue",
+            )
+        elif answered != expected:
             anomalies.append(
                 f"the {name} returned {_opens_text(served)}, where {_EDGE_PROBE_COUNT} bars "
                 f"counted back from its toTimestamp by open time are {_opens_text(expected)}",
