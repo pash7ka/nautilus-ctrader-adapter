@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "nautilus-trader>=1.228.0",
-    "protobuf>=5.29",
+    "protobuf>=7.35.1,<8",
 ]
 
 [project.urls]
@@ -29,12 +29,10 @@ dev = [
     "pytest-asyncio>=1.0",
     "ruff>=0.14",
     # protoc, used by scripts/gen_protobuf.py to regenerate bindings.
-    # Pinned to the 1.68 line because it carries protobuf 5.29.x: protobuf refuses
-    # generated code newer than the runtime, and nautilus-trader pins protobuf==5.29.6
-    # under its `ib` extra. An unpinned grpcio-tools resolves to protobuf 7.x, whose
-    # output would fail to import for anyone using interactive_brokers.
-    # Changes together with REQUIRED_PROTOBUF_MAJOR_MINOR in scripts/gen_protobuf.py.
-    "grpcio-tools~=1.68.0",
+    # Its protoc stamps a protobuf version into the generated code, and protobuf refuses
+    # generated code newer than the runtime: the `protobuf` floor above moves with this pin.
+    # Changes together with REQUIRED_PROTOBUF_MAJOR in scripts/gen_protobuf.py.
+    "grpcio-tools~=1.84.0",
 ]
 
 [build-system]

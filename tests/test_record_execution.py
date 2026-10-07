@@ -879,7 +879,7 @@ def test_every_repeated_list_that_could_hold_ids_is_scrubbed_or_judged_harmless(
     found: set[str] = set()
     for payload_type in codec._build_registry().values():
         for owner, field in fields_of(payload_type.DESCRIPTOR, set()):
-            if field.label != FieldDescriptor.LABEL_REPEATED or field.type not in _WIDE_OR_TEXT:
+            if not field.is_repeated or field.type not in _WIDE_OR_TEXT:
                 continue
             found.add(field.name)
             decided = field.name in r._ACCOUNT_ID_LISTS or field.name in HARMLESS_LISTS
@@ -1000,7 +1000,7 @@ def test_every_money_field_of_the_schema_is_classified() -> None:
     assert set(r._MONEY_FIELDS.values()) == {r.LEVEL, r.DELTA, r.ZEROED}
     # The scrubber pairs single fields only.
     for owner, name in r._MONEY_FIELDS:
-        assert descriptors[owner].fields_by_name[name].label != FieldDescriptor.LABEL_REPEATED
+        assert not descriptors[owner].fields_by_name[name].is_repeated
 
 
 def history_deal(n: int, *, gross: int, swap: int, commission: int, fee: int, balance: int):
@@ -1164,7 +1164,7 @@ def integers(message) -> list[int]:
     """Every integer `message` holds, at any depth."""
     found: list[int] = []
     for descriptor, value in message.ListFields():
-        items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+        items = value if descriptor.is_repeated else (value,)
         if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
             for item in items:
                 found.extend(integers(item))

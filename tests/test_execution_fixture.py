@@ -41,10 +41,10 @@ def messages(recording: dict):
 def fields(message):
     for descriptor, value in message.ListFields():
         if descriptor.type == FieldDescriptor.TYPE_MESSAGE:
-            items = value if descriptor.label == FieldDescriptor.LABEL_REPEATED else (value,)
+            items = value if descriptor.is_repeated else (value,)
             for item in items:
                 yield from fields(item)
-        elif descriptor.label == FieldDescriptor.LABEL_REPEATED:
+        elif descriptor.is_repeated:
             for item in value:
                 yield descriptor.name, item
         else:

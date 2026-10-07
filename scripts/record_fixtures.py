@@ -172,7 +172,7 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
         name = field.name
         # Before the message branch below, so a cleared field can be a nested message too.
         if name in _CLEARED_FIELDS:
-            if field.label == FieldDescriptor.LABEL_REQUIRED:
+            if field.is_required:
                 # Clearing would leave it unset and break serialization; zero it instead, so
                 # it stays present without carrying an invented value.
                 setattr(message, name, _FAKE_REQUIRED_VALUES.get(name, 0))
@@ -181,7 +181,7 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
             continue
 
         if field.type == FieldDescriptor.TYPE_MESSAGE:
-            items = value if field.label == FieldDescriptor.LABEL_REPEATED else (value,)
+            items = value if field.is_repeated else (value,)
             for item in items:
                 _scrub_in_place(item, real_account_id, real_login)
             continue
@@ -193,7 +193,7 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
         # The safety net for fields not named above: substituted rather than cleared, because
         # an unknown field may be `required`.
         elif field.type in _IDENTIFYING_INT_TYPES:
-            if field.label == FieldDescriptor.LABEL_REPEATED:
+            if field.is_repeated:
                 for i, item in enumerate(value):
                     if real_account_id is not None and item == real_account_id:
                         value[i] = FAKE_ACCOUNT_ID

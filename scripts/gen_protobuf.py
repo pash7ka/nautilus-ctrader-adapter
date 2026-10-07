@@ -9,9 +9,11 @@ exactly those lines to package-absolute imports, and refuses to finish if the nu
 differs from the number the schema declares - a change in protoc's output format must stop
 generation, not ship broken bindings.
 
-The toolchain version matters too. Protobuf refuses generated code newer than the runtime,
-and nautilus-trader pins protobuf==5.29.6 under its `ib` extra, so `grpcio-tools` is pinned
-to the 1.68 line in pyproject.toml. This script refuses to run against anything else.
+The toolchain version matters too. Protobuf refuses generated code from another major
+version, or newer than the runtime. `grpcio-tools` is pinned in pyproject.toml, its bundled
+protoc stamps its version into the generated files, and the `protobuf` floor there must not be
+older than that stamp (tests/test_messages.py checks it). This script refuses to run on a
+runtime of another major version.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MESSAGES_DIR = ROOT / "src" / "nautilus_ctrader" / "messages"
 PACKAGE = "nautilus_ctrader.messages"
 # Changes together with the grpcio-tools pin in pyproject.toml.
-REQUIRED_PROTOBUF_MAJOR_MINOR = (5, 29)
+REQUIRED_PROTOBUF_MAJOR = 7
 
 _PROTO_IMPORT = re.compile(r'^import "(OpenApi\w+)\.proto";', re.MULTILINE)
 _BARE_PYTHON_IMPORT = re.compile(r"^import (OpenApi\w+_pb2) as (\w+)$", re.MULTILINE)
@@ -34,12 +36,10 @@ _BARE_PYTHON_IMPORT = re.compile(r"^import (OpenApi\w+_pb2) as (\w+)$", re.MULTI
 def _check_toolchain() -> str | None:
     from google.protobuf import __version__ as runtime_version
 
-    parts = tuple(int(p) for p in runtime_version.split(".")[:2])
-    if parts != REQUIRED_PROTOBUF_MAJOR_MINOR:
-        wanted = ".".join(str(p) for p in REQUIRED_PROTOBUF_MAJOR_MINOR)
+    if int(runtime_version.split(".")[0]) != REQUIRED_PROTOBUF_MAJOR:
         return (
-            f"protobuf runtime is {runtime_version}, expected {wanted}.x. "
-            "Generated code must not be newer than the runtime any user will have; "
+            f"protobuf runtime is {runtime_version}, expected {REQUIRED_PROTOBUF_MAJOR}.x. "
+            "Generated code must match the major version any user will have; "
             "check the grpcio-tools pin in pyproject.toml."
         )
     return None
