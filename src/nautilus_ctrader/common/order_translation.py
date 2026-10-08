@@ -28,7 +28,7 @@ from nautilus_trader.model.orders import Order
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.parsing import PRICE_SCALE, VOLUME_SCALE
-from nautilus_ctrader.common.venue_records import LevelTerms
+from nautilus_ctrader.common.venue_records import LevelTerms, price_of
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
@@ -341,4 +341,128 @@ def amend_levels(
         if stop_loss is not None:
             request.trailingStopLoss = terms.trailing_stop_loss
             request.guaranteedStopLoss = terms.guaranteed_stop_loss
+    return request
+
+
+# The broker's order types that rest until triggered; the others fill at once.
+_PENDING_TYPES = (om.LIMIT, om.STOP, om.STOP_LIMIT)
+_STOP_TYPES = (om.STOP, om.STOP_LIMIT)
+
+
+def market_refusal(done: str) -> str:
+    """Why a market order cannot be `done`, such as "cancelled"."""
+    return f"a market order fills at once and cannot be {done}"
+
+
+def _require_pending(order: om.ProtoOAOrder, done: str) -> None:
+    if order.orderType not in _PENDING_TYPES:
+        raise Unsupported(market_refusal(done))
+
+
+def cancel_order(account_id: int, order: om.ProtoOAOrder) -> oa.ProtoOACancelOrderReq:
+    """A cancel of the broker's pending `order`."""
+    _require_pending(order, "cancelled")
+    return oa.ProtoOACancelOrderReq(ctidTraderAccountId=account_id, orderId=order.orderId)
+
+
+def _amended_price(
+    instrument: Instrument,
+    order: om.ProtoOAOrder,
+    field: str,
+    wanted: Price | None,
+    *,
+    settable: bool,
+    name: str,
+) -> float | None:
+    """The order's price `field` once amended to `wanted`; the order's own if it is the same."""
+    held = getattr(order, field) if order.HasField(field) else None
+    if wanted is None:
+        return held
+    if held is not None and price_of(held, instrument.price_precision) == wanted.as_decimal():
+        return held
+    if not settable:
+        type_name = om.ProtoOAOrderType.Name(order.orderType)
+        raise Unsupported(f"the venue cannot set the {name} of a {type_name} order")
+    _require_on_price_grid(instrument, wanted)
+    return wanted.as_double()
+
+
+def amend_order(
+    account_id: int,
+    instrument: Instrument,
+    order: om.ProtoOAOrder,
+    *,
+    quantity: Quantity | None,
+    price: Price | None,
+    trigger_price: Price | None,
+) -> oa.ProtoOAAmendOrderReq | None:
+    """The broker's pending `order` with the values given; `None` when it already has them.
+
+    `price` is a `LIMIT` order's limit price, `trigger_price` a `STOP` or `STOP_LIMIT` order's
+    stop price; another price that differs from the order's is refused, as is one off the
+    instrument's grid. Everything the command does not change is sent again from `order`, so
+    the amend changes nothing else:
+    - the volume, the expiration, the slippage and the stop trigger method;
+    - the attached stop-loss and take-profit, relative if the order holds them so, else
+      absolute, with the trailing and guaranteed flags whenever there is a stop-loss.
+    """
+    _require_pending(order, "modified")
+    volume = order.tradeData.volume if quantity is None else volume_from_quantity(quantity)
+    limit = _amended_price(
+        instrument,
+        order,
+        "limitPrice",
+        price,
+        settable=order.orderType == om.LIMIT,
+        name="limit price",
+    )
+    stop = _amended_price(
+        instrument,
+        order,
+        "stopPrice",
+        trigger_price,
+        settable=order.orderType in _STOP_TYPES,
+        name="trigger price",
+    )
+    if (
+        volume == order.tradeData.volume
+        and limit == (order.limitPrice if order.HasField("limitPrice") else None)
+        and stop == (order.stopPrice if order.HasField("stopPrice") else None)
+    ):
+        return None
+    # TODO(verify): what the venue does with an omitted optional field, and whether `volume` is
+    # the order's whole volume or its unfilled rest once partly filled. A live amend of a pending
+    # order with attached levels settles both; the answer is expected to be `ORDER_REPLACED`.
+    request = oa.ProtoOAAmendOrderReq(
+        ctidTraderAccountId=account_id,
+        orderId=order.orderId,
+        volume=volume,
+    )
+    # The schema allows a limit price on a LIMIT order only and a stop price on a stop only.
+    if order.orderType == om.LIMIT and limit is not None:
+        request.limitPrice = limit
+    if order.orderType in _STOP_TYPES:
+        if stop is not None:
+            request.stopPrice = stop
+        request.stopTriggerMethod = order.stopTriggerMethod
+    if order.HasField("expirationTimestamp"):
+        request.expirationTimestamp = order.expirationTimestamp
+    if order.HasField("slippageInPoints"):
+        request.slippageInPoints = order.slippageInPoints
+    # TODO(verify): which form the venue reports for a level set as a distance, and whether it
+    # reports both; the distance is preferred, as it is what follows a moved order price.
+    with_stop = True
+    if order.HasField("relativeStopLoss"):
+        request.relativeStopLoss = order.relativeStopLoss
+    elif order.HasField("stopLoss"):
+        request.stopLoss = order.stopLoss
+    else:
+        with_stop = False
+    if order.HasField("relativeTakeProfit"):
+        request.relativeTakeProfit = order.relativeTakeProfit
+    elif order.HasField("takeProfit"):
+        request.takeProfit = order.takeProfit
+    if with_stop:
+        request.trailingStopLoss = order.trailingStopLoss
+        request.guaranteedStopLoss = order.tradeData.guaranteedStopLoss
     return request

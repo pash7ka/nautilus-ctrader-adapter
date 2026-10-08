@@ -173,7 +173,10 @@ class ExecutionVenue:
     A request whose payload type is in `fail` is answered with an error. `replies` holds each
     served payload type's answer, for a test that holds it back.
 
-    Order requests have no handler until a test registers one with `server.on`.
+    A cancel or an amend of a pending order acts on the snapshot's orders and is answered as the
+    broker answers it: the order cancelled or replaced, or an order error for an order it does not
+    hold pending. Other order requests have no handler until a test registers one with
+    `server.on`.
     """
 
     def __init__(self) -> None:
@@ -218,6 +221,8 @@ class ExecutionVenue:
         )
         self._serve(om.PROTO_OA_ORDER_DETAILS_REQ, self._details)
         self._serve(om.PROTO_OA_CASH_FLOW_HISTORY_LIST_REQ, self._cash_flow)
+        self.server.on(om.PROTO_OA_CANCEL_ORDER_REQ, self._cancel_order)
+        self.server.on(om.PROTO_OA_AMEND_ORDER_REQ, self._amend_order)
         self.server.on(
             om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
             lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
@@ -280,12 +285,60 @@ class ExecutionVenue:
             deal=sorted(deals.values(), key=_executed),
         )
 
+    def _pending_order(self, order_id: int) -> om.ProtoOAOrder | Message:
+        """The snapshot's pending order `order_id`, or the broker's error for any other id."""
+        for order in self.snapshot.order:
+            if order.orderId == order_id and order.orderType in PENDING_TYPES:
+                return order
+        return oa.ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=ACCOUNT_ID,
+            errorCode="ORDER_NOT_FOUND",
+            orderId=order_id,
+            description="Order not found",
+        )
+
+    def _cancel_order(self, request: oa.ProtoOACancelOrderReq) -> Message:
+        order = self._pending_order(request.orderId)
+        if not isinstance(order, om.ProtoOAOrder):
+            return order
+        cancelled = om.ProtoOAOrder()
+        cancelled.CopyFrom(order)
+        self.snapshot.order.remove(order)
+        cancelled.orderStatus = om.ORDER_STATUS_CANCELLED
+        cancelled.utcLastUpdateTimestamp += 1
+        self.orders.append(cancelled)
+        return pending_event(om.ORDER_CANCELLED, cancelled)
+
+    def _amend_order(self, request: oa.ProtoOAAmendOrderReq) -> Message:
+        order = self._pending_order(request.orderId)
+        if not isinstance(order, om.ProtoOAOrder):
+            return order
+        for field, value in request.ListFields():
+            if field.name == "guaranteedStopLoss":
+                order.tradeData.guaranteedStopLoss = value
+            elif field.name == "volume":
+                order.tradeData.volume = value
+            elif field.name not in ("payloadType", "ctidTraderAccountId", "orderId"):
+                setattr(order, field.name, value)
+        order.utcLastUpdateTimestamp += 1
+        return pending_event(om.ORDER_REPLACED, order)
+
     def _page(self, response: type[Message], field: str, items: list) -> Message:
         return response(
             ctidTraderAccountId=ACCOUNT_ID,
             hasMore=len(items) > self.page_size,
             **{field: items[: self.page_size]},
         )
+
+
+PENDING_TYPES = (om.LIMIT, om.STOP, om.STOP_LIMIT)
+
+
+def pending_event(kind: int, order: om.ProtoOAOrder) -> oa.ProtoOAExecutionEvent:
+    """An execution event of a pending order, as the broker sends one about it (hand-built)."""
+    event = oa.ProtoOAExecutionEvent(ctidTraderAccountId=ACCOUNT_ID, executionType=kind)
+    event.order.CopyFrom(order)
+    return event
 
 
 def _executed(deal: om.ProtoOADeal) -> int:

@@ -3177,3 +3177,99 @@ def test_a_foreign_leg_is_found_by_its_venue_order_id_in_any_generation() -> Non
     assert b.foreign_leg_position(leg_venue_order_id(9_999_999, Level.STOP_LOSS)) is None
     assert b.foreign_leg_position(str(FENTRY)) is None
     assert b.foreign_leg_position(stop_id(P)) is None
+
+
+# The last state of each open pending order Nautilus knows from reports, which an amend sends
+# again.
+
+
+def resting(utc: int, *, limit: float = 84000.0, volume: int = 100, kind: int = om.LIMIT):
+    return make_order(7, 8, order_type=kind, utc=utc, limit=limit, volume=volume)
+
+
+CREATED = make_position(8, volume=0, status=om.POSITION_STATUS_CREATED)
+
+
+def test_an_open_pending_order_is_held_as_last_changed() -> None:
+    b = book()
+    b.apply(make_event(om.ORDER_ACCEPTED, resting(10)), NOTHING)
+    assert b.open_order(7) == resting(10)
+
+    b.apply(make_event(om.ORDER_REPLACED, resting(12, limit=84100.0)), NOTHING)
+    # A response applied after a later event leaves the later state.
+    b.apply(make_event(om.ORDER_REPLACED, resting(11, limit=84050.0)), NOTHING)
+
+    assert b.open_order(7) == resting(12, limit=84100.0)
+
+
+def test_a_partly_filled_pending_order_is_held_with_its_fill() -> None:
+    b = book()
+    b.apply(make_event(om.ORDER_ACCEPTED, resting(10), position=CREATED), NOTHING)
+    partly = resting(11)
+    partly.executedVolume = 40
+    deal = make_deal(9_300_001, 7, 8, side=om.BUY, volume=40, price=84000.0, ts=11)
+
+    b.apply(
+        make_event(om.ORDER_PARTIAL_FILL, partly, position=make_position(8), deal=deal), NOTHING
+    )
+
+    assert b.open_order(7) == partly
+
+
+@pytest.mark.parametrize("kind", [om.ORDER_CANCELLED, om.ORDER_EXPIRED, om.ORDER_FILLED])
+def test_an_ended_pending_order_is_no_longer_held(kind) -> None:
+    b = book()
+    b.apply(make_event(om.ORDER_ACCEPTED, resting(10), position=CREATED), NOTHING)
+    deal = make_deal(9_300_001, 7, 8, side=om.BUY, volume=100, price=84000.0, ts=11)
+
+    b.apply(
+        make_event(
+            kind,
+            resting(11),
+            position=make_position(8),
+            deal=deal if kind == om.ORDER_FILLED else None,
+        ),
+        NOTHING,
+    )
+    b.apply(make_event(om.ORDER_REPLACED, resting(12, limit=84100.0)), NOTHING)
+
+    assert b.open_order(7) is None
+    assert b.standing_order(7, 13) == []
+
+
+def test_a_market_order_is_never_held() -> None:
+    b = book()
+    b.apply(make_event(om.ORDER_ACCEPTED, make_order(7, 8, utc=10), position=CREATED), NOTHING)
+
+    assert b.open_order(7) is None
+
+
+def test_load_holds_the_open_pending_orders_and_forgets_the_rest() -> None:
+    b = book()
+    b.apply(make_event(om.ORDER_ACCEPTED, resting(10)), NOTHING)
+    other = make_order(17, 18, order_type=om.STOP, utc=3, stop=85000.0)
+
+    b.load(snapshot(orders=[other]), {})
+
+    assert b.open_order(7) is None
+    assert b.open_order(17) == other
+
+
+def test_a_held_order_stands_as_an_update_of_its_terms() -> None:
+    b = book()
+    b.apply(make_event(om.ORDER_ACCEPTED, resting(10, volume=200)), NOTHING)
+
+    assert b.standing_order(7, 15) == [
+        OrderEvent(
+            OrderEventKind.UPDATED, "7", None, 15, quantity=Decimal("2"), price=Decimal("84000.00")
+        )
+    ]
+
+
+def test_the_held_order_is_a_copy() -> None:
+    b = book()
+    b.apply(make_event(om.ORDER_ACCEPTED, resting(10)), NOTHING)
+
+    b.open_order(7).limitPrice = 1.0
+
+    assert b.open_order(7).limitPrice == 84000.0

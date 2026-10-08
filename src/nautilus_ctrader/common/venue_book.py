@@ -54,6 +54,8 @@ EXTERNAL_TYPE = {
     om.STOP_LIMIT: ExternalType.STOP_LIMIT,
 }
 _FILLS = (om.ORDER_FILLED, om.ORDER_PARTIAL_FILL)
+# Orders that rest at the broker until they trigger; the node never sends one.
+_PENDING = (om.LIMIT, om.STOP, om.STOP_LIMIT)
 _ENDED = {
     om.ORDER_CANCELLED: OrderEventKind.CANCELED,
     om.ORDER_EXPIRED: OrderEventKind.EXPIRED,
@@ -192,6 +194,12 @@ def terms_of(position: om.ProtoOAPosition) -> LevelTerms:
     )
 
 
+def _copied(order: om.ProtoOAOrder) -> om.ProtoOAOrder:
+    copy = om.ProtoOAOrder()
+    copy.CopyFrom(order)
+    return copy
+
+
 def remaining_of(order: om.ProtoOAOrder) -> int:
     """What is left of an order, as a venue volume."""
     # TODO(verify): whether the broker reports a partly filled protective order's total volume or
@@ -290,6 +298,9 @@ class VenueBook:
         # Never-opened entries that ended, dropped from `_positions`.
         self._ended_entries: set[int] = set()
         self._reported: set[int] = set()
+        # The last known state of each pending order among them while open, by broker order id:
+        # an amend sends it again.
+        self._open_orders: dict[int, om.ProtoOAOrder] = {}
         self._seen: set[tuple] = set()
         self._synced_deals: set[int] = set()
 
@@ -381,6 +392,7 @@ class VenueBook:
         self._positions = {}
         self._unloaded_orders = {}
         self._reported = set()
+        self._open_orders = {}
         notices: list[Record] = []
         for venue_position in snapshot.position:
             position = self._new_position(
@@ -418,6 +430,8 @@ class VenueBook:
                 self._reported.add(order.orderId)
                 if self._precision(order.tradeData.symbolId) is None:
                     self._unloaded_orders[order.orderId] = self._pending(order)
+                elif order.orderType in _PENDING:
+                    self._open_orders[order.orderId] = _copied(order)
         for position in self._positions.values():
             if not position.ours and position.levels:
                 # Reconciliation reports the standing levels' legs, at the generation chosen here
@@ -580,6 +594,19 @@ class VenueBook:
         if position_id is None or self._positions[position_id].ours:
             return None
         return position_id, level
+
+    def open_order(self, order_id: int) -> om.ProtoOAOrder | None:
+        """The last known state of an open pending order Nautilus knows from reports."""
+        order = self._open_orders.get(order_id)
+        return None if order is None else _copied(order)
+
+    def standing_order(self, order_id: int, ts_ms: int) -> list[Record]:
+        """An open pending order Nautilus knows from reports, as held; nothing if not held."""
+        order = self._open_orders.get(order_id)
+        precision = None if order is None else self._precision(order.tradeData.symbolId)
+        if precision is None:
+            return []
+        return [self._order_updated(order, precision, ts_ms)]
 
     def entry_position(self, entry_order_id: int) -> int | None:
         """The position broker order `entry_order_id` opened, open or closed since the last load."""
@@ -846,6 +873,7 @@ class VenueBook:
         order, kind = event.order, event.executionType
         venue_order_id, ts = str(order.orderId), order.utcLastUpdateTimestamp
         known = order.orderId in self._reported
+        self._keep_open_order(event, known)
         if kind == om.ORDER_ACCEPTED:
             if known:
                 return []
@@ -862,23 +890,39 @@ class VenueBook:
         if not known:
             return []
         if kind == om.ORDER_REPLACED:
-            report = self._external_report(order, precision, reduce_only=reduce_only)
-            return [
-                OrderEvent(
-                    OrderEventKind.UPDATED,
-                    venue_order_id,
-                    None,
-                    ts,
-                    quantity=report.units,
-                    price=report.price,
-                    trigger_price=report.trigger_price,
-                ),
-            ]
+            return [self._order_updated(order, precision, ts)]
         if kind in _ENDED:
             return [
                 OrderEvent(_ENDED[kind], venue_order_id, None, ts, reason=event.errorCode or None),
             ]
         return []
+
+    def _order_updated(self, order: om.ProtoOAOrder, precision: int, ts_ms: int) -> OrderEvent:
+        report = self._external_report(order, precision, reduce_only=False)
+        return OrderEvent(
+            OrderEventKind.UPDATED,
+            str(order.orderId),
+            None,
+            ts_ms,
+            quantity=report.units,
+            price=report.price,
+            trigger_price=report.trigger_price,
+        )
+
+    def _keep_open_order(self, event: oa.ProtoOAExecutionEvent, known: bool) -> None:
+        """Keep the latest state of a pending order reported to Nautilus while it is open."""
+        order, kind = event.order, event.executionType
+        if order.orderType not in _PENDING:
+            return
+        if kind == om.ORDER_FILLED or kind in _ENDED:
+            self._open_orders.pop(order.orderId, None)
+        elif kind in (om.ORDER_ACCEPTED, om.ORDER_PARTIAL_FILL) and not known:
+            self._open_orders[order.orderId] = _copied(order)
+        elif kind in (om.ORDER_REPLACED, om.ORDER_PARTIAL_FILL):
+            held = self._open_orders.get(order.orderId)
+            # An ended order is not held, so a late event never brings it back.
+            if held is not None and order.utcLastUpdateTimestamp >= held.utcLastUpdateTimestamp:
+                self._open_orders[order.orderId] = _copied(order)
 
     # Event kinds
 

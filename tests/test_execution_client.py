@@ -79,8 +79,10 @@ from tests.execution_venue import (
     exec_config,
     harness,
     on_us100,
+    pending_event,
     push,
     push_spot,
+    started,
     status,
     submit_bracket,
     submitted,
@@ -1767,20 +1769,23 @@ def foreign_leg(h, venue_order_id: str):
     return None if client_order_id is None else h.cache.order(client_order_id)
 
 
-def protected_by_hand(*, trailing: bool) -> list:
+def protected_by_hand(*, trailing: bool, guaranteed: bool = False) -> list:
     """The first position as a trader opened and protected it."""
     events = list(FOREIGN_EVENTS[:3])
-    if trailing:
+    if trailing or guaranteed:
         protected = type(events[2])()
         protected.CopyFrom(events[2])
-        protected.position.trailingStopLoss = True
-        protected.position.stopLossTriggerMethod = om.OPPOSITE
+        if trailing:
+            protected.position.trailingStopLoss = True
+            protected.position.stopLossTriggerMethod = om.OPPOSITE
+        if guaranteed:
+            protected.position.guaranteedStopLoss = True
         events[2] = protected
     return events
 
 
-async def foreign_legs(h, *, trailing: bool = False) -> tuple:
-    await push(h, *protected_by_hand(trailing=trailing))
+async def foreign_legs(h, *, trailing: bool = False, guaranteed: bool = False) -> tuple:
+    await push(h, *protected_by_hand(trailing=trailing, guaranteed=guaranteed))
     await wait_until(
         lambda: foreign_leg(h, FOREIGN_SL) is not None and foreign_leg(h, FOREIGN_TP) is not None,
         description="the foreign legs",
@@ -2029,3 +2034,400 @@ async def test_commands_whose_level_the_broker_keeps_are_rejected() -> None:
         assert cancel_rejected.strategy_id == modify_rejected.strategy_id == EXTERNAL
         assert foreign_leg(h, FOREIGN_SL).status == OrderStatus.ACCEPTED
         assert foreign_leg(h, FOREIGN_TP).price == Price.from_str("85387.22")
+
+
+# A trader's pending order: a cancel or a modify of it is carried out at the broker, whoever sends
+# it. Nautilus hears of the outcome from the broker's answer, as reports, as for a foreign leg.
+
+RESTING, RESTING_POSITION = 6_800_001, 5_800_001
+EXPIRES = 1_900_000_000_000
+
+
+def resting(kind: int = om.LIMIT, **fields) -> om.ProtoOAOrder:
+    """A trader's pending buy of 2.00 `US100.cash`: a limit at 84000.00 or a stop at 86000.00."""
+    order = make_order(
+        RESTING,
+        RESTING_POSITION,
+        order_type=kind,
+        utc=int(time.time() * 1000) - 60_000,
+        limit=84000.0 if kind == om.LIMIT else None,
+        stop=None if kind == om.LIMIT else 86000.0,
+        volume=200,
+        symbol=US100_SYMBOL_ID,
+    )
+    order.timeInForce = om.GOOD_TILL_CANCEL
+    for name, value in fields.items():
+        setattr(order, name, value)
+    return order
+
+
+def resting_venue(order: om.ProtoOAOrder | None = None) -> ExecutionVenue:
+    execution_venue = ExecutionVenue()
+    execution_venue.snapshot.order.append(order or resting())
+    return execution_venue
+
+
+async def held_resting(h):
+    """The trader's order, as Nautilus learnt it from the start's reconciliation."""
+    await started(h)
+    order = foreign_leg(h, str(RESTING))
+    assert order is not None and order.status == OrderStatus.ACCEPTED
+    return order
+
+
+def order_amends(h) -> list[oa.ProtoOAAmendOrderReq]:
+    return h.received(oa.ProtoOAAmendOrderReq)
+
+
+async def test_a_pending_external_order_is_cancelled_at_the_broker() -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+        await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.CANCELED)
+
+        assert h.received(oa.ProtoOACancelOrderReq) == [
+            oa.ProtoOACancelOrderReq(ctidTraderAccountId=ACCOUNT_ID, orderId=RESTING)
+        ]
+        assert reports_of(h, str(RESTING))[-1].order_status == OrderStatus.CANCELED
+        assert reports_of(h, str(RESTING))[-1].client_order_id == order.client_order_id
+        assert sent_about(h, order) == []
+        assert h.client._book.open_order(RESTING) is None
+
+        # The broker holds it no longer, so nothing is sent.
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+        await wait_until(lambda: sent_about(h, order))
+        (rejected,) = sent_about(h, order)
+        assert isinstance(rejected, OrderCancelRejected)
+        assert rejected.reason == "the order is not open at the venue"
+        assert len(h.received(oa.ProtoOACancelOrderReq)) == 1
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "change", "sent", "held"),
+    [
+        pytest.param(
+            om.LIMIT,
+            {"price": "84100.00"},
+            {"volume": 200, "limitPrice": 84100.0},
+            {"price": Price.from_str("84100.00")},
+            id="price",
+        ),
+        pytest.param(
+            om.STOP,
+            {"trigger_price": "86100.00"},
+            {"volume": 200, "stopPrice": 86100.0, "stopTriggerMethod": om.TRADE},
+            {"trigger_price": Price.from_str("86100.00")},
+            id="trigger-price",
+        ),
+        pytest.param(
+            om.LIMIT,
+            {"quantity": "3.00"},
+            {"volume": 300, "limitPrice": 84000.0},
+            {"quantity": Quantity.from_str("3.00"), "price": Price.from_str("84000.00")},
+            id="quantity",
+        ),
+    ],
+)
+async def test_a_pending_external_order_is_amended_at_the_broker(kind, change, sent, held) -> None:
+    async with harness(execution_venue=resting_venue(resting(kind))) as h:
+        order = await held_resting(h)
+        # Sent by a strategy that is not the order's: Nautilus checks no ownership.
+        await h.client._modify_order(modify(order.client_order_id.value, **change))
+
+        def amended() -> bool:
+            now = foreign_leg(h, str(RESTING))
+            return all(getattr(now, name) == value for name, value in held.items())
+
+        await wait_until(amended, description="the order amended")
+        (amend,) = order_amends(h)
+        assert amend == oa.ProtoOAAmendOrderReq(
+            ctidTraderAccountId=ACCOUNT_ID, orderId=RESTING, **sent
+        )
+        assert foreign_leg(h, str(RESTING)).status == OrderStatus.ACCEPTED
+        assert reports_of(h, str(RESTING))[-1].order_status == OrderStatus.ACCEPTED
+        assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+
+async def test_an_amend_of_a_pending_order_sends_its_attached_levels_again() -> None:
+    order = resting(
+        stopLoss=83000.0,
+        takeProfit=85500.0,
+        trailingStopLoss=True,
+        expirationTimestamp=EXPIRES,
+        timeInForce=om.GOOD_TILL_DATE,
+    )
+    order.tradeData.guaranteedStopLoss = True
+    async with harness(execution_venue=resting_venue(order)) as h:
+        held = await held_resting(h)
+        await h.client._modify_order(modify(held.client_order_id.value, price="84100.00"))
+        await wait_until(lambda: order_amends(h))
+
+        (amend,) = order_amends(h)
+        assert amend == oa.ProtoOAAmendOrderReq(
+            ctidTraderAccountId=ACCOUNT_ID,
+            orderId=RESTING,
+            volume=200,
+            limitPrice=84100.0,
+            expirationTimestamp=EXPIRES,
+            stopLoss=83000.0,
+            takeProfit=85500.0,
+            trailingStopLoss=True,
+            guaranteedStopLoss=True,
+        )
+        await wait_until(
+            lambda: foreign_leg(h, str(RESTING)).price == Price.from_str("84100.00"),
+        )
+        # The broker's answer is what the next amend starts from.
+        assert h.client._book.open_order(RESTING).limitPrice == 84100.0
+
+
+async def test_a_pending_order_learnt_live_is_amended_from_its_last_state() -> None:
+    async with harness() as h:
+        order = resting()
+        await push(h, pending_event(om.ORDER_ACCEPTED, order))
+        await wait_until(lambda: foreign_leg(h, str(RESTING)) is not None)
+        moved = resting(limitPrice=84050.0)
+        moved.utcLastUpdateTimestamp = order.utcLastUpdateTimestamp + 1
+        h.venue.snapshot.order.append(moved)
+        await push(h, pending_event(om.ORDER_REPLACED, moved))
+        await wait_until(
+            lambda: foreign_leg(h, str(RESTING)).price == Price.from_str("84050.00"),
+        )
+
+        held = foreign_leg(h, str(RESTING))
+        await h.client._modify_order(modify(held.client_order_id.value, quantity="1.00"))
+        await wait_until(
+            lambda: foreign_leg(h, str(RESTING)).quantity == Quantity.from_str("1.00"),
+        )
+
+        (amend,) = order_amends(h)
+        assert amend.volume == 100
+        assert amend.limitPrice == 84050.0
+
+
+REFUSED_PRICE = oa.ProtoOAOrderErrorEvent(
+    ctidTraderAccountId=ACCOUNT_ID, errorCode="TRADING_BAD_PRICES", description="Invalid price"
+)
+
+
+@pytest.mark.parametrize("by_event", [False, True], ids=["order-error", "execution-event"])
+async def test_commands_on_a_pending_order_the_broker_refuses_are_rejected(by_event) -> None:
+    execution_venue = resting_venue()
+
+    def refuse(kind: int):
+        def answer(_request):
+            if not by_event:
+                return REFUSED_PRICE
+            event = pending_event(kind, execution_venue.snapshot.order[0])
+            event.errorCode = "TRADING_BAD_PRICES"
+            return event
+
+        return answer
+
+    execution_venue.server.on(om.PROTO_OA_CANCEL_ORDER_REQ, refuse(om.ORDER_CANCEL_REJECTED))
+    execution_venue.server.on(om.PROTO_OA_AMEND_ORDER_REQ, refuse(om.ORDER_REJECTED))
+    async with harness(execution_venue=execution_venue) as h:
+        order = await held_resting(h)
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+        await h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        await wait_until(lambda: len(sent_about(h, order)) == 2)
+
+        cancel_rejected, modify_rejected = sent_about(h, order)
+        assert isinstance(cancel_rejected, OrderCancelRejected)
+        assert isinstance(modify_rejected, OrderModifyRejected)
+        for rejected in (cancel_rejected, modify_rejected):
+            assert rejected.strategy_id == EXTERNAL
+            assert rejected.reason.startswith("TRADING_BAD_PRICES")
+        await sync(h)
+        held = foreign_leg(h, str(RESTING))
+        assert held.status == OrderStatus.ACCEPTED
+        assert held.price == Price.from_str("84000.00")
+        assert h.client._book.open_order(RESTING) is not None
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"price": "84000.005"}, "finer than the instrument's price precision"),
+        ({"trigger_price": "85000.00"}, "cannot set the trigger price of a LIMIT order"),
+    ],
+)
+async def test_a_modify_the_venue_cannot_express_is_refused_unsent(change, reason) -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+        await h.client._modify_order(modify(order.client_order_id.value, **change))
+        await wait_until(lambda: sent_about(h, order))
+
+        (rejected,) = sent_about(h, order)
+        assert isinstance(rejected, OrderModifyRejected)
+        assert reason in rejected.reason
+        assert order_amends(h) == []
+
+
+async def test_a_modify_that_changes_nothing_is_answered_as_the_broker_holds_the_order() -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+        h.engine.process(
+            OrderPendingUpdate(
+                TRADER_ID,
+                EXTERNAL,
+                US100_ID,
+                order.client_order_id,
+                order.venue_order_id,
+                ACCOUNT,
+                UUID4(),
+                0,
+                0,
+            ),
+        )
+        await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.PENDING_UPDATE)
+        before = len(reports_of(h, str(RESTING)))
+
+        await h.client._modify_order(modify(order.client_order_id.value, price="84000.00"))
+        await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.ACCEPTED)
+
+        assert order_amends(h) == []
+        assert len(reports_of(h, str(RESTING))) == before + 1
+        assert sent_about(h, order) == []
+
+
+async def test_a_market_order_can_be_neither_cancelled_nor_modified() -> None:
+    async with harness(execution_venue=answered(FIRST_EVENTS[:3])) as h:
+        await opened_bracket(h)
+        await h.client._cancel_order(cancel(ENTRY))
+        await h.client._modify_order(modify(ENTRY, quantity="2.00"))
+        await wait_until(lambda: last_kind(h, ENTRY) == "OrderModifyRejected")
+
+        cancel_rejected, modify_rejected = (
+            e for e in h.events_of(ENTRY) if "Rejected" in type(e).__name__
+        )
+        assert cancel_rejected.reason == "a market order fills at once and cannot be cancelled"
+        assert modify_rejected.reason == "a market order fills at once and cannot be modified"
+        assert h.received(oa.ProtoOACancelOrderReq) == order_amends(h) == []
+
+
+def kinds(order) -> list[str]:
+    """The kinds of the events Nautilus applied to `order`, oldest first."""
+    return [type(e).__name__ for e in order.events]
+
+
+def engine_cancel(h, order) -> None:
+    """A cancel of `order` by strategy `S-002`, through the engine as a strategy sends one."""
+    h.engine.process(
+        OrderPendingCancel(
+            TRADER_ID,
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            order.venue_order_id,
+            ACCOUNT,
+            UUID4(),
+            0,
+            0,
+        ),
+    )
+    h.engine.execute(
+        CancelOrder(
+            trader_id=TRADER_ID,
+            strategy_id=StrategyId("S-002"),
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            command_id=UUID4(),
+            ts_init=0,
+        ),
+    )
+
+
+async def test_a_cancel_through_the_engine_ends_the_pending_cancel() -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+        engine_cancel(h, order)
+
+        await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.CANCELED)
+        assert kinds(foreign_leg(h, str(RESTING)))[-2:] == ["OrderPendingCancel", "OrderCanceled"]
+        assert len(h.received(oa.ProtoOACancelOrderReq)) == 1
+        assert sent_about(h, order) == []
+
+
+async def test_a_refused_cancel_of_a_foreign_leg_through_the_engine_ends_its_pending_cancel() -> (
+    None
+):
+    execution_venue = ExecutionVenue()
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, _ = await foreign_legs(h)
+        engine_cancel(h, stop)
+
+        await wait_until(lambda: kinds(foreign_leg(h, FOREIGN_SL))[-1] == "OrderCancelRejected")
+        assert foreign_leg(h, FOREIGN_SL).status == OrderStatus.ACCEPTED
+        assert kinds(foreign_leg(h, FOREIGN_SL))[-2:] == [
+            "OrderPendingCancel",
+            "OrderCancelRejected",
+        ]
+        (rejected,) = [
+            e for e in h.events_of(stop.client_order_id.value) if isinstance(e, OrderCancelRejected)
+        ]
+        assert rejected.strategy_id == EXTERNAL
+        assert rejected.reason == "TRADING_BAD_STOPS: Invalid stops"
+
+
+async def test_a_modify_of_a_guaranteed_stop_loss_keeps_it_guaranteed() -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, _ = await foreign_legs(h, guaranteed=True)
+        await h.client._modify_order(modify(stop.client_order_id.value, trigger_price="85150.00"))
+        await wait_until(
+            lambda: foreign_leg(h, FOREIGN_SL).trigger_price == Price.from_str("85150.00"),
+        )
+
+        (amend,) = amends
+        assert levels(amend) == (85150.0, 85387.22)
+        assert amend.HasField("guaranteedStopLoss") and amend.guaranteedStopLoss
+        assert amend.HasField("trailingStopLoss") and not amend.trailingStopLoss
+
+
+async def test_commands_on_a_pending_order_the_broker_answers_unchanged_are_rejected() -> None:
+    execution_venue = resting_venue()
+
+    def unchanged(_request):
+        order = execution_venue.snapshot.order[0]
+        order.utcLastUpdateTimestamp += 1
+        return pending_event(om.ORDER_REPLACED, order)
+
+    execution_venue.server.on(om.PROTO_OA_CANCEL_ORDER_REQ, unchanged)
+    execution_venue.server.on(om.PROTO_OA_AMEND_ORDER_REQ, unchanged)
+    async with harness(execution_venue=execution_venue) as h:
+        order = await held_resting(h)
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+        await h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        await wait_until(lambda: len(sent_about(h, order)) == 2)
+
+        cancel_rejected, modify_rejected = sent_about(h, order)
+        assert cancel_rejected.reason == "the broker kept the order open"
+        assert modify_rejected.reason == "the broker did not amend the order as asked"
+        assert cancel_rejected.strategy_id == modify_rejected.strategy_id == EXTERNAL
+        await sync(h)
+        held = foreign_leg(h, str(RESTING))
+        assert held.status == OrderStatus.ACCEPTED
+        assert held.price == Price.from_str("84000.00")
+
+
+async def test_two_amends_of_one_pending_order_never_undo_each_other() -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+        await asyncio.gather(
+            h.client._modify_order(modify(order.client_order_id.value, price="84100.00")),
+            h.client._modify_order(modify(order.client_order_id.value, quantity="3.00")),
+        )
+        await wait_until(
+            lambda: foreign_leg(h, str(RESTING)).quantity == Quantity.from_str("3.00"),
+        )
+
+        first, second = order_amends(h)
+        assert (first.volume, first.limitPrice) == (200, 84100.0)
+        assert (second.volume, second.limitPrice) == (300, 84100.0)
+        assert foreign_leg(h, str(RESTING)).price == Price.from_str("84100.00")

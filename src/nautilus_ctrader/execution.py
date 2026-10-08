@@ -194,6 +194,34 @@ def _reason(code: str, description: str | None) -> str:
     return f"{code}: {description}" if description else code
 
 
+def _foreign_live(view: PositionView | None, level: Level, venue_order_id: str) -> bool:
+    """Whether `venue_order_id` is the live leg of `level` of the foreign position `view`."""
+    return view is not None and view.foreign_legs.get(level) == venue_order_id
+
+
+def _updated(
+    records: Iterable[Record],
+    *,
+    client_order_id: str | None = None,
+    venue_order_id: str | None = None,
+) -> bool:
+    """Whether `records` update the order the given id names."""
+    return any(
+        isinstance(r, OrderEvent)
+        and r.kind == OrderEventKind.UPDATED
+        and (client_order_id is None or r.client_order_id == client_order_id)
+        and (venue_order_id is None or r.venue_order_id == venue_order_id)
+        for r in records
+    )
+
+
+def _not_moved(held: Decimal | None) -> str:
+    """Why a level is not at the price a modify asked for, given the price the broker holds."""
+    return (
+        "the broker holds no such level" if held is None else f"the broker kept the level at {held}"
+    )
+
+
 def _with_positions(
     snapshot: oa.ProtoOAReconcileRes,
     again: oa.ProtoOAReconcileRes,
@@ -382,6 +410,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._brackets = PendingBrackets()
         # One amend of a position at a time, so each computes from what the last one left.
         self._amend_locks: dict[int, asyncio.Lock] = {}
+        # Likewise for a pending order, by broker order id.
+        self._order_locks: dict[int, asyncio.Lock] = {}
         self._protection_timers: set[asyncio.TimerHandle] = set()
         # Events held while the model is rebuilt, or `None` when it stands.
         self._buffer: list[_ModelEvent] | None = None
@@ -2112,9 +2142,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         await self._cancel([cancel.client_order_id for cancel in command.cancels])
 
     async def _cancel(self, client_order_ids: list[ClientOrderId]) -> None:
-        """Cancel legs, the node's or foreign, one amend per position; anything else is refused."""
+        """Cancel legs, one amend per position, and pending orders; anything else is refused."""
         by_position: dict[int, dict[Level, ClientOrderId]] = {}
         foreign: dict[int, dict[Level, tuple[ClientOrderId, str]]] = {}
+        orders: list[tuple[ClientOrderId, om.ProtoOAOrder]] = []
         for client_order_id in client_order_ids:
             pending = self._brackets.by_leg(client_order_id.value)
             if pending is not None:
@@ -2132,21 +2163,24 @@ class CTraderExecutionClient(LiveExecutionClient):
                 continue
             foreign_leg = self._foreign_leg(client_order_id)
             if foreign_leg is None:
-                self._cancel_rejected(
-                    client_order_id,
-                    "only a protective leg can be cancelled; a market order fills at once",
-                )
-            elif not self._foreign_leg_alive(*foreign_leg):
-                self._cancel_rejected(client_order_id, "the leg is already closed")
-            else:
-                position_id, level, venue_order_id = foreign_leg
+                held = self._open_order(client_order_id, "cancelled")
+                if isinstance(held, str):
+                    self._cancel_rejected(client_order_id, held)
+                else:
+                    orders.append((client_order_id, held))
+                continue
+            position_id, level, venue_order_id = foreign_leg
+            if _foreign_live(self._book.view(position_id), level, venue_order_id):
                 foreign.setdefault(position_id, {})[level] = (client_order_id, venue_order_id)
+            else:
+                self._cancel_rejected(client_order_id, "the leg is already closed")
         await asyncio.gather(
             *(self._remove_levels(position_id, legs) for position_id, legs in by_position.items()),
             *(
                 self._remove_foreign_levels(position_id, legs)
                 for position_id, legs in foreign.items()
             ),
+            *(self._cancel_pending(client_order_id, held) for client_order_id, held in orders),
         )
 
     async def _remove_levels(self, position_id: int, legs: dict[Level, ClientOrderId]) -> None:
@@ -2180,7 +2214,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             gone = {
                 level
                 for level, (_, venue_order_id) in legs.items()
-                if view.foreign_legs.get(level) == venue_order_id
+                if _foreign_live(view, level, venue_order_id)
             }
             return {lv: p for lv, p in view.levels.items() if lv not in gone}
 
@@ -2191,7 +2225,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             return
         view = self._book.view(position_id)
         for level, (client_order_id, venue_order_id) in legs.items():
-            if view is not None and view.foreign_legs.get(level) == venue_order_id:
+            if _foreign_live(view, level, venue_order_id):
                 self._cancel_rejected(client_order_id, "the broker kept the level")
 
     def _foreign_leg(self, client_order_id: ClientOrderId) -> tuple[int, Level, str] | None:
@@ -2203,9 +2237,64 @@ class CTraderExecutionClient(LiveExecutionClient):
         found = self._book.foreign_leg_position(venue_order_id)
         return None if found is None else (*found, venue_order_id)
 
-    def _foreign_leg_alive(self, position_id: int, level: Level, venue_order_id: str) -> bool:
-        view = self._book.view(position_id)
-        return view is not None and view.foreign_legs.get(level) == venue_order_id
+    def _open_order(self, client_order_id: ClientOrderId, done: str) -> om.ProtoOAOrder | str:
+        """The broker's pending order behind `client_order_id`, or why it cannot be `done`."""
+        order = self._cache.order(client_order_id)
+        if order is not None and order.order_type == OrderType.MARKET:
+            return order_translation.market_refusal(done)
+        venue_order_id = (
+            None if order is None or order.venue_order_id is None else order.venue_order_id.value
+        )
+        held = (
+            self._book.open_order(int(venue_order_id))
+            if venue_order_id is not None and venue_order_id.isdigit()
+            else None
+        )
+        return "the order is not open at the venue" if held is None else held
+
+    async def _cancel_pending(self, client_order_id: ClientOrderId, held: om.ProtoOAOrder) -> None:
+        """Cancel a pending order; the broker's answer reports it cancelled."""
+        try:
+            request = order_translation.cancel_order(self._account.account_id, held)
+        except Unsupported as e:
+            self._cancel_rejected(client_order_id, str(e))
+            return
+        outcome = await self._change_order(request)
+        if outcome is None:
+            self._log.warning(
+                f"Cancel of {client_order_id}: no answer, so its outcome is unknown; "
+                "it is not resent",
+            )
+        elif isinstance(outcome, _Refused):
+            self._cancel_rejected(client_order_id, outcome.reason)
+        elif self._book.open_order(held.orderId) is not None:
+            self._cancel_rejected(client_order_id, "the broker kept the order open")
+
+    async def _change_order(
+        self,
+        request: oa.ProtoOACancelOrderReq | oa.ProtoOAAmendOrderReq,
+    ) -> list[Record] | _Refused | None:
+        """Send a cancel or an amend of a pending order.
+
+        Returns the records of the broker's answer, its refusal, or `None` when the outcome is
+        unknown.
+        """
+        outcome = await self._send(request)
+        if outcome is None or isinstance(outcome, _Refused):
+            return outcome
+        if not isinstance(outcome, oa.ProtoOAExecutionEvent):
+            return []
+        # TODO(verify): how the venue refuses a cancel or an amend of a pending order: with an
+        # order error, or with an execution event like this. Such an event is not applied to the
+        # model: the order it names still stands.
+        if outcome.executionType in (om.ORDER_REJECTED, om.ORDER_CANCEL_REJECTED):
+            code = outcome.errorCode or om.ProtoOAExecutionType.Name(outcome.executionType)
+            return _Refused(code)
+        records = self._on_execution_event(outcome)
+        if isinstance(records, _Buffered):
+            await self._wait_for_model()
+            return []
+        return records
 
     async def _modify_order(self, command: ModifyOrder) -> None:
         client_order_id = command.client_order_id
@@ -2221,7 +2310,11 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._modify_foreign_leg(command, order, *foreign_leg)
             return
         if order is None or (pending is None and found is None):
-            self._modify_rejected(client_order_id, "only a protective leg can be modified")
+            held = self._open_order(client_order_id, "modified")
+            if isinstance(held, str):
+                self._modify_rejected(client_order_id, held)
+            else:
+                await self._modify_pending(command, held.orderId)
             return
         level = pending[1] if pending is not None else found[1]
         if pending is None and not self._leg_alive(client_order_id.value):
@@ -2261,20 +2354,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         view = self._book.view(found[0])
         held_price = None if view is None else view.levels.get(level)
         if held_price != wanted:
-            reason = (
-                "the broker holds no such level"
-                if held_price is None
-                else f"the broker kept the level at {held_price}"
-            )
-            self._modify_rejected(client_order_id, reason)
+            self._modify_rejected(client_order_id, _not_moved(held_price))
             return
-        updated = any(
-            isinstance(r, OrderEvent)
-            and r.kind == OrderEventKind.UPDATED
-            and r.client_order_id == client_order_id.value
-            for r in outcome
-        )
-        if not updated:
+        if not _updated(outcome, client_order_id=client_order_id.value):
             # The level stood there already, so no event says so; the modify still needs one.
             self._leg_updated(client_order_id, level, wanted)
 
@@ -2288,10 +2370,10 @@ class CTraderExecutionClient(LiveExecutionClient):
     ) -> None:
         """Move the level of a foreign leg; the broker's answer reports the leg moved."""
         client_order_id = command.client_order_id
-        if not self._foreign_leg_alive(position_id, level, venue_order_id):
+        view = self._book.view(position_id)
+        if not _foreign_live(view, level, venue_order_id):
             self._modify_rejected(client_order_id, "the leg is already closed")
             return
-        view = self._book.view(position_id)
         instrument = self._instrument_provider.find(order.instrument_id)
         held = reports.quantity(view.leg_units[level], instrument)
         if command.quantity is not None and command.quantity != held:
@@ -2306,7 +2388,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             wanted = price.as_decimal()
 
             def levels_of(view: PositionView) -> dict[Level, Decimal]:
-                if view.foreign_legs.get(level) != venue_order_id:
+                if not _foreign_live(view, level, venue_order_id):
                     return view.levels
                 return {**view.levels, level: wanted}
 
@@ -2315,25 +2397,21 @@ class CTraderExecutionClient(LiveExecutionClient):
                 self._modify_rejected(client_order_id, outcome.reason)
                 return
             view = self._book.view(position_id)
-            if view is None or view.foreign_legs.get(level) != venue_order_id:
+            if not _foreign_live(view, level, venue_order_id):
                 self._modify_rejected(client_order_id, "the leg is already closed")
                 return
-            if view.levels[level] != wanted:
-                self._modify_rejected(
-                    client_order_id, f"the broker kept the level at {view.levels[level]}"
-                )
+            if view.levels.get(level) != wanted:
+                self._modify_rejected(client_order_id, _not_moved(view.levels.get(level)))
                 return
-            if any(
-                isinstance(r, OrderEvent)
-                and r.kind == OrderEventKind.UPDATED
-                and r.venue_order_id == venue_order_id
-                for r in outcome
-            ):
+            if _updated(outcome, venue_order_id=venue_order_id):
                 return
         # Nothing changed at the broker, so no answer reports the leg; the report says how it
         # stands, which ends Nautilus's pending update.
         stop = level == Level.STOP_LOSS
-        standing = view.levels[level]
+        standing = view.levels.get(level)
+        if standing is None:
+            self._modify_rejected(client_order_id, _not_moved(standing))
+            return
         self._handle_records(
             [
                 OrderEvent(
@@ -2347,6 +2425,66 @@ class CTraderExecutionClient(LiveExecutionClient):
                 ),
             ],
         )
+
+    async def _modify_pending(self, command: ModifyOrder, order_id: int) -> None:
+        """Amend pending order `order_id`, one amend of it at a time.
+
+        Each amend starts from the order as the one before it left it, so it never undoes it.
+        """
+        async with self._order_locks.setdefault(order_id, asyncio.Lock()):
+            await self._amend_pending(command, order_id)
+
+    async def _amend_pending(self, command: ModifyOrder, order_id: int) -> None:
+        """Amend a pending order; the broker's answer reports it amended."""
+        client_order_id = command.client_order_id
+        held = self._book.open_order(order_id)
+        if held is None:
+            self._modify_rejected(client_order_id, "the order is not open at the venue")
+            return
+        instrument = self._instrument_provider.instrument_for_symbol_id(held.tradeData.symbolId)
+        if instrument is None:
+            self._modify_rejected(
+                client_order_id, f"symbol {held.tradeData.symbolId} is not loaded"
+            )
+            return
+        amend = partial(
+            order_translation.amend_order,
+            self._account.account_id,
+            instrument,
+            quantity=command.quantity,
+            price=command.price,
+            trigger_price=command.trigger_price,
+        )
+        try:
+            request = amend(held)
+        except Unsupported as e:
+            self._modify_rejected(client_order_id, str(e))
+            return
+        if request is not None:
+            outcome = await self._change_order(request)
+            if outcome is None:
+                self._log.warning(
+                    f"Modify of {client_order_id}: no answer, so its outcome is unknown; "
+                    "it is not resent",
+                )
+                return
+            if isinstance(outcome, _Refused):
+                self._modify_rejected(client_order_id, outcome.reason)
+                return
+            now = self._book.open_order(held.orderId)
+            if now is None:
+                # Ended meanwhile: the record that ended it tells Nautilus.
+                return
+            if amend(now) is not None:
+                self._modify_rejected(
+                    client_order_id, "the broker did not amend the order as asked"
+                )
+                return
+            if _updated(outcome, venue_order_id=str(held.orderId)):
+                return
+        # Nothing changed at the broker, so no answer reports the order; the report says how it
+        # stands, which ends Nautilus's pending update.
+        self._handle_records(self._book.standing_order(held.orderId, self._clock.timestamp_ms()))
 
     def _leg_alive(self, leg_id: str) -> bool:
         found = self._book.leg_position(leg_id)
@@ -2466,11 +2604,14 @@ class CTraderExecutionClient(LiveExecutionClient):
             )
 
     def _drop_amend_locks(self) -> None:
-        """Forget the lock of each position no longer open; an amend there is refused anyway."""
+        """Forget the lock of each position or order no longer open; an amend there is refused."""
         for position_id, lock in list(self._amend_locks.items()):
             view = self._book.view(position_id)
             if not lock.locked() and (view is None or not view.open):
                 del self._amend_locks[position_id]
+        for order_id, lock in list(self._order_locks.items()):
+            if not lock.locked() and self._book.open_order(order_id) is None:
+                del self._order_locks[order_id]
 
     @staticmethod
     def _level_price(
