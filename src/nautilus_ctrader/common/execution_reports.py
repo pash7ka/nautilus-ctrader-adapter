@@ -131,11 +131,13 @@ def order_status_report(
     instrument: Instrument,
     account_id: AccountId,
     ts_init: int,
+    client_order_id: str | None = None,
 ) -> OrderStatusReport:
-    """An order Nautilus does not know yet, as it stood before any fill: accepted, none filled.
+    """An external order as it stood before any fill: accepted, none filled.
 
     Its fills follow as their own reports. A filled status alone would make Nautilus infer a fill
-    of its own, without the commission, and refuse the real one.
+    of its own, without the commission, and refuse the real one. `client_order_id` is the id
+    Nautilus gave the order, when it holds it already.
     """
     time_in_force, expire_time = _time_in_force(record.time_in_force, record.expire_ts_ms)
     accepted_ms = record.ts_ms if record.ts_accepted_ms is None else record.ts_accepted_ms
@@ -153,6 +155,7 @@ def order_status_report(
         ts_accepted=nanos(accepted_ms),
         ts_last=nanos(record.ts_ms),
         ts_init=ts_init,
+        client_order_id=None if client_order_id is None else ClientOrderId(client_order_id),
         venue_position_id=(
             None if record.venue_position_id is None else PositionId(record.venue_position_id)
         ),

@@ -13,6 +13,7 @@ from nautilus_ctrader.common.venue_records import (
     Level,
     leg_venue_order_id,
     money_of,
+    parse_leg_venue_order_id,
     price_of,
     units_of,
 )
@@ -74,10 +75,56 @@ def test_a_legs_venue_order_id_is_named_after_its_entry() -> None:
     assert leg_venue_order_id(6000001, Level.TAKE_PROFIT) == "6000001-TP"
 
 
+@pytest.mark.parametrize(
+    ("entry", "level", "generation", "text"),
+    [
+        (6000001, Level.STOP_LOSS, 1, "6000001-SL"),
+        (6000001, Level.TAKE_PROFIT, 1, "6000001-TP"),
+        (6000001, Level.STOP_LOSS, 2, "6000001-SL-2"),
+        (6000001, Level.TAKE_PROFIT, 10, "6000001-TP-10"),
+    ],
+)
+def test_a_legs_generation_is_written_from_the_second_and_read_back(
+    entry, level, generation, text
+) -> None:
+    assert leg_venue_order_id(entry, level, generation) == text
+    assert parse_leg_venue_order_id(text) == (entry, level, generation)
+
+
+def test_a_legs_generation_starts_at_one() -> None:
+    with pytest.raises(ValueError, match="starts at 1"):
+        leg_venue_order_id(6000001, Level.STOP_LOSS, 0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "6000001",
+        "6000001-SL-1",
+        "6000001-SL-02",
+        "6000001-SL-",
+        "6000001-XX",
+        "06000001-SL",
+        "-SL",
+        "6000001-sl",
+        "6000001-SL-2-3",
+        " 6000001-SL",
+        "6000001-SL\n",
+        # A non-ASCII digit.
+        "٦000001-SL",
+        "O-SL-5000001",
+        "",
+    ],
+)
+def test_anything_but_a_legs_venue_order_id_is_not_read_as_one(text) -> None:
+    assert parse_leg_venue_order_id(text) is None
+
+
 def test_a_legs_venue_order_id_is_never_read_as_a_spread_leg() -> None:
     # Nautilus treats a fill whose venue order id contains this as a spread leg's.
     for level in Level:
-        assert "-LEG-" not in leg_venue_order_id(6000001, level)
+        for generation in (1, 2):
+            assert "-LEG-" not in leg_venue_order_id(6000001, level, generation)
 
 
 def test_an_external_orders_added_fields_come_last_and_default_to_none() -> None:

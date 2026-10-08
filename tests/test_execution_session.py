@@ -1,7 +1,8 @@
 """The whole recorded session through the execution client, as a node would live it.
 
 The first position is made the node's; the second, traded by hand and closed by its
-take-profit, and the pending order placed and cancelled by hand stay foreign.
+take-profit, and the pending order placed and cancelled by hand stay foreign. The second's levels
+reach Nautilus as external legs.
 """
 
 from __future__ import annotations
@@ -68,14 +69,19 @@ async def test_the_recorded_session_reaches_nautilus_as_the_venue_told_it() -> N
         assert status(h, TARGET) == OrderStatus.CANCELED
         assert h.cache.position(PositionId(str(FIRST))).is_closed
         # Every other order is reported as it stood before any fill, then each fill and each
-        # later change as a report of its own.
+        # later change as a report of its own. The foreign position's levels are its legs; its
+        # protective order is never reported under its own id.
         assert [(type(r).__name__, r.venue_order_id.value) for r in h.reports] == [
             ("OrderStatusReport", "6000003"),
             ("FillReport", "6000003"),
             ("OrderStatusReport", "6000004"),
             ("FillReport", "6000004"),
-            ("OrderStatusReport", "6000005"),
-            ("FillReport", "6000005"),
+            ("OrderStatusReport", "6000004-SL"),
+            ("OrderStatusReport", "6000004-TP"),
+            *[("OrderStatusReport", "6000004-SL")] * 2,
+            *[("OrderStatusReport", "6000004-TP")] * 5,
+            ("FillReport", "6000004-TP"),
+            ("OrderStatusReport", "6000004-SL"),
             ("OrderStatusReport", "6000006"),
             ("OrderStatusReport", "6000006"),
         ]
@@ -86,20 +92,29 @@ async def test_the_recorded_session_reaches_nautilus_as_the_venue_told_it() -> N
                 reported.setdefault(r.venue_order_id.value, r)
         assert reported["6000004"].order_type == OrderType.MARKET
         assert not reported["6000004"].reduce_only
-        target = reported["6000005"]
-        assert target.order_type == OrderType.LIMIT
-        assert target.price == Price.from_str("85179.30")
-        assert target.reduce_only
-        assert target.venue_position_id == PositionId(str(SECOND))
+        for venue_order_id, order_type in (
+            ("6000004-SL", OrderType.STOP_MARKET),
+            ("6000004-TP", OrderType.LIMIT),
+        ):
+            leg = reported[venue_order_id]
+            assert leg.order_type == order_type
+            assert leg.reduce_only
+            assert leg.venue_position_id == PositionId(str(SECOND))
+            assert leg.parent_order_id is None and not leg.linked_order_ids
         assert reported["6000006"].order_type == OrderType.LIMIT
         assert not reported["6000006"].reduce_only
         assert reported["6000006"].venue_position_id == PositionId(str(PENDING))
-        # A foreign close carries the deal's id and commission, not a fill Nautilus made up.
-        closing = external(h, "6000005")
-        assert closing.status == OrderStatus.FILLED
-        (fill,) = [e for e in closing.events if isinstance(e, OrderFilled)]
+        # The triggered level carries the deal's id and commission, not a fill Nautilus made up.
+        target = external(h, "6000004-TP")
+        assert target.status == OrderStatus.FILLED
+        assert target.price == Price.from_str("85179.30")
+        (fill,) = [e for e in target.events if isinstance(e, OrderFilled)]
         assert fill.trade_id == TradeId("7000005")
         assert fill.commission == Money(Decimal("27.69"), USD)
+        stop = external(h, "6000004-SL")
+        assert stop.status == OrderStatus.CANCELED
+        assert stop.trigger_price == Price.from_str("85031.14")
+        assert external(h, "6000005") is None
         assert external(h, "6000004").status == OrderStatus.FILLED
         # Only the node's own position has a trader acting on it.
         assert len(h.activity) == 5

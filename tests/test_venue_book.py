@@ -18,6 +18,7 @@ from nautilus_ctrader.common.venue_records import (
     Activity,
     ActivityKind,
     AwaitProtection,
+    EntryUnknown,
     Exposure,
     ExternalOrder,
     ExternalType,
@@ -27,6 +28,7 @@ from nautilus_ctrader.common.venue_records import (
     OrderEvent,
     OrderEventKind,
     ProtectionMissing,
+    leg_venue_order_id,
     units_of,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -652,17 +654,24 @@ def test_an_event_without_an_order_means_nothing_here() -> None:
     assert book().apply(event, NOTHING) == []
 
 
-def test_a_protective_order_of_an_unknown_foreign_position_means_nothing() -> None:
-    records = book().apply(
-        make_event(
-            om.ORDER_REPLACED,
-            make_order(5, 6, order_type=om.STOP_LOSS_TAKE_PROFIT, closing=True, stop=1.0),
-            position=make_position(6),
-        ),
-        NOTHING,
-    )
+def test_a_foreign_level_with_no_known_entry_says_so_once() -> None:
+    b = book()
 
-    assert records == []
+    def replaced(utc: int, stop: float) -> list:
+        return b.apply(
+            make_event(
+                om.ORDER_REPLACED,
+                make_order(
+                    5, 6, order_type=om.STOP_LOSS_TAKE_PROFIT, closing=True, utc=utc, stop=stop
+                ),
+                position=make_position(6),
+            ),
+            NOTHING,
+        )
+
+    assert replaced(10, 1.0) == [EntryUnknown(6)]
+    assert replaced(11, 2.0) == []
+    assert b.view(6).foreign_legs == {}
 
 
 # Helpers for the rules below.
@@ -838,7 +847,7 @@ def test_a_partly_triggered_leg_has_its_remainder_cancelled_when_the_position_cl
     ]
 
 
-def test_a_partial_trigger_on_a_foreign_position_is_reported_once_then_filled() -> None:
+def test_a_partial_trigger_of_an_unknown_entry_is_reported_under_its_protective_id() -> None:
     b = book()
 
     def event(kind, deal_id, volume, left, ts):
@@ -2541,3 +2550,437 @@ def test_a_replaced_pending_order_changes_its_units_and_a_partial_fill_takes_wha
         Exposure(UNLOADED, "order", "BUY", Decimal("2")),
         Exposure(UNLOADED, "position", "BUY", Decimal("1")),
     )
+
+
+# A position the node did not open: its levels are external legs named after its entry.
+
+FP, FENTRY, FPROTECTIVE = 9_000_005, 9_100_005, 9_100_006
+PROTECTED_AT = 21
+BOTH = {"stop": 85000.0, "limit": 85500.0}
+
+
+def foreign_protective(utc: int, *, stop=None, limit=None, volume: int = 100):
+    order = make_order(
+        FPROTECTIVE,
+        FP,
+        order_type=om.STOP_LOSS_TAKE_PROFIT,
+        side=om.SELL,
+        closing=True,
+        utc=utc,
+        stop=stop,
+        limit=limit,
+        volume=volume,
+    )
+    order.tradeData.openTimestamp = PROTECTED_AT
+    return order
+
+
+def foreign_entry_filled() -> oa.ProtoOAExecutionEvent:
+    return make_event(
+        om.ORDER_FILLED,
+        make_order(FENTRY, FP, utc=20),
+        position=make_position(FP),
+        deal=make_deal(9_200_005, FENTRY, FP, side=om.BUY, volume=100, price=85250.0, ts=20),
+    )
+
+
+def foreign_opened(b: VenueBook) -> list:
+    """A trader's market buy FP, filled, then protected; returns the records of the protection."""
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            make_order(FENTRY, FP, utc=10),
+            position=make_position(FP, volume=0, status=om.POSITION_STATUS_CREATED),
+        ),
+        NOTHING,
+    )
+    b.apply(foreign_entry_filled(), NOTHING)
+    return b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            foreign_protective(PROTECTED_AT, **BOTH),
+            position=make_position(FP),
+            server=True,
+        ),
+        NOTHING,
+    )
+
+
+def foreign_leg_id(level: Level, generation: int = 1) -> str:
+    return leg_venue_order_id(FENTRY, level, generation)
+
+
+def first_seen(level: Level, ts: int, price: str, *, generation=1) -> ExternalOrder:
+    stop = level == Level.STOP_LOSS
+    return ExternalOrder(
+        foreign_leg_id(level, generation),
+        SYMBOL,
+        "SELL",
+        ExternalType.STOP_MARKET if stop else ExternalType.LIMIT,
+        Decimal("1"),
+        True,
+        str(FP),
+        ts,
+        price=None if stop else Decimal(price),
+        trigger_price=Decimal(price) if stop else None,
+        time_in_force="GOOD_TILL_CANCEL",
+        ts_accepted_ms=PROTECTED_AT,
+    )
+
+
+def foreign(kind, level, ts, *, generation=1, **kw) -> OrderEvent:
+    return OrderEvent(kind, foreign_leg_id(level, generation), None, ts, **kw)
+
+
+def foreign_trigger(deal_id, price, ts, *, deal_volume=100, left=0, **order):
+    position = make_position(FP, volume=left) if left else closed(FP)
+    return make_event(
+        om.ORDER_PARTIAL_FILL if left else om.ORDER_FILLED,
+        foreign_protective(ts, **order),
+        position=position,
+        deal=make_deal(
+            deal_id, FPROTECTIVE, FP, side=om.SELL, volume=deal_volume, price=price, ts=ts
+        ),
+        server=True,
+    )
+
+
+def foreign_close(order_id: int, volume: int, left: int, ts: int):
+    return make_event(
+        om.ORDER_FILLED,
+        make_order(order_id, FP, side=om.SELL, closing=True, utc=ts - 1, volume=volume),
+        position=make_position(FP, volume=left) if left else closed(FP),
+        deal=make_deal(order_id, order_id, FP, side=om.SELL, volume=volume, price=85300.0, ts=ts),
+    )
+
+
+def test_a_foreign_positions_levels_are_first_seen_as_reduce_only_external_orders() -> None:
+    b = book()
+
+    assert foreign_opened(b) == [
+        first_seen(Level.STOP_LOSS, PROTECTED_AT, "85000.00"),
+        first_seen(Level.TAKE_PROFIT, PROTECTED_AT, "85500.00"),
+    ]
+    view = b.view(FP)
+    assert not view.ours and view.entry_order_id == FENTRY
+    assert view.legs == {}
+    assert view.foreign_legs == {
+        Level.STOP_LOSS: f"{FENTRY}-SL",
+        Level.TAKE_PROFIT: f"{FENTRY}-TP",
+    }
+    assert view.leg_units == {Level.STOP_LOSS: Decimal("1"), Level.TAKE_PROFIT: Decimal("1")}
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        pytest.param(
+            make_event(om.ORDER_REPLACED, foreign_protective(25, stop=85100.0, limit=85500.0)),
+            [
+                foreign(
+                    OrderEventKind.UPDATED,
+                    Level.STOP_LOSS,
+                    25,
+                    quantity=Decimal("1"),
+                    trigger_price=Decimal("85100.00"),
+                )
+            ],
+            id="stop-loss moved",
+        ),
+        pytest.param(
+            make_event(om.ORDER_REPLACED, foreign_protective(25, stop=85000.0, limit=85400.0)),
+            [
+                foreign(
+                    OrderEventKind.UPDATED,
+                    Level.TAKE_PROFIT,
+                    25,
+                    quantity=Decimal("1"),
+                    price=Decimal("85400.00"),
+                )
+            ],
+            id="take-profit moved",
+        ),
+        pytest.param(
+            make_event(om.ORDER_REPLACED, foreign_protective(25, stop=85000.0)),
+            [foreign(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 25)],
+            id="take-profit removed",
+        ),
+        pytest.param(
+            make_event(om.ORDER_CANCELLED, foreign_protective(25, **BOTH)),
+            [
+                foreign(OrderEventKind.CANCELED, Level.STOP_LOSS, 25),
+                foreign(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 25),
+            ],
+            id="protective order cancelled",
+        ),
+        pytest.param(
+            make_event(
+                om.ORDER_REPLACED,
+                foreign_protective(42, volume=60, **BOTH),
+                position=make_position(FP, volume=60),
+                server=True,
+            ),
+            [
+                foreign(OrderEventKind.UPDATED, Level.STOP_LOSS, 42, quantity=Decimal("0.6")),
+                foreign(OrderEventKind.UPDATED, Level.TAKE_PROFIT, 42, quantity=Decimal("0.6")),
+            ],
+            id="protective order follows a partial close",
+        ),
+        pytest.param(
+            foreign_trigger(9_200_006, 84990.0, 30, **BOTH),
+            [
+                foreign(
+                    OrderEventKind.FILLED,
+                    Level.STOP_LOSS,
+                    30,
+                    fill=fill(9_200_006, "84990.00", 30, position=FP),
+                ),
+                foreign(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 30),
+            ],
+            id="stop-loss triggered",
+        ),
+        pytest.param(
+            foreign_trigger(9_200_006, 85510.0, 30, **BOTH),
+            [
+                foreign(
+                    OrderEventKind.FILLED,
+                    Level.TAKE_PROFIT,
+                    30,
+                    fill=fill(9_200_006, "85510.00", 30, position=FP),
+                ),
+                foreign(OrderEventKind.CANCELED, Level.STOP_LOSS, 30),
+            ],
+            id="take-profit triggered",
+        ),
+        pytest.param(
+            foreign_close(9_100_007, 100, 0, 41),
+            [
+                ExternalOrder(
+                    "9100007",
+                    SYMBOL,
+                    "SELL",
+                    ExternalType.MARKET,
+                    Decimal("1"),
+                    True,
+                    str(FP),
+                    40,
+                    fills=(fill(9_100_007, "85300.00", 41, position=FP),),
+                ),
+                foreign(OrderEventKind.CANCELED, Level.STOP_LOSS, 41),
+                foreign(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 41),
+            ],
+            id="closed by a trader",
+        ),
+    ],
+)
+def test_a_foreign_legs_later_news_is_order_events_on_its_venue_order_id(event, expected) -> None:
+    b = book()
+    foreign_opened(b)
+
+    assert b.apply(event, NOTHING) == expected
+
+
+@pytest.mark.parametrize(
+    ("held_closed", "generation"),
+    [
+        # Nautilus may not have applied the first leg's cancel yet: its id is never reused.
+        (set(), 2),
+        ({f"{FENTRY}-TP-2"}, 3),
+    ],
+)
+def test_a_foreign_level_put_back_after_its_leg_closed_is_a_new_generation(
+    held_closed, generation
+) -> None:
+    b = VenueBook(precision, held_closed=held_closed.__contains__)
+    foreign_opened(b)
+    b.apply(make_event(om.ORDER_REPLACED, foreign_protective(25, stop=85000.0)), NOTHING)
+
+    records = b.apply(
+        make_event(om.ORDER_REPLACED, foreign_protective(26, stop=85000.0, limit=85600.0)),
+        NOTHING,
+    )
+
+    assert records == [first_seen(Level.TAKE_PROFIT, 26, "85600.00", generation=generation)]
+    assert b.view(FP).foreign_legs[Level.TAKE_PROFIT] == foreign_leg_id(
+        Level.TAKE_PROFIT, generation
+    )
+
+
+@pytest.mark.parametrize(
+    ("held_closed", "generation"),
+    [(set(), 1), ({f"{FENTRY}-SL"}, 2)],
+)
+def test_a_foreign_leg_takes_the_first_generation_nautilus_does_not_hold_closed(
+    held_closed, generation
+) -> None:
+    b = VenueBook(precision, held_closed=held_closed.__contains__)
+
+    assert foreign_opened(b) == [
+        first_seen(Level.STOP_LOSS, PROTECTED_AT, "85000.00", generation=generation),
+        first_seen(Level.TAKE_PROFIT, PROTECTED_AT, "85500.00"),
+    ]
+
+
+def test_a_partial_close_then_a_trigger_before_the_protective_order_follows() -> None:
+    b = book()
+    foreign_opened(b)
+    b.apply(foreign_close(9_100_007, 1, 99, 41), NOTHING)
+
+    records = b.apply(foreign_trigger(9_200_008, 84990.0, 42, deal_volume=99, **BOTH), NOTHING)
+
+    # The stop-loss fills what was left; the rest of its older quantity is cancelled with it.
+    assert records == [
+        foreign(
+            OrderEventKind.FILLED,
+            Level.STOP_LOSS,
+            42,
+            fill=fill(9_200_008, "84990.00", 42, units="0.99", position=FP),
+        ),
+        foreign(OrderEventKind.CANCELED, Level.STOP_LOSS, 42),
+        foreign(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 42),
+    ]
+
+
+def test_a_foreign_legs_quantity_is_raised_before_a_fill_above_it() -> None:
+    b = book()
+    foreign_opened(b)
+    b.apply(
+        make_event(
+            om.ORDER_REPLACED,
+            foreign_protective(25, volume=60, **BOTH),
+            position=make_position(FP, volume=60),
+            server=True,
+        ),
+        NOTHING,
+    )
+
+    records = b.apply(foreign_trigger(9_200_008, 84990.0, 30, **BOTH), NOTHING)
+
+    assert records == [
+        foreign(OrderEventKind.UPDATED, Level.STOP_LOSS, 30, quantity=Decimal("1")),
+        foreign(
+            OrderEventKind.FILLED,
+            Level.STOP_LOSS,
+            30,
+            fill=fill(9_200_008, "84990.00", 30, position=FP),
+        ),
+        foreign(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 30),
+    ]
+
+
+def test_a_partial_trigger_fills_a_foreign_leg_twice() -> None:
+    b = book()
+    foreign_opened(b)
+
+    first = b.apply(foreign_trigger(1, 84990.0, 30, deal_volume=40, left=60, **BOTH), NOTHING)
+    second = b.apply(foreign_trigger(2, 84980.0, 31, deal_volume=60, volume=60, **BOTH), NOTHING)
+
+    assert first == [
+        foreign(
+            OrderEventKind.FILLED,
+            Level.STOP_LOSS,
+            30,
+            fill=fill(1, "84990.00", 30, units="0.4", position=FP),
+        ),
+    ]
+    assert second == [
+        foreign(
+            OrderEventKind.FILLED,
+            Level.STOP_LOSS,
+            31,
+            fill=fill(2, "84980.00", 31, units="0.6", position=FP),
+        ),
+        foreign(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 31),
+    ]
+
+
+def test_levels_seen_before_their_entry_become_legs_once_the_entry_is_seen() -> None:
+    b = book()
+    unknown = b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            foreign_protective(PROTECTED_AT, **BOTH),
+            position=make_position(FP),
+            server=True,
+        ),
+        NOTHING,
+    )
+
+    learnt = b.apply(foreign_entry_filled(), NOTHING)
+
+    assert unknown == [EntryUnknown(FP)]
+    assert isinstance(learnt[0], ExternalOrder) and learnt[0].venue_order_id == str(FENTRY)
+    # Never older than the protective order that holds the levels.
+    assert learnt[1:] == [
+        first_seen(Level.STOP_LOSS, PROTECTED_AT, "85000.00"),
+        first_seen(Level.TAKE_PROFIT, PROTECTED_AT, "85500.00"),
+    ]
+
+
+def test_load_takes_a_foreign_entry_and_says_when_none_is_listed() -> None:
+    def foreign_snapshot() -> oa.ProtoOAReconcileRes:
+        response = oa.ProtoOAReconcileRes(ctidTraderAccountId=1_000_001)
+        position = make_position(FP)
+        position.stopLoss = 85000.0
+        response.position.append(position)
+        response.order.append(foreign_protective(5, stop=85000.0))
+        return response
+
+    known, unknown = book(), book()
+
+    assert known.load(foreign_snapshot(), {FP: [make_order(FENTRY, FP)]}) == []
+    assert unknown.load(foreign_snapshot(), {}) == [EntryUnknown(FP)]
+    assert known.view(FP).foreign_legs == {Level.STOP_LOSS: f"{FENTRY}-SL"}
+    assert unknown.view(FP).foreign_legs == {}
+
+
+def trailing(position_id: int, order_id: int, stop: float, utc: int):
+    return oa.ProtoOATrailingSLChangedEvent(
+        ctidTraderAccountId=1_000_001,
+        positionId=position_id,
+        orderId=order_id,
+        stopPrice=stop,
+        utcLastUpdateTimestamp=utc,
+    )
+
+
+def test_a_trailing_stop_moves_a_foreign_stop_loss_leg_once() -> None:
+    b = book()
+    foreign_opened(b)
+    event = trailing(FP, FPROTECTIVE, 85050.0, 30)
+
+    assert b.trailing_stop_moved(event) == [
+        foreign(
+            OrderEventKind.UPDATED,
+            Level.STOP_LOSS,
+            30,
+            quantity=Decimal("1"),
+            trigger_price=Decimal("85050.00"),
+        )
+    ]
+    assert b.trailing_stop_moved(event) == []
+    assert b.view(FP).levels[Level.STOP_LOSS] == Decimal("85050.00")
+
+
+def test_a_trailing_stop_moves_the_nodes_stop_loss_leg_with_no_activity() -> None:
+    b = book()
+    opened(b)
+
+    assert b.trailing_stop_moved(trailing(P, PROTECTIVE, 85050.0, 30)) == [
+        leg(
+            OrderEventKind.UPDATED,
+            Level.STOP_LOSS,
+            30,
+            quantity=Decimal("1"),
+            trigger_price=Decimal("85050.00"),
+        )
+    ]
+
+
+def test_a_trailing_move_of_another_protective_order_or_position_means_nothing() -> None:
+    b = book()
+    foreign_opened(b)
+
+    assert b.trailing_stop_moved(trailing(FP, 1, 85050.0, 30)) == []
+    assert b.trailing_stop_moved(trailing(77, FPROTECTIVE, 85050.0, 30)) == []
+    assert b.view(FP).levels[Level.STOP_LOSS] == Decimal("85000.00")

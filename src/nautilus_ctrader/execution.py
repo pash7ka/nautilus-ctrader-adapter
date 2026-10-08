@@ -100,6 +100,7 @@ from nautilus_ctrader.common.venue_records import (
     Activity,
     ActivityKind,
     AwaitProtection,
+    EntryUnknown,
     ExternalOrder,
     Level,
     Notice,
@@ -217,6 +218,10 @@ class BrokerState:
     requests: int
 
 
+# The pushed events that change the venue model.
+_ModelEvent = oa.ProtoOAExecutionEvent | oa.ProtoOATrailingSLChangedEvent
+
+
 class _Buffered:
     """An execution event held while the venue model is rebuilt; it is applied later."""
 
@@ -314,7 +319,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         # Scopes this client's spot holds in the registry every client of the account shares.
         self._owner = f"exec:{self.id}"
         self._session: CTraderSession | None = None
-        self._book = VenueBook(self._price_precision)
+        self._book = VenueBook(self._price_precision, held_closed=self._held_closed)
         self._currency: Currency | None = None
         self._balance = Decimal(0)
         self._balance_version = -1
@@ -329,8 +334,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         # One amend of a position at a time, so each computes from what the last one left.
         self._amend_locks: dict[int, asyncio.Lock] = {}
         self._protection_timers: set[asyncio.TimerHandle] = set()
-        # Execution events held while the model is rebuilt, or `None` when it stands.
-        self._buffer: list[oa.ProtoOAExecutionEvent] | None = None
+        # Events held while the model is rebuilt, or `None` when it stands.
+        self._buffer: list[_ModelEvent] | None = None
         # Set whenever no buffer is held, so an amend whose answer was held can wait for it.
         self._model_standing = asyncio.Event()
         self._model_standing.set()
@@ -383,6 +388,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._session = session
             self._msgbus.subscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
             session.add_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
+            session.add_event_handler(oa.ProtoOATrailingSLChangedEvent, self._on_trailing_stop)
             session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
             session.add_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
             session.add_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
@@ -463,6 +469,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             return
         self._msgbus.unsubscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
         session.remove_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
+        session.remove_event_handler(oa.ProtoOATrailingSLChangedEvent, self._on_trailing_stop)
         session.remove_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
         session.remove_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
         session.remove_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
@@ -864,6 +871,21 @@ class CTraderExecutionClient(LiveExecutionClient):
                 found.append(int(position.id.value))
         return found
 
+    def _held_closed(self, venue_order_id: str) -> bool:
+        """Whether Nautilus holds `venue_order_id` as a closed order."""
+        client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
+        order = None if client_order_id is None else self._cache.order(client_order_id)
+        return order is not None and order.is_closed
+
+    def _known_id(self, venue_order_id: str) -> str | None:
+        """The client order id Nautilus gave the external order `venue_order_id`, if it holds it.
+
+        Nautilus's check of its open orders looks for a report under this id: an open order with
+        none is taken for missing.
+        """
+        client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
+        return None if client_order_id is None else client_order_id.value
+
     def _held_price(self, client_order_id: str) -> Decimal | None:
         """The price Nautilus holds for a leg: a stop's trigger price, a limit's price."""
         order = self._cache.order(ClientOrderId(client_order_id))
@@ -934,7 +956,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             if held is None or self._session is None:
                 return
             for event in held:
-                self._on_execution_event(event)
+                if isinstance(event, oa.ProtoOATrailingSLChangedEvent):
+                    self._on_trailing_stop(event)
+                else:
+                    self._on_execution_event(event)
             # A protective order that came during an outage arrives with the rebuild, no event.
             self._settle_brackets()
         finally:
@@ -1273,6 +1298,19 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._drop_amend_locks()
         return records
 
+    def _on_trailing_stop(self, event: oa.ProtoOATrailingSLChangedEvent) -> None:
+        """A trailing stop-loss the broker moved: its leg follows."""
+        if self._buffer is not None:
+            self._buffer.append(event)
+            return
+        try:
+            records = self._book.trailing_stop_moved(event)
+        except Exception as e:
+            self._log.exception("A trailing stop move could not be applied to the venue model", e)
+            records = []
+        self._handle_records(records)
+        self._saw_broker_time(event.utcLastUpdateTimestamp)
+
     def _saw_broker_time(self, *times_ms: int) -> None:
         # Unset fields read as 0, which never moves the newest time.
         self._broker_ms = max(self._broker_ms, *times_ms)
@@ -1429,6 +1467,11 @@ class CTraderExecutionClient(LiveExecutionClient):
                 self._log.warning(record.text)
             elif isinstance(record, (AwaitProtection, ProtectionMissing)):
                 self._on_protection(record)
+            elif isinstance(record, EntryUnknown):
+                self._log.debug(
+                    f"Position {record.position_id} has levels but no known entry; its legs wait "
+                    "until the entry is known",
+                )
             else:
                 self._log.warning(f"{type(record).__name__} is not a known record; ignored")
         except Exception as e:
@@ -1520,6 +1563,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self.account_id,
                     self._currency,
                     ts_init,
+                    client_order_id=order.client_order_id.value,
                 ),
             )
         elif order.is_closed:
@@ -1541,7 +1585,13 @@ class CTraderExecutionClient(LiveExecutionClient):
             return
         ts_init = self._clock.timestamp_ns()
         self._send_order_status_report(
-            reports.order_status_report(record, instrument, self.account_id, ts_init),
+            reports.order_status_report(
+                record,
+                instrument,
+                self.account_id,
+                ts_init,
+                client_order_id=self._known_id(record.venue_order_id),
+            ),
         )
         for fill in record.fills:
             self._send_external_fill(
@@ -1552,6 +1602,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self.account_id,
                     self._currency,
                     ts_init,
+                    client_order_id=self._known_id(record.venue_order_id),
                 ),
             )
 
