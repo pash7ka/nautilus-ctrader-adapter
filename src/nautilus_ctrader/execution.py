@@ -177,6 +177,10 @@ def check_account(trader: om.ProtoOATrader) -> None:
         )
 
 
+def _open_reports(status: ExecutionMassStatus) -> list[OrderStatusReport]:
+    return [report for report in status.order_reports.values() if report.order_status in _OPEN]
+
+
 def _ms(moment) -> int:
     """A datetime as Unix milliseconds."""
     return int(moment.timestamp() * 1000)
@@ -220,10 +224,15 @@ class BrokerState:
 
 
 class _HeldLegs:
-    """What Nautilus's cache holds of legs, as reconciliation asks it; read for one pass."""
+    """What Nautilus's cache holds of legs, as reconciliation asks it; read for one pass.
 
-    def __init__(self, cache: Cache, account_id: AccountId) -> None:
+    `closed` is the client's own test of a closed order, so the venue model and reconciliation
+    pick a leg's generation alike.
+    """
+
+    def __init__(self, cache: Cache, account_id: AccountId, closed: Callable[[str], bool]) -> None:
         self._cache = cache
+        self.closed = closed
         self._open: dict[int, list[str]] = {}
         for order in cache.orders_open(venue=CTRADER_VENUE):
             # An order Nautilus made from a report holds no account id.
@@ -236,10 +245,6 @@ class _HeldLegs:
     def _order(self, venue_order_id: str) -> Order | None:
         client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
         return None if client_order_id is None else self._cache.order(client_order_id)
-
-    def closed(self, venue_order_id: str) -> bool:
-        order = self._order(venue_order_id)
-        return order is not None and order.is_closed
 
     def trade_ids(self, venue_order_id: str) -> set[str]:
         order = self._order(venue_order_id)
@@ -265,6 +270,13 @@ class _Deferred:
     """An order event the client made itself while records were held, sent in its turn."""
 
     event: NautilusOrderEvent
+
+
+@dataclass(frozen=True)
+class _Resent:
+    """An open order's report sent again after a mass status, in its turn."""
+
+    report: OrderStatusReport
 
 
 @dataclass(frozen=True)
@@ -374,8 +386,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._broker_ms = -1
         # Closes whose answer the connection lost: in flight until the next reconnect pass.
         self._lost_closes: set[str] = set()
-        # The start's mass status the held events wait on, and how long they wait at most.
+        # The start's mass status the held events wait on, its open orders, and how long they
+        # wait at most.
         self._awaited_report: UUID4 | None = None
+        self._awaited_open: list[OrderStatusReport] = []
         self._release_timer: asyncio.TimerHandle | None = None
         self._reconciled_wait_secs = config.connect_timeout_secs
         # The fill window Nautilus asked for at start, which a reconnect reuses.
@@ -397,7 +411,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._expired_held = 0
         # Records and the client's own events held behind those events, in order, and the task
         # that delivers them; set while it does.
-        self._outbox: deque[Record | _Deferred] = deque()
+        self._outbox: deque[Record | _Resent | _Deferred] = deque()
         self._outbox_task: asyncio.Task | None = None
         self._delivering = False
 
@@ -529,7 +543,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             status = await self._reconcile_pass(self._since_ms(self._lookback_mins))
             # Reported under the node's id if it reached the broker; never in flight past this.
             self._end_lost_closes()
+            opened = _open_reports(status)
+            # Nautilus reconciles it before this returns.
             self._send_mass_status_report(status)
+            self._resend_changed(opened)
         except BaseException:
             # Lost closes stay in flight: the retried pass may still find them.
             self._release_buffer()
@@ -604,7 +621,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             raise
         if self._margins != margins:
             self._emit_account_state(self._clock.timestamp_ns())
-        self._await_reconciliation(status.id)
+        self._await_reconciliation(status)
         return status
 
     async def _reconcile_pass(self, since_ms: int) -> ExecutionMassStatus:
@@ -728,7 +745,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                         self._price_precision,
                         self._book.known_closes(),
                         self._operations,
-                        _HeldLegs(self._cache, self.account_id),
+                        _HeldLegs(self._cache, self.account_id, self._held_closed),
                     )
                     record = next((r for r in built.orders if r.client_order_id == order_id), None)
                     if (
@@ -872,7 +889,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._price_precision,
             self._book.known_closes(),
             self._operations,
-            _HeldLegs(self._cache, self.account_id),
+            _HeldLegs(self._cache, self.account_id, self._held_closed),
         )
         for notice in found.notices:
             self._log.warning(notice.text)
@@ -960,9 +977,11 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._buffer = []
         self._model_standing.clear()
 
-    def _await_reconciliation(self, report_id: UUID4) -> None:
+    def _await_reconciliation(self, status: ExecutionMassStatus) -> None:
         self._stop_awaiting()
-        self._awaited_report = report_id
+        self._awaited_report = status.id
+        # Taken now: Nautilus removes from the mass status the reports it skips.
+        self._awaited_open = _open_reports(status)
         self._release_timer = self._loop.call_later(
             self._reconciled_wait_secs, self._reconciliation_waited
         )
@@ -972,10 +991,12 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._release_timer.cancel()
             self._release_timer = None
         self._awaited_report = None
+        self._awaited_open = []
 
     def _on_reconciled(self, mass_status: ExecutionMassStatus) -> None:
         # Nautilus publishes a mass status more than once; the first match releases.
         if self._awaited_report is not None and mass_status.id == self._awaited_report:
+            self._resend_changed(self._awaited_open)
             self._release_safely()
 
     def _reconciliation_waited(self) -> None:
@@ -984,7 +1005,39 @@ class CTraderExecutionClient(LiveExecutionClient):
             "Nautilus did not reconcile the mass status within "
             f"{self._reconciled_wait_secs:g}s; applying the execution events held meanwhile",
         )
+        self._resend_changed(self._awaited_open)
         self._release_safely()
+
+    def _resend_changed(self, opened: Iterable[OrderStatusReport]) -> None:
+        """Send again each open order whose quantity or price differs from what Nautilus holds.
+
+        Nautilus skips a mass status's report whose status and fills match the order it holds,
+        whatever its price: a level moved, or a quantity reduced, while the node was not
+        listening would never reach it. Sent alone, the report becomes an `OrderUpdated`.
+        """
+        # Runs inside the engine's publish or a timer callback, as the release does.
+        try:
+            changed = []
+            for report in opened:
+                order = self._held_order(report)
+                if order is None or not order.is_open:
+                    continue
+                if reports.changes_terms(order, report):
+                    self._log.info(
+                        f"Order {order.client_order_id} changed at the venue while Nautilus was "
+                        "not listening; reported again",
+                    )
+                    changed.append(_Resent(self._named(report)))
+            self._handle_records(changed)
+        except Exception as e:
+            self._log.exception("Reporting the orders changed meanwhile failed", e)
+
+    def _held_order(self, report: OrderStatusReport) -> Order | None:
+        """The order Nautilus holds for `report`: the node's by its id, another by venue id."""
+        client_order_id = report.client_order_id or self._cache.client_order_id(
+            report.venue_order_id
+        )
+        return None if client_order_id is None else self._cache.order(client_order_id)
 
     def _release_safely(self) -> None:
         # Runs inside the engine's publish or a timer callback: a raise there would end the
@@ -1167,7 +1220,15 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _stand(self, state: BrokerState) -> None:
         """Rebuild the venue model and the margins from `state`'s snapshot."""
         orders = {position_id: found.orders for position_id, found in state.histories.items()}
-        self._handle_records(self._book.load(state.snapshot, orders))
+        records = self._book.load(state.snapshot, orders)
+        for record in records:
+            # Its order list was just read: reading it again would find no entry either.
+            if isinstance(record, EntryUnknown):
+                self._log.debug(
+                    f"Position {record.position_id} has levels but its order list names no "
+                    "entry; it has no legs",
+                )
+        self._handle_records(r for r in records if not isinstance(r, EntryUnknown))
         self._margins = {}
         self._margin_times = {}
         for position in state.snapshot.position:
@@ -1436,13 +1497,13 @@ class CTraderExecutionClient(LiveExecutionClient):
                 )
 
     @staticmethod
-    def _applied_at_once(record: Record | _Deferred) -> bool:
+    def _applied_at_once(record: Record | _Resent | _Deferred) -> bool:
         """Whether Nautilus applies what the record becomes at once: a report or an activity."""
         if isinstance(record, OrderEvent):
             return record.client_order_id is None
-        return isinstance(record, (ExternalOrder, Activity))
+        return isinstance(record, (ExternalOrder, Activity, _Resent))
 
-    def _handle_records(self, records: Iterable[Record]) -> None:
+    def _handle_records(self, records: Iterable[Record | _Resent]) -> None:
         """Deliver the records in order, each behind the events this client sent before it.
 
         A report or an activity would overtake an event still in Nautilus's queue, so it waits,
@@ -1504,10 +1565,12 @@ class CTraderExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.exception("A held order event could not be sent", e)
 
-    def _handle_record(self, record: Record) -> None:
+    def _handle_record(self, record: Record | _Resent) -> None:
         try:
             if isinstance(record, OrderEvent):
                 self._order_event(record)
+            elif isinstance(record, _Resent):
+                self._send_order_status_report(record.report)
             elif isinstance(record, ExternalOrder):
                 self._external_order(record)
             elif isinstance(record, Activity):

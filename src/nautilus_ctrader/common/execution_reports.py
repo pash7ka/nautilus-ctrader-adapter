@@ -257,6 +257,24 @@ def held_order_report(
     )
 
 
+def changes_terms(order: Order, report: OrderStatusReport) -> bool:
+    """Whether `report` gives `order` another quantity, price or trigger price, its fills alike.
+
+    A report with other fills is not one: sent alone, Nautilus would infer a fill or refuse it.
+    """
+    if report.filled_qty != order.filled_qty:
+        return False
+    if report.quantity != order.quantity:
+        return True
+    if order.has_price and report.price is not None and report.price != order.price:
+        return True
+    return (
+        order.has_trigger_price
+        and report.trigger_price is not None
+        and report.trigger_price != order.trigger_price
+    )
+
+
 def reported_order(
     record: ReportedOrder,
     instrument: Instrument,

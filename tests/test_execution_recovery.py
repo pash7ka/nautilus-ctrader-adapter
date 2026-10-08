@@ -28,10 +28,10 @@ from nautilus_trader.execution.messages import (
     ModifyOrder,
     SubmitOrder,
 )
-from nautilus_trader.execution.reports import ExecutionMassStatus
+from nautilus_trader.execution.reports import ExecutionMassStatus, OrderStatusReport
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import ContingencyType, OrderSide, OrderStatus, OrderType
-from nautilus_trader.model.events import OrderFilled, OrderModifyRejected
+from nautilus_trader.model.events import OrderFilled, OrderModifyRejected, OrderUpdated
 from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
@@ -93,6 +93,7 @@ from tests.execution_venue import (
     status,
     submit_bracket,
     submitted,
+    sync,
 )
 from tests.polling import wait_until
 
@@ -1767,3 +1768,208 @@ async def test_reports_outside_a_mass_status_name_the_foreign_legs_nautilus_hold
             leg(h, "6000001").client_order_id,
             leg(h, "6000003").client_order_id,
         }
+
+
+SL, TP = "6000001-SL", "6000001-TP"
+
+
+async def test_reconciliation_asks_nautilus_through_the_clients_own_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(execution_venue=foreign_venue(OPEN_AT)) as h:
+        monkeypatch.setattr(h.client, "_held_closed", lambda venue_order_id: venue_order_id == TP)
+
+        built = await h.client.generate_mass_status()
+
+        ids = {report.venue_order_id.value for report in built.order_reports.values()}
+        assert {SL, f"{TP}-2"} <= ids
+        assert TP not in ids
+
+
+async def test_a_list_read_at_a_rebuild_is_not_read_again_for_a_missing_entry() -> None:
+    venue = foreign_venue(OPEN_AT)
+    # Hand-built: a list that names no entry, as one cut short could.
+    venue.position_orders[FIRST] = [
+        order
+        for order in venue.position_orders[FIRST]
+        if order.closingOrder or order.orderType == om.STOP_LOSS_TAKE_PROFIT
+    ]
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        # A read the release started would have reached the venue by the second round trip.
+        await sync(h)
+        await sync(h)
+
+        # One list per rebuild: the connect's and the start's.
+        assert len(h.received(oa.ProtoOAOrderListByPositionIdReq)) == 2
+        assert (
+            "debug",
+            f"Position {FIRST} has levels but its order list names no entry; it has no legs",
+        ) in h.logger.lines
+        assert leg(h, SL) is None
+        assert h.logger.errors() == []
+
+
+# -- Open orders that changed while Nautilus was not listening ----------------------------------
+
+
+def updates(order) -> list[OrderUpdated]:
+    return [e for e in order.events if isinstance(e, OrderUpdated)]
+
+
+def order_reports(h: Harness) -> list[OrderStatusReport]:
+    """The order reports the client sent on their own, outside any mass status."""
+    return [r for r in h.reports if isinstance(r, OrderStatusReport)]
+
+
+def changed_at(at: float, venue: ExecutionVenue, *, mine: bool = True) -> None:
+    """Make the venue what it holds at `at`, as a reconnect pass will find it."""
+    serve(venue, at, mine=mine, later_ms=0 if mine else LATER_MS)
+
+
+async def reconnected(h: Harness) -> None:
+    await h.server.drop_connections()
+    await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+    await wait_until(lambda: not h.client._outbox, description="records delivered")
+
+
+async def test_a_level_moved_during_a_reconnect_gap_updates_the_nodes_leg() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS[:3])
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+        assert updates(h.cache.order(ClientOrderId(STOP))) == []
+
+        # Both levels moved and part of the position was closed by hand meanwhile.
+        changed_at(OPEN_AT, venue)
+        await reconnected(h)
+
+        (moved,) = updates(h.cache.order(ClientOrderId(STOP)))
+        assert moved.trigger_price == Price.from_str("85200.20")
+        assert moved.quantity == Quantity.from_str("0.99")
+        (target,) = updates(h.cache.order(ClientOrderId(TARGET)))
+        assert target.price == Price.from_str("85353.42")
+        assert {r.client_order_id for r in order_reports(h)} == {
+            ClientOrderId(STOP),
+            ClientOrderId(TARGET),
+        }
+        assert h.logger.errors() == []
+
+
+async def test_a_restart_with_cache_updates_a_leg_whose_level_moved() -> None:
+    cache = await legs_accepted()
+    assert cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85197.20")
+
+    async with harness(execution_venue=serving(OPEN_AT), cache=cache) as h:
+        await started(h)
+        await wait_until(lambda: not h.client._outbox, description="records delivered")
+
+        stop = h.cache.order(ClientOrderId(STOP))
+        assert stop.status == OrderStatus.ACCEPTED
+        (moved,) = updates(stop)
+        assert moved.trigger_price == Price.from_str("85200.20")
+        assert stop.quantity == Quantity.from_str("0.99")
+        target = h.cache.order(ClientOrderId(TARGET))
+        assert target.price == Price.from_str("85353.42")
+        assert target.quantity == Quantity.from_str("0.99")
+        assert h.logger.errors() == []
+
+
+async def test_a_partial_close_in_the_gap_reduces_the_take_profit_leg() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS[:3])
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+
+        changed_at(OPEN_AT, venue)
+        # Hand-built: the take-profit back where Nautilus holds it, so only the volume differs.
+        venue.snapshot.position[0].takeProfit = 85387.22
+        for order in venue.snapshot.order:
+            order.limitPrice = 85387.22
+        await reconnected(h)
+
+        target = h.cache.order(ClientOrderId(TARGET))
+        (reduced,) = updates(target)
+        assert reduced.quantity == Quantity.from_str("0.99")
+        assert target.price == Price.from_str("85387.22")
+        assert target.status == OrderStatus.ACCEPTED
+        assert h.logger.errors() == []
+
+
+async def test_a_foreign_level_moved_during_a_reconnect_gap_updates_its_leg() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await push(h, *FOREIGN[:PROTECTED])
+        await wait_until(lambda: leg(h, TP) is not None, description="legs reported")
+        assert leg(h, SL).trigger_price == Price.from_str("85197.20")
+
+        changed_at(OPEN_AT, venue, mine=False)
+        await reconnected(h)
+
+        stop = leg(h, SL)
+        (moved,) = updates(stop)
+        assert moved.trigger_price == Price.from_str("85200.20")
+        assert stop.quantity == Quantity.from_str("0.99")
+        assert leg(h, TP).price == Price.from_str("85353.42")
+        assert set(foreign_orders(h)) == {"6000001", "6000003", SL, TP}
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("mine", [pytest.param(True, id="own"), pytest.param(False, id="foreign")])
+async def test_a_reconnect_with_nothing_changed_reports_nothing_again(mine: bool) -> None:
+    venue = ExecutionVenue()
+    changed_at(OPEN_AT, venue, mine=mine)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        await wait_until(lambda: not h.client._outbox, description="records delivered")
+        events = {o.client_order_id: len(o.events) for o in h.cache.orders()}
+        sent = len(h.reports)
+
+        await reconnected(h)
+
+        assert len(h.reports) == sent
+        assert {o.client_order_id: len(o.events) for o in h.cache.orders()} == events
+        assert not any(updates(order) for order in h.cache.orders())
+        assert h.logger.errors() == []
+
+
+async def test_a_closed_order_is_never_reported_again() -> None:
+    cache = await position_closed()
+    venue = ExecutionVenue()
+    serve(venue, CLOSED_AT, later_ms=LATER_MS)
+    # Hand-built: the take-profit's last level is not the one Nautilus holds.
+    for order in venue.position_orders[FIRST]:
+        if order.orderType == om.STOP_LOSS_TAKE_PROFIT:
+            order.limitPrice = 85400.0
+    held = cache.order(ClientOrderId(TARGET)).price
+
+    async with harness(execution_venue=venue, cache=cache) as h:
+        built = await h.client.generate_mass_status()
+        target = built.order_reports[VenueOrderId(TP)]
+        assert target.order_status == OrderStatus.CANCELED
+        assert target.price != held
+        h.engine.reconcile_execution_mass_status(built)
+        await sync(h)
+
+        assert order_reports(h) == []
+        assert h.cache.order(ClientOrderId(TARGET)).price == held
+        assert h.logger.errors() == []
+
+
+async def test_a_level_moved_is_updated_when_reconciliation_never_comes() -> None:
+    cache = await legs_accepted()
+
+    async with harness(execution_venue=serving(OPEN_AT), cache=cache) as h:
+        h.client._reconciled_wait_secs = 0.2
+        assert await h.client.generate_mass_status() is not None
+
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85200.20"),
+        )
+        texts = [text for _, text in h.logger.lines]
+        waited = next(i for i, text in enumerate(texts) if "did not reconcile" in text)
+        changed = next(i for i, text in enumerate(texts) if "reported again" in text)
+        assert h.logger.lines[waited][0] == "warning"
+        assert waited < changed

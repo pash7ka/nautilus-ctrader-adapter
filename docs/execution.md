@@ -276,6 +276,15 @@ pushed during the rebuild are applied once the mass status is sent and the balan
 has been rewritten; the account state is sent again after them. The rebuild is logged at
 WARNING.
 
+Nautilus skips a mass status's order report whose status and filled quantity match the order it
+holds, without comparing its quantity or prices. So once a mass status is reconciled, at start
+and on a reconnect, and before the held events are applied, the adapter compares each open order
+it reported with the order Nautilus holds. One whose quantity, price or trigger price differs is
+sent again as a report of its own, which Nautilus turns into the `OrderUpdated`. This covers the
+node's legs, foreign legs and pending orders, at start only with a persistent cache. The same
+happens when the start's mass status is never reconciled and the held events are applied after
+the wait. Closed orders and fills are never sent again this way.
+
 **Closed orders and fills from before the current moment reach Nautilus only inside a mass
 status, never as order events.** An order that filled while the connection was down is seen in
 the reconnect's mass status; no event is replayed for it.
