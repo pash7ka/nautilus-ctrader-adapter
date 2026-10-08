@@ -42,6 +42,7 @@ from nautilus_ctrader.common.venue_records import (
     price_of,
     units_of,
 )
+from nautilus_ctrader.constants import PENDING_ORDER_TYPES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
@@ -54,8 +55,6 @@ EXTERNAL_TYPE = {
     om.STOP_LIMIT: ExternalType.STOP_LIMIT,
 }
 _FILLS = (om.ORDER_FILLED, om.ORDER_PARTIAL_FILL)
-# Orders that rest at the broker until they trigger; the node never sends one.
-_PENDING = (om.LIMIT, om.STOP, om.STOP_LIMIT)
 _ENDED = {
     om.ORDER_CANCELLED: OrderEventKind.CANCELED,
     om.ORDER_EXPIRED: OrderEventKind.EXPIRED,
@@ -430,7 +429,7 @@ class VenueBook:
                 self._reported.add(order.orderId)
                 if self._precision(order.tradeData.symbolId) is None:
                     self._unloaded_orders[order.orderId] = self._pending(order)
-                elif order.orderType in _PENDING:
+                elif order.orderType in PENDING_ORDER_TYPES:
                     self._open_orders[order.orderId] = _copied(order)
         for position in self._positions.values():
             if not position.ours and position.levels:
@@ -873,7 +872,7 @@ class VenueBook:
         order, kind = event.order, event.executionType
         venue_order_id, ts = str(order.orderId), order.utcLastUpdateTimestamp
         known = order.orderId in self._reported
-        self._keep_open_order(event, known)
+        taken = self._keep_open_order(event, known)
         if kind == om.ORDER_ACCEPTED:
             if known:
                 return []
@@ -890,6 +889,10 @@ class VenueBook:
         if not known:
             return []
         if kind == om.ORDER_REPLACED:
+            # A pending order's state older than the one held, or of an order since ended,
+            # would take Nautilus back.
+            if order.orderType in PENDING_ORDER_TYPES and not taken:
+                return []
             return [self._order_updated(order, precision, ts)]
         if kind in _ENDED:
             return [
@@ -909,20 +912,27 @@ class VenueBook:
             trigger_price=report.trigger_price,
         )
 
-    def _keep_open_order(self, event: oa.ProtoOAExecutionEvent, known: bool) -> None:
-        """Keep the latest state of a pending order reported to Nautilus while it is open."""
+    def _keep_open_order(self, event: oa.ProtoOAExecutionEvent, known: bool) -> bool:
+        """Keep the latest state of a pending order reported to Nautilus while it is open.
+
+        Returns whether the event's state was taken as the latest.
+        """
         order, kind = event.order, event.executionType
-        if order.orderType not in _PENDING:
-            return
+        if order.orderType not in PENDING_ORDER_TYPES:
+            return False
         if kind == om.ORDER_FILLED or kind in _ENDED:
             self._open_orders.pop(order.orderId, None)
-        elif kind in (om.ORDER_ACCEPTED, om.ORDER_PARTIAL_FILL) and not known:
+            return False
+        if kind in (om.ORDER_ACCEPTED, om.ORDER_PARTIAL_FILL) and not known:
             self._open_orders[order.orderId] = _copied(order)
-        elif kind in (om.ORDER_REPLACED, om.ORDER_PARTIAL_FILL):
+            return True
+        if kind in (om.ORDER_REPLACED, om.ORDER_PARTIAL_FILL):
             held = self._open_orders.get(order.orderId)
             # An ended order is not held, so a late event never brings it back.
             if held is not None and order.utcLastUpdateTimestamp >= held.utcLastUpdateTimestamp:
                 self._open_orders[order.orderId] = _copied(order)
+                return True
+        return False
 
     # Event kinds
 

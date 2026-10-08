@@ -1011,3 +1011,28 @@ def test_an_order_amend_that_changes_nothing_is_none(order, change) -> None:
 def test_an_order_amend_the_venue_cannot_express_is_refused(order, change, reason) -> None:
     with pytest.raises(tr.Unsupported, match=reason):
         amend(order, **change)
+
+
+@pytest.mark.parametrize(
+    ("order", "carried"),
+    [
+        pytest.param(pending(om.LIMIT, limitPrice=1.105), True, id="as-asked"),
+        # A double the venue sends may carry noise past the price's digits.
+        pytest.param(pending(om.LIMIT, limitPrice=1.1050000000001), True, id="noise"),
+        pytest.param(pending(om.LIMIT, limitPrice=1.1), False, id="other-price"),
+        pytest.param(pending(om.LIMIT), False, id="no-price"),
+    ],
+)
+def test_an_order_carries_the_price_an_amend_asks_for(order, carried) -> None:
+    asked = amend(pending(om.LIMIT, limitPrice=1.1), price="1.10500")
+
+    assert tr.carries(asked, order, EURUSD.price_precision) is carried
+
+
+def test_an_order_with_another_volume_does_not_carry_the_amend() -> None:
+    asked = amend(pending(om.STOP, stopPrice=1.12), quantity="2000")
+    order = pending(om.STOP, stopPrice=1.12)
+
+    assert not tr.carries(asked, order, EURUSD.price_precision)
+    order.tradeData.volume = 200_000
+    assert tr.carries(asked, order, EURUSD.price_precision)

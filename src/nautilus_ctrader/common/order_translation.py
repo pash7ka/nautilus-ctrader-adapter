@@ -29,6 +29,7 @@ from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.parsing import PRICE_SCALE, VOLUME_SCALE
 from nautilus_ctrader.common.venue_records import LevelTerms, price_of
+from nautilus_ctrader.constants import PENDING_ORDER_TYPES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
@@ -344,8 +345,6 @@ def amend_levels(
     return request
 
 
-# The broker's order types that rest until triggered; the others fill at once.
-_PENDING_TYPES = (om.LIMIT, om.STOP, om.STOP_LIMIT)
 _STOP_TYPES = (om.STOP, om.STOP_LIMIT)
 
 
@@ -355,7 +354,7 @@ def market_refusal(done: str) -> str:
 
 
 def _require_pending(order: om.ProtoOAOrder, done: str) -> None:
-    if order.orderType not in _PENDING_TYPES:
+    if order.orderType not in PENDING_ORDER_TYPES:
         raise Unsupported(market_refusal(done))
 
 
@@ -466,3 +465,19 @@ def amend_order(
         request.trailingStopLoss = order.trailingStopLoss
         request.guaranteedStopLoss = order.tradeData.guaranteedStopLoss
     return request
+
+
+def carries(request: oa.ProtoOAAmendOrderReq, order: om.ProtoOAOrder, precision: int) -> bool:
+    """Whether `order` has the volume, and the limit and stop prices, that `request` asks for.
+
+    Prices are compared at `precision` decimals, as the venue sends them.
+    """
+
+    def same(field: str) -> bool:
+        if not request.HasField(field):
+            return True
+        return order.HasField(field) and price_of(getattr(order, field), precision) == price_of(
+            getattr(request, field), precision
+        )
+
+    return request.volume == order.tradeData.volume and same("limitPrice") and same("stopPrice")

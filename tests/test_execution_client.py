@@ -89,6 +89,7 @@ from tests.execution_venue import (
     sync,
     trader,
 )
+from tests.fake_server import Pushed
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
@@ -2431,3 +2432,72 @@ async def test_two_amends_of_one_pending_order_never_undo_each_other() -> None:
         assert (first.volume, first.limitPrice) == (200, 84100.0)
         assert (second.volume, second.limitPrice) == (300, 84100.0)
         assert foreign_leg(h, str(RESTING)).price == Price.from_str("84100.00")
+
+
+def amend_then(execution_venue: ExecutionVenue, trader_change: int):
+    """The broker amends as asked, but a trader's change reaches the client before its answer.
+
+    `trader_change` is `ORDER_REPLACED` (the trader moves the limit to 84200.00) or
+    `ORDER_CANCELLED`.
+    """
+
+    def answer(request):
+        ours = execution_venue.replies_to_amend(request)
+        theirs = om.ProtoOAOrder()
+        theirs.CopyFrom(execution_venue.snapshot.order[0])
+        theirs.utcLastUpdateTimestamp += 1
+        if trader_change == om.ORDER_REPLACED:
+            theirs.limitPrice = 84200.0
+            execution_venue.snapshot.order[0].CopyFrom(theirs)
+        else:
+            theirs.orderStatus = om.ORDER_STATUS_CANCELLED
+            del execution_venue.snapshot.order[:]
+        return [Pushed(pending_event(trader_change, theirs)), ours]
+
+    execution_venue.server.on(om.PROTO_OA_AMEND_ORDER_REQ, answer)
+
+
+async def test_a_trader_change_newer_than_the_amends_answer_is_what_nautilus_holds() -> None:
+    execution_venue = resting_venue()
+    amend_then(execution_venue, om.ORDER_REPLACED)
+    async with harness(execution_venue=execution_venue) as h:
+        order = await held_resting(h)
+        await h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        await sync(h)
+
+        await wait_until(lambda: not h.client._outbox)
+        assert foreign_leg(h, str(RESTING)).price == Price.from_str("84200.00")
+        assert h.client._book.open_order(RESTING).limitPrice == 84200.0
+        # The amend's own answer, older than the trader's change, is never reported.
+        assert Price.from_str("84100.00") not in [r.price for r in reports_of(h, str(RESTING))]
+        assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+
+async def test_a_trader_cancel_before_the_amends_answer_reports_nothing_after_it() -> None:
+    execution_venue = resting_venue()
+    amend_then(execution_venue, om.ORDER_CANCELLED)
+    async with harness(execution_venue=execution_venue) as h:
+        order = await held_resting(h)
+        await h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        await sync(h)
+
+        await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.CANCELED)
+        await wait_until(lambda: not h.client._outbox)
+        assert reports_of(h, str(RESTING))[-1].order_status == OrderStatus.CANCELED
+        assert foreign_leg(h, str(RESTING)).price == Price.from_str("84000.00")
+        assert sent_about(h, order) == []
+        assert not any("is not reported" in line for line in h.logger.warnings())
+        assert h.logger.errors() == []
+
+
+async def test_a_pending_orders_amend_lock_goes_once_the_order_has_ended() -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+        await h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        assert RESTING in h.client._order_locks
+
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+
+        assert h.client._book.open_order(RESTING) is None
+        assert RESTING not in h.client._order_locks

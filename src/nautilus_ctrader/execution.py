@@ -314,6 +314,17 @@ class _Resent:
 
 
 @dataclass(frozen=True)
+class _Answered:
+    """The broker's answer to a cancel or an amend of a pending order.
+
+    `order` is the order as the answer itself states it, `None` if it states none.
+    """
+
+    records: list[Record]
+    order: om.ProtoOAOrder | None
+
+
+@dataclass(frozen=True)
 class _Refused:
     """A request the broker refused, or one that never left."""
 
@@ -2123,7 +2134,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         for level in sorted(bracket.modified - bracket.cancels, key=lambda lv: lv.value):
             self._modify_rejected(ClientOrderId(bracket.legs[level]), reason)
 
-    # -- Legs -------------------------------------------------------------------------------------
+    # -- Cancel and modify ------------------------------------------------------------------------
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         await self._cancel([command.client_order_id])
@@ -2273,17 +2284,16 @@ class CTraderExecutionClient(LiveExecutionClient):
     async def _change_order(
         self,
         request: oa.ProtoOACancelOrderReq | oa.ProtoOAAmendOrderReq,
-    ) -> list[Record] | _Refused | None:
+    ) -> _Answered | _Refused | None:
         """Send a cancel or an amend of a pending order.
 
-        Returns the records of the broker's answer, its refusal, or `None` when the outcome is
-        unknown.
+        Returns the broker's answer, its refusal, or `None` when the outcome is unknown.
         """
         outcome = await self._send(request)
         if outcome is None or isinstance(outcome, _Refused):
             return outcome
         if not isinstance(outcome, oa.ProtoOAExecutionEvent):
-            return []
+            return _Answered([], None)
         # TODO(verify): how the venue refuses a cancel or an amend of a pending order: with an
         # order error, or with an execution event like this. Such an event is not applied to the
         # model: the order it names still stands.
@@ -2293,8 +2303,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         records = self._on_execution_event(outcome)
         if isinstance(records, _Buffered):
             await self._wait_for_model()
-            return []
-        return records
+            records = []
+        return _Answered(records, outcome.order if outcome.HasField("order") else None)
 
     async def _modify_order(self, command: ModifyOrder) -> None:
         client_order_id = command.client_order_id
@@ -2447,16 +2457,15 @@ class CTraderExecutionClient(LiveExecutionClient):
                 client_order_id, f"symbol {held.tradeData.symbolId} is not loaded"
             )
             return
-        amend = partial(
-            order_translation.amend_order,
-            self._account.account_id,
-            instrument,
-            quantity=command.quantity,
-            price=command.price,
-            trigger_price=command.trigger_price,
-        )
         try:
-            request = amend(held)
+            request = order_translation.amend_order(
+                self._account.account_id,
+                instrument,
+                held,
+                quantity=command.quantity,
+                price=command.price,
+                trigger_price=command.trigger_price,
+            )
         except Unsupported as e:
             self._modify_rejected(client_order_id, str(e))
             return
@@ -2471,16 +2480,21 @@ class CTraderExecutionClient(LiveExecutionClient):
             if isinstance(outcome, _Refused):
                 self._modify_rejected(client_order_id, outcome.reason)
                 return
-            now = self._book.open_order(held.orderId)
-            if now is None:
-                # Ended meanwhile: the record that ended it tells Nautilus.
-                return
-            if amend(now) is not None:
+            # Judged by the answer itself: a trader's change applied after it is not a refusal.
+            answered = (
+                outcome.order if outcome.order is not None else self._book.open_order(order_id)
+            )
+            if answered is not None and not order_translation.carries(
+                request, answered, instrument.price_precision
+            ):
                 self._modify_rejected(
                     client_order_id, "the broker did not amend the order as asked"
                 )
                 return
-            if _updated(outcome, venue_order_id=str(held.orderId)):
+            if self._book.open_order(order_id) is None:
+                # Ended meanwhile: the record that ended it tells Nautilus.
+                return
+            if _updated(outcome.records, venue_order_id=str(order_id)):
                 return
         # Nothing changed at the broker, so no answer reports the order; the report says how it
         # stands, which ends Nautilus's pending update.

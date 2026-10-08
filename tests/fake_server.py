@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from google.protobuf.message import Message
 
@@ -19,7 +20,15 @@ from nautilus_ctrader.constants import LENGTH_PREFIX_BYTES
 from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiCommonModelMessages_pb2 as common_model
 
-Handler = Callable[[Message], Message | list[Message] | None]
+
+@dataclass(frozen=True)
+class Pushed:
+    """A handler's reply sent as an event of its own, without the request's client message id."""
+
+    message: Message
+
+
+Handler = Callable[[Message], Message | Pushed | list[Message | Pushed] | None]
 
 
 class FakeCTraderServer:
@@ -147,7 +156,10 @@ class FakeCTraderServer:
         if replies is None:
             return
         for reply in replies if isinstance(replies, list) else [replies]:
-            await self._write(writer, reply, envelope.clientMsgId or None)
+            if isinstance(reply, Pushed):
+                await self._write(writer, reply.message)
+            else:
+                await self._write(writer, reply, envelope.clientMsgId or None)
 
     async def _write(
         self,

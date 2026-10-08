@@ -9,6 +9,7 @@ from __future__ import annotations
 from nautilus_trader.model.identifiers import Venue
 
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as _oa
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as _om
 
 CTRADER: str = "CTRADER"
 CTRADER_VENUE: Venue = Venue(CTRADER)
@@ -38,6 +39,9 @@ DEFAULT_REQUEST_TIMEOUT_SECS: float = 5.0
 
 # Bounds the TCP connect and TLS handshake, which would otherwise wait on the OS timeout.
 CONNECT_TIMEOUT_SECS: float = 10.0
+
+# The broker's order types that rest until they trigger; the others fill at once.
+PENDING_ORDER_TYPES: tuple[int, ...] = (_om.LIMIT, _om.STOP, _om.STOP_LIMIT)
 
 BUCKET_DEFAULT: str = "default"
 BUCKET_HISTORICAL: str = "historical"

@@ -3196,10 +3196,11 @@ def test_an_open_pending_order_is_held_as_last_changed() -> None:
     assert b.open_order(7) == resting(10)
 
     b.apply(make_event(om.ORDER_REPLACED, resting(12, limit=84100.0)), NOTHING)
-    # A response applied after a later event leaves the later state.
-    b.apply(make_event(om.ORDER_REPLACED, resting(11, limit=84050.0)), NOTHING)
+    # A response applied after a later event leaves the later state, and says nothing.
+    stale = b.apply(make_event(om.ORDER_REPLACED, resting(11, limit=84050.0)), NOTHING)
 
     assert b.open_order(7) == resting(12, limit=84100.0)
+    assert stale == []
 
 
 def test_a_partly_filled_pending_order_is_held_with_its_fill() -> None:
@@ -3231,8 +3232,9 @@ def test_an_ended_pending_order_is_no_longer_held(kind) -> None:
         ),
         NOTHING,
     )
-    b.apply(make_event(om.ORDER_REPLACED, resting(12, limit=84100.0)), NOTHING)
+    late = b.apply(make_event(om.ORDER_REPLACED, resting(12, limit=84100.0)), NOTHING)
 
+    assert late == []
     assert b.open_order(7) is None
     assert b.standing_order(7, 13) == []
 
