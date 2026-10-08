@@ -403,7 +403,8 @@ class VenueBook:
                     self._unloaded_orders[order.orderId] = self._pending(order)
         for position in self._positions.values():
             if not position.ours and position.levels:
-                # Reconciliation reports the standing levels' legs, so this says nothing of them.
+                # Reconciliation reports the standing levels' legs, at the generation chosen here
+                # from the same cache, so this says nothing of them.
                 notices += [
                     record
                     for record in self._foreign_levels(position, {}, position.updated_ms)
@@ -441,10 +442,8 @@ class VenueBook:
         key = ("trailing", event.orderId, event.utcLastUpdateTimestamp, event.stopPrice)
         if precision is None or key in self._seen:
             return []
-        current = position.protective_order_id
-        if event.orderId in position.retired_protective_ids or (
-            current is not None and event.orderId != current
-        ):
+        # A retired id is never current.
+        if event.orderId != position.protective_order_id:
             return []
         old_levels = dict(position.levels)
         position.levels[Level.STOP_LOSS] = price_of(event.stopPrice, precision)
@@ -455,6 +454,23 @@ class VenueBook:
         else:
             records = self._foreign_levels(position, old_levels, ts)
         self._seen.add(key)
+        return records
+
+    def entry_found(self, position_id: int, orders: Sequence[om.ProtoOAOrder]) -> list[Record]:
+        """The order list of a position whose entry the model did not know, read afterwards.
+
+        A foreign position's standing levels get their legs. The node's own entry is taken as
+        its opening event would take it, and its legs wait for that entry's events. Nothing
+        changes for a position the model does not hold, one whose entry it knows, or a list
+        that names no entry.
+        """
+        position = self._positions.get(position_id)
+        entry = entry_of(orders)
+        if position is None or position.entry_order_id is not None or entry is None:
+            return []
+        records = self._adopt(position, entry, restored=False)
+        if not position.ours:
+            records += self._foreign_levels(position, {}, entry.utcLastUpdateTimestamp)
         return records
 
     @staticmethod

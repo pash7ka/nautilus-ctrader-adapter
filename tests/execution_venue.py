@@ -107,6 +107,26 @@ def on_fake_account(messages: Iterable[Message]) -> list[Message]:
     return moved
 
 
+def shifted(messages: Iterable[Message], by_ms: int) -> list[Message]:
+    """Copies of `messages` with every timestamp they carry `by_ms` later."""
+
+    def shift(message: Message) -> None:
+        for field, value in message.ListFields():
+            if field.message_type is not None:
+                for item in value if field.is_repeated else [value]:
+                    shift(item)
+            elif field.name.endswith("Timestamp"):
+                setattr(message, field.name, value + by_ms)
+
+    moved = []
+    for message in messages:
+        copy = type(message)()
+        copy.CopyFrom(message)
+        shift(copy)
+        moved.append(copy)
+    return moved
+
+
 def on_us100(messages: Iterable[Message]) -> list[Message]:
     """Copies of recorded messages, orders and deals, on `US100.cash` and the fake account."""
     moved = []
@@ -488,6 +508,8 @@ ENTRY, STOP, TARGET = "O-E-5000001", "O-SL-5000001", "O-TP-5000001"
 # The recorded first position, made the node's, on US100.cash: accepted, filled, protected,
 # both levels changed by hand, partly closed by hand, then closed by its stop-loss.
 FIRST_EVENTS = on_us100(first_n(as_ours(events(), [FIRST]), FIRST))
+# The same position as traded by hand: its levels are external legs.
+FOREIGN_EVENTS = on_us100(first_n(events(), FIRST))
 
 
 async def submitted(h: Harness, orders: OrderList | None = None) -> OrderList:
@@ -534,13 +556,19 @@ def broker_lists(
     return on_us100([snapshot])[0], {FIRST: moved}, deals
 
 
-def serve(venue: ExecutionVenue, at: float) -> None:
-    """Make the venue's snapshot and lists the node's first position at timeline time `at`."""
-    snapshot, histories, deals = broker_lists(at)
-    venue.snapshot = snapshot
-    venue.position_orders = {pid: list(found.orders) for pid, found in histories.items()}
-    venue.position_deals = {pid: list(found.deals) for pid, found in histories.items()}
-    venue.deals = list(deals)
+def serve(venue: ExecutionVenue, at: float, *, mine: bool = True, later_ms: int = 0) -> None:
+    """Make the venue's snapshot and lists the first position at timeline time `at`.
+
+    The position is the node's when `mine`, else as traded by hand; every time is `later_ms`
+    later than recorded.
+    """
+    snapshot, histories, deals = broker_lists(at, mine=mine)
+    (venue.snapshot,) = shifted([snapshot], later_ms)
+    venue.position_orders = {
+        pid: shifted(found.orders, later_ms) for pid, found in histories.items()
+    }
+    venue.position_deals = {pid: shifted(found.deals, later_ms) for pid, found in histories.items()}
+    venue.deals = shifted(deals, later_ms)
 
 
 async def started(h: Harness) -> ExecutionMassStatus:

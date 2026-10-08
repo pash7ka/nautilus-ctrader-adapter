@@ -19,6 +19,7 @@ from decimal import Decimal
 import pytest
 from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
+from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     GenerateFillReports,
@@ -35,11 +36,13 @@ from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
     PositionId,
+    StrategyId,
     Symbol,
     TradeId,
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.trading.strategy import Strategy
 
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.execution_reports import mass_status
@@ -64,6 +67,7 @@ from tests.execution_venue import (
     CLOSE,
     ENTRY,
     FIRST_EVENTS,
+    FOREIGN_EVENTS,
     OURS,
     STOP,
     STRATEGY_ID,
@@ -84,6 +88,7 @@ from tests.execution_venue import (
     push,
     push_spot,
     serve,
+    shifted,
     started,
     status,
     submit_bracket,
@@ -407,6 +412,7 @@ CLOSES = {
     ),
     "stop-out": stop_out,
     "foreign close": lambda: (records_at(CLOSED_AT, mine=False), "6000003", "5000001"),
+    "foreign level trigger": lambda: (records_at(CLOSED_AT, mine=False), "6000001-SL", "5000001"),
 }
 
 
@@ -1498,3 +1504,266 @@ async def test_a_position_missing_from_the_snapshot_is_read_again() -> None:
         assert report.venue_position_id == PositionId(str(OURS))
         assert h.cache.position(PositionId(str(OURS))).is_open
         assert reconciliation_orders(h) == []
+
+
+# -- The levels of a position the node did not open, through the engine ----------------------
+
+# The recorded session as if it had ended an hour ago, so its deals are in the fill window.
+LATER_MS = int(time.time() * 1000) - 1_600_000_406_510 - 3_600_000
+FOREIGN = shifted(FOREIGN_EVENTS, LATER_MS)
+PROTECTED, TP_REMOVED = 3, 5  # how many of FOREIGN have come by then
+NETTING_STRATEGY = StrategyId("S-NET-000")
+
+
+class Oms:
+    """How Nautilus nets the foreign position: by venue position, or by a claiming strategy."""
+
+    def __init__(self, netting: bool) -> None:
+        self.netting = netting
+        self.strategy_id = NETTING_STRATEGY if netting else StrategyId("EXTERNAL")
+        self.position_id = PositionId(f"{US100_ID}-{NETTING_STRATEGY}" if netting else str(FIRST))
+
+    def claim(self, h: Harness) -> None:
+        """A NETTING strategy claims the external orders on `US100.cash`, as configured."""
+        if self.netting:
+            strategy = Strategy(
+                StrategyConfig(
+                    strategy_id="S-NET",
+                    order_id_tag="000",
+                    oms_type="NETTING",
+                    external_order_claims=[str(US100_ID)],
+                ),
+            )
+            h.engine.register_oms_type(strategy)
+            h.engine.register_external_order_claims(strategy)
+
+
+OMS = [pytest.param(False, id="HEDGING"), pytest.param(True, id="NETTING")]
+
+
+def foreign_venue(at: float) -> ExecutionVenue:
+    venue = ExecutionVenue()
+    serve(venue, at, mine=False, later_ms=LATER_MS)
+    return venue
+
+
+def leg(h: Harness, venue_order_id: str):
+    return leg_in(h.cache, venue_order_id)
+
+
+def leg_in(cache: Cache, venue_order_id: str):
+    client_order_id = cache.client_order_id(VenueOrderId(venue_order_id))
+    return None if client_order_id is None else cache.order(client_order_id)
+
+
+async def foreign_cache(oms: Oms, seen: int) -> Cache:
+    """The cache of a node that saw the first `seen` of FOREIGN live, then stopped."""
+    async with harness() as h:
+        oms.claim(h)
+        await push(h, *FOREIGN[:seen])
+        await wait_until(lambda: leg(h, "6000001-TP") is not None, description="legs reported")
+        await wait_until(lambda: not h.client._outbox, description="records delivered")
+        return h.cache
+
+
+def foreign_orders(h: Harness) -> dict[str, OrderStatus]:
+    return {
+        o.venue_order_id.value: o.status
+        for o in h.cache.orders()
+        if o.venue_order_id is not None and o.venue_order_id.value.startswith("600000")
+    }
+
+
+async def stop_loss_triggered(h: Harness, oms: Oms) -> None:
+    """Push the stop-loss's last move and its trigger; the fill reduces the position by itself."""
+    before = h.cache.position(oms.position_id).quantity.as_decimal()
+    await push(h, *FOREIGN[-2:])
+    await wait_until(lambda: leg(h, "6000001-SL").status == OrderStatus.FILLED)
+    assert leg(h, "6000001-SL").trade_ids == [TradeId("7000003")]
+    after = h.cache.position(oms.position_id)
+    assert after.quantity.as_decimal() == before - Decimal("0.99")
+    assert after.is_closed or oms.netting
+
+
+def assert_one_owner(h: Harness, oms: Oms) -> None:
+    """The external position and every order on it belong to one strategy."""
+    assert {o.strategy_id for o in h.cache.orders()} == {oms.strategy_id}
+    assert [(p.id, p.strategy_id) for p in h.cache.positions()] == [
+        (oms.position_id, oms.strategy_id)
+    ]
+
+
+@pytest.mark.parametrize("netting", OMS)
+async def test_a_restart_with_foreign_levels_standing_reports_their_legs(netting: bool) -> None:
+    oms = Oms(netting)
+    async with harness(execution_venue=foreign_venue(OPEN_AT)) as h:
+        oms.claim(h)
+        await started(h)
+
+        assert foreign_orders(h) == {
+            "6000001": OrderStatus.FILLED,
+            "6000003": OrderStatus.FILLED,
+            "6000001-SL": OrderStatus.ACCEPTED,
+            "6000001-TP": OrderStatus.ACCEPTED,
+        }
+        stop, target = leg(h, "6000001-SL"), leg(h, "6000001-TP")
+        assert stop.order_type == OrderType.STOP_MARKET
+        assert stop.trigger_price == Price.from_str("85200.20")
+        assert target.order_type == OrderType.LIMIT
+        assert target.price == Price.from_str("85353.42")
+        for order in (stop, target):
+            assert order.is_reduce_only
+            assert order.quantity == Quantity.from_str("0.99")
+        position = h.cache.position(oms.position_id)
+        assert position.is_open
+        # Under a NETTING claim Nautilus also reads the position report as a hedge position it
+        # lacks and adds an order of its own for it, so the venue's volume is HEDGING's alone.
+        assert position.quantity == Quantity.from_str("0.99") or oms.netting
+        assert_one_owner(h, oms)
+
+        # The stop-loss moved, then triggered: the fill reaches the leg Nautilus holds.
+        await stop_loss_triggered(h, oms)
+
+        assert leg(h, "6000001-TP").status == OrderStatus.CANCELED
+        assert leg(h, "6000002") is None
+        assert_one_owner(h, oms)
+        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("netting", OMS)
+async def test_foreign_levels_found_at_a_reconnect_take_their_trigger(netting: bool) -> None:
+    oms = Oms(netting)
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        oms.claim(h)
+        await started(h)
+
+        # The position opened while the connection was down.
+        serve(venue, OPEN_AT, mine=False, later_ms=LATER_MS)
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        assert leg(h, "6000001-SL").status == OrderStatus.ACCEPTED
+        assert leg(h, "6000001-TP").status == OrderStatus.ACCEPTED
+
+        await stop_loss_triggered(h, oms)
+        assert leg(h, "6000001-TP").status == OrderStatus.CANCELED
+        assert_one_owner(h, oms)
+        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("netting", OMS)
+async def test_a_restart_after_a_foreign_level_was_removed_cancels_its_leg(netting: bool) -> None:
+    oms = Oms(netting)
+    cache = await foreign_cache(oms, PROTECTED)
+
+    async with harness(execution_venue=foreign_venue(REMOVED_AT), cache=cache) as h:
+        oms.claim(h)
+        await started(h)
+
+        target = leg(h, "6000001-TP")
+        assert target.status == OrderStatus.CANCELED
+        # At the price Nautilus held: the broker lists none for a level gone.
+        assert target.price == Price.from_str("85387.22")
+        stop = leg(h, "6000001-SL")
+        assert stop.status == OrderStatus.ACCEPTED
+        assert stop.trigger_price == Price.from_str("85200.20")
+        assert h.cache.position(oms.position_id).is_open
+        assert_one_owner(h, oms)
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("netting", OMS)
+async def test_a_restart_after_a_foreign_level_was_put_back_opens_a_new_leg(netting: bool) -> None:
+    oms = Oms(netting)
+    cache = await foreign_cache(oms, TP_REMOVED)
+    assert leg_in(cache, "6000001-TP").status == OrderStatus.CANCELED
+
+    async with harness(execution_venue=foreign_venue(OPEN_AT), cache=cache) as h:
+        oms.claim(h)
+        await started(h)
+
+        assert leg(h, "6000001-TP").status == OrderStatus.CANCELED
+        again = leg(h, "6000001-TP-2")
+        assert again.status == OrderStatus.ACCEPTED
+        assert again.price == Price.from_str("85353.42")
+        assert again.quantity == Quantity.from_str("0.99")
+        assert leg(h, "6000001-SL").status == OrderStatus.ACCEPTED
+        assert_one_owner(h, oms)
+
+        # The model holds the same leg: its later news reaches it.
+        await stop_loss_triggered(h, oms)
+        assert leg(h, "6000001-TP-2").status == OrderStatus.CANCELED
+        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("netting", OMS)
+async def test_a_foreign_level_triggered_in_the_gap_fills_its_leg(netting: bool) -> None:
+    oms = Oms(netting)
+    cache = await foreign_cache(oms, PROTECTED)
+
+    async with harness(execution_venue=foreign_venue(CLOSED_AT), cache=cache) as h:
+        oms.claim(h)
+        await started(h)
+
+        stop = leg(h, "6000001-SL")
+        assert stop.status == OrderStatus.FILLED
+        (filled,) = [e for e in stop.events if isinstance(e, OrderFilled)]
+        assert filled.trade_id == TradeId("7000003")
+        assert filled.position_id == oms.position_id
+        assert leg(h, "6000001-TP").status == OrderStatus.CANCELED
+        assert leg(h, "6000002") is None
+        # The leg's fill closed the position the entry opened.
+        assert h.cache.position(oms.position_id).is_closed
+        assert_one_owner(h, oms)
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("netting", OMS)
+async def test_a_reconnect_after_a_foreign_legs_fill_reports_the_deal_once(netting: bool) -> None:
+    oms = Oms(netting)
+    venue = foreign_venue(OPEN_AT)
+    async with harness(execution_venue=venue) as h:
+        oms.claim(h)
+        await started(h)
+        await stop_loss_triggered(h, oms)
+        before = foreign_orders(h)
+
+        serve(venue, CLOSED_AT, mine=False, later_ms=LATER_MS)
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+
+        assert foreign_orders(h) == before
+        assert leg(h, "6000001-SL").trade_ids == [TradeId("7000003")]
+        trades = [t for o in h.cache.orders() for t in o.trade_ids]
+        assert len(trades) == len(set(trades))
+        assert not any("Duplicate" in line for line in h.logger.warnings())
+        assert h.logger.errors() == []
+
+
+async def test_reports_outside_a_mass_status_name_the_foreign_legs_nautilus_holds() -> None:
+    async with harness(execution_venue=foreign_venue(OPEN_AT)) as h:
+        await started(h)
+        command = GenerateOrderStatusReports(
+            instrument_id=None,
+            start=None,
+            end=None,
+            open_only=True,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        found = await h.client.generate_order_status_reports(command)
+
+        named = {report.venue_order_id.value: report.client_order_id for report in found}
+        assert named == {
+            "6000001-SL": leg(h, "6000001-SL").client_order_id,
+            "6000001-TP": leg(h, "6000001-TP").client_order_id,
+        }
+        fills = await h.client.generate_fill_reports(fills_command())
+        assert {fill.client_order_id for fill in fills} == {
+            leg(h, "6000001").client_order_id,
+            leg(h, "6000003").client_order_id,
+        }

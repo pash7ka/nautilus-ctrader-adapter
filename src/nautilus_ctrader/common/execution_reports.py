@@ -356,6 +356,7 @@ def mass_status(
     ts_init: int,
     *,
     held_price: Callable[[str], Decimal | None],
+    known_id: Callable[[str], str | None] = lambda _venue_order_id: None,
 ) -> tuple[ExecutionMassStatus, tuple[ReportedOrder, ...]]:
     """The reconciliation records as one mass status, orders in record order.
 
@@ -363,6 +364,11 @@ def mass_status(
       out silently.
     - `held_price`: the price Nautilus holds for a leg, by client order id: the trigger price of
       a stop, the limit price otherwise, `None` for an order it does not hold.
+    - `known_id`: the client order id Nautilus gave an external order, by venue order id, `None`
+      for one it does not hold; a leg that is not the node's finds its held price through it.
+      The report itself names no client order id for such an order: Nautilus finds it by its
+      venue order id, and drops a report naming a cached order whose status it already holds,
+      a changed price or quantity with it.
 
     A leg whose level the broker no longer lists has no price of its own. It is reported at
     the held price: no price change was seen, and Nautilus would otherwise emit an update
@@ -379,7 +385,7 @@ def mass_status(
         instrument = instrument_for(record.symbol_id)
         if instrument is None:
             continue
-        priced = _priced(record, held_price, instrument.price_precision)
+        priced = _priced(record, held_price, known_id, instrument.price_precision)
         if priced is None:
             left_out.append(record)
         else:
@@ -406,7 +412,10 @@ def mass_status(
 
 
 def _priced(
-    record: ReportedOrder, held_price: Callable[[str], Decimal | None], precision: int
+    record: ReportedOrder,
+    held_price: Callable[[str], Decimal | None],
+    known_id: Callable[[str], str | None],
+    precision: int,
 ) -> ReportedOrder | None:
     """`record` with every price its type needs, or `None` if one is missing and unknown."""
     if record.order_type == ExternalType.LIMIT and record.price is None:
@@ -420,7 +429,8 @@ def _priced(
         return None
     else:
         return record
-    held = None if record.client_order_id is None else held_price(record.client_order_id)
+    client_order_id = record.client_order_id or known_id(record.venue_order_id)
+    held = None if client_order_id is None else held_price(client_order_id)
     if held is None and record.fills:
         units = sum((fill.units for fill in record.fills), Decimal(0))
         total = sum((fill.price * fill.units for fill in record.fills), Decimal(0))

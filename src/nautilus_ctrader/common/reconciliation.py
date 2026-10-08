@@ -7,9 +7,10 @@ given, so the same input always gives the same records.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_EVEN, Decimal
+from typing import Protocol
 
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.venue_book import (
@@ -32,6 +33,7 @@ from nautilus_ctrader.common.venue_records import (
     ReportStatus,
     leg_venue_order_id,
     money_of,
+    parse_leg_venue_order_id,
     price_of,
     units_of,
 )
@@ -61,6 +63,38 @@ class PositionHistory:
     complete: bool = True
 
 
+class HeldOrders(Protocol):
+    """What Nautilus holds of the legs of positions the node did not open, by venue order id."""
+
+    def closed(self, venue_order_id: str) -> bool:
+        """Whether Nautilus holds the order as a closed order."""
+        ...
+
+    def trade_ids(self, venue_order_id: str) -> Collection[str]:
+        """The trade ids of the fills Nautilus holds for the order."""
+        ...
+
+    def open_legs(self, entry_order_id: int) -> Collection[str]:
+        """The venue order ids of the open legs Nautilus holds for the entry `entry_order_id`."""
+        ...
+
+
+class NothingHeld:
+    """Nautilus holds no order: a start without a persistent cache."""
+
+    def closed(self, venue_order_id: str) -> bool:
+        return False
+
+    def trade_ids(self, venue_order_id: str) -> Collection[str]:
+        return ()
+
+    def open_legs(self, entry_order_id: int) -> Collection[str]:
+        return ()
+
+
+NOTHING_HELD = NothingHeld()
+
+
 @dataclass(frozen=True)
 class Reconciliation:
     """`orders` is chronological, as `reconcile` describes."""
@@ -77,12 +111,14 @@ def reconcile(
     precision: Callable[[int], int | None],
     known_closes: Mapping[int, str],
     operations: Operations,
+    held: HeldOrders = NOTHING_HELD,
 ) -> Reconciliation:
     """The reports for everything the broker holds now and every position traded in the window.
 
     `snapshot` is asked with protection orders. `histories` holds each position's own lists, by
     position id. `known_closes` maps a broker order id to the node's close the venue model has
     matched it to. `precision` gives a symbol's price precision, `None` for an unloaded one.
+    `held` says what Nautilus holds of the legs of positions the node did not open.
 
     Positions taken: every open one in `snapshot`, every one with a deal in `window_deals`, and
     every one in `histories`.
@@ -119,7 +155,19 @@ def reconcile(
       - Closed position: `FILLED` with the protective order's deal `which_level` attributes to
         it, or `CANCELED` with what it had if that falls short of the leg; any other leg is
         `CANCELED` at the closing deal's time.
-    - A protective order's deal no leg takes (a foreign position, or no leg of that level): an
+    - For a position that is not the node's, each level as a leg with no client order id, no
+      parent and no links, typed as the node's legs are, under `leg_venue_order_id` of its
+      entry at a generation chosen from `held`:
+      - A level that stands, or one with a fill, takes the lowest generation Nautilus does not
+        hold closed, or one that holds a fill of the level's.
+      - Open position: `ACCEPTED` for each standing level; a level gone is reported only if it
+        filled in part, `CANCELED` with its fills.
+      - Closed position: each level of the protective order that filled, else of the last one
+        listed, `FILLED` or `CANCELED` as for the node's legs. An unfilled one is reported only
+        at generation 1 or when Nautilus holds it open: a later generation unheld means Nautilus
+        already holds the level's last leg ended.
+      - Every other leg of the entry Nautilus holds open is `CANCELED`, at the price it holds.
+    - A protective order's deal no leg takes (no leg of that level, or no level known): an
       external reduce-only order under the protective order's own id, typed by `which_level`
       (`STOP_MARKET` or `LIMIT`), or `MARKET` with no level known.
     - An open position's `ReportedPosition`, even when its lists show no entry fill (with a
@@ -183,8 +231,8 @@ def reconcile(
                 )
                 positions.append(_position_report(venue_position, digits))
             continue
-        held = open_volume(found)
-        still_open = held > 0
+        volume = open_volume(found)
+        still_open = volume > 0
         if venue_position is not None and not still_open and found.complete:
             # Closed after the snapshot was taken.
             venue_position = None
@@ -203,12 +251,13 @@ def reconcile(
             operations,
             claimed,
             in_window,
+            held,
         )
         notices += said
         entry_ts = _sort_key(reports[0])[0]
         keyed += [(_sort_key(report, not_before=entry_ts), report) for report in reports]
         if venue_position is not None:
-            units = units_of(held) if found.complete and still_open else None
+            units = units_of(volume) if found.complete and still_open else None
             positions.append(_position_report(venue_position, digits, units))
     reported = {report.venue_order_id for _, report in keyed}
     for order in snapshot.order:
@@ -238,6 +287,7 @@ def one_position(
     precision: Callable[[int], int | None],
     known_closes: Mapping[int, str],
     operations: Operations,
+    held: HeldOrders = NOTHING_HELD,
 ) -> Reconciliation:
     """`reconcile` of position `position_id` alone, open or closed, from its own lists `found`.
 
@@ -248,7 +298,9 @@ def one_position(
         position=[p for p in snapshot.position if p.positionId == position_id],
         order=[o for o in snapshot.order if o.positionId == position_id],
     )
-    return reconcile(alone, {position_id: found}, found.deals, precision, known_closes, operations)
+    return reconcile(
+        alone, {position_id: found}, found.deals, precision, known_closes, operations, held
+    )
 
 
 def open_volume(found: PositionHistory) -> int:
@@ -353,6 +405,7 @@ class _Position:
         operations: Operations,
         claimed: set[str],
         in_window: set[str],
+        held: HeldOrders,
     ) -> tuple[list[ReportedOrder], list[Notice]]:
         """The entry's report first, then the rest in no particular order."""
         notices: list[Notice] = []
@@ -382,8 +435,11 @@ class _Position:
                 entry, linked_order_ids=tuple(leg_ids.values()), contingency=Contingency.OTO
             )
         reports = [entry, *self._closes(known_closes, operations, claimed, in_window)]
-        leg_fills, external, said = self._triggers(leg_ids)
+        # A foreign position's every level is a leg.
+        leg_fills, external, said = self._triggers(_LEVELS if entry_id is None else leg_ids)
         notices += said
+        if entry_id is None:
+            reports += self._foreign_legs(leg_fills, venue_position, live_protective, held)
         for level, leg_id in leg_ids.items():
             linked = tuple(other for key, other in leg_ids.items() if key != level)
             reports.append(
@@ -434,9 +490,9 @@ class _Position:
         return reports
 
     def _triggers(
-        self, leg_ids: Mapping[Level, str]
+        self, with_legs: Collection[Level]
     ) -> tuple[dict[Level, list[Fill]], list[ReportedOrder], list[Notice]]:
-        """The protective orders' deals: the legs' fills, and reports for those no leg takes."""
+        """The protective orders' deals: fills for the levels `with_legs`, reports for the rest."""
         leg_fills: dict[Level, list[Fill]] = {}
         external: list[ReportedOrder] = []
         notices: list[Notice] = []
@@ -453,7 +509,7 @@ class _Position:
                     continue
                 level, said = which_level(self.side, levels, fill.price)
                 notices += [notice for notice in said if isinstance(notice, Notice)]
-                if level in leg_ids:
+                if level in with_legs:
                     leg_fills.setdefault(level, []).append(fill)
                 else:
                     untaken.append(fill)
@@ -473,16 +529,109 @@ class _Position:
                 )
         return leg_fills, external, notices
 
+    def _foreign_legs(
+        self,
+        leg_fills: Mapping[Level, list[Fill]],
+        venue_position: om.ProtoOAPosition | None,
+        live_protective: om.ProtoOAOrder | None,
+        held: HeldOrders,
+    ) -> list[ReportedOrder]:
+        """A foreign position's levels as its legs, as `reconcile` describes."""
+        held_open = held.open_legs(self.entry.orderId)
+        reports: list[ReportedOrder] = []
+        for level in _LEVELS:
+            fills = leg_fills.get(level, [])
+            if venue_position is not None:
+                levels = _position_levels(venue_position, self.precision)
+            else:
+                source = self._closing_source(fills)
+                levels = {} if source is None else levels_of(source, self.precision)
+            if level not in levels and not fills:
+                continue
+            venue_order_id, generation = self._generation(level, fills, held)
+            report = self._leg(
+                level,
+                None,
+                None,
+                (),
+                fills,
+                venue_position,
+                live_protective,
+                venue_order_id=venue_order_id,
+            )
+            ended_unfilled = report.status == ReportStatus.CANCELED and not fills
+            if ended_unfilled and generation > 1 and venue_order_id not in held_open:
+                continue
+            reports.append(report)
+        reported = {report.venue_order_id for report in reports}
+        for venue_order_id in sorted(held_open):
+            parsed = parse_leg_venue_order_id(venue_order_id)
+            if venue_order_id in reported or parsed is None:
+                continue
+            gone = self._leg(
+                parsed[1],
+                None,
+                None,
+                (),
+                [],
+                venue_position,
+                live_protective,
+                venue_order_id=venue_order_id,
+            )
+            if venue_position is not None:
+                ts_ms = venue_position.utcLastUpdateTimestamp
+            else:
+                ts_ms = self.deals[-1].executionTimestamp
+            # Any level the broker lists now is another leg's: the price is the one held.
+            reports.append(
+                replace(
+                    gone,
+                    status=ReportStatus.CANCELED,
+                    ts_ms=max(ts_ms, gone.ts_accepted_ms),
+                    price=None,
+                    trigger_price=None,
+                )
+            )
+        return reports
+
+    def _generation(self, level: Level, fills: list[Fill], held: HeldOrders) -> tuple[str, int]:
+        """A foreign leg's venue order id and generation.
+
+        The lowest generation Nautilus does not hold closed, or that holds one of `fills`.
+        """
+        trade_ids = {fill.trade_id for fill in fills}
+        generation = 1
+        while True:
+            venue_order_id = leg_venue_order_id(self.entry.orderId, level, generation)
+            if not held.closed(venue_order_id) or trade_ids.intersection(
+                held.trade_ids(venue_order_id)
+            ):
+                return venue_order_id, generation
+            generation += 1
+
+    def _closing_source(self, fills: list[Fill]) -> om.ProtoOAOrder | None:
+        """The protective order that filled for a level, else the last one listed."""
+        return next(
+            (o for o in self.protective if o.orderId in self._fill_orders(fills)),
+            max(self.protective, key=lambda o: o.utcLastUpdateTimestamp, default=None),
+        )
+
     def _leg(
         self,
         level: Level,
-        leg_id: str,
+        leg_id: str | None,
         entry_id: str | None,
         linked: tuple[str, ...],
         fills: list[Fill],
         venue_position: om.ProtoOAPosition | None,
         live_protective: om.ProtoOAOrder | None,
+        *,
+        venue_order_id: str | None = None,
     ) -> ReportedOrder:
+        """A leg as the broker's lists leave it; `leg_id` is the node's, `None` for a foreign one.
+
+        `venue_order_id` defaults to the leg's first generation.
+        """
         filled = sum((fill.units for fill in fills), Decimal(0))
         first_fill = self.entry_fills[0].ts_ms
         if venue_position is not None:
@@ -500,11 +649,7 @@ class _Position:
                 status, ts_ms = ReportStatus.CANCELED, venue_position.utcLastUpdateTimestamp
             units = filled + rest
         else:
-            # The protective order that filled for this level, else the last one listed.
-            source = next(
-                (o for o in self.protective if o.orderId in self._fill_orders(fills)),
-                max(self.protective, key=lambda o: o.utcLastUpdateTimestamp, default=None),
-            )
+            source = self._closing_source(fills)
             levels = {} if source is None else levels_of(source, self.precision)
             leg_units = (
                 units_of(source.tradeData.volume)
@@ -526,7 +671,7 @@ class _Position:
         level_price = levels.get(level)
         stop = level == Level.STOP_LOSS
         return ReportedOrder(
-            venue_order_id=leg_venue_order_id(self.entry.orderId, level),
+            venue_order_id=venue_order_id or leg_venue_order_id(self.entry.orderId, level),
             client_order_id=leg_id,
             symbol_id=self.entry.tradeData.symbolId,
             side=_OPPOSITE[self.side],
@@ -544,7 +689,7 @@ class _Position:
             time_in_force=_GOOD_TILL_CANCEL,
             parent_order_id=entry_id,
             linked_order_ids=linked,
-            contingency=Contingency.OUO,
+            contingency=None if leg_id is None else Contingency.OUO,
             fills=tuple(fills),
         )
 

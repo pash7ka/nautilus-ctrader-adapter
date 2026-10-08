@@ -29,14 +29,20 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.account_venue import ACCOUNT_ID
 from tests.execution_replay import (
     FIRST,
-    events,
-    first_n,
     make_deal,
     make_event,
     make_order,
     make_position,
 )
-from tests.execution_venue import US100_SYMBOL_ID, Harness, harness, on_us100, push
+from tests.execution_venue import (
+    FOREIGN_EVENTS,
+    US100_SYMBOL_ID,
+    ExecutionVenue,
+    Harness,
+    harness,
+    on_us100,
+    push,
+)
 from tests.polling import wait_until
 
 ORDER, POSITION = 6_800_001, 5_800_001
@@ -260,7 +266,7 @@ async def test_a_fill_nautilus_refuses_is_an_error() -> None:
 
 # The recorded first position as traded by hand, on US100.cash: protected, its take-profit
 # removed and put back, partly closed, then closed by its stop-loss.
-FOREIGN_FIRST = on_us100(first_n(events(), FIRST))
+FOREIGN_FIRST = FOREIGN_EVENTS
 FOREIGN_SL, FOREIGN_TP, FOREIGN_TP_AGAIN = "6000001-SL", "6000001-TP", "6000001-TP-2"
 
 
@@ -376,7 +382,33 @@ async def test_a_foreign_position_with_no_known_entry_is_a_debug_line() -> None:
             f"Position {FIRST} has levels but no known entry; its legs wait until "
             "the entry is known",
         ) in h.logger.lines
+        await wait_until(lambda: h.received(oa.ProtoOAOrderListByPositionIdReq))
         assert h.logger.warnings() == []
+
+
+async def test_levels_seen_before_their_entry_get_legs_from_the_order_list() -> None:
+    venue = ExecutionVenue()
+    # What the broker lists for the position: its entry, and the protective order.
+    venue.position_orders[FIRST] = [FOREIGN_FIRST[1].order, FOREIGN_FIRST[2].order]
+    async with harness(execution_venue=venue) as h:
+        await push(h, FOREIGN_FIRST[2])
+        await wait_until(lambda: by_venue_id(h, FOREIGN_TP) is not None, description="legs")
+
+        (asked,) = h.received(oa.ProtoOAOrderListByPositionIdReq)
+        assert asked.positionId == FIRST
+        stop, target = by_venue_id(h, FOREIGN_SL), by_venue_id(h, FOREIGN_TP)
+        assert stop.status == target.status == OrderStatus.ACCEPTED
+        assert stop.trigger_price == Price.from_str("85197.20")
+        assert target.price == Price.from_str("85387.22")
+
+        # The entry's own events follow: the entry is reported, the legs not again.
+        await push(h, *FOREIGN_FIRST[:2])
+        await wait_until(lambda: by_venue_id(h, "6000001") is not None, description="entry")
+        assert by_venue_id(h, "6000001").status == OrderStatus.FILLED
+        reported = [r.venue_order_id.value for r in h.reports if isinstance(r, OrderStatusReport)]
+        assert reported.count(FOREIGN_SL) == reported.count(FOREIGN_TP) == 1
+        assert h.logger.warnings() == []
+        assert h.logger.errors() == []
 
 
 async def test_a_trailing_stop_move_during_a_rebuild_waits_for_the_model() -> None:

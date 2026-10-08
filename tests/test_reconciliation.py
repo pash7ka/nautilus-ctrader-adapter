@@ -15,7 +15,7 @@ from nautilus_ctrader.common.reconciliation import (
     reconcile,
     unfilled_order,
 )
-from nautilus_ctrader.common.venue_book import levels_of
+from nautilus_ctrader.common.venue_book import VenueBook, levels_of
 from nautilus_ctrader.common.venue_records import (
     Contingency,
     ExternalType,
@@ -46,6 +46,7 @@ from tests.execution_replay import (
 
 NOTHING = NoOperations()
 CLOSED_AT = 408.8  # FIRST closed by its stop-loss, nothing open
+REMOVED_AT = 228.8  # FIRST open, its take-profit removed by hand
 EMPTY_AT = 762.7  # SECOND closed too, nothing open or pending
 OPEN_AT = 358.0  # FIRST open with 99 after a manual partial close, both levels set
 UNLOADED = 5_000_004
@@ -123,16 +124,28 @@ def test_closed_position_reports_entry_before_its_closes() -> None:
     assert result.positions == ()
 
 
-def test_foreign_closed_position_uses_real_ids() -> None:
+def test_foreign_closed_position_reports_its_levels_as_legs() -> None:
     result = closed_first(mine=False)
 
-    assert [report.venue_order_id for report in result.orders] == ["6000001", "6000003", "6000002"]
-    protective = result.orders[2]
-    assert protective.order_type == ExternalType.STOP_MARKET
-    assert protective.trigger_price == Decimal("85206.20")
-    assert protective.reduce_only
-    assert protective.status == ReportStatus.FILLED
-    assert trade_ids(protective) == ("7000003",)
+    # The protective order is the legs' source, never an order of its own.
+    ids = [report.venue_order_id for report in result.orders]
+    assert ids == ["6000001", "6000003", "6000001-SL", "6000001-TP"]
+    _, _, stop, target = result.orders
+    assert stop.order_type == ExternalType.STOP_MARKET
+    assert stop.trigger_price == Decimal("85206.20")
+    assert stop.status == ReportStatus.FILLED
+    assert trade_ids(stop) == ("7000003",)
+    assert stop.units == stop.filled_units == units_of(99)
+    assert target.order_type == ExternalType.LIMIT
+    assert target.price == Decimal("85353.42")
+    assert target.status == ReportStatus.CANCELED
+    assert target.ts_ms == stop.fills[0].ts_ms
+    for leg in (stop, target):
+        assert leg.reduce_only
+        assert leg.side == "SELL"
+        assert leg.venue_position_id == str(FIRST)
+        assert leg.parent_order_id is None
+        assert leg.linked_order_ids == ()
     assert all(report.client_order_id is None for report in result.orders)
     assert all(report.contingency is None for report in result.orders)
 
@@ -273,7 +286,12 @@ def test_open_protective_order_is_never_a_report() -> None:
         result = run(snapshot, histories, deals)
 
         assert "6000002" not in by_id(result)
-        assert {r.venue_order_id for r in result.orders} >= {"6000001", "6000003"}
+        assert {r.venue_order_id for r in result.orders} == {
+            "6000001",
+            "6000003",
+            "6000001-SL",
+            "6000001-TP",
+        }
 
 
 def test_pending_order_is_reported_accepted_without_id() -> None:
@@ -503,3 +521,163 @@ def test_a_position_in_the_histories_alone_is_taken() -> None:
         r.venue_order_id for r in closed_first(mine=True).orders
     ]
     assert result.positions == ()
+
+
+# -- The levels of a position the node did not open ---------------------------------------------
+
+
+class Held:
+    """What Nautilus holds of foreign legs, as a test sets it."""
+
+    def __init__(
+        self,
+        *,
+        closed: tuple[str, ...] = (),
+        trades: dict[str, tuple[str, ...]] | None = None,
+        open_legs: tuple[str, ...] = (),
+    ) -> None:
+        self._closed = set(closed)
+        self._trades = trades or {}
+        self._open = open_legs
+
+    def closed(self, venue_order_id: str) -> bool:
+        return venue_order_id in self._closed
+
+    def trade_ids(self, venue_order_id: str) -> tuple[str, ...]:
+        return self._trades.get(venue_order_id, ())
+
+    def open_legs(self, entry_order_id: int) -> tuple[str, ...]:
+        return tuple(i for i in self._open if i.startswith(f"{entry_order_id}-"))
+
+
+def foreign_legs(result: Reconciliation) -> dict[str, ReportedOrder]:
+    return {i: r for i, r in by_id(result).items() if i.startswith("6000001-")}
+
+
+def held_run(snapshot, histories, deals, held: Held) -> Reconciliation:
+    return reconcile(snapshot, histories, deals, precision, {}, NOTHING, held)
+
+
+def closed_held(held: Held) -> Reconciliation:
+    return held_run(snapshot_at(CLOSED_AT), {FIRST: history(FIRST)}, window(FIRST), held)
+
+
+def test_an_open_foreign_position_has_a_leg_per_standing_level() -> None:
+    snapshot, histories, deals = open_first(mine=False)
+
+    legs = foreign_legs(run(snapshot, histories, deals))
+
+    assert list(legs) == ["6000001-SL", "6000001-TP"]
+    stop, target = legs.values()
+    (protective,) = snapshot.order
+    assert stop.status == target.status == ReportStatus.ACCEPTED
+    assert stop.order_type == ExternalType.STOP_MARKET
+    assert stop.trigger_price == Decimal("85200.20")
+    assert stop.price is None
+    assert target.order_type == ExternalType.LIMIT
+    assert target.price == Decimal("85353.42")
+    assert target.trigger_price is None
+    for leg in (stop, target):
+        assert leg.units == units_of(99)
+        assert leg.filled_units == 0
+        assert leg.client_order_id is None
+        assert leg.contingency is None
+        assert leg.reduce_only
+        # Accepted when the protective order holding the level was created.
+        assert leg.ts_accepted_ms == protective.tradeData.openTimestamp
+
+
+def test_a_foreign_leg_takes_the_first_generation_nautilus_does_not_hold_closed() -> None:
+    snapshot, histories, deals = open_first(mine=False)
+
+    once = foreign_legs(held_run(snapshot, histories, deals, Held(closed=("6000001-TP",))))
+    twice = foreign_legs(
+        held_run(snapshot, histories, deals, Held(closed=("6000001-TP", "6000001-TP-2")))
+    )
+
+    assert list(once) == ["6000001-SL", "6000001-TP-2"]
+    assert list(twice) == ["6000001-SL", "6000001-TP-3"]
+    assert once["6000001-TP-2"].status == ReportStatus.ACCEPTED
+
+
+def test_the_legs_reported_are_the_ones_the_venue_model_holds() -> None:
+    snapshot, histories, deals = open_first(mine=False)
+    for closed in ((), ("6000001-SL",), ("6000001-TP", "6000001-TP-2")):
+        book = VenueBook(precision, held_closed=Held(closed=closed).closed)
+        book.load(snapshot, {FIRST: histories[FIRST].orders})
+
+        legs = foreign_legs(held_run(snapshot, histories, deals, Held(closed=closed)))
+
+        assert sorted(legs) == sorted(book.view(FIRST).foreign_legs.values())
+
+
+def test_a_foreign_level_gone_is_cancelled_only_where_nautilus_holds_its_leg_open() -> None:
+    snapshot, histories, deals = open_first(mine=False, at=REMOVED_AT)
+
+    unheld = foreign_legs(run(snapshot, histories, deals))
+    held = foreign_legs(held_run(snapshot, histories, deals, Held(open_legs=("6000001-TP",))))
+
+    assert list(unheld) == ["6000001-SL"]
+    assert list(held) == ["6000001-SL", "6000001-TP"]
+    target = held["6000001-TP"]
+    assert target.status == ReportStatus.CANCELED
+    # Its price is the one Nautilus holds.
+    assert target.price is None
+    assert target.ts_ms == snapshot.position[0].utcLastUpdateTimestamp
+
+
+def test_every_other_foreign_leg_nautilus_holds_open_is_cancelled() -> None:
+    snapshot, histories, deals = open_first(mine=False)
+    held = Held(open_legs=("6000001-SL-2", "6000001-TP"))
+
+    legs = foreign_legs(held_run(snapshot, histories, deals, held))
+
+    assert legs["6000001-SL"].status == ReportStatus.ACCEPTED
+    assert legs["6000001-TP"].status == ReportStatus.ACCEPTED
+    stale = legs["6000001-SL-2"]
+    assert stale.status == ReportStatus.CANCELED
+    assert stale.trigger_price is None
+
+
+def test_a_trigger_nautilus_already_holds_is_reported_under_the_same_leg() -> None:
+    # A reconnect after the stop-loss leg filled live: the take-profit leg ended with it.
+    held = Held(closed=("6000001-SL", "6000001-TP"), trades={"6000001-SL": ("7000003",)})
+
+    result = closed_held(held)
+
+    assert [r.venue_order_id for r in result.orders] == ["6000001", "6000003", "6000001-SL"]
+    assert trade_ids(by_id(result)["6000001-SL"]) == ("7000003",)
+
+
+def test_a_trigger_after_its_leg_was_cancelled_fills_the_next_generation() -> None:
+    legs = foreign_legs(closed_held(Held(closed=("6000001-SL",))))
+
+    assert list(legs) == ["6000001-SL-2", "6000001-TP"]
+    assert trade_ids(legs["6000001-SL-2"]) == ("7000003",)
+    assert legs["6000001-TP"].status == ReportStatus.CANCELED
+
+
+def test_a_closed_foreign_positions_leg_nautilus_holds_open_is_cancelled() -> None:
+    held = Held(closed=("6000001-TP",), open_legs=("6000001-TP-2",))
+
+    legs = foreign_legs(closed_held(held))
+
+    assert list(legs) == ["6000001-SL", "6000001-TP-2"]
+    target = legs["6000001-TP-2"]
+    assert target.status == ReportStatus.CANCELED
+    assert target.price == Decimal("85353.42")
+    assert target.ts_ms == legs["6000001-SL"].fills[0].ts_ms
+
+
+def test_a_foreign_protective_fill_with_no_level_known_keeps_its_own_id() -> None:
+    pid = 5_000_160
+    entry = make_order(6_000_160, pid, utc=1000)
+    protective = make_order(6_000_161, pid, order_type=om.STOP_LOSS_TAKE_PROFIT, utc=2000)
+    closing = make_deal(7_000_161, 6_000_161, pid, side=om.SELL, volume=100, price=85000.0, ts=2000)
+    deals = (filled(entry, 7_000_160, 100, 1000), closing)
+
+    result = run(reconcile_res(), {pid: PositionHistory((entry, protective), deals)}, deals)
+
+    assert [r.venue_order_id for r in result.orders] == ["6000160", "6000161"]
+    assert result.orders[1].order_type == ExternalType.MARKET
+    assert result.orders[1].reduce_only

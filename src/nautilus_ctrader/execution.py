@@ -110,6 +110,7 @@ from nautilus_ctrader.common.venue_records import (
     Record,
     ReportedOrder,
     money_of,
+    parse_leg_venue_order_id,
 )
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
@@ -216,6 +217,36 @@ class BrokerState:
     histories: dict[int, PositionHistory]
     window_deals: tuple[om.ProtoOADeal, ...]
     requests: int
+
+
+class _HeldLegs:
+    """What Nautilus's cache holds of legs, as reconciliation asks it; read for one pass."""
+
+    def __init__(self, cache: Cache, account_id: AccountId) -> None:
+        self._cache = cache
+        self._open: dict[int, list[str]] = {}
+        for order in cache.orders_open(venue=CTRADER_VENUE):
+            # An order Nautilus made from a report holds no account id.
+            if order.account_id not in (None, account_id) or order.venue_order_id is None:
+                continue
+            parsed = parse_leg_venue_order_id(order.venue_order_id.value)
+            if parsed is not None:
+                self._open.setdefault(parsed[0], []).append(order.venue_order_id.value)
+
+    def _order(self, venue_order_id: str) -> Order | None:
+        client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
+        return None if client_order_id is None else self._cache.order(client_order_id)
+
+    def closed(self, venue_order_id: str) -> bool:
+        order = self._order(venue_order_id)
+        return order is not None and order.is_closed
+
+    def trade_ids(self, venue_order_id: str) -> set[str]:
+        order = self._order(venue_order_id)
+        return set() if order is None else {trade_id.value for trade_id in order.trade_ids}
+
+    def open_legs(self, entry_order_id: int) -> tuple[str, ...]:
+        return tuple(self._open.get(entry_order_id, ()))
 
 
 # The pushed events that change the venue model.
@@ -697,6 +728,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                         self._price_precision,
                         self._book.known_closes(),
                         self._operations,
+                        _HeldLegs(self._cache, self.account_id),
                     )
                     record = next((r for r in built.orders if r.client_order_id == order_id), None)
                     if (
@@ -726,6 +758,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._currency,
             self._clock.timestamp_ns(),
             held_price=self._held_price,
+            known_id=self._known_id,
         )
         if not status.order_reports:
             return unanswered("no price or instrument to report it at")
@@ -769,14 +802,15 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Every open order and live leg; with `open_only` false, also those that ended unfilled.
 
         A filled order reaches Nautilus only inside a mass status: without its fills Nautilus
-        would infer one with no commission.
+        would infer one with no commission. An external order Nautilus holds is reported under
+        the client order id it gave it.
         """
         since_ms = None if command.open_only else self._command_since_ms(command.start)
         status = await self._reports(since_ms)
         if status is None:
             return []
         return [
-            report
+            self._named(report)
             for report in status.order_reports.values()
             if command.instrument_id in (None, report.instrument_id)
             and (
@@ -797,7 +831,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             return []
         until = None if command.end is None else reports.nanos(_ms(command.end))
         return [
-            fill
+            self._named(fill)
             for venue_order_id, fills in status.fill_reports.items()
             if command.venue_order_id in (None, venue_order_id)
             for fill in fills
@@ -838,6 +872,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._price_precision,
             self._book.known_closes(),
             self._operations,
+            _HeldLegs(self._cache, self.account_id),
         )
         for notice in found.notices:
             self._log.warning(notice.text)
@@ -850,12 +885,13 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._currency,
             self._clock.timestamp_ns(),
             held_price=self._held_price,
+            known_id=self._known_id,
         )
         for record in left_out:
             # Normal after a restart without a persistent cache.
             self._log.debug(
-                f"Leg {record.client_order_id} is not reported: its level is gone and Nautilus "
-                "holds no price for it",
+                f"Leg {record.client_order_id or record.venue_order_id} is not reported: its "
+                "level is gone and Nautilus holds no price for it",
             )
         return status
 
@@ -885,6 +921,19 @@ class CTraderExecutionClient(LiveExecutionClient):
         """
         client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
         return None if client_order_id is None else client_order_id.value
+
+    def _named[R: (OrderStatusReport, FillReport)](self, report: R) -> R:
+        """`report` under the client order id Nautilus gave its external order, if it holds it.
+
+        Nautilus's check of its open orders looks for a report under that id. A mass status is
+        left as it is: Nautilus names its reports itself, and drops one already named whose
+        status it holds, a price change with it.
+        """
+        if report.client_order_id is None:
+            known = self._known_id(report.venue_order_id.value)
+            if known is not None:
+                report.client_order_id = ClientOrderId(known)
+        return report
 
     def _held_price(self, client_order_id: str) -> Decimal | None:
         """The price Nautilus holds for a leg: a stop's trigger price, a limit's price."""
@@ -1472,10 +1521,35 @@ class CTraderExecutionClient(LiveExecutionClient):
                     f"Position {record.position_id} has levels but no known entry; its legs wait "
                     "until the entry is known",
                 )
+                self.create_task(
+                    self._find_entry(record.position_id),
+                    log_msg=f"read the orders of position {record.position_id}",
+                )
             else:
                 self._log.warning(f"{type(record).__name__} is not a known record; ignored")
         except Exception as e:
             self._log.exception(f"{type(record).__name__} could not be reported", e)
+
+    async def _find_entry(self, position_id: int) -> None:
+        """Read the order list of a position whose entry the model lacks, and hand it over.
+
+        Read once the model stands. A rebuild under way when the list arrives reads every list
+        itself, so this one is then dropped.
+        """
+        await self._model_standing.wait()
+        try:
+            orders = await self._position_orders(
+                position_id, partial(self._request, bucket=BUCKET_HISTORICAL)
+            )
+        except CTraderError as e:
+            self._log.warning(
+                f"Position {position_id}: its order list could not be read, so its levels stay "
+                f"without legs: {e}",
+            )
+            return
+        if self._session is None or self._buffer is not None:
+            return
+        self._handle_records(self._book.entry_found(position_id, orders))
 
     def _nautilus_order(self, record: OrderEvent) -> Order | None:
         """The order a record is about: the node's by its own id, an external one by venue id."""

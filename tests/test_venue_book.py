@@ -2984,3 +2984,89 @@ def test_a_trailing_move_of_another_protective_order_or_position_means_nothing()
     assert b.trailing_stop_moved(trailing(FP, 1, 85050.0, 30)) == []
     assert b.trailing_stop_moved(trailing(77, FPROTECTIVE, 85050.0, 30)) == []
     assert b.view(FP).levels[Level.STOP_LOSS] == Decimal("85000.00")
+
+
+def test_a_trailing_move_of_a_position_with_no_protective_order_means_nothing() -> None:
+    theirs, own = book(), book()
+    theirs.apply(foreign_entry_filled(), NOTHING)
+    entered(own)
+
+    assert theirs.trailing_stop_moved(trailing(FP, FPROTECTIVE, 85050.0, 30)) == []
+    assert own.trailing_stop_moved(trailing(P, PROTECTIVE, 85050.0, 30)) == []
+    assert theirs.view(FP).levels == {}
+    assert own.view(P).levels == {}
+
+
+def protected_first(b: VenueBook) -> list:
+    """FP's protective order, seen before anything else of FP."""
+    return b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            foreign_protective(PROTECTED_AT, **BOTH),
+            position=make_position(FP),
+            server=True,
+        ),
+        NOTHING,
+    )
+
+
+def test_an_entry_found_in_the_order_list_gives_the_levels_their_legs() -> None:
+    b = book()
+    assert protected_first(b) == [EntryUnknown(FP)]
+    listed = [foreign_protective(PROTECTED_AT, **BOTH), make_order(FENTRY, FP, utc=20)]
+
+    found = b.entry_found(FP, listed)
+
+    assert found == [
+        first_seen(Level.STOP_LOSS, PROTECTED_AT, "85000.00"),
+        first_seen(Level.TAKE_PROFIT, PROTECTED_AT, "85500.00"),
+    ]
+    assert b.view(FP).entry_order_id == FENTRY
+    # Known now: a second list, and the entry's own fill, add no leg.
+    assert b.entry_found(FP, listed) == []
+    learnt = b.apply(foreign_entry_filled(), NOTHING)
+    assert [type(r) for r in learnt] == [ExternalOrder]
+    assert learnt[0].venue_order_id == str(FENTRY)
+
+
+def test_an_order_list_without_the_entry_or_position_changes_nothing() -> None:
+    b = book()
+    protected_first(b)
+
+    assert b.entry_found(FP, [foreign_protective(PROTECTED_AT, **BOTH)]) == []
+    assert b.entry_found(77, [make_order(FENTRY, 77)]) == []
+    assert b.view(FP).entry_order_id is None
+    assert b.view(FP).foreign_legs == {}
+
+
+def test_the_nodes_own_entry_found_in_the_order_list_waits_for_its_events() -> None:
+    b = book()
+    b.apply(
+        make_event(om.ORDER_ACCEPTED, protective(21, **BOTH), position=make_position(P)),
+        NOTHING,
+    )
+
+    assert b.entry_found(P, [our_entry(P, ENTRY, utc=10)]) == []
+
+    view = b.view(P)
+    assert view.ours
+    assert view.foreign_legs == {}
+    assert view.legs == {
+        Level.STOP_LOSS: (stop_id(P), True),
+        Level.TAKE_PROFIT: (target_id(P), True),
+    }
+    filled = b.apply(
+        make_event(
+            om.ORDER_FILLED,
+            our_entry(P, ENTRY, utc=20),
+            position=make_position(P),
+            deal=make_deal(9_200_001, ENTRY, P, side=om.BUY, volume=100, price=85250.0, ts=20),
+        ),
+        NOTHING,
+    )
+    assert [r.kind for r in filled if isinstance(r, OrderEvent)] == [
+        OrderEventKind.ACCEPTED,
+        OrderEventKind.FILLED,
+        OrderEventKind.ACCEPTED,
+        OrderEventKind.ACCEPTED,
+    ]
