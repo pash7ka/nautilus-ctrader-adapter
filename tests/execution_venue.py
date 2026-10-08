@@ -216,6 +216,7 @@ class ExecutionVenue:
                 oa.ProtoOAOrderListRes, "order", _between(self.orders, r, _last_update)
             ),
         )
+        self._serve(om.PROTO_OA_ORDER_DETAILS_REQ, self._details)
         self._serve(om.PROTO_OA_CASH_FLOW_HISTORY_LIST_REQ, self._cash_flow)
         self.server.on(
             om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
@@ -249,6 +250,34 @@ class ExecutionVenue:
         return oa.ProtoOACashFlowHistoryListRes(
             ctidTraderAccountId=ACCOUNT_ID,
             depositWithdraw=_between(self.cash_flow, request, _changed),
+        )
+
+    def _details(self, request: oa.ProtoOAOrderDetailsReq) -> Message:
+        """The order as last changed in any list the venue holds, with its deals."""
+        listed = [
+            order
+            for order in (
+                *self.snapshot.order,
+                *self.orders,
+                *(o for found in self.position_orders.values() for o in found),
+            )
+            if order.orderId == request.orderId
+        ]
+        if not listed:
+            return oa.ProtoOAErrorRes(
+                ctidTraderAccountId=ACCOUNT_ID,
+                errorCode="ORDER_NOT_FOUND",
+                description="no such order",
+            )
+        deals = {
+            deal.dealId: deal
+            for deal in (*self.deals, *(d for found in self.position_deals.values() for d in found))
+            if deal.orderId == request.orderId
+        }
+        return oa.ProtoOAOrderDetailsRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            order=max(listed, key=_last_update),
+            deal=sorted(deals.values(), key=_executed),
         )
 
     def _page(self, response: type[Message], field: str, items: list) -> Message:

@@ -549,6 +549,13 @@ class VenueBook:
                     return position.position_id, level
         return None
 
+    def entry_position(self, entry_order_id: int) -> int | None:
+        """The position broker order `entry_order_id` opened, open or closed since the last load."""
+        for position in self._positions.values():
+            if position.entry_order_id == entry_order_id:
+                return position.position_id
+        return None
+
     def cancel_leg(self, position_id: int, level: Level, ts_ms: int) -> list[Record]:
         """The node cancels a live leg whose level the broker does not hold: no request is needed.
 

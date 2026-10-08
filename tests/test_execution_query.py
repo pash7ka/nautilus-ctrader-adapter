@@ -11,6 +11,7 @@ import time
 from collections.abc import Iterable
 from decimal import Decimal
 
+import pytest
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import GenerateOrderStatusReport, QueryOrder
 from nautilus_trader.model.currencies import USD
@@ -25,6 +26,7 @@ from nautilus_trader.model.identifiers import (
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.model.orders import Order
 
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.order_record import LegIds
@@ -533,3 +535,204 @@ async def test_an_entry_answered_filled_leaves_a_known_position_unrebuilt() -> N
         assert rebuilds == []
         assert all(alive for _, alive in h.client._book.view(FIRST).legs.values())
         assert len(h.client._brackets) == 1
+
+
+# -- Orders Nautilus holds under an id of its own: looked up by venue order id -----------------
+
+SL, TP = "6000001-SL", "6000001-TP"
+CLOSED_AT = 408.8  # FIRST closed by its stop-loss, nothing open
+# A trader's resting limit buy, hand-built; Nautilus learns it from the start's reconciliation.
+RESTING, RESTING_POSITION = 6_800_001, 5_800_001
+
+
+def held(h: Harness, venue_order_id: str | int) -> Order:
+    client_order_id = h.cache.client_order_id(VenueOrderId(str(venue_order_id)))
+    assert client_order_id is not None, venue_order_id
+    return h.cache.order(client_order_id)
+
+
+async def asked_to_cancel(h: Harness, venue_order_id: str | int) -> QueryOrder:
+    """Put the order in `PENDING_CANCEL`; return the query Nautilus then sends, with both ids."""
+    order = held(h, venue_order_id)
+    h.engine.process(
+        OrderPendingCancel(
+            TRADER_ID,
+            order.strategy_id,
+            order.instrument_id,
+            order.client_order_id,
+            order.venue_order_id,
+            h.client.account_id,
+            UUID4(),
+            0,
+            0,
+        ),
+    )
+    await wait_until(lambda: held(h, venue_order_id).status == OrderStatus.PENDING_CANCEL)
+    return QueryOrder(
+        trader_id=TRADER_ID,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=order.venue_order_id,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def never_walked(h: Harness) -> None:
+    assert h.received(oa.ProtoOAOrderListReq) == []
+
+
+def details_asked(h: Harness) -> list[int]:
+    return [request.orderId for request in h.received(oa.ProtoOAOrderDetailsReq)]
+
+
+def foreign_venue() -> ExecutionVenue:
+    venue = ExecutionVenue()
+    serve(venue, OPEN_AT, mine=False)
+    return venue
+
+
+@pytest.mark.parametrize(
+    ("stop_loss", "trigger"),
+    [pytest.param(None, "85200.20", id="standing"), pytest.param(85150.0, "85150.00", id="moved")],
+)
+async def test_query_for_a_foreign_leg_answers_its_level_at_the_broker(
+    stop_loss: float | None, trigger: str
+) -> None:
+    venue = foreign_venue()
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        asked = await asked_to_cancel(h, SL)
+        if stop_loss is not None:
+            venue.snapshot.position[0].stopLoss = stop_loss
+
+        await h.client._query_order(asked)
+
+        await wait_until(lambda: held(h, SL).status == OrderStatus.ACCEPTED)
+        stop = held(h, SL)
+        assert stop.client_order_id == asked.client_order_id
+        assert stop.trigger_price == Price.from_str(trigger)
+        assert stop.quantity == Quantity.from_str("0.99")
+        (report,) = h.reports
+        assert report.venue_order_id == VenueOrderId(SL)
+        assert report.client_order_id == asked.client_order_id
+        assert h.mass_statuses == []
+        never_walked(h)
+        assert details_asked(h) == []
+        assert h.logger.errors() == []
+
+
+async def test_query_for_a_foreign_leg_whose_level_is_gone_answers_canceled() -> None:
+    venue = foreign_venue()
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        asked = await asked_to_cancel(h, TP)
+        venue.snapshot.position[0].ClearField("takeProfit")
+
+        await h.client._query_order(asked)
+
+        await wait_until(lambda: held(h, TP).status == OrderStatus.CANCELED)
+        # At the price Nautilus held: the broker lists none for a level gone.
+        assert held(h, TP).price == Price.from_str("85353.42")
+        (report,) = h.reports
+        assert report.client_order_id == asked.client_order_id
+        assert held(h, SL).status == OrderStatus.ACCEPTED
+        never_walked(h)
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("rebuilt", [False, True], ids=["known", "rebuilt"])
+async def test_query_for_a_foreign_leg_whose_position_closed_answers_its_closing(
+    rebuilt: bool,
+) -> None:
+    venue = foreign_venue()
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        asked_stop = await asked_to_cancel(h, SL)
+        asked_target = await asked_to_cancel(h, TP)
+        # The stop-loss triggered; its events never came.
+        serve(venue, CLOSED_AT, mine=False)
+        if rebuilt:
+            # A model rebuilt since holds no closed position: the entry's details name it.
+            await h.client._load()
+
+        await h.client._query_order(asked_stop)
+        await h.client._query_order(asked_target)
+
+        await wait_until(lambda: held(h, SL).status == OrderStatus.FILLED)
+        await wait_until(lambda: held(h, TP).status == OrderStatus.CANCELED)
+        assert held(h, SL).trade_ids == [TradeId("7000003")]
+        assert h.cache.position(PositionId(str(FIRST))).is_closed
+        (built,) = h.mass_statuses
+        assert list(built.order_reports) == [VenueOrderId(SL)]
+        assert [report.venue_order_id for report in h.reports] == [VenueOrderId(TP)]
+        assert details_asked(h) == ([6000001, 6000001] if rebuilt else [])
+        never_walked(h)
+        assert h.logger.errors() == []
+
+
+def resting(*, status: int = om.ORDER_STATUS_ACCEPTED) -> om.ProtoOAOrder:
+    order = make_order(
+        RESTING,
+        RESTING_POSITION,
+        order_type=om.LIMIT,
+        utc=now_ms() - MINUTE_MS,
+        limit=84000.0,
+        volume=200,
+        symbol=US100_SYMBOL_ID,
+    )
+    order.orderStatus = status
+    return order
+
+
+async def test_query_for_a_pending_external_order_answers_from_the_snapshot() -> None:
+    venue = ExecutionVenue()
+    venue.snapshot.order.append(resting())
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        asked = await asked_to_cancel(h, RESTING)
+        # Moved by the trader meanwhile.
+        venue.snapshot.order[0].limitPrice = 84100.0
+
+        await h.client._query_order(asked)
+
+        await wait_until(lambda: held(h, RESTING).status == OrderStatus.ACCEPTED)
+        assert held(h, RESTING).price == Price.from_str("84100.00")
+        (report,) = h.reports
+        assert report.client_order_id == asked.client_order_id
+        generated = await h.client.generate_order_status_report(
+            GenerateOrderStatusReport(
+                instrument_id=US100_ID,
+                client_order_id=asked.client_order_id,
+                venue_order_id=asked.venue_order_id,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+        assert generated.order_status == OrderStatus.ACCEPTED
+        assert generated.client_order_id == asked.client_order_id
+        never_walked(h)
+        assert details_asked(h) == []
+        assert h.logger.errors() == []
+
+
+async def test_query_for_a_pending_external_order_gone_answers_from_its_details() -> None:
+    venue = ExecutionVenue()
+    venue.snapshot.order.append(resting())
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        asked = await asked_to_cancel(h, RESTING)
+        # Cancelled at the broker; the answer to the cancel never came.
+        del venue.snapshot.order[:]
+        venue.orders = [resting(status=om.ORDER_STATUS_CANCELLED)]
+
+        await h.client._query_order(asked)
+
+        await wait_until(lambda: held(h, RESTING).status == OrderStatus.CANCELED)
+        (report,) = h.reports
+        assert report.client_order_id == asked.client_order_id
+        assert details_asked(h) == [RESTING]
+        never_walked(h)
+        assert h.mass_statuses == []
+        assert h.logger.errors() == []

@@ -227,12 +227,18 @@ class _HeldLegs:
     """What Nautilus's cache holds of legs, as reconciliation asks it; read for one pass.
 
     `closed` is the client's own test of a closed order, so the venue model and reconciliation
-    pick a leg's generation alike.
+    pick a leg's generation alike; `order` finds the order Nautilus holds for a venue order id.
     """
 
-    def __init__(self, cache: Cache, account_id: AccountId, closed: Callable[[str], bool]) -> None:
-        self._cache = cache
+    def __init__(
+        self,
+        cache: Cache,
+        account_id: AccountId,
+        closed: Callable[[str], bool],
+        order: Callable[[str], Order | None],
+    ) -> None:
         self.closed = closed
+        self._order = order
         self._open: dict[int, list[str]] = {}
         for order in cache.orders_open(venue=CTRADER_VENUE):
             # An order Nautilus made from a report holds no account id.
@@ -241,10 +247,6 @@ class _HeldLegs:
             parsed = parse_leg_venue_order_id(order.venue_order_id.value)
             if parsed is not None:
                 self._open.setdefault(parsed[0], []).append(order.venue_order_id.value)
-
-    def _order(self, venue_order_id: str) -> Order | None:
-        client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
-        return None if client_order_id is None else self._cache.order(client_order_id)
 
     def trade_ids(self, venue_order_id: str) -> set[str]:
         order = self._order(venue_order_id)
@@ -661,24 +663,32 @@ class CTraderExecutionClient(LiveExecutionClient):
         client_order_id: ClientOrderId | None,
         venue_order_id: VenueOrderId | None,
     ) -> tuple[OrderStatusReport | None, bool]:
-        """The broker's report of one of the node's orders, and whether it was sent already.
+        """The broker's report of one order Nautilus holds, and whether it was sent already.
 
         The order is looked up by what it is:
 
-        - a leg: its position in the venue model;
-        - a close: its broker order once the model has matched it, else, while it is still in
-          flight, its position, where the lists name it by the close in flight;
-        - an entry or a market order: the broker's pending orders, then its order list over
-          the fill window.
+        - the node's leg: its position in the venue model;
+        - any other leg, such as a level of a position the node did not open: by its venue order
+          id, in the position its entry opened, which the venue model or the entry's details name;
+        - the node's close: its broker order once the model has matched it, else, while it is
+          still in flight, its position, where the lists name it by the close in flight;
+        - any other order the broker has numbered, external or the node's: by its venue order
+          id, among the broker's pending orders, else in the order's own details;
+        - the node's entry or market order the broker has not numbered yet: by the node's record,
+          among the broker's pending orders, then in its order list over the fill window.
 
-        The report is built from that position's own lists. One with fills is sent at once as
-        a one-order mass status carrying them: a bare filled report would make Nautilus infer a
-        fill of its own. Nothing is answered while the connection is down, while a leg's entry
-        is still in flight, or when nothing matches; a DEBUG line says which.
+        The report is built from that position's own lists, and carries the client order id
+        Nautilus holds the order under. One with fills is sent at once as a one-order mass status
+        carrying them: a bare filled report would make Nautilus infer a fill of its own. Nothing
+        is answered while the connection is down, while a leg's entry is still in flight, or
+        when nothing matches; a DEBUG line says which.
         """
-        if client_order_id is None and venue_order_id is not None:
-            client_order_id = self._cache.client_order_id(venue_order_id)
-        order = None if client_order_id is None else self._cache.order(client_order_id)
+        if client_order_id is not None:
+            order = self._cache.order(client_order_id)
+        elif venue_order_id is not None:
+            order = self._order_by_venue_id(venue_order_id.value)
+        else:
+            order = None
 
         def unanswered(reason: str) -> tuple[None, bool]:
             self._log.debug(f"Query of {client_order_id or venue_order_id} not answered: {reason}")
@@ -691,42 +701,58 @@ class CTraderExecutionClient(LiveExecutionClient):
         if self._instrument_provider.find(order.instrument_id) is None:
             return unanswered(f"{order.instrument_id} is not loaded")
         order_id = order.client_order_id.value
+        if order.venue_order_id is not None:
+            venue_order_id = order.venue_order_id
+        venue_id = None if venue_order_id is None else venue_order_id.value
         leg = self._book.leg_position(order_id)
         if leg is None and self._brackets.by_leg(order_id) is not None:
             return unanswered("its entry is still in flight")
         close = self._book.close_order(order_id)
+        other_leg = None
+        numbered = False
+        if leg is None and close is None and venue_id is not None:
+            other_leg = parse_leg_venue_order_id(venue_id)
+            # A broker order id: the only key to an external order, whose client id no list holds.
+            numbered = venue_id.isascii() and venue_id.isdigit()
+        by_venue_id = False
+
+        def wanted(record: ReportedOrder) -> bool:
+            if by_venue_id:
+                return record.venue_order_id == venue_id
+            return record.client_order_id == order_id
+
+        closing: int | None = None
         listed: om.ProtoOAOrder | None = None
         record: ReportedOrder | None = None
         try:
             if leg is not None or close is not None:
                 position_id = leg[0] if leg is not None else close[1]
-            elif order.is_reduce_only:
-                # Not matched yet: its position's lists name it by the close still in flight.
-                position_id = self._operations.close_position(order_id)
+            elif other_leg is not None:
+                by_venue_id = True
+                position_id = await self._entry_position(other_leg[0])
                 if position_id is None:
-                    return unanswered("not found at the venue")
-            else:
+                    return unanswered("its entry names no position at the venue")
+            elif (
+                order.is_reduce_only
+                and (closing := self._operations.close_position(order_id)) is not None
+            ):
+                # Not matched yet: its position's lists name it by the close still in flight.
+                position_id = closing
+            elif numbered or not order.is_reduce_only:
+                by_venue_id = numbered
                 pending = await self._request(
                     oa.ProtoOAReconcileReq(ctidTraderAccountId=self._account.account_id),
                 )
-                listed = entry_named(pending.order, order_id)
+                if by_venue_id:
+                    listed = next((o for o in pending.order if str(o.orderId) == venue_id), None)
+                else:
+                    listed = entry_named(pending.order, order_id)
                 position_id = None
                 if listed is None:
-                    windows = history.weekly_windows(
-                        self._since_ms(self._lookback_mins), self._clock.timestamp_ms()
-                    )
-                    # TODO(verify): that the order list holds an order the broker rejected;
-                    # none was recorded.
-                    for start, end in reversed(windows):
-                        found = await history.orders_between(
-                            partial(self._request, bucket=BUCKET_HISTORICAL),
-                            self._account.account_id,
-                            start,
-                            end,
-                        )
-                        listed = entry_named(found, order_id)
-                        if listed is not None:
-                            break
+                    if by_venue_id:
+                        listed = await self._order_details(int(venue_id))
+                    else:
+                        listed = await self._entry_in_history(order_id)
                     if listed is None:
                         return unanswered("not found at the venue")
                     if listed.HasField("positionId"):
@@ -734,6 +760,8 @@ class CTraderExecutionClient(LiveExecutionClient):
                 elif listed.executedVolume and listed.HasField("positionId"):
                     # Partly filled: answered from its position, with its fills.
                     position_id = listed.positionId
+            else:
+                return unanswered("not found at the venue")
             if position_id is not None:
                 state = await self._read_broker(since_ms=None, positions=[position_id])
                 found = state.histories.get(position_id)
@@ -745,15 +773,10 @@ class CTraderExecutionClient(LiveExecutionClient):
                         self._price_precision,
                         self._book.known_closes(),
                         self._operations,
-                        _HeldLegs(self._cache, self.account_id, self._held_closed),
+                        self._held_legs(),
                     )
-                    record = next((r for r in built.orders if r.client_order_id == order_id), None)
-                    if (
-                        record is not None
-                        and leg is None
-                        and close is None
-                        and order.is_reduce_only
-                    ):
+                    record = next(filter(wanted, built.orders), None)
+                    if record is not None and closing is not None:
                         # Its late events, after the close's timeout, stay the node's close's.
                         self._book.match_close(int(record.venue_order_id), position_id, order_id)
         except CTraderError as e:
@@ -781,12 +804,54 @@ class CTraderExecutionClient(LiveExecutionClient):
             return unanswered("no price or instrument to report it at")
         (report,) = status.order_reports.values()
         if not record.fills:
-            return report, False
+            return self._named(report), False
         self._send_mass_status_report(status)
         bracket = self._brackets.by_entry(order_id)
         if bracket is not None and self._bracket_position(bracket) is None:
             await self._learn_position(order_id)
-        return report, True
+        return self._named(report), True
+
+    async def _entry_position(self, entry_order_id: int) -> int | None:
+        """The position broker order `entry_order_id` opened: the venue model's, else its details'.
+
+        The model holds no position closed before it was last rebuilt.
+        """
+        position_id = self._book.entry_position(entry_order_id)
+        if position_id is not None:
+            return position_id
+        entry = await self._order_details(entry_order_id)
+        return entry.positionId if entry.HasField("positionId") else None
+
+    async def _order_details(self, order_id: int) -> om.ProtoOAOrder:
+        """Broker order `order_id` as it stands now, pending or ended."""
+        # TODO(verify): no order details request was recorded: that one answers an order that
+        # has ended, what it answers for an unknown id, and which request limit it counts against
+        # (taken as the historical one here).
+        response = await self._request(
+            oa.ProtoOAOrderDetailsReq(
+                ctidTraderAccountId=self._account.account_id, orderId=order_id
+            ),
+            bucket=BUCKET_HISTORICAL,
+        )
+        return response.order
+
+    async def _entry_in_history(self, client_order_id: str) -> om.ProtoOAOrder | None:
+        """The node's order `client_order_id` in the account's order list over the fill window."""
+        windows = history.weekly_windows(
+            self._since_ms(self._lookback_mins), self._clock.timestamp_ms()
+        )
+        # TODO(verify): that the order list holds an order the broker rejected; none was recorded.
+        for start, end in reversed(windows):
+            found = await history.orders_between(
+                partial(self._request, bucket=BUCKET_HISTORICAL),
+                self._account.account_id,
+                start,
+                end,
+            )
+            listed = entry_named(found, client_order_id)
+            if listed is not None:
+                return listed
+        return None
 
     async def _learn_position(self, entry_id: str) -> None:
         """Rebuild the model after a query found bracket `entry_id`'s entry filled.
@@ -889,7 +954,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._price_precision,
             self._book.known_closes(),
             self._operations,
-            _HeldLegs(self._cache, self.account_id, self._held_closed),
+            self._held_legs(),
         )
         for notice in found.notices:
             self._log.warning(notice.text)
@@ -924,10 +989,17 @@ class CTraderExecutionClient(LiveExecutionClient):
                 found.append(int(position.id.value))
         return found
 
+    def _order_by_venue_id(self, venue_order_id: str) -> Order | None:
+        """The order Nautilus holds under `venue_order_id`, the node's or an external one."""
+        client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
+        return None if client_order_id is None else self._cache.order(client_order_id)
+
+    def _held_legs(self) -> _HeldLegs:
+        return _HeldLegs(self._cache, self.account_id, self._held_closed, self._order_by_venue_id)
+
     def _held_closed(self, venue_order_id: str) -> bool:
         """Whether Nautilus holds `venue_order_id` as a closed order."""
-        client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
-        order = None if client_order_id is None else self._cache.order(client_order_id)
+        order = self._order_by_venue_id(venue_order_id)
         return order is not None and order.is_closed
 
     def _known_id(self, venue_order_id: str) -> str | None:
@@ -936,8 +1008,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         Nautilus's check of its open orders looks for a report under this id: an open order with
         none is taken for missing.
         """
-        client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
-        return None if client_order_id is None else client_order_id.value
+        order = self._order_by_venue_id(venue_order_id)
+        return None if order is None else order.client_order_id.value
 
     def _named[R: (OrderStatusReport, FillReport)](self, report: R) -> R:
         """`report` under the client order id Nautilus gave its external order, if it holds it.
@@ -1034,10 +1106,9 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     def _held_order(self, report: OrderStatusReport) -> Order | None:
         """The order Nautilus holds for `report`: the node's by its id, another by venue id."""
-        client_order_id = report.client_order_id or self._cache.client_order_id(
-            report.venue_order_id
-        )
-        return None if client_order_id is None else self._cache.order(client_order_id)
+        if report.client_order_id is not None:
+            return self._cache.order(report.client_order_id)
+        return self._order_by_venue_id(report.venue_order_id.value)
 
     def _release_safely(self) -> None:
         # Runs inside the engine's publish or a timer callback: a raise there would end the
@@ -1620,8 +1691,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             return self._cache.order(ClientOrderId(record.client_order_id))
         if record.venue_order_id is None:
             return None
-        client_order_id = self._cache.client_order_id(VenueOrderId(record.venue_order_id))
-        return None if client_order_id is None else self._cache.order(client_order_id)
+        return self._order_by_venue_id(record.venue_order_id)
 
     def _order_event(self, record: OrderEvent) -> None:
         order = self._nautilus_order(record)
@@ -1748,8 +1818,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         # TODO(verify): that the deals of one order arrive in time order. Nautilus skips a
         # reconciliation fill older than one it applied to the same order.
         self._send_fill_report(report)
-        client_order_id = self._cache.client_order_id(report.venue_order_id)
-        order = None if client_order_id is None else self._cache.order(client_order_id)
+        order = self._order_by_venue_id(report.venue_order_id.value)
         if order is None or report.trade_id not in order.trade_ids:
             self._log.error(
                 f"Nautilus did not apply fill {report.trade_id} of order "

@@ -307,12 +307,25 @@ The three report generators answer from the same read, without rebuilding the mo
 A `QueryOrder`, and Nautilus's own check of an order left in flight, are answered from the
 broker's lists:
 
-- a leg is answered from the venue model;
+- the node's leg is answered from the venue model;
+- any other leg, such as a level of a position the node did not open, is matched by its venue
+  order id in the position its entry opened. The venue model names that position, or, for one
+  closed before the model was last rebuilt, the entry's own details (`ProtoOAOrderDetailsReq`).
+  A standing level answers `ACCEPTED` at its current price and quantity; a level or position
+  that is gone answers its closing status;
 - a close is answered from its broker order, once the model has matched it. Before that, while
   the close is still in flight, it is answered from its position's lists, where the closing order
   of the same volume is named by the node's close;
-- an entry or a market order is looked up in the broker's pending orders, then in the order list
-  over the fill window. A partly filled entry is answered from its position, with its fills.
+- any other order the broker has numbered, an external one included, is matched by its venue
+  order id among the broker's pending orders, then in its own details. It never goes through the
+  order list over the fill window, which is searched by the node's record and so never finds
+  an external order;
+- an entry or a market order the broker has not numbered yet (its acceptance was lost) is looked
+  up by the node's record in the broker's pending orders, then in the order list over the fill
+  window.
+
+A partly filled order is answered from its position, with its fills. An answer about an
+external order carries the client order id Nautilus gave it.
 
 The answer is built from that one position's own lists. **An order that already filled is
 answered with its real fills**, as a one-order mass status carrying the report and its fills
