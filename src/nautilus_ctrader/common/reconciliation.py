@@ -548,7 +548,8 @@ class _Position:
                 levels = {} if source is None else levels_of(source, self.precision)
             if level not in levels and not fills:
                 continue
-            venue_order_id, generation = self._generation(level, fills, held)
+            stands = venue_position is not None and level in levels
+            venue_order_id, generation, fills = self._generation(level, fills, held, stands=stands)
             report = self._leg(
                 level,
                 None,
@@ -594,19 +595,25 @@ class _Position:
             )
         return reports
 
-    def _generation(self, level: Level, fills: list[Fill], held: HeldOrders) -> tuple[str, int]:
-        """A foreign leg's venue order id and generation.
+    def _generation(
+        self, level: Level, fills: list[Fill], held: HeldOrders, *, stands: bool
+    ) -> tuple[str, int, list[Fill]]:
+        """A foreign leg's venue order id, its generation, and the fills it takes of `fills`.
 
-        The lowest generation Nautilus does not hold closed, or that holds one of `fills`.
+        - A level that `stands` takes the lowest generation Nautilus does not hold closed, as
+          `VenueBook.load` does, and leaves the fills Nautilus holds under an earlier one.
+        - An ended level takes the lowest generation Nautilus does not hold closed or that holds
+          one of `fills`, and takes them all.
         """
         trade_ids = {fill.trade_id for fill in fills}
+        taken: set[str] = set()
         generation = 1
         while True:
             venue_order_id = leg_venue_order_id(self.entry.orderId, level, generation)
-            if not held.closed(venue_order_id) or trade_ids.intersection(
-                held.trade_ids(venue_order_id)
-            ):
-                return venue_order_id, generation
+            held_trades = trade_ids.intersection(held.trade_ids(venue_order_id))
+            if not held.closed(venue_order_id) or (held_trades and not stands):
+                return venue_order_id, generation, [f for f in fills if f.trade_id not in taken]
+            taken |= held_trades
             generation += 1
 
     def _closing_source(self, fills: list[Fill]) -> om.ProtoOAOrder | None:

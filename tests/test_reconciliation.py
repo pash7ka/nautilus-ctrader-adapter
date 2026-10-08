@@ -611,6 +611,32 @@ def test_the_legs_reported_are_the_ones_the_venue_model_holds() -> None:
         assert sorted(legs) == sorted(book.view(FIRST).foreign_legs.values())
 
 
+def test_a_level_put_back_after_a_partial_trigger_takes_a_new_leg() -> None:
+    # Hand-built: the recording holds no level that partly triggered, was removed and set again.
+    snapshot, histories, deals = open_first(mine=False)
+    (protective,) = snapshot.order
+    until = snapshot.position[0].utcLastUpdateTimestamp
+    partial = make_deal(
+        7_000_050, protective.orderId, FIRST, side=om.SELL, volume=10, price=85353.42, ts=until - 1
+    )
+    found = histories[FIRST]
+    histories = {FIRST: PositionHistory((*found.orders, protective), (*found.deals, partial))}
+    # Nautilus holds the first leg closed, with the partial fill.
+    held = Held(closed=("6000001-TP",), trades={"6000001-TP": ("7000050",)})
+    book = VenueBook(precision, held_closed=held.closed)
+    book.load(snapshot, {FIRST: histories[FIRST].orders})
+
+    legs = foreign_legs(held_run(snapshot, histories, (*deals, partial), held))
+
+    assert sorted(legs) == sorted(book.view(FIRST).foreign_legs.values())
+    assert list(legs) == ["6000001-SL", "6000001-TP-2"]
+    # The fill is the first leg's: the new one does not take it again.
+    again = legs["6000001-TP-2"]
+    assert again.status == ReportStatus.ACCEPTED
+    assert again.fills == ()
+    assert again.filled_units == 0
+
+
 def test_a_foreign_level_gone_is_cancelled_only_where_nautilus_holds_its_leg_open() -> None:
     snapshot, histories, deals = open_first(mine=False, at=REMOVED_AT)
 
