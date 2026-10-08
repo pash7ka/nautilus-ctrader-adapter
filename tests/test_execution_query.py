@@ -639,6 +639,7 @@ async def test_query_for_a_foreign_leg_whose_level_is_gone_answers_canceled() ->
         assert report.client_order_id == asked.client_order_id
         assert held(h, SL).status == OrderStatus.ACCEPTED
         never_walked(h)
+        assert details_asked(h) == []
         assert h.logger.errors() == []
 
 
@@ -735,4 +736,179 @@ async def test_query_for_a_pending_external_order_gone_answers_from_its_details(
         assert details_asked(h) == [RESTING]
         never_walked(h)
         assert h.mass_statuses == []
+        assert h.logger.errors() == []
+
+
+def walked(h: Harness) -> bool:
+    return bool(h.received(oa.ProtoOAOrderListReq))
+
+
+def details_fail(venue: ExecutionVenue, how: str) -> None:
+    """The order details request fails: with an error, or as the venue holds no such order."""
+    if how == "error":
+        venue.fail.add(om.PROTO_OA_ORDER_DETAILS_REQ)
+
+
+DETAILS_FAIL = [pytest.param("error", id="details-error"), pytest.param("unknown", id="unknown-id")]
+
+
+async def market_numbered(h: Harness) -> None:
+    """The node's market order `MARKET_ID`, accepted under its broker order id."""
+    await market_submitted(h)
+    h.client.generate_order_accepted(
+        STRATEGY_ID, US100_ID, ClientOrderId(MARKET_ID), VenueOrderId(str(MARKET_ORDER)), 0
+    )
+    await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.ACCEPTED)
+
+
+async def test_an_own_numbered_entry_that_filled_is_answered_from_its_details() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        await push_spot(h, BID, ASK)
+        # At the levels the broker holds at `OPEN_AT`, so no correcting amend is needed.
+        await submit_bracket(h, bracket(h, stop_price="85200.20", target_price="85353.42"))
+        # The broker numbered the entry and filled it; no event of it came.
+        h.client.generate_order_accepted(
+            STRATEGY_ID, US100_ID, ClientOrderId(ENTRY), VenueOrderId("6000001"), 0
+        )
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.ACCEPTED)
+        serve(venue, OPEN_AT)
+
+        await h.client._query_order(query(h, ENTRY))
+
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.FILLED)
+        assert trade_ids(h, ENTRY) == [TradeId("7000001")]
+        (built,) = h.mass_statuses
+        assert built.order_reports[VenueOrderId("6000001")].client_order_id == ClientOrderId(ENTRY)
+        assert details_asked(h) == [6000001]
+        never_walked(h)
+        # The bracket is settled from the rebuilt model.
+        assert len(h.client._brackets) == 0
+        assert h.logger.errors() == []
+
+
+async def test_an_own_numbered_order_cancelled_is_answered_from_its_details() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await market_numbered(h)
+        venue.orders = [
+            market_entry(order_status=om.ORDER_STATUS_CANCELLED, utc=now_ms() - MINUTE_MS)
+        ]
+
+        await h.client._query_order(query(h, MARKET_ID))
+
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.CANCELED)
+        (report,) = h.reports
+        assert report.client_order_id == ClientOrderId(MARKET_ID)
+        assert details_asked(h) == [MARKET_ORDER]
+        never_walked(h)
+        assert h.mass_statuses == []
+
+
+async def test_a_numbered_order_whose_details_fail_is_found_in_the_order_list() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await market_numbered(h)
+        details_fail(venue, "error")
+        venue.orders = [
+            market_entry(order_status=om.ORDER_STATUS_CANCELLED, utc=now_ms() - MINUTE_MS)
+        ]
+
+        await h.client._query_order(query(h, MARKET_ID))
+
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.CANCELED)
+        (report,) = h.reports
+        assert report.client_order_id == ClientOrderId(MARKET_ID)
+        assert details_asked(h) == [MARKET_ORDER]
+        assert walked(h)
+        assert any("details could not be read" in line for line in debug_lines(h))
+
+
+async def test_a_numbered_order_found_nowhere_is_not_answered() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await market_numbered(h)
+        details_fail(venue, "error")
+
+        await h.client._query_order(query(h, MARKET_ID))
+
+        assert walked(h)
+        assert h.reports == []
+        assert h.mass_statuses == []
+        assert status(h, MARKET_ID) == OrderStatus.ACCEPTED
+        assert any(MARKET_ID in line and "not found" in line for line in debug_lines(h))
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("how", DETAILS_FAIL)
+async def test_a_pending_external_order_found_nowhere_is_not_answered(how: str) -> None:
+    venue = ExecutionVenue()
+    venue.snapshot.order.append(resting())
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        asked = await asked_to_cancel(h, RESTING)
+        del venue.snapshot.order[:]
+        details_fail(venue, how)
+
+        await h.client._query_order(asked)
+
+        assert details_asked(h) == [RESTING]
+        assert walked(h)
+        assert h.reports == []
+        assert held(h, RESTING).status == OrderStatus.PENDING_CANCEL
+        lines = debug_lines(h)
+        assert any("details could not be read" in line for line in lines)
+        assert any(str(asked.client_order_id) in line and "not found" in line for line in lines)
+        assert h.logger.errors() == []
+
+
+@pytest.mark.parametrize("how", DETAILS_FAIL)
+async def test_a_foreign_leg_whose_entry_details_fail_is_not_answered(how: str) -> None:
+    venue = foreign_venue()
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        asked = await asked_to_cancel(h, SL)
+        serve(venue, CLOSED_AT, mine=False)
+        await h.client._load()
+        venue.position_orders = {}
+        details_fail(venue, how)
+
+        await h.client._query_order(asked)
+
+        assert details_asked(h) == [6000001]
+        assert h.reports == []
+        assert h.mass_statuses == []
+        assert held(h, SL).status == OrderStatus.PENDING_CANCEL
+        assert any(
+            str(asked.client_order_id) in line and "not answered" in line for line in debug_lines(h)
+        )
+        never_walked(h)
+        assert h.logger.errors() == []
+
+
+async def test_query_for_a_later_generation_of_a_foreign_leg_answers_that_generation() -> None:
+    later = "6000001-SL-2"
+    venue = foreign_venue()
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        first = held(h, SL)
+        # Nautilus holds the stop-loss's first leg ended, so the level standing is a new leg.
+        h.client.generate_order_canceled(
+            first.strategy_id, first.instrument_id, first.client_order_id, first.venue_order_id, 0
+        )
+        await wait_until(lambda: held(h, SL).status == OrderStatus.CANCELED)
+        await started(h)
+        await wait_until(lambda: h.cache.client_order_id(VenueOrderId(later)) is not None)
+        asked = await asked_to_cancel(h, later)
+        venue.snapshot.position[0].stopLoss = 85150.0
+
+        await h.client._query_order(asked)
+
+        await wait_until(lambda: held(h, later).status == OrderStatus.ACCEPTED)
+        assert held(h, later).trigger_price == Price.from_str("85150.00")
+        assert [report.venue_order_id for report in h.reports] == [VenueOrderId(later)]
+        assert h.reports[0].client_order_id == asked.client_order_id
+        assert held(h, SL).status == OrderStatus.CANCELED
+        never_walked(h)
+        assert details_asked(h) == []
         assert h.logger.errors() == []

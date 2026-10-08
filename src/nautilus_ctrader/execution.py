@@ -186,6 +186,10 @@ def _ms(moment) -> int:
     return int(moment.timestamp() * 1000)
 
 
+def _with_id(orders: Iterable[om.ProtoOAOrder], order_id: int) -> om.ProtoOAOrder | None:
+    return next((order for order in orders if order.orderId == order_id), None)
+
+
 def _reason(code: str, description: str | None) -> str:
     return f"{code}: {description}" if description else code
 
@@ -240,13 +244,13 @@ class _HeldLegs:
         self.closed = closed
         self._order = order
         self._open: dict[int, list[str]] = {}
-        for order in cache.orders_open(venue=CTRADER_VENUE):
+        for held in cache.orders_open(venue=CTRADER_VENUE):
             # An order Nautilus made from a report holds no account id.
-            if order.account_id not in (None, account_id) or order.venue_order_id is None:
+            if held.account_id not in (None, account_id) or held.venue_order_id is None:
                 continue
-            parsed = parse_leg_venue_order_id(order.venue_order_id.value)
+            parsed = parse_leg_venue_order_id(held.venue_order_id.value)
             if parsed is not None:
-                self._open.setdefault(parsed[0], []).append(order.venue_order_id.value)
+                self._open.setdefault(parsed[0], []).append(held.venue_order_id.value)
 
     def trade_ids(self, venue_order_id: str) -> set[str]:
         order = self._order(venue_order_id)
@@ -673,7 +677,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         - the node's close: its broker order once the model has matched it, else, while it is
           still in flight, its position, where the lists name it by the close in flight;
         - any other order the broker has numbered, external or the node's: by its venue order
-          id, among the broker's pending orders, else in the order's own details;
+          id, among the broker's pending orders, else in the order's own details, else in the
+          order list over the fill window;
         - the node's entry or market order the broker has not numbered yet: by the node's record,
           among the broker's pending orders, then in its order list over the fill window.
 
@@ -744,15 +749,17 @@ class CTraderExecutionClient(LiveExecutionClient):
                     oa.ProtoOAReconcileReq(ctidTraderAccountId=self._account.account_id),
                 )
                 if by_venue_id:
-                    listed = next((o for o in pending.order if str(o.orderId) == venue_id), None)
+                    listed = _with_id(pending.order, int(venue_id))
                 else:
                     listed = entry_named(pending.order, order_id)
                 position_id = None
                 if listed is None:
                     if by_venue_id:
-                        listed = await self._order_details(int(venue_id))
+                        listed = await self._numbered_order(int(venue_id))
                     else:
-                        listed = await self._entry_in_history(order_id)
+                        listed = await self._order_in_history(
+                            partial(entry_named, client_order_id=order_id)
+                        )
                     if listed is None:
                         return unanswered("not found at the venue")
                     if listed.HasField("positionId"):
@@ -822,11 +829,22 @@ class CTraderExecutionClient(LiveExecutionClient):
         entry = await self._order_details(entry_order_id)
         return entry.positionId if entry.HasField("positionId") else None
 
+    async def _numbered_order(self, order_id: int) -> om.ProtoOAOrder | None:
+        """Broker order `order_id`: its own details, else the order list over the fill window."""
+        try:
+            return await self._order_details(order_id)
+        except (CTraderRequestError, CTraderTimeoutError) as e:
+            self._log.debug(
+                f"Order {order_id}: its details could not be read; searching the order list: {e}"
+            )
+        return await self._order_in_history(partial(_with_id, order_id=order_id))
+
     async def _order_details(self, order_id: int) -> om.ProtoOAOrder:
         """Broker order `order_id` as it stands now, pending or ended."""
         # TODO(verify): no order details request was recorded: that one answers an order that
         # has ended, what it answers for an unknown id, and which request limit it counts against
-        # (taken as the historical one here).
+        # (taken as the historical one here). Where it fails, the order list over the fill
+        # window is searched instead.
         response = await self._request(
             oa.ProtoOAOrderDetailsReq(
                 ctidTraderAccountId=self._account.account_id, orderId=order_id
@@ -835,8 +853,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         )
         return response.order
 
-    async def _entry_in_history(self, client_order_id: str) -> om.ProtoOAOrder | None:
-        """The node's order `client_order_id` in the account's order list over the fill window."""
+    async def _order_in_history(
+        self, find: Callable[[Iterable[om.ProtoOAOrder]], om.ProtoOAOrder | None]
+    ) -> om.ProtoOAOrder | None:
+        """The order `find` picks from the account's order list over the fill window."""
         windows = history.weekly_windows(
             self._since_ms(self._lookback_mins), self._clock.timestamp_ms()
         )
@@ -848,7 +868,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 start,
                 end,
             )
-            listed = entry_named(found, client_order_id)
+            listed = find(found)
             if listed is not None:
                 return listed
         return None

@@ -317,9 +317,9 @@ broker's lists:
   the close is still in flight, it is answered from its position's lists, where the closing order
   of the same volume is named by the node's close;
 - any other order the broker has numbered, an external one included, is matched by its venue
-  order id among the broker's pending orders, then in its own details. It never goes through the
-  order list over the fill window, which is searched by the node's record and so never finds
-  an external order;
+  order id among the broker's pending orders, then in its own details (`ProtoOAOrderDetailsReq`).
+  Where the details cannot be read, the order list over the fill window is searched by the same
+  broker order id;
 - an entry or a market order the broker has not numbered yet (its acceptance was lost) is looked
   up by the node's record in the broker's pending orders, then in the order list over the fill
   window.
