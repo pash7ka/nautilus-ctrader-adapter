@@ -29,6 +29,19 @@ class Level(Enum):
     TAKE_PROFIT = "TP"
 
 
+@dataclass(frozen=True)
+class LevelTerms:
+    """How a position's levels work besides their prices, as its last known state says.
+
+    An amend sends them again, so that it changes only the prices it means to change.
+    `stop_loss_trigger_method` is the protocol's `ProtoOAOrderTriggerMethod` value.
+    """
+
+    trailing_stop_loss: bool
+    guaranteed_stop_loss: bool
+    stop_loss_trigger_method: int
+
+
 def leg_venue_order_id(entry_order_id: int, level: Level, generation: int = 1) -> str:
     """A leg's venue order id: `<entry>-SL`, then `<entry>-SL-2`, `<entry>-SL-3`, ...
 

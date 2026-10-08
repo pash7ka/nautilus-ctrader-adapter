@@ -28,6 +28,7 @@ from nautilus_trader.model.orders import Order
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.parsing import PRICE_SCALE, VOLUME_SCALE
+from nautilus_ctrader.common.venue_records import LevelTerms
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
@@ -309,11 +310,16 @@ def amend_levels(
     *,
     stop_loss: Price | None,
     take_profit: Price | None,
+    terms: LevelTerms | None,
 ) -> oa.ProtoOAAmendPositionSLTPReq:
     """The position's levels as they should stand: a level given is set, one left out is removed.
 
     The request describes both levels at once, so the caller always passes the whole intended
     state, including a level it is not changing.
+
+    `terms` are the position's own, sent again so the amend changes nothing but the prices; `None`
+    for a position whose state was never seen sends none. The trailing and guaranteed flags
+    describe the stop-loss and go only with one.
     """
     # TODO(verify): that leaving a level out removes it, rather than leaving it unchanged. A
     # live amend on an open position settles it; if it does not remove, this is the one place
@@ -326,4 +332,13 @@ def amend_levels(
         request.stopLoss = stop_loss.as_double()
     if take_profit is not None:
         request.takeProfit = take_profit.as_double()
+    # TODO(verify): what the venue does with an omitted optional field: keeps the position's
+    # value, or applies the schema's default (`stopLossTriggerMethod` defaults to TRADE). Known
+    # values are always sent, so it matters only where they are not. A live amend of a trailing
+    # stop-loss also shows that sending them unchanged is accepted.
+    if terms is not None:
+        request.stopLossTriggerMethod = terms.stop_loss_trigger_method
+        if stop_loss is not None:
+            request.trailingStopLoss = terms.trailing_stop_loss
+            request.guaranteedStopLoss = terms.guaranteed_stop_loss
     return request

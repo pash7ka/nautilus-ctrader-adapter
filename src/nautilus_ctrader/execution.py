@@ -2112,8 +2112,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         await self._cancel([cancel.client_order_id for cancel in command.cancels])
 
     async def _cancel(self, client_order_ids: list[ClientOrderId]) -> None:
-        """Cancel legs, one amend per position; anything else is refused."""
+        """Cancel legs, the node's or foreign, one amend per position; anything else is refused."""
         by_position: dict[int, dict[Level, ClientOrderId]] = {}
+        foreign: dict[int, dict[Level, tuple[ClientOrderId, str]]] = {}
         for client_order_id in client_order_ids:
             pending = self._brackets.by_leg(client_order_id.value)
             if pending is not None:
@@ -2122,18 +2123,30 @@ class CTraderExecutionClient(LiveExecutionClient):
                 bracket.cancels.add(level)
                 continue
             found = self._book.leg_position(client_order_id.value)
-            if found is None:
+            if found is not None:
+                if self._leg_alive(client_order_id.value):
+                    position_id, level = found
+                    by_position.setdefault(position_id, {})[level] = client_order_id
+                else:
+                    self._cancel_rejected(client_order_id, "the leg is already closed")
+                continue
+            foreign_leg = self._foreign_leg(client_order_id)
+            if foreign_leg is None:
                 self._cancel_rejected(
                     client_order_id,
                     "only a protective leg can be cancelled; a market order fills at once",
                 )
-            elif not self._leg_alive(client_order_id.value):
+            elif not self._foreign_leg_alive(*foreign_leg):
                 self._cancel_rejected(client_order_id, "the leg is already closed")
             else:
-                position_id, level = found
-                by_position.setdefault(position_id, {})[level] = client_order_id
+                position_id, level, venue_order_id = foreign_leg
+                foreign.setdefault(position_id, {})[level] = (client_order_id, venue_order_id)
         await asyncio.gather(
             *(self._remove_levels(position_id, legs) for position_id, legs in by_position.items()),
+            *(
+                self._remove_foreign_levels(position_id, legs)
+                for position_id, legs in foreign.items()
+            ),
         )
 
     async def _remove_levels(self, position_id: int, legs: dict[Level, ClientOrderId]) -> None:
@@ -2155,11 +2168,58 @@ class CTraderExecutionClient(LiveExecutionClient):
                 # A level the broker did not hold was not in its answer: nothing cancelled the leg.
                 self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
 
+    async def _remove_foreign_levels(
+        self,
+        position_id: int,
+        legs: dict[Level, tuple[ClientOrderId, str]],
+    ) -> None:
+        """Remove the levels of foreign legs; the broker's answer reports each one cancelled."""
+
+        def levels_of(view: PositionView) -> dict[Level, Decimal]:
+            # A level put back since the command is a new leg, not the one cancelled.
+            gone = {
+                level
+                for level, (_, venue_order_id) in legs.items()
+                if view.foreign_legs.get(level) == venue_order_id
+            }
+            return {lv: p for lv, p in view.levels.items() if lv not in gone}
+
+        outcome = await self._amend(position_id, levels_of)
+        if isinstance(outcome, _Refused):
+            for client_order_id, _ in legs.values():
+                self._cancel_rejected(client_order_id, outcome.reason)
+            return
+        view = self._book.view(position_id)
+        for level, (client_order_id, venue_order_id) in legs.items():
+            if view is not None and view.foreign_legs.get(level) == venue_order_id:
+                self._cancel_rejected(client_order_id, "the broker kept the level")
+
+    def _foreign_leg(self, client_order_id: ClientOrderId) -> tuple[int, Level, str] | None:
+        """The position, level and venue order id of a leg of a position the node did not open."""
+        order = self._cache.order(client_order_id)
+        if order is None or order.venue_order_id is None:
+            return None
+        venue_order_id = order.venue_order_id.value
+        found = self._book.foreign_leg_position(venue_order_id)
+        return None if found is None else (*found, venue_order_id)
+
+    def _foreign_leg_alive(self, position_id: int, level: Level, venue_order_id: str) -> bool:
+        view = self._book.view(position_id)
+        return view is not None and view.foreign_legs.get(level) == venue_order_id
+
     async def _modify_order(self, command: ModifyOrder) -> None:
         client_order_id = command.client_order_id
         order = self._cache.order(client_order_id)
         pending = self._brackets.by_leg(client_order_id.value)
         found = self._book.leg_position(client_order_id.value)
+        foreign_leg = (
+            self._foreign_leg(client_order_id)
+            if order is not None and pending is None and found is None
+            else None
+        )
+        if foreign_leg is not None:
+            await self._modify_foreign_leg(command, order, *foreign_leg)
+            return
         if order is None or (pending is None and found is None):
             self._modify_rejected(client_order_id, "only a protective leg can be modified")
             return
@@ -2217,6 +2277,76 @@ class CTraderExecutionClient(LiveExecutionClient):
         if not updated:
             # The level stood there already, so no event says so; the modify still needs one.
             self._leg_updated(client_order_id, level, wanted)
+
+    async def _modify_foreign_leg(
+        self,
+        command: ModifyOrder,
+        order: Order,
+        position_id: int,
+        level: Level,
+        venue_order_id: str,
+    ) -> None:
+        """Move the level of a foreign leg; the broker's answer reports the leg moved."""
+        client_order_id = command.client_order_id
+        if not self._foreign_leg_alive(position_id, level, venue_order_id):
+            self._modify_rejected(client_order_id, "the leg is already closed")
+            return
+        view = self._book.view(position_id)
+        instrument = self._instrument_provider.find(order.instrument_id)
+        held = reports.quantity(view.leg_units[level], instrument)
+        if command.quantity is not None and command.quantity != held:
+            self._modify_rejected(
+                client_order_id,
+                f"a protective level covers the whole position ({held}); its quantity cannot "
+                "be set",
+            )
+            return
+        price = command.trigger_price if level == Level.STOP_LOSS else command.price
+        if price is not None:
+            wanted = price.as_decimal()
+
+            def levels_of(view: PositionView) -> dict[Level, Decimal]:
+                if view.foreign_legs.get(level) != venue_order_id:
+                    return view.levels
+                return {**view.levels, level: wanted}
+
+            outcome = await self._amend(position_id, levels_of)
+            if isinstance(outcome, _Refused):
+                self._modify_rejected(client_order_id, outcome.reason)
+                return
+            view = self._book.view(position_id)
+            if view is None or view.foreign_legs.get(level) != venue_order_id:
+                self._modify_rejected(client_order_id, "the leg is already closed")
+                return
+            if view.levels[level] != wanted:
+                self._modify_rejected(
+                    client_order_id, f"the broker kept the level at {view.levels[level]}"
+                )
+                return
+            if any(
+                isinstance(r, OrderEvent)
+                and r.kind == OrderEventKind.UPDATED
+                and r.venue_order_id == venue_order_id
+                for r in outcome
+            ):
+                return
+        # Nothing changed at the broker, so no answer reports the leg; the report says how it
+        # stands, which ends Nautilus's pending update.
+        stop = level == Level.STOP_LOSS
+        standing = view.levels[level]
+        self._handle_records(
+            [
+                OrderEvent(
+                    OrderEventKind.UPDATED,
+                    venue_order_id,
+                    None,
+                    self._clock.timestamp_ms(),
+                    quantity=view.leg_units[level],
+                    price=None if stop else standing,
+                    trigger_price=standing if stop else None,
+                ),
+            ],
+        )
 
     def _leg_alive(self, leg_id: str) -> bool:
         found = self._book.leg_position(leg_id)
@@ -2306,6 +2436,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 position_id,
                 stop_loss=self._level_price(levels, Level.STOP_LOSS, instrument),
                 take_profit=self._level_price(levels, Level.TAKE_PROFIT, instrument),
+                terms=view.terms,
             )
             self._operations.begin_amend(position_id)
             try:

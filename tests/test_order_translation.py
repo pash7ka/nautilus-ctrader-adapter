@@ -33,6 +33,7 @@ from nautilus_trader.model.orders import LimitOrder, MarketOrder, StopMarketOrde
 
 from nautilus_ctrader.common import order_translation as tr
 from nautilus_ctrader.common import parsing
+from nautilus_ctrader.common.venue_records import LevelTerms
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.fixtures import load_recorded
 
@@ -622,12 +623,20 @@ def test_a_close_with_a_time_in_force_other_than_gtc_or_ioc_is_refused() -> None
         tr.close_position(ACCOUNT_ID, 5_000_001, order, position_side=PositionSide.LONG)
 
 
+TRAILING = LevelTerms(
+    trailing_stop_loss=True,
+    guaranteed_stop_loss=False,
+    stop_loss_trigger_method=om.OPPOSITE,
+)
+
+
 def test_an_amend_sets_the_levels_it_is_given() -> None:
     request = tr.amend_levels(
         ACCOUNT_ID,
         5_000_001,
         stop_loss=Price.from_str("1.10000"),
         take_profit=Price.from_str("1.12000"),
+        terms=None,
     )
 
     assert request.positionId == 5_000_001
@@ -641,6 +650,7 @@ def test_an_amend_leaves_out_a_level_that_is_to_be_removed() -> None:
         5_000_001,
         stop_loss=None,
         take_profit=Price.from_str("1.12000"),
+        terms=None,
     )
 
     assert not request.HasField("stopLoss")
@@ -648,11 +658,74 @@ def test_an_amend_leaves_out_a_level_that_is_to_be_removed() -> None:
 
 
 def test_an_amend_with_no_level_removes_both() -> None:
-    request = tr.amend_levels(ACCOUNT_ID, 5_000_001, stop_loss=None, take_profit=None)
+    request = tr.amend_levels(ACCOUNT_ID, 5_000_001, stop_loss=None, take_profit=None, terms=None)
 
     assert request.positionId == 5_000_001
     assert not request.HasField("stopLoss")
     assert not request.HasField("takeProfit")
+
+
+@pytest.mark.parametrize(
+    "terms",
+    [
+        TRAILING,
+        LevelTerms(
+            trailing_stop_loss=False,
+            guaranteed_stop_loss=True,
+            stop_loss_trigger_method=om.DOUBLE_TRADE,
+        ),
+        # The schema's defaults are sent too: an omitted field may read as a change.
+        LevelTerms(
+            trailing_stop_loss=False,
+            guaranteed_stop_loss=False,
+            stop_loss_trigger_method=om.TRADE,
+        ),
+    ],
+)
+def test_an_amend_keeps_how_the_positions_stop_loss_works(terms: LevelTerms) -> None:
+    request = tr.amend_levels(
+        ACCOUNT_ID,
+        5_000_001,
+        stop_loss=Price.from_str("1.10000"),
+        take_profit=None,
+        terms=terms,
+    )
+
+    assert request.HasField("trailingStopLoss")
+    assert request.HasField("guaranteedStopLoss")
+    assert request.HasField("stopLossTriggerMethod")
+    assert request.trailingStopLoss == terms.trailing_stop_loss
+    assert request.guaranteedStopLoss == terms.guaranteed_stop_loss
+    assert request.stopLossTriggerMethod == terms.stop_loss_trigger_method
+
+
+def test_an_amend_removing_the_stop_loss_sends_no_trailing_or_guaranteed_stop() -> None:
+    request = tr.amend_levels(
+        ACCOUNT_ID,
+        5_000_001,
+        stop_loss=None,
+        take_profit=Price.from_str("1.12000"),
+        terms=TRAILING,
+    )
+
+    assert not request.HasField("trailingStopLoss")
+    assert not request.HasField("guaranteedStopLoss")
+    # It applies to the take-profit as well.
+    assert request.stopLossTriggerMethod == om.OPPOSITE
+
+
+def test_an_amend_of_a_position_never_seen_sends_no_terms() -> None:
+    request = tr.amend_levels(
+        ACCOUNT_ID,
+        5_000_001,
+        stop_loss=Price.from_str("1.10000"),
+        take_profit=None,
+        terms=None,
+    )
+
+    assert not request.HasField("trailingStopLoss")
+    assert not request.HasField("guaranteedStopLoss")
+    assert not request.HasField("stopLossTriggerMethod")
 
 
 def test_an_id_too_long_for_the_venue_is_refused() -> None:

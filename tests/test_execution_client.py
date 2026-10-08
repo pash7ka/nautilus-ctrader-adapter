@@ -9,7 +9,7 @@ from decimal import Decimal
 import pytest
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
-from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.config import InstrumentProviderConfig, StrategyConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
     BatchCancelOrders,
@@ -23,26 +23,31 @@ from nautilus_trader.execution.reports import FillReport, OrderStatusReport
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.events import (
+    OrderCancelRejected,
     OrderFilled,
     OrderModifyRejected,
     OrderPendingCancel,
+    OrderPendingUpdate,
     OrderRejected,
 )
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientOrderId,
     PositionId,
+    StrategyId,
     TradeId,
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.trading.strategy import Strategy
 
 from nautilus_ctrader.activity import CTraderAccountActivity
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.account import account_client_from_config
 from nautilus_ctrader.common.errors import CTraderAccountError
 from nautilus_ctrader.common.order_record import LegIds
-from nautilus_ctrader.common.venue_records import Level
+from nautilus_ctrader.common.venue_book import terms_of
+from nautilus_ctrader.common.venue_records import Level, LevelTerms
 from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -61,6 +66,7 @@ from tests.execution_replay import (
 from tests.execution_venue import (
     ENTRY,
     FIRST_EVENTS,
+    FOREIGN_EVENTS,
     STOP,
     STRATEGY_ID,
     TARGET,
@@ -1074,7 +1080,7 @@ def protective(
 
 
 def amend_echo(amends: list, *, kind: int = om.ORDER_REPLACED):
-    """The broker's answer setting whatever levels an amend asks for; keeps each in `amends`."""
+    """The broker's answer setting whatever an amend asks for; keeps each in `amends`."""
 
     def answer(request):
         amends.append(request)
@@ -1082,8 +1088,13 @@ def amend_echo(amends: list, *, kind: int = om.ORDER_REPLACED):
         limit = request.takeProfit if request.HasField("takeProfit") else None
         utc = AMEND_FROM + len(amends)
         if stop is None and limit is None:
-            return protective(None, None, utc=utc, kind=om.ORDER_CANCELLED)
-        return protective(stop, limit, utc=utc, kind=kind)
+            event = protective(None, None, utc=utc, kind=om.ORDER_CANCELLED)
+        else:
+            event = protective(stop, limit, utc=utc, kind=kind)
+        for name in ("trailingStopLoss", "guaranteedStopLoss", "stopLossTriggerMethod"):
+            if request.HasField(name):
+                setattr(event.position, name, getattr(request, name))
+        return event
 
     return answer
 
@@ -1095,10 +1106,27 @@ def echo_amends(execution_venue: ExecutionVenue, *, kind: int = om.ORDER_REPLACE
     return amends
 
 
-def cancel(client_order_id: str) -> CancelOrder:
+def kept_terms(amend: oa.ProtoOAAmendPositionSLTPReq, terms: LevelTerms) -> bool:
+    """Whether `amend` sends the position's terms again: the stop-loss flags only with one."""
+    with_stop = amend.HasField("stopLoss")
+    return (
+        amend.HasField("stopLossTriggerMethod")
+        and amend.stopLossTriggerMethod == terms.stop_loss_trigger_method
+        and amend.HasField("trailingStopLoss") == with_stop
+        and amend.HasField("guaranteedStopLoss") == with_stop
+        and (not with_stop or amend.trailingStopLoss == terms.trailing_stop_loss)
+        and (not with_stop or amend.guaranteedStopLoss == terms.guaranteed_stop_loss)
+    )
+
+
+# How the first position's levels work, as recorded.
+FIRST_TERMS = terms_of(FIRST_EVENTS[2].position)
+
+
+def cancel(client_order_id: str, *, strategy_id: StrategyId = STRATEGY_ID) -> CancelOrder:
     return CancelOrder(
         trader_id=TRADER_ID,
-        strategy_id=STRATEGY_ID,
+        strategy_id=strategy_id,
         instrument_id=US100_ID,
         client_order_id=ClientOrderId(client_order_id),
         venue_order_id=None,
@@ -1113,10 +1141,11 @@ def modify(
     price: str | None = None,
     trigger_price: str | None = None,
     quantity: str | None = None,
+    strategy_id: StrategyId = STRATEGY_ID,
 ) -> ModifyOrder:
     return ModifyOrder(
         trader_id=TRADER_ID,
-        strategy_id=STRATEGY_ID,
+        strategy_id=strategy_id,
         instrument_id=US100_ID,
         client_order_id=ClientOrderId(client_order_id),
         venue_order_id=None,
@@ -1156,6 +1185,8 @@ async def test_the_levels_are_set_exactly_once_the_protective_order_has_come() -
         assert amend.positionId == FIRST
         assert amend.stopLoss == 85190.0
         assert amend.takeProfit == 85400.0
+        assert h.client._book.view(FIRST).terms == FIRST_TERMS
+        assert kept_terms(amend, FIRST_TERMS)
         assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderAccepted", "OrderUpdated"]
         assert h.client._book.view(FIRST).levels == {
             Level.STOP_LOSS: Decimal("85190.00"),
@@ -1368,6 +1399,7 @@ async def test_a_leg_is_cancelled_by_removing_its_level_alone() -> None:
         (amend,) = amends
         assert not amend.HasField("stopLoss")
         assert amend.takeProfit == 85387.22
+        assert kept_terms(amend, FIRST_TERMS)
         assert status(h, TARGET) == OrderStatus.ACCEPTED
 
         await h.client._cancel_order(cancel(STOP))
@@ -1386,6 +1418,7 @@ async def test_a_leg_is_moved_by_an_amend_keeping_the_other_level() -> None:
         (amend,) = amends
         assert amend.stopLoss == 85197.2
         assert amend.takeProfit == 85400.0
+        assert kept_terms(amend, FIRST_TERMS)
         await wait_until(
             lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
         )
@@ -1491,6 +1524,7 @@ async def test_cancel_all_removes_a_positions_levels_in_one_amend() -> None:
         (amend,) = amends
         assert not amend.HasField("stopLoss")
         assert not amend.HasField("takeProfit")
+        assert kept_terms(amend, FIRST_TERMS)
 
 
 async def test_cancel_all_answers_an_order_both_open_and_in_flight_once() -> None:
@@ -1717,3 +1751,281 @@ async def test_a_wait_ending_with_nothing_to_set_leaves_the_bracket_to_its_corre
         assert amends[-1].stopLoss == 85150.0
         assert not amends[-1].HasField("takeProfit")
         assert len(h.client._brackets) == 0
+
+
+# A position the node did not open: its levels are external legs, and a command on one is
+# carried out as on the node's own. Nautilus hears of the outcome from the broker's answer, as
+# reports; the client itself sends no event of such an order but a rejection.
+
+FOREIGN_SL, FOREIGN_TP = "6000001-SL", "6000001-TP"
+EXTERNAL = StrategyId("EXTERNAL")
+FOREIGN_TERMS = terms_of(FOREIGN_EVENTS[2].position)
+
+
+def foreign_leg(h, venue_order_id: str):
+    client_order_id = h.cache.client_order_id(VenueOrderId(venue_order_id))
+    return None if client_order_id is None else h.cache.order(client_order_id)
+
+
+def protected_by_hand(*, trailing: bool) -> list:
+    """The first position as a trader opened and protected it."""
+    events = list(FOREIGN_EVENTS[:3])
+    if trailing:
+        protected = type(events[2])()
+        protected.CopyFrom(events[2])
+        protected.position.trailingStopLoss = True
+        protected.position.stopLossTriggerMethod = om.OPPOSITE
+        events[2] = protected
+    return events
+
+
+async def foreign_legs(h, *, trailing: bool = False) -> tuple:
+    await push(h, *protected_by_hand(trailing=trailing))
+    await wait_until(
+        lambda: foreign_leg(h, FOREIGN_SL) is not None and foreign_leg(h, FOREIGN_TP) is not None,
+        description="the foreign legs",
+    )
+    return foreign_leg(h, FOREIGN_SL), foreign_leg(h, FOREIGN_TP)
+
+
+def reports_of(h, venue_order_id: str) -> list[OrderStatusReport]:
+    return [
+        r
+        for r in h.reports
+        if isinstance(r, OrderStatusReport) and r.venue_order_id == VenueOrderId(venue_order_id)
+    ]
+
+
+def sent_about(h, order) -> list:
+    """The events the client itself sent Nautilus about `order`."""
+    return [e for e in h.events if e.client_order_id == order.client_order_id]
+
+
+def levels(amend: oa.ProtoOAAmendPositionSLTPReq) -> tuple:
+    return (
+        amend.stopLoss if amend.HasField("stopLoss") else None,
+        amend.takeProfit if amend.HasField("takeProfit") else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("leg_id", "other_id", "sent"),
+    [(FOREIGN_SL, FOREIGN_TP, (None, 85387.22)), (FOREIGN_TP, FOREIGN_SL, (85197.2, None))],
+)
+async def test_a_foreign_leg_is_cancelled_by_removing_its_level(leg_id, other_id, sent) -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await foreign_legs(h)
+        order = foreign_leg(h, leg_id)
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+        await wait_until(lambda: foreign_leg(h, leg_id).status == OrderStatus.CANCELED)
+
+        (amend,) = amends
+        assert amend.positionId == FIRST
+        assert levels(amend) == sent
+        assert kept_terms(amend, FOREIGN_TERMS)
+        assert foreign_leg(h, other_id).status == OrderStatus.ACCEPTED
+        assert reports_of(h, leg_id)[-1].order_status == OrderStatus.CANCELED
+        assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+        await wait_until(lambda: len(sent_about(h, order)) == 1)
+        (rejected,) = sent_about(h, order)
+        assert isinstance(rejected, OrderCancelRejected)
+        assert rejected.reason == "the leg is already closed"
+        assert len(amends) == 1
+
+
+@pytest.mark.parametrize(
+    ("leg_id", "change", "sent"),
+    [
+        (FOREIGN_SL, {"trigger_price": "85150.00"}, (85150.0, 85387.22)),
+        (FOREIGN_TP, {"price": "85400.00"}, (85197.2, 85400.0)),
+    ],
+)
+async def test_a_foreign_leg_is_moved_by_an_amend_keeping_the_other_level(
+    leg_id, change, sent
+) -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await foreign_legs(h)
+        order = foreign_leg(h, leg_id)
+        wanted = Price.from_str(next(iter(change.values())))
+        await h.client._modify_order(modify(order.client_order_id.value, **change))
+
+        def moved() -> bool:
+            held = foreign_leg(h, leg_id)
+            return (held.trigger_price if leg_id == FOREIGN_SL else held.price) == wanted
+
+        await wait_until(moved, description="the leg moved")
+        (amend,) = amends
+        assert levels(amend) == sent
+        assert kept_terms(amend, FOREIGN_TERMS)
+        assert foreign_leg(h, leg_id).status == OrderStatus.ACCEPTED
+        assert foreign_leg(h, leg_id).quantity == Quantity.from_str("1.00")
+        assert reports_of(h, leg_id)[-1].order_status == OrderStatus.ACCEPTED
+        assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+
+async def test_a_modify_of_a_trailing_stop_loss_keeps_it_trailing() -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, _ = await foreign_legs(h, trailing=True)
+        await h.client._modify_order(modify(stop.client_order_id.value, trigger_price="85150.00"))
+        await wait_until(
+            lambda: foreign_leg(h, FOREIGN_SL).trigger_price == Price.from_str("85150.00"),
+        )
+
+        (amend,) = amends
+        assert levels(amend) == (85150.0, 85387.22)
+        assert amend.HasField("trailingStopLoss") and amend.trailingStopLoss
+        assert amend.HasField("stopLossTriggerMethod")
+        assert amend.stopLossTriggerMethod == om.OPPOSITE
+        assert amend.HasField("guaranteedStopLoss") and not amend.guaranteedStopLoss
+
+
+async def test_commands_the_broker_refuses_are_rejected_under_the_orders_strategy() -> None:
+    execution_venue = ExecutionVenue()
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, target = await foreign_legs(h)
+        # Sent by a strategy that is not the orders': Nautilus checks no ownership.
+        await h.client._cancel_order(cancel(stop.client_order_id.value))
+        await h.client._modify_order(modify(target.client_order_id.value, price="85400.00"))
+        await wait_until(lambda: sent_about(h, stop) and sent_about(h, target))
+
+        (cancel_rejected,) = sent_about(h, stop)
+        (modify_rejected,) = sent_about(h, target)
+        assert isinstance(cancel_rejected, OrderCancelRejected)
+        assert isinstance(modify_rejected, OrderModifyRejected)
+        for rejected in (cancel_rejected, modify_rejected):
+            assert rejected.strategy_id == EXTERNAL
+            assert rejected.reason == "TRADING_BAD_STOPS: Invalid stops"
+        assert foreign_leg(h, FOREIGN_SL).status == OrderStatus.ACCEPTED
+        assert foreign_leg(h, FOREIGN_TP).price == Price.from_str("85387.22")
+        assert set(h.client._book.view(FIRST).levels) == {Level.STOP_LOSS, Level.TAKE_PROFIT}
+
+
+async def test_a_quantity_change_of_a_foreign_leg_is_refused() -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, _ = await foreign_legs(h)
+        await h.client._modify_order(
+            modify(
+                stop.client_order_id.value,
+                trigger_price="85150.00",
+                quantity="0.50",
+                strategy_id=StrategyId("S-002"),
+            ),
+        )
+        await wait_until(lambda: sent_about(h, stop))
+
+        (rejected,) = sent_about(h, stop)
+        assert isinstance(rejected, OrderModifyRejected)
+        assert rejected.strategy_id == EXTERNAL
+        assert "covers the whole position (1.00)" in rejected.reason
+        assert amends == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"trigger_price": "85197.20"}, {"quantity": "1.00"}],
+    ids=["same-level", "same-quantity"],
+)
+async def test_a_modify_that_changes_nothing_is_answered_as_the_broker_holds_the_leg(
+    change,
+) -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, _ = await foreign_legs(h)
+        h.engine.process(
+            OrderPendingUpdate(
+                TRADER_ID,
+                EXTERNAL,
+                US100_ID,
+                stop.client_order_id,
+                stop.venue_order_id,
+                ACCOUNT,
+                UUID4(),
+                0,
+                0,
+            ),
+        )
+        await wait_until(lambda: foreign_leg(h, FOREIGN_SL).status == OrderStatus.PENDING_UPDATE)
+        before = len(reports_of(h, FOREIGN_SL))
+
+        await h.client._modify_order(modify(stop.client_order_id.value, **change))
+        await wait_until(lambda: foreign_leg(h, FOREIGN_SL).status == OrderStatus.ACCEPTED)
+
+        assert amends == []
+        assert len(reports_of(h, FOREIGN_SL)) == before + 1
+        assert foreign_leg(h, FOREIGN_SL).trigger_price == Price.from_str("85197.20")
+        assert sent_about(h, stop) == []
+
+
+async def test_cancel_all_of_a_claiming_strategy_cancels_the_foreign_legs_it_claimed() -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        claiming = Strategy(
+            StrategyConfig(
+                strategy_id="S-CLAIM",
+                order_id_tag="001",
+                external_order_claims=[str(US100_ID)],
+            ),
+        )
+        h.engine.register_external_order_claims(claiming)
+        stop, target = await foreign_legs(h)
+        assert stop.strategy_id == target.strategy_id == claiming.id
+
+        def cancel_all(strategy_id: StrategyId) -> CancelAllOrders:
+            return CancelAllOrders(
+                trader_id=TRADER_ID,
+                strategy_id=strategy_id,
+                instrument_id=US100_ID,
+                order_side=OrderSide.NO_ORDER_SIDE,
+                command_id=UUID4(),
+                ts_init=0,
+            )
+
+        # Another strategy's selection holds neither.
+        await h.client._cancel_all_orders(cancel_all(STRATEGY_ID))
+        assert amends == []
+
+        await h.client._cancel_all_orders(cancel_all(claiming.id))
+        await wait_until(
+            lambda: (
+                foreign_leg(h, FOREIGN_SL).status == OrderStatus.CANCELED
+                and foreign_leg(h, FOREIGN_TP).status == OrderStatus.CANCELED
+            ),
+        )
+        (amend,) = amends
+        assert levels(amend) == (None, None)
+        assert sent_about(h, stop) == sent_about(h, target) == []
+        assert h.logger.errors() == []
+
+
+async def test_commands_whose_level_the_broker_keeps_are_rejected() -> None:
+    execution_venue = ExecutionVenue()
+    amends = keep_levels(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, target = await foreign_legs(h)
+        await h.client._cancel_order(cancel(stop.client_order_id.value))
+        await h.client._modify_order(modify(target.client_order_id.value, price="85400.00"))
+        await wait_until(lambda: sent_about(h, stop) and sent_about(h, target))
+
+        assert len(amends) == 2
+        (cancel_rejected,) = sent_about(h, stop)
+        (modify_rejected,) = sent_about(h, target)
+        assert cancel_rejected.reason == "the broker kept the level"
+        assert modify_rejected.reason == "the broker kept the level at 85387.22"
+        assert cancel_rejected.strategy_id == modify_rejected.strategy_id == EXTERNAL
+        assert foreign_leg(h, FOREIGN_SL).status == OrderStatus.ACCEPTED
+        assert foreign_leg(h, FOREIGN_TP).price == Price.from_str("85387.22")

@@ -24,6 +24,7 @@ from nautilus_ctrader.common.venue_records import (
     ExternalType,
     Fill,
     Level,
+    LevelTerms,
     Notice,
     OrderEvent,
     OrderEventKind,
@@ -3070,3 +3071,109 @@ def test_the_nodes_own_entry_found_in_the_order_list_waits_for_its_events() -> N
         OrderEventKind.ACCEPTED,
         OrderEventKind.ACCEPTED,
     ]
+
+
+# What an amend must send again besides the levels, from the position's last known state.
+
+TRAILING = LevelTerms(
+    trailing_stop_loss=True,
+    guaranteed_stop_loss=True,
+    stop_loss_trigger_method=om.OPPOSITE,
+)
+PLAIN = LevelTerms(
+    trailing_stop_loss=False,
+    guaranteed_stop_loss=False,
+    stop_loss_trigger_method=om.TRADE,
+)
+
+
+def trailing_position(utc: int) -> om.ProtoOAPosition:
+    position = make_position(FP)
+    position.trailingStopLoss = True
+    position.guaranteedStopLoss = True
+    position.stopLossTriggerMethod = om.OPPOSITE
+    position.utcLastUpdateTimestamp = utc
+    return position
+
+
+def test_the_view_holds_how_the_positions_stop_loss_works_as_last_known() -> None:
+    b = book()
+    foreign_opened(b)
+    assert b.view(FP).terms == PLAIN
+
+    b.apply(
+        make_event(
+            om.ORDER_REPLACED,
+            foreign_protective(30, stop=85100.0, limit=85500.0),
+            position=trailing_position(30),
+        ),
+        NOTHING,
+    )
+    assert b.view(FP).terms == TRAILING
+
+    # An older state applied late changes nothing.
+    stale = make_position(FP)
+    stale.utcLastUpdateTimestamp = 29
+    b.apply(
+        make_event(
+            om.ORDER_REPLACED,
+            foreign_protective(29, stop=85050.0, limit=85500.0),
+            position=stale,
+        ),
+        NOTHING,
+    )
+    assert b.view(FP).terms == TRAILING
+
+    # A field the venue leaves out is the schema's default.
+    later = make_position(FP)
+    later.utcLastUpdateTimestamp = 31
+    b.apply(
+        make_event(
+            om.ORDER_REPLACED,
+            foreign_protective(31, stop=85100.0, limit=85500.0),
+            position=later,
+        ),
+        NOTHING,
+    )
+    assert b.view(FP).terms == PLAIN
+
+
+def test_load_takes_how_the_positions_stop_loss_works_from_the_snapshot() -> None:
+    b = book()
+    loaded = snapshot(stop=85000.0)
+    loaded.position[0].trailingStopLoss = True
+    loaded.position[0].guaranteedStopLoss = True
+    loaded.position[0].stopLossTriggerMethod = om.OPPOSITE
+
+    b.load(loaded, {P: [our_entry(P, ENTRY)]})
+
+    assert b.view(P).terms == TRAILING
+
+
+def test_a_position_never_seen_in_a_state_has_no_known_terms() -> None:
+    b = book()
+    b.apply(
+        make_event(
+            om.ORDER_FILLED,
+            our_entry(P, ENTRY, utc=20),
+            deal=make_deal(9_200_001, ENTRY, P, side=om.BUY, volume=100, price=85250.0, ts=20),
+        ),
+        NOTHING,
+    )
+
+    assert b.view(P).open
+    assert b.view(P).terms is None
+
+
+def test_a_foreign_leg_is_found_by_its_venue_order_id_in_any_generation() -> None:
+    b = book()
+    foreign_opened(b)
+    opened(b)
+
+    assert b.foreign_leg_position(foreign_leg_id(Level.STOP_LOSS)) == (FP, Level.STOP_LOSS)
+    assert b.foreign_leg_position(foreign_leg_id(Level.TAKE_PROFIT, 2)) == (FP, Level.TAKE_PROFIT)
+    # The node's own legs, an entry never seen and anything else are no foreign leg.
+    assert b.foreign_leg_position(leg_venue_order_id(ENTRY, Level.STOP_LOSS)) is None
+    assert b.foreign_leg_position(leg_venue_order_id(9_999_999, Level.STOP_LOSS)) is None
+    assert b.foreign_leg_position(str(FENTRY)) is None
+    assert b.foreign_leg_position(stop_id(P)) is None

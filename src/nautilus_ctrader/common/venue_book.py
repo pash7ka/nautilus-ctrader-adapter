@@ -29,6 +29,7 @@ from nautilus_ctrader.common.venue_records import (
     ExternalType,
     Fill,
     Level,
+    LevelTerms,
     Notice,
     Operations,
     OrderEvent,
@@ -37,6 +38,7 @@ from nautilus_ctrader.common.venue_records import (
     Record,
     leg_venue_order_id,
     money_of,
+    parse_leg_venue_order_id,
     price_of,
     units_of,
 )
@@ -106,6 +108,8 @@ class _Position:
     # Protective orders replaced by a new id or cancelled: any later event of theirs is stale.
     retired_protective_ids: set[int] = field(default_factory=set)
     levels: dict[Level, Decimal] = field(default_factory=dict)
+    # `None` until a state of the position is seen.
+    terms: LevelTerms | None = None
     # The `utcLastUpdateTimestamp` of the position state last applied; a created position has
     # none and counts as 0.
     updated_ms: int = -1
@@ -122,6 +126,7 @@ class PositionView:
     - `legs`: the node's legs, by client order id and whether each is alive.
     - `leg_units`: the quantity Nautilus has for each accepted live leg, the node's or foreign.
     - `foreign_legs`: the venue order id of each live leg of a position the node did not open.
+    - `terms`: how the levels work, from the last position state seen; `None` before any.
     """
 
     position_id: int
@@ -137,6 +142,7 @@ class PositionView:
     legs: dict[Level, tuple[str, bool]]
     leg_units: dict[Level, Decimal]
     foreign_legs: dict[Level, str] = field(default_factory=dict)
+    terms: LevelTerms | None = None
 
 
 def entry_of(orders: Sequence[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
@@ -175,6 +181,15 @@ def levels_of(order: om.ProtoOAOrder, precision: int) -> dict[Level, Decimal]:
     if order.HasField("limitPrice"):
         levels[Level.TAKE_PROFIT] = price_of(order.limitPrice, precision)
     return levels
+
+
+def terms_of(position: om.ProtoOAPosition) -> LevelTerms:
+    """How `position`'s levels work; a field the venue leaves out is the schema's default."""
+    return LevelTerms(
+        trailing_stop_loss=position.trailingStopLoss,
+        guaranteed_stop_loss=position.guaranteedStopLoss,
+        stop_loss_trigger_method=position.stopLossTriggerMethod,
+    )
 
 
 def remaining_of(order: om.ProtoOAOrder) -> int:
@@ -311,6 +326,7 @@ class VenueBook:
                 for level, leg in position.foreign_legs.items()
                 if leg.alive
             },
+            terms=position.terms,
         )
 
     def exposure(self) -> tuple[Exposure, ...]:
@@ -375,6 +391,7 @@ class VenueBook:
             position.open = True
             position.volume = venue_position.tradeData.volume
             position.updated_ms = venue_position.utcLastUpdateTimestamp
+            position.terms = terms_of(venue_position)
             precision = self._precision(position.symbol_id)
             if precision is not None:
                 if venue_position.HasField("stopLoss"):
@@ -549,6 +566,21 @@ class VenueBook:
                     return position.position_id, level
         return None
 
+    def foreign_leg_position(self, venue_order_id: str) -> tuple[int, Level] | None:
+        """The position and level of a leg of a position the node did not open, by venue order id.
+
+        Any generation of the leg's id is found, alive or not: whether it is the live one is
+        `view().foreign_legs`' to say.
+        """
+        parsed = parse_leg_venue_order_id(venue_order_id)
+        if parsed is None:
+            return None
+        entry_order_id, level, _generation = parsed
+        position_id = self.entry_position(entry_order_id)
+        if position_id is None or self._positions[position_id].ours:
+            return None
+        return position_id, level
+
     def entry_position(self, entry_order_id: int) -> int | None:
         """The position broker order `entry_order_id` opened, open or closed since the last load."""
         for position in self._positions.values():
@@ -627,6 +659,7 @@ class VenueBook:
             if updated < position.updated_ms:
                 return
             position.updated_ms = updated
+            position.terms = terms_of(event.position)
             position.volume = event.position.tradeData.volume
             position.open = event.position.positionStatus == om.POSITION_STATUS_OPEN
         elif event.executionType in _FILLS and event.HasField("deal"):
