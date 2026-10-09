@@ -25,6 +25,7 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.orders import Order
 
+from nautilus_ctrader import execution
 from nautilus_ctrader.common.reconciliation import PositionHistory, reconcile
 from nautilus_ctrader.common.venue_book import VenueBook, entry_of
 from nautilus_ctrader.common.venue_records import (
@@ -289,6 +290,19 @@ def test_reconciliation_reports_every_opening_order_of_a_grown_position() -> Non
     assert position.units == 3000
 
 
+def test_a_raise_filled_in_its_entrys_millisecond_is_reported_after_it() -> None:
+    # Hand-built: the raise, whose broker id is the lower, filled at the entry's fill time.
+    deals = [copied(deal) for deal in DEALS]
+    for deal in deals:
+        deal.executionTimestamp = OPENED_MS
+    history = {POSITION: PositionHistory(tuple(LISTED), tuple(deals))}
+
+    built = reconcile(SNAPSHOTS[0], history, (), precision, {}, NOTHING)
+
+    assert ADD_ON < OPENING
+    assert [o.venue_order_id for o in built.orders][:2] == [str(OPENING), str(ADD_ON)]
+
+
 def test_live_and_reconciliation_name_a_grown_positions_legs_alike() -> None:
     book = VenueBook(precision)
     records = applied(book, opening_events() + add_on_events())
@@ -428,12 +442,23 @@ def fills(order: Order) -> list[OrderFilled]:
 
 def held(h: Harness) -> dict[str, tuple[OrderStatus, Decimal, Decimal]]:
     """Every order Nautilus holds on the instrument: its status, quantity and filled quantity."""
-    return {
+    orders = h.cache.orders(instrument_id=EURUSD_ID)
+    found = {
         order.venue_order_id.value: (
             order.status,
             order.quantity.as_decimal(),
             order.filled_qty.as_decimal(),
         )
+        for order in orders
+    }
+    assert len(found) == len(orders), "two orders share a venue order id"
+    return found
+
+
+def client_ids(h: Harness) -> dict[str, str]:
+    """The client order id of every order Nautilus holds on the instrument, by venue order id."""
+    return {
+        order.venue_order_id.value: order.client_order_id.value
         for order in h.cache.orders(instrument_id=EURUSD_ID)
     }
 
@@ -467,6 +492,63 @@ async def test_a_grown_foreign_position_starts_and_reconnects_with_one_set_of_le
         assert held(h) == GROWN
         assert h.cache.position(position_id).quantity.as_decimal() == Decimal(3000)
         assert h.logger.errors() == []
+
+
+async def test_the_nodes_raised_position_starts_and_reconnects_under_the_nodes_ids() -> None:
+    venue = live_venue()
+    (venue.snapshot,) = own([venue.snapshot])
+    venue.position_orders = {POSITION: own(venue.position_orders[POSITION])}
+    ours = {
+        str(OPENING): entry_id(POSITION),
+        STOP: OWN_STOP,
+        TARGET: OWN_TARGET,
+    }
+
+    def assert_named(h: Harness) -> None:
+        assert held(h) == GROWN
+        named = client_ids(h)
+        # The node's orders under its own ids; only the raise has an id Nautilus made.
+        assert {venue_id: named[venue_id] for venue_id in ours} == ours
+        assert named[str(ADD_ON)] not in ours.values()
+        assert by_venue_id(h, ADD_ON).strategy_id == EXTERNAL
+        assert h.cache.position(PositionId(str(POSITION))).quantity.as_decimal() == 3000
+
+    async with harness(execution_venue=venue, instruments=(EURUSD_ID,)) as h:
+        await started(h)
+        await wait_until(lambda: not h.client._outbox, description="records delivered")
+        assert_named(h)
+
+        await reconnected(h)
+
+        assert_named(h)
+        assert h.activity == []
+        assert h.logger.errors() == []
+
+
+async def test_an_order_list_that_never_ends_is_an_error(monkeypatch) -> None:
+    monkeypatch.setattr(execution, "_MAX_ORDER_PAGES", 2)
+    venue = live_venue()
+    pages: list[int] = []
+
+    def endless(request: Message) -> Message:
+        # Each page one more raise, older than the last, and always more to come.
+        pages.append(len(pages))
+        order = listed(ADD_ON)
+        order.orderId = 6_100_000 + len(pages)
+        order.utcLastUpdateTimestamp -= len(pages)
+        return oa.ProtoOAOrderListByPositionIdRes(
+            ctidTraderAccountId=request.ctidTraderAccountId, order=[order], hasMore=True
+        )
+
+    venue.server.on(om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ, endless)
+    async with harness(execution_venue=venue, instruments=(EURUSD_ID,)) as h:
+        await h.client.generate_mass_status()
+
+        truncated = (
+            f"Position {POSITION}: its order list did not end within 2 pages; its entry may "
+            "be missing"
+        )
+        assert pages and set(h.logger.errors()) == {truncated}
 
 
 async def test_a_foreign_position_raised_live_keeps_its_legs_across_a_reconnect() -> None:

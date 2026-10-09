@@ -3048,6 +3048,56 @@ def test_the_entry_is_the_earliest_opening_order_and_the_nodes_record_comes_firs
     assert entry_of([ours, late, early]).orderId == ours.orderId
 
 
+def opened_at(position_id: int, opened_ms: int) -> om.ProtoOAPosition:
+    position = make_position(position_id)
+    position.tradeData.openTimestamp = opened_ms
+    return position
+
+
+def test_the_nodes_entry_first_seen_after_its_position_opened_is_still_its_entry() -> None:
+    b = book()
+    b.apply(
+        make_event(om.ORDER_ACCEPTED, protective(21, **BOTH), position=opened_at(P, 20)),
+        NOTHING,
+    )
+    # Stamped later than the position's open time: only the node's record tells it apart.
+    entry = our_entry(P, ENTRY, utc=30)
+    entry.tradeData.openTimestamp = 25
+    deal = make_deal(9_200_001, ENTRY, P, side=om.BUY, volume=100, price=85250.0, ts=20)
+
+    records = b.apply(
+        make_event(om.ORDER_FILLED, entry, position=opened_at(P, 20), deal=deal), NOTHING
+    )
+
+    assert b.view(P).entry_order_id == ENTRY
+    fills = [r for r in records if isinstance(r, OrderEvent) and r.kind == OrderEventKind.FILLED]
+    assert [(r.venue_order_id, r.client_order_id) for r in fills] == [(str(ENTRY), entry_id(P))]
+
+
+def test_an_opening_order_that_does_not_say_when_it_was_created_is_no_raise() -> None:
+    b = book()
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            foreign_protective(PROTECTED_AT, **BOTH),
+            position=opened_at(FP, 20),
+            server=True,
+        ),
+        NOTHING,
+    )
+    # No `openTimestamp`: its last change, later than the position's open time, is no creation.
+    later = make_event(
+        om.ORDER_FILLED,
+        make_order(FENTRY, FP, utc=30),
+        position=opened_at(FP, 20),
+        deal=make_deal(9_200_005, FENTRY, FP, side=om.BUY, volume=100, price=85250.0, ts=20),
+    )
+
+    b.apply(later, NOTHING)
+
+    assert b.view(FP).entry_order_id == FENTRY
+
+
 def test_an_order_list_without_the_entry_or_position_changes_nothing() -> None:
     b = book()
     protected_first(b)

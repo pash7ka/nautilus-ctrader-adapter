@@ -1034,15 +1034,23 @@ class VenueBook:
 
     @staticmethod
     def _raises(position: _Position, event: oa.ProtoOAExecutionEvent) -> bool:
-        """Whether `event`'s opening order was created after its position opened."""
+        """Whether `event`'s opening order was created after its position opened.
+
+        Never an order with the node's record, nor one that does not say when it was created.
+        """
+        order = event.order
+        # The node never raises a position.
+        if order_record.parse_label(order.tradeData.label) is not None:
+            return False
         # Confirmed from a recorded order list and snapshot: a raise by hand was created after the
         # position's open time, and the entry before it.
         # TODO(verify): that a raise's own events carry its creation time and the position's open
         # time as the lists do; none was recorded. Without them the model's open time decides.
+        created = opened_of(order)
         opened = _opened_ms(event.position) if event.HasField("position") else None
         if opened is None:
             opened = position.opened_ms
-        return opened is not None and created_of(event.order) > opened
+        return created is not None and opened is not None and created > opened
 
     def _entry_event(
         self,

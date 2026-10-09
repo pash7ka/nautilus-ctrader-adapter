@@ -185,8 +185,9 @@ def reconcile(
 
     `orders` is sorted by the first fill's time, or `ts_ms` for a report with no fill, so a
     cancelled leg of a closed position sorts at the closing deal. Ties put a non-closing order
-    first, then go by venue order id. No report of a position sorts before its entry: a fill
-    Nautilus meets before the entry's would open the position the other way.
+    first, then a position's entry, then go by venue order id. No report of a position sorts
+    before its entry: a fill Nautilus meets before the entry's would open the position the other
+    way.
     """
     open_positions = {position.positionId: position for position in snapshot.position}
     symbols = {pid: position.tradeData.symbolId for pid, position in open_positions.items()}
@@ -203,7 +204,7 @@ def reconcile(
     }
     claimed = set(known_closes.values())
     in_window = {str(deal.dealId) for deal in window_deals}
-    keyed: list[tuple[tuple[int, bool, str], ReportedOrder]] = []
+    keyed: list[tuple[tuple[int, bool, bool, str], ReportedOrder]] = []
     positions: list[ReportedPosition] = []
     notices: list[Notice] = []
     for position_id in sorted(symbols):
@@ -259,7 +260,10 @@ def reconcile(
         )
         notices += said
         entry_ts = _sort_key(reports[0])[0]
-        keyed += [(_sort_key(report, not_before=entry_ts), report) for report in reports]
+        keyed += [
+            (_sort_key(report, not_before=entry_ts, entry=index == 0), report)
+            for index, report in enumerate(reports)
+        ]
         if venue_position is not None:
             units = units_of(volume) if found.complete and still_open else None
             positions.append(_position_report(venue_position, digits, units))
@@ -374,9 +378,11 @@ def _close_id(
     return close_id
 
 
-def _sort_key(report: ReportedOrder, not_before: int = 0) -> tuple[int, bool, str]:
+def _sort_key(
+    report: ReportedOrder, not_before: int = 0, *, entry: bool = False
+) -> tuple[int, bool, bool, str]:
     first = report.fills[0].ts_ms if report.fills else report.ts_ms
-    return max(first, not_before), report.reduce_only, report.venue_order_id
+    return max(first, not_before), report.reduce_only, not entry, report.venue_order_id
 
 
 class _Position:

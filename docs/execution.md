@@ -552,9 +552,9 @@ Notes on reading it:
   `manual_change` activity and, because Nautilus needs it for its own bookkeeping, as an external
   closing order. So is a trader's raise of it: a `manual_change` with the action `opened` and the
   volume added, and an external filled order. A trader's move, removal or addition of a level is
-  the activity alone, plus the
-  node's leg events (`OrderUpdated` or `OrderCanceled`). A trader's change of a position the node
-  did not open is no activity: it reaches Nautilus as reports of that position's orders and legs.
+  the activity alone, plus the node's leg events (`OrderUpdated` or `OrderCanceled`). A trader's
+  change of a position the node did not open is no activity: it reaches Nautilus as reports of
+  that position's orders and legs.
 - **In the broker's order.** What the adapter tells Nautilus follows the order in which the
   broker sent it. The node's own orders (entries, legs, closes) reach Nautilus as events, which it
   queues. An order the node did not send, a foreign position's leg included, reaches it through

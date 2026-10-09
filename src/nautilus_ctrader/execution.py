@@ -1412,7 +1412,9 @@ class CTraderExecutionClient(LiveExecutionClient):
             # one page was recorded.
             payload.toTimestamp = min(order.utcLastUpdateTimestamp for order in new)
         else:
-            self._log.warning(
+            # The earliest orders are the ones left out, and the entry among them: the node's
+            # own position can then be taken for a foreign one.
+            self._log.error(
                 f"Position {position_id}: its order list did not end within "
                 f"{_MAX_ORDER_PAGES} pages; its entry may be missing",
             )

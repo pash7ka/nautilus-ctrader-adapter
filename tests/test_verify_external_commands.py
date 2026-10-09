@@ -2285,10 +2285,10 @@ async def test_a_watch_reports_the_owners_partial_close(tmp_path) -> None:
     assert vec.format_report(result).startswith(vec._WATCH_TITLE)
 
 
-async def test_a_watch_sees_the_close_in_events_carrying_the_terminals_request_id(
+async def test_a_watch_sees_the_close_in_events_carrying_an_id_it_did_not_send(
     tmp_path,
 ) -> None:
-    # The events of a close made in the terminal carry the terminal's own `clientMsgId`.
+    # The events of a close made elsewhere carry a `clientMsgId` this connection did not send.
     venue = watch_venue()
 
     result = await run(
@@ -2296,7 +2296,7 @@ async def test_a_watch_sees_the_close_in_events_carrying_the_terminals_request_i
         tmp_path,
         while_listening=owner_closes_the_minimum,
         watch=True,
-        client_msg_id="terminal-request",
+        client_msg_id="another-request",
     )
 
     findings = by_item(result)
