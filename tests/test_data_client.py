@@ -49,7 +49,7 @@ from nautilus_ctrader.common.errors import (
 )
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
-from nautilus_ctrader.data import CTraderDataClient, _conversion_message
+from nautilus_ctrader.data import CTraderDataClient, _conversion_message, _raw_bar
 from nautilus_ctrader.failures import REQUEST_FAILED_TOPIC
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -2197,6 +2197,22 @@ async def test_a_request_covering_a_live_subscription_suppresses_the_streamed_ba
 
         # The request already delivered the bar the stream would now close.
         assert not h.bars()
+
+
+async def test_a_closed_bar_with_impossible_prices_is_dropped_and_reported_once() -> None:
+    recorded = RECORDED_HISTORY[(EURUSD_SYMBOL_ID, M1)][FIRST_M1_MINUTE]
+    unusable = om.ProtoOATrendbar()
+    unusable.CopyFrom(recorded)
+    unusable.deltaOpen = recorded.deltaHigh + 1  # an open above the high
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        for _ in range(2):
+            h.client._emit_bar(EURUSD_M1, EURUSD_SYMBOL_ID, 60, _raw_bar(unusable))
+
+        assert not h.bars()
+        # Recorded once for the bar type, so a repeat is logged at DEBUG.
+        assert h.client._bar_errors == {EURUSD_M1}
 
 
 async def test_a_failed_request_covering_a_live_subscription_leaves_the_bar_to_the_stream() -> None:

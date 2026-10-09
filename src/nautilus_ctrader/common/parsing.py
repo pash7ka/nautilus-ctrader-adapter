@@ -292,7 +292,7 @@ def bar_from_trendbar(
     the enclosing `ProtoOAGetTrendbarsRes`), so reading it here would silently default to M1.
     Live bars (from a spot event subscription) do set `tb.period`; when they do, it must agree
     with `bar_type`, or `CTraderProtocolError` is raised rather than silently trusting one over
-    the other.
+    the other. A bar whose high and low do not enclose its open and close raises it too.
     """
     period = trendbar_period_for(bar_type)
     if tb.HasField("period") and tb.period != period:
@@ -311,7 +311,20 @@ def bar_from_trendbar(
     period_secs = PERIOD_SECS[period]
     ts_event = (bar_boundary_secs(tb.utcTimestampInMinutes) + period_secs) * 1_000_000_000
 
-    return Bar(bar_type, open_price, high_price, low_price, close_price, volume, ts_event, ts_init)
+    try:
+        return Bar(
+            bar_type,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            volume,
+            ts_event,
+            ts_init,
+        )
+    except ValueError as e:
+        # Nautilus checks that the high and low enclose the open and the close.
+        raise CTraderProtocolError(f"{bar_type}: trendbar has inconsistent prices ({e})") from e
 
 
 def quote_from_prices(

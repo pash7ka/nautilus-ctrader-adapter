@@ -17,10 +17,11 @@ import pytest
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.core.data import Data
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.live.data_engine import LiveDataEngine
-from nautilus_trader.model.data import Bar, BarType, DataType, QuoteTick
+from nautilus_trader.model.data import Bar, BarType, DataType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.portfolio.portfolio import Portfolio
@@ -51,6 +52,10 @@ USDJPY_ID = InstrumentId(Symbol("USDJPY"), CTRADER_VENUE)
 # The fake venue's account carries no USDJPY, so nothing loads it.
 USDJPY_H1 = BarType.from_str(f"{USDJPY_ID}-1-HOUR-BID-EXTERNAL")
 REFUSAL = "INVALID_REQUEST"
+
+
+class CustomData(Data):
+    """A data type of the application's own, which only the generic `_request` can be asked for."""
 
 
 class Requester(Actor):
@@ -110,6 +115,7 @@ async def node(
     live: bool = True,
     server: FakeCTraderServer | None = None,
     client_config: CTraderDataClientConfig | None = None,
+    connect: bool = True,
 ) -> AsyncIterator[Node]:
     client_config = client_config or config()
     server = server or trendbar_venue()
@@ -151,7 +157,8 @@ async def node(
     actor = Requester()
     actor.register_base(Portfolio(msgbus, cache, clock), msgbus, cache, clock)
     actor.start()
-    await client._connect()
+    if connect:
+        await client._connect()
     try:
         yield Node(server, client, msgbus, clock, actor, responses)
     finally:
@@ -235,8 +242,17 @@ async def test_a_bar_type_with_no_trendbar_period_fails() -> None:
         await n.answered()
 
         failure = n.assert_failed_once(request_id)
-        assert failure.reason == f"no trendbar period for {EURUSD_LAST}"
+        assert failure.reason == "trendbars are only available for the BID price type"
         assert not received(n.server, oa.ProtoOAGetTrendbarsReq)
+
+
+async def test_a_bar_request_before_the_client_connected_fails() -> None:
+    async with node(connect=False) as n:
+        start = n.clock.utc_now() - timedelta(hours=1)
+        request_id = n.actor.request_bars(EURUSD_H1, start=start, callback=n.actor.on_answered)
+        await n.answered()
+
+        assert n.assert_failed_once(request_id).reason == "not connected"
 
 
 async def test_bars_of_an_instrument_that_is_not_loaded_fail() -> None:
@@ -283,6 +299,27 @@ async def test_a_bar_request_cancelled_at_disconnect_fails() -> None:
         await n.answered()
 
         assert n.assert_failed_once(request_id).reason == "connection closed"
+
+
+@pytest.mark.parametrize("what", ["bars", "instrument", "quote ticks"])
+async def test_a_request_cancelled_before_its_handler_started_fails(what: str) -> None:
+    # The plain engine hands the request over synchronously, so the client's task exists but
+    # has not run when the cancel arrives, as when a disconnect lands in the same loop turn.
+    async with node(live=False) as n:
+        start = n.clock.utc_now() - timedelta(hours=1)
+        callback = n.actor.on_answered
+        if what == "bars":
+            request_id = n.actor.request_bars(EURUSD_H1, start=start, callback=callback)
+        elif what == "instrument":
+            request_id = n.actor.request_instrument(EURUSD_ID, callback=callback)
+        else:
+            request_id = n.actor.request_quote_ticks(EURUSD_ID, start, callback=callback)
+
+        await n.client.cancel_pending_tasks()
+        await n.answered()
+
+        assert n.assert_failed_once(request_id).reason == "connection closed"
+        assert not received(n.server, oa.ProtoOAGetTrendbarsReq)
 
 
 async def test_a_bar_request_in_flight_when_the_client_disconnects_fails() -> None:
@@ -392,7 +429,7 @@ def _ask(n: Node, what: str) -> UUID4:
             callback=callback,
         ),
         "custom data": lambda: actor.request_data(
-            DataType(QuoteTick, metadata={"instrument_id": EURUSD_ID}),
+            DataType(CustomData),
             ClientId(CTRADER_VENUE.value),
             start=start,
             callback=callback,
@@ -402,21 +439,21 @@ def _ask(n: Node, what: str) -> UUID4:
 
 
 @pytest.mark.parametrize(
-    "what",
+    ("what", "type_name"),
     [
-        "quote ticks",
-        "trade ticks",
-        "funding rates",
-        "order book deltas",
-        "order book depth",
-        "order book snapshot",
-        "custom data",
+        ("quote ticks", "QuoteTick"),
+        ("trade ticks", "TradeTick"),
+        ("funding rates", "FundingRateUpdate"),
+        ("order book deltas", "OrderBookDeltas"),
+        ("order book depth", "OrderBookDepth10"),
+        ("order book snapshot", "OrderBookDeltas"),
+        ("custom data", "CustomData"),
     ],
 )
-async def test_a_request_the_venue_has_no_history_for_fails(what: str) -> None:
+async def test_a_request_the_venue_has_no_history_for_fails(what: str, type_name: str) -> None:
     async with node() as n:
         request_id = _ask(n, what)
         await n.answered()
 
         failure = n.assert_failed_once(request_id)
-        assert failure.reason.endswith("requests are not supported")
+        assert failure.reason == f"{type_name} requests are not supported"

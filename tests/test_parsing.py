@@ -208,6 +208,18 @@ def test_bar_from_trendbar_rejects_a_period_that_disagrees_with_the_bar_type() -
         parsing.bar_from_trendbar(tb, bar_type, spec.digits, 2, ts_init=0)
 
 
+def test_bar_from_trendbar_rejects_prices_no_bar_can_hold() -> None:
+    res = REC["trendbars_h1"][0]
+    tb = om.ProtoOATrendbar()
+    tb.CopyFrom(res.trendbar[-1])
+    tb.deltaOpen = tb.deltaHigh + 1  # an open above the high
+    light = next(s for s in LIGHT.values() if s.symbolId == res.symbolId)
+    spec = SPECS[res.symbolId]
+    bar_type = BarType.from_str(f"{light.symbolName}.CTRADER-1-HOUR-BID-EXTERNAL")
+    with pytest.raises(CTraderProtocolError, match="inconsistent prices"):
+        parsing.bar_from_trendbar(tb, bar_type, spec.digits, 2, ts_init=0)
+
+
 def test_bar_from_trendbar_accepts_a_live_bar_whose_period_matches() -> None:
     # Live spot-event trend bars, unlike historical ones, do set `period`.
     event = next(e for e in REC["spot_events"] if e.trendbar)
