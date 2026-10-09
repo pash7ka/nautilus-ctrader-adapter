@@ -13,6 +13,7 @@ import importlib.util
 import pathlib
 import sys
 import time
+from collections.abc import Callable
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -167,12 +168,16 @@ def owner_venue() -> ExecutionVenue:
     return venue
 
 
-def settings(tmp_path: pathlib.Path, *, answer_wait_secs: float = 5.0) -> vec.Settings:
+def settings(
+    tmp_path: pathlib.Path, *, answer_wait_secs: float = 5.0, close_wait_secs: float = 10.0
+) -> vec.Settings:
     return vec.Settings(
         symbol=SYMBOL,
         trailing_wait_secs=0.3,
         answer_wait_secs=answer_wait_secs,
         settle_secs=0.05,
+        close_wait_secs=close_wait_secs,
+        close_settle_secs=0.3,
         log_dir=tmp_path,
     )
 
@@ -181,27 +186,33 @@ async def run(
     venue: ExecutionVenue,
     tmp_path: pathlib.Path,
     *,
-    while_listening: list[Message] = (),
+    while_listening: list[Message] | Callable[[ExecutionVenue], list[Message]] = (),
     answer_wait_secs: float = 5.0,
+    close_wait_secs: float = 10.0,
+    watch: bool = False,
 ) -> vec.Result:
-    """One run of the check against `venue`; `while_listening` is pushed once it listens."""
+    """One run against `venue`; `while_listening`, or what it makes, is pushed once it listens."""
     server = venue.server
     await server.start()
     listening = asyncio.Event()
     try:
         task = asyncio.create_task(
             vec.run_check(
-                settings(tmp_path, answer_wait_secs=answer_wait_secs),
+                settings(
+                    tmp_path, answer_wait_secs=answer_wait_secs, close_wait_secs=close_wait_secs
+                ),
                 CREDENTIALS,
                 TRADER_LOGIN,
                 address=vec.Address(server.host, server.host, server.port, tls=False),
                 status=lambda _text: None,
                 listening=listening,
+                watch=watch,
             ),
         )
         if while_listening:
             await wait_until(lambda: listening.is_set() or task.done(), timeout_secs=60.0)
-            for message in while_listening:
+            pushed = while_listening(venue) if callable(while_listening) else while_listening
+            for message in pushed:
                 await server.push(message)
         return await asyncio.wait_for(task, 60.0)
     finally:
@@ -1477,5 +1488,729 @@ async def test_no_secret_is_printed_logged_or_recorded(tmp_path, capsys) -> None
         for text in (out, err, logged, raw):
             assert secret not in text
     # Account identifiers are allowed at run time, but the report and progress name none.
+    for identifier in (str(ACCOUNT_ID), str(TRADER_LOGIN)):
+        assert identifier not in out
+
+
+# -- Watching a partial close --------------------------------------------------------------
+
+# The watched position's volume, in the venue's hundredths of a unit, and the half to close.
+WHOLE, HALF = 2, 1
+CLOSE, CLOSE_DEAL = 6_900_003, 7_900_002
+
+
+def watched_position(opened: int) -> om.ProtoOAPosition:
+    position = owner_position(opened)
+    position.tradeData.volume = WHOLE
+    position.trailingStopLoss = False
+    return position
+
+
+def watched_protective(opened: int) -> om.ProtoOAOrder:
+    order = protective_order(opened)
+    order.tradeData.volume = WHOLE
+    order.trailingStopLoss = False
+    return order
+
+
+def watch_venue() -> ExecutionVenue:
+    """The fake venue holding the owner's protected position of twice the minimum, alone."""
+    venue = ExecutionVenue()
+    opened = int(time.time() * 1000) - 600_000
+    entry = make_order(ENTRY, POSITION, volume=WHOLE, utc=opened, symbol=US100_SYMBOL_ID)
+    entry.orderStatus = om.ORDER_STATUS_FILLED
+    deal = make_deal(
+        7_900_001, ENTRY, POSITION, side=om.BUY, volume=WHOLE, price=85000.0, ts=opened
+    )
+    deal.symbolId = US100_SYMBOL_ID
+    venue.snapshot.position.append(watched_position(opened))
+    venue.snapshot.order.append(watched_protective(opened))
+    venue.position_orders = {POSITION: [entry, watched_protective(opened)]}
+    venue.position_deals = {POSITION: [deal]}
+    venue.deals = [deal]
+    return venue
+
+
+def owner_closes_half(venue: ExecutionVenue, *, replaced: bool = True) -> list[Message]:
+    """The owner's close of half the position from the terminal, as the broker reports it.
+
+    The venue's lists change with it; the protective order is reduced only when `replaced`.
+    """
+    now = int(time.time() * 1000)
+    position = venue.snapshot.position[0]
+    before = om.ProtoOAPosition()
+    before.CopyFrom(position)
+    position.tradeData.volume = HALF
+    position.utcLastUpdateTimestamp = now
+    close = make_order(
+        CLOSE, POSITION, side=om.SELL, closing=True, volume=HALF, utc=now, symbol=US100_SYMBOL_ID
+    )
+    deal = make_deal(CLOSE_DEAL, CLOSE, POSITION, side=om.SELL, volume=HALF, price=85050.0, ts=now)
+    deal.symbolId = US100_SYMBOL_ID
+    messages = [
+        make_event(om.ORDER_ACCEPTED, close, position=before),
+        make_event(om.ORDER_FILLED, close, position=position, deal=deal),
+    ]
+    venue.position_orders[POSITION].append(close)
+    venue.position_deals[POSITION].append(deal)
+    venue.deals.append(deal)
+    if replaced:
+        protective = venue.snapshot.order[0]
+        protective.tradeData.volume = HALF
+        protective.utcLastUpdateTimestamp = now + 1
+        messages.append(make_event(om.ORDER_REPLACED, protective, position=position, server=True))
+    for message in messages:
+        message.ctidTraderAccountId = ACCOUNT_ID
+    return messages
+
+
+def only_reads_received(venue: ExecutionVenue) -> bool:
+    # The account list goes over the account client's own pre-connection, not the guarded one.
+    reads = vec.READ_REQUESTS | {oa.ProtoOAGetAccountListByAccessTokenReq}
+    return all(type(m) in reads for m in venue.server.received)
+
+
+def test_the_watch_refuses_without_its_flag(
+    nothing_may_be_built: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def no_input(_prompt: str = "") -> str:
+        nothing_may_be_built.append("input")
+        raise AssertionError("input was asked")
+
+    monkeypatch.setattr(builtins, "input", no_input)
+
+    assert vec.main(["--symbol", SYMBOL, "--close-wait-secs", "60"]) == 2
+    assert nothing_may_be_built == []
+    out, err = capsys.readouterr()
+    assert "--watch-partial-close" in err
+    assert out == ""
+
+
+def test_the_two_modes_cannot_be_asked_for_together(nothing_may_be_built: list[str]) -> None:
+    argv = ["--symbol", SYMBOL, "--send-commands", "--watch-partial-close"]
+
+    assert vec.main(argv) == 2
+    assert nothing_may_be_built == []
+
+
+def test_the_watch_refuses_a_mistyped_symbol_after_printing_its_plan(
+    nothing_may_be_built: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": "EURUSD")
+
+    assert vec.main(["--symbol", SYMBOL, "--watch-partial-close"]) == 2
+    assert nothing_may_be_built == []
+    assert vec.watch_plan(SYMBOL, 120.0) in capsys.readouterr().out
+
+
+def test_the_watch_plan_says_what_to_place_and_that_nothing_is_changed() -> None:
+    text = vec.watch_plan(SYMBOL, 90.0)
+
+    assert SYMBOL in text
+    assert "changes nothing at the broker" in text
+    assert "it sends no order, amend, cancel or close" in text
+    assert "at least twice the minimum volume, with a stop-loss and a" in text
+    assert "nothing else on that symbol" in text
+    assert "listens up to 90 s" in text
+    assert "STAYS OPEN" in text and "close it by hand" in text
+
+
+def test_main_runs_the_watch_with_its_window(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list = []
+
+    async def canned(settings, credentials, trader_login, **kwargs):
+        seen.append((settings, kwargs))
+        return vec.Result(title=vec._WATCH_TITLE, findings=[vec.Finding(1, "t", vec.OK)])
+
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": SYMBOL)
+    monkeypatch.setattr(vec.get_tokens, "load_env", lambda _path: dict(FAKE_ENV))
+    monkeypatch.setattr(vec, "run_check", canned)
+
+    argv = ["--symbol", SYMBOL, "--watch-partial-close", "--close-wait-secs", "45"]
+    assert vec.main(argv) == 0
+    ((given, kwargs),) = seen
+    assert (given.close_wait_secs, kwargs) == (45.0, {"watch": True})
+    assert vec._WATCH_TITLE in capsys.readouterr().out
+
+
+def test_a_watch_stopped_by_hand_says_to_close_the_position(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": SYMBOL)
+    monkeypatch.setattr(vec.get_tokens, "load_env", lambda _path: dict(FAKE_ENV))
+    monkeypatch.setattr(vec, "run_check", interrupted)
+
+    assert vec.main(["--symbol", SYMBOL, "--watch-partial-close"]) == 130
+    out = capsys.readouterr().out
+    assert "Stopped by hand" in out
+    assert "close the position by hand" in out
+    assert "pending order" not in out
+
+
+def test_the_parser_gives_the_watch_two_minutes() -> None:
+    args = vec.build_arg_parser().parse_args(["--symbol", SYMBOL, "--watch-partial-close"])
+
+    assert args.watch_partial_close and not args.send_commands
+    assert args.close_wait_secs == 120.0
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [c for c in all_requests() if c not in vec.READ_REQUESTS],
+    ids=lambda c: c.__name__,
+)
+def test_the_watch_guard_admits_no_command_even_on_the_owners_objects(
+    cls: type[Message],
+) -> None:
+    checked = vec.Guard(vec.Recorder(vec.record_execution.Recording(0)), vec.READ_REQUESTS)
+    # Targets let a command through the other mode's guard.
+    checked.targets = TARGETS
+
+    with pytest.raises(vec.CommandRefused, match=cls.__name__):
+        checked.check(cls())
+    assert checked.refused
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        cancel(PENDING),
+        amend(orderId=PENDING, volume=MINIMUM, limitPrice=84000.0),
+        levels(positionId=POSITION, stopLoss=84899.9, takeProfit=85100.0),
+    ],
+    ids=lambda c: type(c).__name__,
+)
+def test_the_watch_guard_refuses_a_command_the_other_mode_would_send(command: Message) -> None:
+    guard().check(command)
+    checked = vec.Guard(vec.Recorder(vec.record_execution.Recording(0)), vec.READ_REQUESTS)
+    checked.targets = TARGETS
+
+    with pytest.raises(vec.CommandRefused, match="is not a request this run may send"):
+        checked.check(command)
+
+
+def test_the_watch_guard_lets_through_authentication_and_reads() -> None:
+    checked = vec.Guard(vec.Recorder(vec.record_execution.Recording(0)), vec.READ_REQUESTS)
+
+    for read in (
+        oa.ProtoOAApplicationAuthReq(clientId="x", clientSecret="y"),
+        oa.ProtoOAAccountAuthReq(ctidTraderAccountId=ACCOUNT_ID, accessToken="z"),
+        oa.ProtoOAReconcileReq(ctidTraderAccountId=ACCOUNT_ID),
+        oa.ProtoOAOrderListByPositionIdReq(ctidTraderAccountId=ACCOUNT_ID, positionId=POSITION),
+    ):
+        checked.check(read)
+    assert vec.COMMAND_REQUESTS.isdisjoint(vec.READ_REQUESTS)
+    assert checked.refused == []
+
+
+def watch_snapshot(*, orders=None, positions=None) -> oa.ProtoOAReconcileRes:
+    found = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
+    found.order.extend([watched_protective(OPENED)] if orders is None else orders)
+    found.position.extend([watched_position(OPENED)] if positions is None else positions)
+    return found
+
+
+def test_the_watched_position_is_chosen() -> None:
+    chosen = vec.choose_watched(watch_snapshot(), symbol_id=US100_SYMBOL_ID, min_volume=MINIMUM)
+
+    assert chosen == watched_position(OPENED)
+
+
+@pytest.mark.parametrize(
+    ("found", "reason"),
+    [
+        (watch_snapshot(positions=[]), "0 positions on the symbol"),
+        (
+            watch_snapshot(positions=[watched_position(OPENED), watched_position(OPENED)]),
+            "2 positions",
+        ),
+        (watch_snapshot(positions=[owner_position(OPENED)]), "under twice the minimum, 0.02"),
+        (
+            watch_snapshot(positions=[changed_position(volume=WHOLE, stopLoss=None)]),
+            "no stop-loss",
+        ),
+        (
+            watch_snapshot(positions=[changed_position(volume=WHOLE, takeProfit=None)]),
+            "no take-profit",
+        ),
+        (
+            watch_snapshot(orders=[watched_protective(OPENED), pending_order(OPENED)]),
+            "1 pending orders on the symbol, not none",
+        ),
+    ],
+)
+def test_anything_but_one_protected_position_alone_is_refused(found, reason: str) -> None:
+    refusal = vec.choose_watched(found, symbol_id=US100_SYMBOL_ID, min_volume=MINIMUM)
+
+    assert isinstance(refusal, vec.Refusal)
+    assert any(reason in line for line in refusal.reasons), refusal.reasons
+
+
+def test_the_watched_positions_legs_are_confirmed_in_nautilus() -> None:
+    position, protective = watched_position(OPENED), watched_protective(OPENED)
+    watched = vec.confirm_watched(position, protective, [protective, ENTRY_ORDER], NAUTILUS[1:])
+
+    assert isinstance(watched, vec.Watched)
+    assert (watched.stop_loss.value, watched.take_profit.value) == ("SL", "TP")
+    assert watched.protective == protective
+
+    for orders, nautilus, reason in (
+        ([protective], NAUTILUS, "names no entry"),
+        ([labelled(make_order(ENTRY, POSITION))], NAUTILUS, "opened by the node"),
+        ([ENTRY_ORDER], [NAUTILUS[2]], "0 open stop-loss legs"),
+    ):
+        refusal = vec.confirm_watched(position, protective, orders, nautilus)
+        assert isinstance(refusal, vec.Refusal)
+        assert any(reason in line for line in refusal.reasons), refusal.reasons
+
+
+def test_half_is_rounded_down_to_a_volume_step() -> None:
+    assert vec.half_of(2, 1) == 1
+    assert vec.half_of(300, 100) == 100
+    assert vec.half_of(400, 100) == 200
+
+
+def arrived(t: float, message: Message) -> vec.Inbound:
+    return vec.Inbound(t, message, pushed=True)
+
+
+def deal_event(*, volume: int = HALF, left: int | None = HALF) -> oa.ProtoOAExecutionEvent:
+    close = make_order(CLOSE, POSITION, side=om.SELL, closing=True, volume=volume)
+    deal = make_deal(CLOSE_DEAL, CLOSE, POSITION, side=om.SELL, volume=volume, price=1.0, ts=1)
+    position = None if left is None else changed_position(volume=left)
+    return make_event(om.ORDER_FILLED, close, position=position, deal=deal)
+
+
+def reduction(*, kind: int = om.ORDER_REPLACED, volume: int = HALF, **fields):
+    order = watched_protective(OPENED)
+    order.tradeData.volume = volume
+    for name, value in fields.items():
+        setattr(order, name, value)
+    return make_event(kind, order, position=changed_position(volume=HALF), server=True)
+
+
+def test_the_close_and_the_reduction_are_picked_out_of_what_arrived() -> None:
+    inbound = [
+        vec.Inbound(0.5, deal_event(), pushed=False),
+        arrived(0.7, trailing_move(84895.0)),
+        arrived(1.0, deal_event()),
+        arrived(1.4, reduction()),
+    ]
+    since = 0.1
+
+    assert vec.closing_deal(inbound, position_id=POSITION, since=since).t == 1.0
+    reduced = vec.reduced_protective(inbound, position_id=POSITION, start_volume=WHOLE, since=since)
+    assert reduced.t == 1.4
+    assert vec.first_drop(inbound, position_id=POSITION, start_volume=WHOLE, since=since).t == 1.0
+    assert vec.first_drop(inbound, position_id=POSITION, start_volume=WHOLE, since=1.1).t == 1.4
+    assert vec.last_position_volume(inbound, position_id=POSITION, since=since) == HALF
+    # A protective order at the whole volume, or one that fills, is no reduction.
+    whole = [arrived(1.0, reduction(volume=WHOLE)), arrived(1.1, reduction(kind=om.ORDER_FILLED))]
+    assert vec.reduced_protective(whole, position_id=POSITION, start_volume=WHOLE, since=0) is None
+    assert vec.closing_deal(whole, position_id=POSITION, since=0) is None
+
+
+@pytest.mark.parametrize(
+    ("deal", "remaining", "status", "line"),
+    [
+        (arrived(1.0, deal_event()), HALF, vec.OK, "deal volume 0.01, filled 0.01"),
+        (arrived(1.0, deal_event(left=None)), HALF, vec.OK, "the event carries no position"),
+        (arrived(1.0, deal_event()), 0, vec.DIFFERS, "went from 0.02 to 0"),
+        (None, HALF, vec.DIFFERS, "no execution event carried a closing deal"),
+        (None, WHOLE, vec.UNKNOWN, "did not drop within 120 s"),
+        (None, None, vec.UNKNOWN, "did not drop within 120 s"),
+    ],
+)
+def test_the_close_should_arrive_with_its_deal(deal, remaining, status, line) -> None:
+    decided, detail = vec.decide_closing_deal(
+        deal, start_volume=WHOLE, remaining=remaining, wait_secs=120.0
+    )
+
+    assert decided == status
+    assert any(line in text for text in detail), detail
+
+
+DEAL_AT = arrived(1.0, deal_event())
+
+
+@pytest.mark.parametrize(
+    ("reduced", "deal", "closed", "status", "line"),
+    [
+        (arrived(1.25, reduction()), DEAL_AT, True, vec.OK, "0.25 s after the deal"),
+        (arrived(0.5, reduction()), DEAL_AT, True, vec.DIFFERS, "0.50 s before the deal"),
+        (
+            arrived(1.25, reduction(kind=om.ORDER_ACCEPTED, orderId=PROTECTIVE + 1)),
+            DEAL_AT,
+            True,
+            vec.DIFFERS,
+            "a new protective order id",
+        ),
+        (arrived(1.25, reduction()), None, True, vec.DIFFERS, "no closing deal arrived"),
+        (None, DEAL_AT, True, vec.DIFFERS, "the broker now lists it at 0.02"),
+        (None, None, False, vec.UNKNOWN, "did not drop"),
+    ],
+)
+def test_the_reduced_volume_should_arrive_replaced_after_the_deal(
+    reduced, deal, closed: bool, status: str, line: str
+) -> None:
+    decided, detail = vec.decide_reduction_arrives(
+        reduced,
+        deal,
+        closed=closed,
+        protective_id=PROTECTIVE,
+        listed=watched_protective(OPENED),
+        settle_secs=10.0,
+        wait_secs=120.0,
+    )
+
+    assert decided == status
+    assert any(line in text for text in detail), detail
+    if status == vec.OK:
+        assert "the same protective order id as at the start" in detail
+
+
+@pytest.mark.parametrize(
+    ("reduced", "start", "remaining", "status", "line"),
+    [
+        (arrived(1.0, reduction()), WHOLE, HALF, vec.OK, "the reduced total, not the volume"),
+        (arrived(1.0, reduction(volume=1)), 3, 2, vec.DIFFERS, "the volume closed, not what"),
+        (arrived(1.0, reduction(volume=1)), 4, 2, vec.DIFFERS, "neither"),
+        (None, WHOLE, HALF, vec.UNKNOWN, "no protective order with a smaller volume"),
+        (arrived(1.0, reduction()), WHOLE, None, vec.UNKNOWN, "not read"),
+    ],
+)
+def test_the_reduced_volume_should_be_what_is_left(
+    reduced, start: int, remaining, status: str, line: str
+) -> None:
+    decided, detail = vec.decide_reduced_total(reduced, start_volume=start, remaining=remaining)
+
+    assert decided == status
+    assert any(line in text for text in detail), detail
+
+
+def listed_at(volume: int, **fields) -> om.ProtoOAOrder:
+    order = watched_protective(OPENED)
+    order.tradeData.volume = volume
+    for name, value in fields.items():
+        setattr(order, name, value)
+    return order
+
+
+@pytest.mark.parametrize(
+    ("reduced", "listed", "status", "line"),
+    [
+        (arrived(1.0, reduction()), listed_at(HALF), vec.OK, "executedVolume not set"),
+        # Set, but agreeing with what is left: the adapter still reads the rest right.
+        (None, listed_at(WHOLE, executedVolume=HALF), vec.OK, "executedVolume 0.01"),
+        (
+            arrived(1.0, reduction(executedVolume=HALF)),
+            None,
+            vec.DIFFERS,
+            "the adapter reads 0 left",
+        ),
+        (None, listed_at(WHOLE), vec.DIFFERS, "the adapter reads 0.02 left"),
+        (None, None, vec.UNKNOWN, "neither pushed smaller nor listed"),
+    ],
+)
+def test_executed_volume_should_leave_remaining_of_reading_what_is_left(
+    reduced, listed, status, line
+) -> None:
+    decided, detail = vec.decide_executed_volume(
+        reduced, listed, closed=True, remaining=HALF, wait_secs=120.0
+    )
+
+    assert decided == status
+    assert any(line in text for text in detail), detail
+
+
+def test_nothing_closed_settles_nothing_about_executed_volume() -> None:
+    decided = vec.decide_executed_volume(
+        None, listed_at(WHOLE), closed=False, remaining=WHOLE, wait_secs=120.0
+    )
+
+    assert decided[0] == vec.UNKNOWN
+
+
+def legs(stop=Decimal("0.01"), target=Decimal("0.01"), *, is_open=True) -> list[vec.LegState]:
+    return [
+        vec.LegState("stop-loss leg", stop, is_open),
+        vec.LegState("take-profit leg", target, is_open),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("held", "errors", "closed", "status", "line"),
+    [
+        (legs(), 0, True, vec.OK, "0 ERROR or overfill lines logged"),
+        (legs(stop=Decimal("0.02")), 0, True, vec.DIFFERS, "stop-loss leg: quantity 0.02"),
+        (legs(), 1, True, vec.DIFFERS, "1 ERROR or overfill lines logged (see stderr)"),
+        (legs(is_open=False), 0, True, vec.DIFFERS, ", not open"),
+        ([vec.LegState("stop-loss leg", None, False)], 0, True, vec.DIFFERS, "not held"),
+        (legs(), 0, False, vec.UNKNOWN, "did not drop"),
+    ],
+)
+def test_the_legs_should_follow_the_remaining_volume(held, errors, closed, status, line) -> None:
+    decided, detail = vec.decide_legs_follow(
+        held, closed=closed, remaining=HALF, errors=errors, wait_secs=120.0
+    )
+
+    assert decided == status
+    assert any(line in text for text in detail), detail
+
+
+@pytest.mark.parametrize(
+    ("remaining", "last_event", "closed", "status", "line"),
+    [
+        (HALF, HALF, True, vec.OK, "the broker lists 0.01"),
+        (HALF, None, True, vec.OK, "from 0.02, 0.01 asked to close"),
+        (HALF, WHOLE, True, vec.DIFFERS, "the last execution event carried 0.02"),
+        (0, 0, True, vec.DIFFERS, "the whole position was closed"),
+        (WHOLE, HALF, True, vec.DIFFERS, "still lists the whole volume"),
+        (WHOLE, None, False, vec.UNKNOWN, "did not drop"),
+        (None, HALF, True, vec.UNKNOWN, "not read at the end"),
+    ],
+)
+def test_the_remaining_volume_is_read_from_the_broker(
+    remaining, last_event, closed, status, line
+) -> None:
+    decided, detail = vec.decide_remaining(
+        start_volume=WHOLE,
+        half=HALF,
+        closed=closed,
+        remaining=remaining,
+        last_event=last_event,
+        wait_secs=120.0,
+    )
+
+    assert decided == status
+    assert any(line in text for text in detail), detail
+
+
+def test_what_is_left_of_the_watched_position_tells_the_owner_to_close_it() -> None:
+    left = watch_snapshot(positions=[changed_position(volume=HALF, trailingStopLoss=False)])
+
+    (line,) = vec.left_open_watched(left, symbol=SYMBOL, position_id=POSITION)
+    assert line == (
+        f"The position on {SYMBOL} stays open at 0.01 with its stop-loss at 84900.0, take-profit "
+        "at 85100.0. Close it by hand in the terminal."
+    )
+    gone = vec.left_open_watched(watch_snapshot(positions=[]), symbol=SYMBOL, position_id=POSITION)
+    assert gone == (f"The position on {SYMBOL} is closed; nothing is left open.",)
+    (unread,) = vec.left_open_watched(None, symbol=SYMBOL, position_id=POSITION)
+    assert "close the position by hand" in unread
+
+
+def test_the_report_names_what_each_finding_settles() -> None:
+    result = vec.Result(
+        title=vec._WATCH_TITLE,
+        findings=[vec.Finding(1, "first", vec.OK, ("detail",), "the open question")],
+    )
+
+    text = vec.format_report(result)
+
+    assert text.startswith(vec._WATCH_TITLE)
+    assert "OK       1. first\n         detail\n         settles: the open question" in text
+
+
+async def test_a_watch_reports_the_owners_partial_close(tmp_path) -> None:
+    venue = watch_venue()
+
+    result = await run(venue, tmp_path, while_listening=owner_closes_half, watch=True)
+
+    assert (result.refusal, result.failure, result.guard.refused) == ((), None, [])
+    assert result.guard.allowed == vec.READ_REQUESTS
+    findings = by_item(result)
+    statuses = {item: f.status for item, f in findings.items()}
+    assert statuses == dict.fromkeys(range(1, 7), vec.OK), result.findings
+    assert all(f.settles for f in result.findings)
+    assert findings[1].detail[1:] == (
+        "deal volume 0.01, filled 0.01",
+        "the event carries the position, at 0.01",
+    )
+    assert "ORDER_REPLACED of a closing STOP_LOSS_TAKE_PROFIT order" in findings[2].detail[0]
+    assert findings[2].detail[1].endswith("s after the deal")
+    assert findings[2].detail[2] == "the same protective order id as at the start"
+    assert findings[3].detail[1] == "the reduced total, not the volume closed"
+    assert findings[5].detail[:2] == (
+        "stop-loss leg: quantity 0.01",
+        "take-profit leg: quantity 0.01",
+    )
+    assert "0 ERROR or overfill lines logged" in findings[5].detail
+    assert findings[6].detail[1] == "the broker lists 0.01"
+    assert vec.exit_code(result) == 0
+
+    assert only_reads_received(venue)
+    assert commands_received(venue) == []
+    assert result.left_open == (
+        f"The position on {SYMBOL} stays open at 0.01 with its stop-loss at 84900.0, take-profit "
+        "at 85100.0. Close it by hand in the terminal.",
+    )
+    assert result.raw.name.startswith("watch_partial_close-")
+    recording, _, _ = vec.record_execution.decode_raw(result.raw.read_bytes())
+    kinds = {
+        m.executionType for m in recording.messages() if isinstance(m, oa.ProtoOAExecutionEvent)
+    }
+    assert {om.ORDER_FILLED, om.ORDER_REPLACED} <= kinds
+    assert vec.format_report(result).startswith(vec._WATCH_TITLE)
+
+
+async def test_a_watch_where_the_protective_order_is_not_reduced_says_so(tmp_path) -> None:
+    venue = watch_venue()
+
+    result = await run(
+        venue,
+        tmp_path,
+        while_listening=lambda v: owner_closes_half(v, replaced=False),
+        watch=True,
+    )
+
+    statuses = {item: f.status for item, f in by_item(result).items()}
+    assert statuses == {
+        1: vec.OK,
+        2: vec.DIFFERS,
+        3: vec.UNKNOWN,
+        4: vec.DIFFERS,
+        5: vec.DIFFERS,
+        6: vec.OK,
+    }, result.findings
+    assert by_item(result)[2].detail[1] == "the broker now lists it at 0.02"
+    assert vec.exit_code(result) == 1
+    assert commands_received(venue) == []
+    assert "stays open at 0.01" in result.left_open[0]
+
+
+async def test_a_watch_where_the_owner_closes_nothing_settles_nothing(tmp_path) -> None:
+    venue = watch_venue()
+
+    result = await run(venue, tmp_path, close_wait_secs=0.5, watch=True)
+
+    assert [f.status for f in result.findings] == [vec.UNKNOWN] * 6, result.findings
+    assert all("did not drop within 0.5 s" in f.detail[-1] for f in result.findings[:2])
+    assert vec.exit_code(result) == 0
+    assert only_reads_received(venue)
+    assert "stays open at 0.02" in result.left_open[0]
+
+
+def watched_by_the_node(venue: ExecutionVenue) -> None:
+    labelled(venue.position_orders[POSITION][0])
+
+
+def a_pending_order_beside(venue: ExecutionVenue) -> None:
+    venue.snapshot.order.append(pending_order(OPENED))
+
+
+def a_second_position(venue: ExecutionVenue) -> None:
+    venue.snapshot.position.append(changed_position(volume=WHOLE, positionId=POSITION + 1))
+
+
+def at_the_minimum(venue: ExecutionVenue) -> None:
+    venue.snapshot.position[0].tradeData.volume = MINIMUM
+
+
+def without_a_take_profit(venue: ExecutionVenue) -> None:
+    venue.snapshot.position[0].ClearField("takeProfit")
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (lists_no_position, "0 positions"),
+        (a_second_position, "2 positions"),
+        (at_the_minimum, "under twice the minimum"),
+        (without_a_take_profit, "no take-profit"),
+        (a_pending_order_beside, "1 pending orders"),
+        (watched_by_the_node, "opened by the node"),
+    ],
+)
+async def test_a_watch_refuses_unless_it_finds_exactly_the_owners_position(
+    tmp_path, change, reason: str
+) -> None:
+    venue = watch_venue()
+    change(venue)
+
+    result = await run(venue, tmp_path, watch=True)
+
+    assert result.findings == []
+    assert any(reason in line for line in result.refusal), result.refusal
+    assert vec.exit_code(result) == 1
+    assert only_reads_received(venue)
+    assert "Refused to act; nothing was changed at the broker:" in vec.format_report(result)
+
+
+async def test_a_watch_that_fails_midway_still_says_what_is_left_open(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failing(self, *_args):
+        raise RuntimeError("the watch broke")
+
+    monkeypatch.setattr(vec.Watch, "_watch", failing)
+
+    result = await run(watch_venue(), tmp_path, watch=True)
+
+    assert result.failure == "RuntimeError"
+    assert any("stays open at 0.02" in line for line in result.left_open)
+    assert vec.exit_code(result) == 1
+    assert "The run ended early on RuntimeError" in vec.format_report(result)
+
+
+async def test_a_watch_stops_listening_at_the_first_guard_refusal(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(vec.Guard, "covers", lambda _self, _connection: False)
+    venue = watch_venue()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    result = await run(venue, tmp_path, close_wait_secs=30.0, watch=True)
+
+    assert loop.time() - started < 20.0
+    assert result.guard.refused == ["the session's connection no longer sends through the guard"]
+    assert [f.status for f in result.findings] == [vec.UNKNOWN] * 6
+    assert "stays open at 0.02" in result.left_open[0]
+    assert vec.exit_code(result) == 1
+    assert only_reads_received(venue)
+
+
+async def test_a_watch_prints_logs_and_records_no_secret(tmp_path, capsys) -> None:
+    venue = watch_venue()
+    server = venue.server
+    await server.start()
+    listening = asyncio.Event()
+    try:
+        task = asyncio.create_task(
+            vec.run_check(
+                settings(tmp_path),
+                CREDENTIALS,
+                TRADER_LOGIN,
+                address=vec.Address(server.host, server.host, server.port, tls=False),
+                listening=listening,
+                watch=True,
+            ),
+        )
+        await wait_until(lambda: listening.is_set() or task.done(), timeout_secs=60.0)
+        for message in owner_closes_half(venue):
+            await server.push(message)
+        result = await asyncio.wait_for(task, 60.0)
+    finally:
+        await server.stop()
+    print(vec.format_report(result))
+
+    out, err = capsys.readouterr()
+    logged = "\n".join(line for _, line in result.logger.lines)
+    raw = result.raw.read_text(encoding="utf-8")
+    assert [f.status for f in result.findings] == [vec.OK] * 6
+    assert ">>> " in out and "Now close 0.01 of the position by hand in the terminal" in out
+    for secret in FAKE_SECRETS.values():
+        for text in (out, err, logged, raw):
+            assert secret not in text
     for identifier in (str(ACCOUNT_ID), str(TRADER_LOGIN)):
         assert identifier not in out

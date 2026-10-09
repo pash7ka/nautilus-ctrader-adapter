@@ -31,6 +31,16 @@ it reaches the socket. The position stays open with its stop-loss: the owner clo
 
     uv run python scripts/verify_external_commands.py --symbol EURUSD --send-commands
 
+With `--watch-partial-close` instead, the script changes nothing at the broker: its guard lets
+through only reads and authentication. The owner places one position of at least twice the
+minimum volume with a stop-loss and a take-profit, and nothing else on the symbol. The script
+finds it as the commands do, checks that Nautilus holds its two legs, then asks the owner to
+close half of it by hand in the terminal and listens for up to `--close-wait-secs`. It reports
+how the broker told of the close and of the protective order's smaller volume, and whether the
+legs in Nautilus followed. The rest of the position stays open: the owner closes it by hand.
+
+    uv run python scripts/verify_external_commands.py --symbol EURUSD --watch-partial-close
+
 The report has one `OK` / `DIFFERS` / `UNKNOWN` line per step and per open protocol question,
 with the broker's answer. Every message the broker sent is kept, unscrubbed, in a raw recording
 under `--log-dir` (by default `tests/recordings/`, which git ignores);
@@ -92,7 +102,7 @@ from nautilus_ctrader.common.errors import (
 from nautilus_ctrader.common.order_record import parse_label
 from nautilus_ctrader.common.order_translation import Unsupported, volume_from_quantity
 from nautilus_ctrader.common.session import CTraderSession
-from nautilus_ctrader.common.venue_book import entry_of
+from nautilus_ctrader.common.venue_book import entry_of, remaining_of
 from nautilus_ctrader.common.venue_records import Level, parse_leg_venue_order_id, units_of
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
@@ -265,11 +275,15 @@ class Recorder:
 class Guard:
     """The one place every request of the session passes; it refuses all but what is allowed.
 
-    Before `targets` is set, no command passes at all.
+    Before `targets` is set, no command passes at all; a guard given only `READ_REQUESTS` never
+    lets one pass.
     """
 
-    def __init__(self, recorder: Recorder) -> None:
+    def __init__(
+        self, recorder: Recorder, allowed: frozenset[type[Message]] = ALLOWED_REQUESTS
+    ) -> None:
         self.recorder = recorder
+        self.allowed = allowed
         self.targets: Targets | None = None
         self.exchanges: list[Exchange] = []
         self.refused: list[str] = []
@@ -282,8 +296,8 @@ class Guard:
 
     def _refusal(self, payload: Message) -> str | None:
         name = type(payload).__name__
-        if type(payload) not in ALLOWED_REQUESTS:
-            return f"{name} is not a request this script may send"
+        if type(payload) not in self.allowed:
+            return f"{name} is not a request this run may send"
         if type(payload) in READ_REQUESTS:
             return None
         targets = self.targets
@@ -492,28 +506,66 @@ def choose(
         if order.tradeData.volume != min_volume:
             volume = units_of(order.tradeData.volume)
             reasons.append(f"the pending order's volume is {volume}, not the minimum {minimum}")
-    if len(positions) != 1:
-        reasons.append(f"{len(positions)} positions on the symbol, not exactly one")
-    else:
-        position = positions[0]
-        if not position.HasField("stopLoss"):
-            reasons.append("the position has no stop-loss")
-        if not position.HasField("takeProfit"):
-            reasons.append("the position has no take-profit")
-        if position.tradeData.volume != min_volume:
-            volume = units_of(position.tradeData.volume)
-            reasons.append(f"the position's volume is {volume}, not the minimum {minimum}")
+    reasons += _protected_position_reasons(positions)
+    if len(positions) == 1 and positions[0].tradeData.volume != min_volume:
+        volume = units_of(positions[0].tradeData.volume)
+        reasons.append(f"the position's volume is {volume}, not the minimum {minimum}")
     if reasons:
         return Refusal(tuple(reasons))
     return Choice(pending[0], positions[0])
 
 
-def confirm(
-    choice: Choice,
+def _protected_position_reasons(positions: Sequence[om.ProtoOAPosition]) -> list[str]:
+    """Why `positions` is not exactly one position with both levels."""
+    if len(positions) != 1:
+        return [f"{len(positions)} positions on the symbol, not exactly one"]
+    reasons = []
+    if not positions[0].HasField("stopLoss"):
+        reasons.append("the position has no stop-loss")
+    if not positions[0].HasField("takeProfit"):
+        reasons.append("the position has no take-profit")
+    return reasons
+
+
+def choose_watched(
+    snapshot: oa.ProtoOAReconcileRes, *, symbol_id: int, min_volume: int
+) -> om.ProtoOAPosition | Refusal:
+    """The owner's position on the symbol to watch, from the broker's snapshot.
+
+    It must be at least twice the minimum, so that half of it can be closed, and alone on the
+    symbol: no pending order may fill while the close is watched.
+    """
+    pending = [
+        order
+        for order in snapshot.order
+        if order.tradeData.symbolId == symbol_id and order.orderType in PENDING_ORDER_TYPES
+    ]
+    positions = [p for p in snapshot.position if p.tradeData.symbolId == symbol_id]
+    reasons: list[str] = []
+    if pending:
+        reasons.append(f"{len(pending)} pending orders on the symbol, not none")
+    reasons += _protected_position_reasons(positions)
+    if len(positions) == 1 and positions[0].tradeData.volume < 2 * min_volume:
+        volume, least = units_of(positions[0].tradeData.volume), units_of(2 * min_volume)
+        reasons.append(f"the position's volume is {volume}, under twice the minimum, {least}")
+    if reasons:
+        return Refusal(tuple(reasons))
+    return positions[0]
+
+
+def _open_by_venue_id(nautilus_orders: Iterable[Order]) -> dict[str, Order]:
+    return {
+        order.venue_order_id.value: order
+        for order in nautilus_orders
+        if order.venue_order_id is not None and order.is_open
+    }
+
+
+def _owner_legs(
     position_orders: Sequence[om.ProtoOAOrder],
-    nautilus_orders: Iterable[Order],
-) -> Found | Refusal:
-    """`choice` as Nautilus holds it: the pending order, and the position's two open legs.
+    open_orders: dict[str, Order],
+) -> tuple[om.ProtoOAOrder | None, dict[Level, list[Order]], list[str]]:
+    """The position's entry, its open legs in Nautilus, and why they are not the owner's two.
 
     `position_orders` are the broker's orders of the position; its entry tells whether the node
     opened it.
@@ -524,23 +576,29 @@ def confirm(
         reasons.append("the position's order list names no entry, so it has no legs")
     elif parse_label(entry.tradeData.label) is not None:
         reasons.append("the position was opened by the node: its entry carries its label")
-    open_orders = {
-        order.venue_order_id.value: order
-        for order in nautilus_orders
-        if order.venue_order_id is not None and order.is_open
-    }
-    pending = open_orders.get(str(choice.pending.orderId))
-    if pending is None:
-        reasons.append("Nautilus holds no open order for the pending order")
     legs: dict[Level, list[Order]] = {Level.STOP_LOSS: [], Level.TAKE_PROFIT: []}
     if entry is not None:
         for venue_order_id, order in open_orders.items():
             parsed = parse_leg_venue_order_id(venue_order_id)
             if parsed is not None and parsed[0] == entry.orderId:
                 legs[parsed[1]].append(order)
-    for level, name in ((Level.STOP_LOSS, "stop-loss"), (Level.TAKE_PROFIT, "take-profit")):
-        if entry is not None and len(legs[level]) != 1:
-            reasons.append(f"Nautilus holds {len(legs[level])} open {name} legs, not one")
+        for level, name in ((Level.STOP_LOSS, "stop-loss"), (Level.TAKE_PROFIT, "take-profit")):
+            if len(legs[level]) != 1:
+                reasons.append(f"Nautilus holds {len(legs[level])} open {name} legs, not one")
+    return entry, legs, reasons
+
+
+def confirm(
+    choice: Choice,
+    position_orders: Sequence[om.ProtoOAOrder],
+    nautilus_orders: Iterable[Order],
+) -> Found | Refusal:
+    """`choice` as Nautilus holds it: the pending order, and the position's two open legs."""
+    open_orders = _open_by_venue_id(nautilus_orders)
+    entry, legs, reasons = _owner_legs(position_orders, open_orders)
+    pending = open_orders.get(str(choice.pending.orderId))
+    if pending is None:
+        reasons.append("Nautilus holds no open order for the pending order")
     if reasons:
         return Refusal(tuple(reasons))
     return Found(
@@ -548,6 +606,33 @@ def confirm(
         position=choice.position,
         entry_id=entry.orderId,
         pending_order=pending.client_order_id,
+        stop_loss=legs[Level.STOP_LOSS][0].client_order_id,
+        take_profit=legs[Level.TAKE_PROFIT][0].client_order_id,
+    )
+
+
+@dataclass(frozen=True)
+class Watched:
+    position: om.ProtoOAPosition
+    # The protective order the broker listed at the start, if it listed one.
+    protective: om.ProtoOAOrder | None
+    stop_loss: ClientOrderId
+    take_profit: ClientOrderId
+
+
+def confirm_watched(
+    position: om.ProtoOAPosition,
+    protective: om.ProtoOAOrder | None,
+    position_orders: Sequence[om.ProtoOAOrder],
+    nautilus_orders: Iterable[Order],
+) -> Watched | Refusal:
+    """The position to watch as Nautilus holds it: its two open legs."""
+    _, legs, reasons = _owner_legs(position_orders, _open_by_venue_id(nautilus_orders))
+    if reasons:
+        return Refusal(tuple(reasons))
+    return Watched(
+        position=position,
+        protective=protective,
         stop_loss=legs[Level.STOP_LOSS][0].client_order_id,
         take_profit=legs[Level.TAKE_PROFIT][0].client_order_id,
     )
@@ -907,28 +992,379 @@ def left_open(
             f"The broker could not be read at the end: check {symbol} in the terminal, close "
             "the position by hand and cancel the pending order if it is still there.",
         )
-    lines = []
-    for position in snapshot.position:
-        if position.positionId != position_id:
-            continue
-        if not position.HasField("stopLoss"):
-            lines.append(
-                f"The position on {symbol} stays open WITHOUT a stop-loss: close it by hand now.",
-            )
-            continue
-        trailing = ", trailing" if position.trailingStopLoss else ""
-        target = (
-            f", take-profit at {position.takeProfit}" if position.HasField("takeProfit") else ""
-        )
-        lines.append(
-            f"The position on {symbol} stays open with its stop-loss at {position.stopLoss}"
-            f"{trailing}{target}. Close it by hand in the terminal.",
-        )
+    lines = [
+        _still_open(position, symbol)
+        for position in snapshot.position
+        if position.positionId == position_id
+    ]
     if any(order.orderId == pending_order_id for order in snapshot.order):
         lines.append(f"The pending order on {symbol} is still open: cancel it by hand.")
     if not lines:
         lines.append(f"Nothing of the two is left open on {symbol}.")
     return tuple(lines)
+
+
+def _still_open(position: om.ProtoOAPosition, symbol: str, *, volume: bool = False) -> str:
+    """The line telling the owner to close `position` by hand; with its volume if `volume`."""
+    size = f" at {units_of(position.tradeData.volume)}" if volume else ""
+    if not position.HasField("stopLoss"):
+        return (
+            f"The position on {symbol} stays open{size} WITHOUT a stop-loss: close it by hand now."
+        )
+    trailing = ", trailing" if position.trailingStopLoss else ""
+    target = f", take-profit at {position.takeProfit}" if position.HasField("takeProfit") else ""
+    return (
+        f"The position on {symbol} stays open{size} with its stop-loss at {position.stopLoss}"
+        f"{trailing}{target}. Close it by hand in the terminal."
+    )
+
+
+def left_open_watched(
+    snapshot: oa.ProtoOAReconcileRes | None, *, symbol: str, position_id: int
+) -> tuple[str, ...]:
+    """What is left of the watched position, as a line telling what to do."""
+    if snapshot is None:
+        return (
+            f"The broker could not be read at the end: check {symbol} in the terminal and close "
+            "the position by hand.",
+        )
+    position = _position(snapshot, position_id)
+    if position is None:
+        return (f"The position on {symbol} is closed; nothing is left open.",)
+    return (_still_open(position, symbol, volume=True),)
+
+
+# -- Watching a partial close --------------------------------------------------------------
+#
+# What the watch observed, picked out of the broker's pushed messages, and the verdicts on it;
+# no I/O, as above.
+
+_FILL_TYPES = (om.ORDER_FILLED, om.ORDER_PARTIAL_FILL)
+
+# Where in the adapter each watch finding's answer is used.
+SETTLES_DEAL = (
+    "venue_book.py `_sync` TODO(verify): whether a fill always carries the position; and when "
+    "the protective order's smaller volume comes relative to the closing deal"
+)
+SETTLES_ARRIVAL = (
+    "venue_book.py `_foreign_fill`: whether, and when, the protective order's smaller volume "
+    "arrives after a partial close; `_protective` TODO(verify): whether the broker replaces the "
+    "protective order's id"
+)
+SETTLES_REMAINING = (
+    "venue_book.py `remaining_of` TODO(verify), and its twin in reconciliation.py: whether a "
+    "protective order's volume is its total or its rest, for a protective order reduced by a "
+    "close (a partial trigger is still unrecorded)"
+)
+SETTLES_LEGS = (
+    "the same question as the arrival, end to end: the legs follow the protective order's "
+    "volume with no overfill"
+)
+SETTLES_POSITION = (
+    "venue_book.py `_sync` TODO(verify): the event's position against the broker's own list"
+)
+
+
+def half_of(volume: int, step: int) -> int:
+    """Half of a venue volume, rounded down to a whole number of volume steps."""
+    return volume // 2 // step * step
+
+
+def _executions(inbound: Sequence[Inbound], since: float) -> list[Inbound]:
+    return [
+        i
+        for i in inbound
+        if i.pushed and i.t >= since and isinstance(i.message, oa.ProtoOAExecutionEvent)
+    ]
+
+
+def _is_closing_deal(event: oa.ProtoOAExecutionEvent, position_id: int) -> bool:
+    """A deal on the position by an order other than its protective one: a level did not fill."""
+    return (
+        event.HasField("deal")
+        and event.deal.positionId == position_id
+        and event.order.orderType != om.STOP_LOSS_TAKE_PROFIT
+    )
+
+
+def _is_reduction(event: oa.ProtoOAExecutionEvent, position_id: int, start_volume: int) -> bool:
+    order = event.order
+    return (
+        event.executionType not in _FILL_TYPES
+        and order.orderType == om.STOP_LOSS_TAKE_PROFIT
+        and order.positionId == position_id
+        and order.tradeData.volume < start_volume
+    )
+
+
+def _is_smaller(event: oa.ProtoOAExecutionEvent, position_id: int, start_volume: int) -> bool:
+    position = event.position
+    return (
+        event.HasField("position")
+        and position.positionId == position_id
+        and (
+            position.tradeData.volume < start_volume
+            or position.positionStatus == om.POSITION_STATUS_CLOSED
+        )
+    )
+
+
+def closing_deal(inbound: Sequence[Inbound], *, position_id: int, since: float) -> Inbound | None:
+    """The first execution event since `since` carrying a closing deal of the position."""
+    return next(
+        (i for i in _executions(inbound, since) if _is_closing_deal(i.message, position_id)),
+        None,
+    )
+
+
+def reduced_protective(
+    inbound: Sequence[Inbound], *, position_id: int, start_volume: int, since: float
+) -> Inbound | None:
+    """The first execution event since `since` of the protective order with a smaller volume."""
+    return next(
+        (
+            i
+            for i in _executions(inbound, since)
+            if _is_reduction(i.message, position_id, start_volume)
+        ),
+        None,
+    )
+
+
+def first_drop(
+    inbound: Sequence[Inbound], *, position_id: int, start_volume: int, since: float
+) -> Inbound | None:
+    """The first message since `since` telling that the position became smaller."""
+    for i in _executions(inbound, since):
+        event = i.message
+        if (
+            _is_closing_deal(event, position_id)
+            or _is_reduction(event, position_id, start_volume)
+            or _is_smaller(event, position_id, start_volume)
+        ):
+            return i
+    return None
+
+
+def last_position_volume(
+    inbound: Sequence[Inbound], *, position_id: int, since: float
+) -> int | None:
+    """The position's volume in the last execution event since `since` that carried it."""
+    volume = None
+    for i in _executions(inbound, since):
+        if i.message.HasField("position") and i.message.position.positionId == position_id:
+            volume = i.message.position.tradeData.volume
+    return volume
+
+
+def _event_text(event: oa.ProtoOAExecutionEvent) -> str:
+    order = event.order
+    kind = om.ProtoOAExecutionType.Name(event.executionType)
+    closing = " closing" if order.closingOrder else ""
+    return (
+        f"{kind} of a{closing} {om.ProtoOAOrderType.Name(order.orderType)} order, "
+        f"isServerEvent={event.isServerEvent}"
+    )
+
+
+def _nothing_closed(wait_secs: float) -> str:
+    return f"the position's volume did not drop within {wait_secs:g} s"
+
+
+def decide_closing_deal(
+    deal: Inbound | None, *, start_volume: int, remaining: int | None, wait_secs: float
+) -> Decision:
+    """Whether the close arrived as an execution event carrying its deal, of the volume closed."""
+    if deal is None:
+        if remaining is not None and remaining < start_volume:
+            return DIFFERS, (
+                f"the broker lists {units_of(remaining)} of {units_of(start_volume)} now, but no "
+                "execution event carried a closing deal",
+            )
+        return UNKNOWN, (_nothing_closed(wait_secs),)
+    event = deal.message
+    lines = [
+        f"t={deal.t:.2f} s: {_event_text(event)}",
+        f"deal volume {units_of(event.deal.volume)}, filled {units_of(event.deal.filledVolume)}",
+        (
+            f"the event carries the position, at {units_of(event.position.tradeData.volume)}"
+            if event.HasField("position")
+            else "the event carries no position"
+        ),
+    ]
+    if remaining is not None and event.deal.filledVolume != start_volume - remaining:
+        lines.append(
+            f"but the position went from {units_of(start_volume)} to {units_of(remaining)}"
+        )
+        return DIFFERS, tuple(lines)
+    return OK, tuple(lines)
+
+
+def decide_reduction_arrives(
+    reduced: Inbound | None,
+    deal: Inbound | None,
+    *,
+    closed: bool,
+    protective_id: int | None,
+    listed: om.ProtoOAOrder | None,
+    settle_secs: float,
+    wait_secs: float,
+) -> Decision:
+    """Whether the protective order's smaller volume arrived as ORDER_REPLACED after the deal.
+
+    `listed` is the protective order as the broker lists it at the end.
+    """
+    if not closed:
+        return UNKNOWN, (_nothing_closed(wait_secs),)
+    if reduced is None:
+        return DIFFERS, (
+            "no execution event of the protective order with a smaller volume within "
+            f"{settle_secs:g} s of the close",
+            (
+                f"the broker now lists it at {units_of(listed.tradeData.volume)}"
+                if listed is not None
+                else "the broker now lists no protective order for the position"
+            ),
+        )
+    event = reduced.message
+    volume = units_of(event.order.tradeData.volume)
+    lines = [f"t={reduced.t:.2f} s: {_event_text(event)}, volume {volume}"]
+    after = deal is not None and reduced.t >= deal.t
+    if deal is None:
+        lines.append("no closing deal arrived to time it against")
+    elif after:
+        lines.append(f"{reduced.t - deal.t:.2f} s after the deal")
+    else:
+        lines.append(f"{deal.t - reduced.t:.2f} s before the deal")
+    if protective_id is None:
+        lines.append("the protective order was not listed at the start")
+    elif event.order.orderId == protective_id:
+        lines.append("the same protective order id as at the start")
+    else:
+        lines.append("a new protective order id")
+    status = OK if after and event.executionType == om.ORDER_REPLACED else DIFFERS
+    return status, tuple(lines)
+
+
+def decide_reduced_total(
+    reduced: Inbound | None, *, start_volume: int, remaining: int | None
+) -> Decision:
+    """Whether the smaller protective order's `tradeData.volume` is what is left of the position."""
+    if reduced is None:
+        return UNKNOWN, ("no protective order with a smaller volume arrived",)
+    if remaining is None:
+        return UNKNOWN, ("the position's remaining volume was not read",)
+    volume = reduced.message.order.tradeData.volume
+    line = f"tradeData.volume {units_of(volume)}; the position holds {units_of(remaining)}"
+    if volume == remaining:
+        return OK, (line, "the reduced total, not the volume closed")
+    if volume == start_volume - remaining:
+        return DIFFERS, (line, "the volume closed, not what is left")
+    return DIFFERS, (line, "neither what is left nor what was closed")
+
+
+def decide_executed_volume(
+    reduced: Inbound | None,
+    listed: om.ProtoOAOrder | None,
+    *,
+    closed: bool,
+    remaining: int | None,
+    wait_secs: float,
+) -> Decision:
+    """Whether `executedVolume` is set on the protective order, and what `remaining_of` reads."""
+    if not closed:
+        return UNKNOWN, (_nothing_closed(wait_secs),)
+    orders = [
+        (where, order)
+        for where, order in (
+            ("in the event", None if reduced is None else reduced.message.order),
+            ("in the broker's list", listed),
+        )
+        if order is not None
+    ]
+    if not orders:
+        return UNKNOWN, ("the protective order was neither pushed smaller nor listed",)
+    if remaining is None:
+        return UNKNOWN, ("the position's remaining volume was not read",)
+    lines = []
+    for where, order in orders:
+        executed = (
+            f"executedVolume {units_of(order.executedVolume)}"
+            if order.HasField("executedVolume")
+            else "executedVolume not set"
+        )
+        lines.append(f"{where}: {executed}; the adapter reads {units_of(remaining_of(order))} left")
+    lines.append(f"the position holds {units_of(remaining)}")
+    agree = all(remaining_of(order) == remaining for _, order in orders)
+    return (OK if agree else DIFFERS), tuple(lines)
+
+
+@dataclass(frozen=True)
+class LegState:
+    """A leg as Nautilus holds it; `quantity` is `None` when Nautilus holds no such order."""
+
+    name: str
+    quantity: Decimal | None
+    is_open: bool
+
+
+def decide_legs_follow(
+    legs: Sequence[LegState],
+    *,
+    closed: bool,
+    remaining: int | None,
+    errors: int,
+    wait_secs: float,
+) -> Decision:
+    """Whether each leg's quantity is the position's remaining volume, with no ERROR logged."""
+    if not closed:
+        return UNKNOWN, (_nothing_closed(wait_secs),)
+    if remaining is None:
+        return UNKNOWN, ("the position's remaining volume was not read",)
+    expected = units_of(remaining)
+    lines = [
+        f"{leg.name}: "
+        + ("not held" if leg.quantity is None else f"quantity {leg.quantity}")
+        + ("" if leg.is_open else ", not open")
+        for leg in legs
+    ]
+    lines.append(f"the position holds {expected}")
+    lines.append(f"{errors} ERROR or overfill lines logged" + (" (see stderr)" if errors else ""))
+    follow = all(leg.is_open and leg.quantity == expected for leg in legs)
+    return (OK if follow and errors == 0 else DIFFERS), tuple(lines)
+
+
+def decide_remaining(
+    *,
+    start_volume: int,
+    half: int,
+    closed: bool,
+    remaining: int | None,
+    last_event: int | None,
+    wait_secs: float,
+) -> Decision:
+    """The position's remaining volume as the broker lists it, against its execution events."""
+    if remaining is None:
+        return UNKNOWN, ("the broker's snapshot was not read at the end",)
+    lines = [
+        f"from {units_of(start_volume)}, {units_of(half)} asked to close",
+        (
+            f"the broker lists {units_of(remaining)}"
+            if remaining
+            else "the broker lists the position no more"
+        ),
+    ]
+    if last_event is not None:
+        lines.append(f"the last execution event carried {units_of(last_event)}")
+    if remaining == start_volume:
+        if closed:
+            return DIFFERS, (*lines, "the broker still lists the whole volume")
+        return UNKNOWN, (_nothing_closed(wait_secs),)
+    if remaining == 0:
+        return DIFFERS, (*lines, "the whole position was closed, not part of it")
+    if last_event is not None and last_event != remaining:
+        return DIFFERS, tuple(lines)
+    return OK, tuple(lines)
 
 
 # -- The run -------------------------------------------------------------------------------
@@ -940,6 +1376,8 @@ class Finding:
     title: str
     status: str
     detail: tuple[str, ...] = ()
+    # The open question in the adapter the finding answers.
+    settles: str = ""
 
 
 @dataclass(frozen=True)
@@ -949,6 +1387,9 @@ class Settings:
     answer_wait_secs: float = 30.0
     # How long to watch for events after each command's answer.
     settle_secs: float = 2.0
+    # How long the watch waits for the owner's partial close, then for what follows it.
+    close_wait_secs: float = 120.0
+    close_settle_secs: float = 10.0
     log_dir: pathlib.Path = _REPO_ROOT / "tests" / "recordings"
 
 
@@ -960,8 +1401,13 @@ class Address:
     tls: bool = True
 
 
+_CHECK_TITLE = "Commands on orders the node did not place (live check)"
+_WATCH_TITLE = "A partial close of the owner's position (live watch)"
+
+
 @dataclass
 class Result:
+    title: str = _CHECK_TITLE
     findings: list[Finding] = field(default_factory=list)
     refusal: tuple[str, ...] = ()
     left_open: tuple[str, ...] = ()
@@ -976,8 +1422,8 @@ def _say(text: str) -> None:
     print(f">>> {text}")
 
 
-class Check:
-    """The steps, carried out through the engine as a strategy would send them."""
+class _Run:
+    """What both modes share: the clients, the guard, and the reads made through it."""
 
     def __init__(
         self,
@@ -1004,6 +1450,62 @@ class Check:
         self._guard = guard
         self._recorder = guard.recorder
         self._status = status
+
+    def _min_quantity(self) -> Quantity:
+        minimum = self._instrument.min_quantity
+        return self._instrument.size_increment if minimum is None else minimum
+
+    def _blocked(self) -> str | None:
+        """Why no further command may be sent, if one may not."""
+        if self._guard.refused:
+            return "the guard refused a request; no further command is sent"
+        session = self._account.session
+        if session is None or not self._guard.covers(session._connection):
+            reason = "the session's connection no longer sends through the guard"
+            self._guard.refused.append(reason)
+            return reason
+        return None
+
+    async def _ask(self, payload: Message) -> Exchange:
+        """Send `payload` through the guard; its exchange, however the broker answered."""
+        failed = None
+        try:
+            await self._account.request(payload, timeout_secs=self._settings.answer_wait_secs)
+        except CTraderError as e:
+            # The exchange keeps the answer or the error; the guard's refusal still raises.
+            failed = type(e).__name__
+        for exchange in reversed(self._guard.exchanges):
+            if exchange.request is payload:
+                return exchange
+        # Failed before the guard saw it, as when the session is reconnecting.
+        return Exchange(payload, self._recorder.now(), failed=failed or "no request sent")
+
+    async def _snapshot(self) -> oa.ProtoOAReconcileRes | None:
+        exchange = await self._ask(
+            oa.ProtoOAReconcileReq(
+                ctidTraderAccountId=self._account.account_id,
+                returnProtectionOrders=True,
+            ),
+        )
+        answer = exchange.answer
+        return answer if isinstance(answer, oa.ProtoOAReconcileRes) else None
+
+    async def _position_orders(self, position_id: int) -> oa.ProtoOAOrderListByPositionIdRes | None:
+        listed = await self._ask(
+            oa.ProtoOAOrderListByPositionIdReq(
+                ctidTraderAccountId=self._account.account_id,
+                positionId=position_id,
+            ),
+        )
+        answer = listed.answer
+        return answer if isinstance(answer, oa.ProtoOAOrderListByPositionIdRes) else None
+
+
+class Check(_Run):
+    """The steps, carried out through the engine as a strategy would send them."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
         # Each accepted command's label and exchange, to look at the events after its answer.
         self._accepted: list[tuple[str, Exchange]] = []
 
@@ -1044,24 +1546,19 @@ class Check:
         if isinstance(choice, Refusal):
             result.refusal = choice.reasons
             return None
-        listed = await self._ask(
-            oa.ProtoOAOrderListByPositionIdReq(
-                ctidTraderAccountId=self._account.account_id,
-                positionId=choice.position.positionId,
-            ),
-        )
-        if not isinstance(listed.answer, oa.ProtoOAOrderListByPositionIdRes):
+        listed = await self._position_orders(choice.position.positionId)
+        if listed is None:
             result.refusal = ("the position's order list could not be read",)
             return None
         found = confirm(
             choice,
-            listed.answer.order,
+            listed.order,
             self._cache.orders(instrument_id=self._instrument.id),
         )
         if isinstance(found, Refusal):
             result.refusal = found.reasons
             return None
-        known = [o.orderId for o in (*snapshot.order, *listed.answer.order)]
+        known = [o.orderId for o in (*snapshot.order, *listed.order)]
         self._guard.targets = Targets(
             pending_order_id=found.pending.orderId,
             position_id=found.position.positionId,
@@ -1074,10 +1571,6 @@ class Check:
             start_take_profit=found.position.takeProfit,
         )
         return found
-
-    def _min_quantity(self) -> Quantity:
-        minimum = self._instrument.min_quantity
-        return self._instrument.size_increment if minimum is None else minimum
 
     def _raised_quantity(self) -> Quantity:
         step = self._instrument.size_increment.as_decimal()
@@ -1382,42 +1875,189 @@ class Check:
             self._accepted.append((label, exchange))
         return outcome, exchange
 
-    def _blocked(self) -> str | None:
-        """Why no further command may be sent, if one may not."""
-        if self._guard.refused:
-            return "the guard refused a request; no further command is sent"
-        session = self._account.session
-        if session is None or not self._guard.covers(session._connection):
-            reason = "the session's connection no longer sends through the guard"
-            self._guard.refused.append(reason)
-            return reason
-        return None
 
-    # -- reads --
+class Watch(_Run):
+    """The watch of a partial close the owner makes by hand. Its guard lets no command pass."""
 
-    async def _ask(self, payload: Message) -> Exchange:
-        """Send `payload` through the guard; its exchange, however the broker answered."""
-        failed = None
+    async def run(self, result: Result, listening: asyncio.Event | None) -> None:
+        """Find the position, watch its close, then say what is left open, however it ends."""
+        watched = await self._find(result)
+        if watched is None:
+            return
+        symbol, position_id = self._settings.symbol, watched.position.positionId
+        # What a break-off says, until the broker is read at the end.
+        result.left_open = left_open_watched(None, symbol=symbol, position_id=position_id)
         try:
-            await self._account.request(payload, timeout_secs=self._settings.answer_wait_secs)
-        except CTraderError as e:
-            # The exchange keeps the answer or the error; the guard's refusal still raises.
-            failed = type(e).__name__
-        for exchange in reversed(self._guard.exchanges):
-            if exchange.request is payload:
-                return exchange
-        # Failed before the guard saw it, as when the session is reconnecting.
-        return Exchange(payload, self._recorder.now(), failed=failed or "no request sent")
+            await self._watch(watched, listening, result)
+        except Exception as e:
+            result.failure = type(e).__name__
+        final = None
+        with contextlib.suppress(Exception):
+            final = await self._snapshot()
+        result.left_open = left_open_watched(final, symbol=symbol, position_id=position_id)
 
-    async def _snapshot(self) -> oa.ProtoOAReconcileRes | None:
-        exchange = await self._ask(
-            oa.ProtoOAReconcileReq(
-                ctidTraderAccountId=self._account.account_id,
-                returnProtectionOrders=True,
-            ),
+    async def _find(self, result: Result) -> Watched | None:
+        snapshot = await self._snapshot()
+        if snapshot is None:
+            result.refusal = ("the broker's snapshot could not be read",)
+            return None
+        try:
+            min_volume = volume_from_quantity(self._min_quantity())
+        except Unsupported as e:
+            result.refusal = (f"the instrument's minimum volume: {e}",)
+            return None
+        position = choose_watched(snapshot, symbol_id=self._symbol_id, min_volume=min_volume)
+        if isinstance(position, Refusal):
+            result.refusal = position.reasons
+            return None
+        listed = await self._position_orders(position.positionId)
+        if listed is None:
+            result.refusal = ("the position's order list could not be read",)
+            return None
+        watched = confirm_watched(
+            position,
+            _protective(snapshot, position.positionId),
+            listed.order,
+            self._cache.orders(instrument_id=self._instrument.id),
         )
-        answer = exchange.answer
-        return answer if isinstance(answer, oa.ProtoOAReconcileRes) else None
+        if isinstance(watched, Refusal):
+            result.refusal = watched.reasons
+            return None
+        return watched
+
+    async def _watch(
+        self, watched: Watched, listening: asyncio.Event | None, result: Result
+    ) -> None:
+        settings = self._settings
+        position_id = watched.position.positionId
+        start_volume = watched.position.tradeData.volume
+        half = half_of(start_volume, volume_from_quantity(self._instrument.size_increment))
+        logged_from = len(result.logger.lines) if result.logger is not None else 0
+        self._status(
+            f"Found the position and its two legs. Now close {units_of(half)} of the position "
+            f"by hand in the terminal. Listening up to {settings.close_wait_secs:g} s.",
+        )
+        start = self._recorder.now()
+        if listening is not None:
+            listening.set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + settings.close_wait_secs
+        seen = None
+        while seen is None and loop.time() < deadline and self._blocked() is None:
+            await asyncio.sleep(_POLL_SECS)
+            seen = first_drop(
+                self._recorder.inbound,
+                position_id=position_id,
+                start_volume=start_volume,
+                since=start,
+            )
+        if seen is not None:
+            self._status(
+                f"The position became smaller. Listening {settings.close_settle_secs:g} s more.",
+            )
+            await asyncio.sleep(settings.close_settle_secs)
+
+        after = await self._snapshot()
+        inbound = self._recorder.inbound
+        deal = closing_deal(inbound, position_id=position_id, since=start)
+        reduced = reduced_protective(
+            inbound, position_id=position_id, start_volume=start_volume, since=start
+        )
+        remaining = None
+        if after is not None:
+            position = _position(after, position_id)
+            remaining = 0 if position is None else position.tradeData.volume
+        closed = seen is not None or (remaining is not None and remaining < start_volume)
+        listed = _protective(after, position_id)
+        legs = [
+            _leg_state(name, self._cache.order(client_order_id))
+            for name, client_order_id in (
+                ("stop-loss leg", watched.stop_loss),
+                ("take-profit leg", watched.take_profit),
+            )
+        ]
+        logged = result.logger.lines[logged_from:] if result.logger is not None else []
+        errors = sum(level == "error" or "overfill" in line.lower() for level, line in logged)
+        wait = settings.close_wait_secs
+        protective_id = None if watched.protective is None else watched.protective.orderId
+        decisions: list[tuple[str, str, Decision]] = [
+            (
+                "The close arrives as an execution event carrying its deal",
+                SETTLES_DEAL,
+                decide_closing_deal(
+                    deal, start_volume=start_volume, remaining=remaining, wait_secs=wait
+                ),
+            ),
+            (
+                "The protective order's smaller volume arrives as ORDER_REPLACED after the deal",
+                SETTLES_ARRIVAL,
+                decide_reduction_arrives(
+                    reduced,
+                    deal,
+                    closed=closed,
+                    protective_id=protective_id,
+                    listed=listed,
+                    settle_secs=settings.close_settle_secs,
+                    wait_secs=wait,
+                ),
+            ),
+            (
+                "The smaller protective order's tradeData.volume is the reduced total",
+                SETTLES_REMAINING,
+                decide_reduced_total(reduced, start_volume=start_volume, remaining=remaining),
+            ),
+            (
+                "executedVolume on the protective order, as remaining_of reads it",
+                SETTLES_REMAINING,
+                decide_executed_volume(
+                    reduced, listed, closed=closed, remaining=remaining, wait_secs=wait
+                ),
+            ),
+            (
+                "The legs in Nautilus hold the position's remaining volume, with no ERROR",
+                SETTLES_LEGS,
+                decide_legs_follow(
+                    legs, closed=closed, remaining=remaining, errors=errors, wait_secs=wait
+                ),
+            ),
+            (
+                "The position's remaining volume as the broker lists it",
+                SETTLES_POSITION,
+                decide_remaining(
+                    start_volume=start_volume,
+                    half=half,
+                    closed=closed,
+                    remaining=remaining,
+                    last_event=last_position_volume(inbound, position_id=position_id, since=start),
+                    wait_secs=wait,
+                ),
+            ),
+        ]
+        result.findings += [
+            Finding(item, title, status, detail, settles)
+            for item, (title, settles, (status, detail)) in enumerate(decisions, start=1)
+        ]
+
+
+def _leg_state(name: str, order: Order | None) -> LegState:
+    if order is None:
+        return LegState(name, None, is_open=False)
+    return LegState(name, order.quantity.as_decimal(), is_open=order.is_open)
+
+
+def _protective(
+    snapshot: oa.ProtoOAReconcileRes | None, position_id: int
+) -> om.ProtoOAOrder | None:
+    if snapshot is None:
+        return None
+    return next(
+        (
+            o
+            for o in snapshot.order
+            if o.positionId == position_id and o.orderType == om.STOP_LOSS_TAKE_PROFIT
+        ),
+        None,
+    )
 
 
 def _order(snapshot: oa.ProtoOAReconcileRes | None, order_id: int) -> om.ProtoOAOrder | None:
@@ -1453,17 +2093,20 @@ async def run_check(
     address: Address | None = None,
     status: Callable[[str], None] = _say,
     listening: asyncio.Event | None = None,
+    watch: bool = False,
 ) -> Result:
     """Connect, find the owner's orders, carry out the steps and keep the broker's messages.
 
-    The raw recording is written to `settings.log_dir` however the run ends, if it holds any
-    message. `listening` is set when the run starts listening for trailing moves.
+    With `watch`, watch the owner's partial close instead, behind a guard that lets no command
+    pass. The raw recording is written to `settings.log_dir` however the run ends, if it holds
+    any message. `listening` is set when the run starts listening: for trailing moves, or for
+    the close.
     """
     address = address or Address()
     recorder = Recorder(record_execution.Recording(int(time.time() * 1000)))
-    guard = Guard(recorder)
+    guard = Guard(recorder, READ_REQUESTS if watch else ALLOWED_REQUESTS)
     logger = ScriptLogger()
-    result = Result(guard=guard, logger=logger)
+    result = Result(title=_WATCH_TITLE if watch else _CHECK_TITLE, guard=guard, logger=logger)
     instrument_id = first_orders.instrument_id_of(settings.symbol)
     account = GuardedAccount(
         guard=guard,
@@ -1523,6 +2166,7 @@ async def run_check(
             cache=cache,
             clock=clock,
             instrument_id=instrument_id,
+            run_type=Watch if watch else Check,
         )
     except Exception as e:
         result.failure = type(e).__name__
@@ -1539,7 +2183,8 @@ async def run_check(
         finally:
             if engine.is_running:
                 engine.stop()
-            result.raw = _write_raw(recorder, settings.log_dir, account, trader_login)
+            name = "watch_partial_close" if watch else "verify_external_commands"
+            result.raw = _write_raw(recorder, settings.log_dir, account, trader_login, name)
             if result.raw is not None:
                 status(f"The broker's messages are kept in {result.raw}")
     return result
@@ -1557,8 +2202,9 @@ async def _connect_and_check(
     cache: Cache,
     clock: LiveClock,
     instrument_id: InstrumentId,
+    run_type: type[Check | Watch],
 ) -> None:
-    """Connect, let Nautilus reconcile the account, then run the check."""
+    """Connect, let Nautilus reconcile the account, then run the check or the watch."""
     provider = account.instrument_provider
     guard = result.guard
     status("Connecting and reconciling the account.")
@@ -1573,7 +2219,7 @@ async def _connect_and_check(
     if mass_status is not None:
         engine.reconcile_execution_mass_status(mass_status)
     await asyncio.sleep(settings.settle_secs)
-    check = Check(
+    check = run_type(
         settings=settings,
         account=account,
         client=client,
@@ -1593,6 +2239,7 @@ def _write_raw(
     log_dir: pathlib.Path,
     account: CTraderAccountClient,
     trader_login: int,
+    name: str,
 ) -> pathlib.Path | None:
     recording = recorder.recording
     if not any(True for _ in recording.messages()):
@@ -1602,7 +2249,7 @@ def _write_raw(
     except Exception:
         return None
     stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
-    path = log_dir / f"verify_external_commands-{stamp}.raw.json"
+    path = log_dir / f"{name}-{stamp}.raw.json"
     log_dir.mkdir(parents=True, exist_ok=True)
     path.write_bytes(
         record_execution.encode_raw(recording, account_id=account_id, login=trader_login)
@@ -1640,9 +2287,28 @@ def plan(symbol: str) -> str:
     )
 
 
+def watch_plan(symbol: str, close_wait_secs: float) -> str:
+    """What the watch asks of the owner, printed before the owner confirms."""
+    return "\n".join(
+        [
+            f"This run watches a partial close on {symbol}. The script itself changes nothing at "
+            "the broker:",
+            "it sends no order, amend, cancel or close; it only reads and listens.",
+            "Place this by hand in the terminal first, and nothing else on that symbol:",
+            "- one position of at least twice the minimum volume, with a stop-loss and a",
+            "  take-profit.",
+            "The run finds it and checks that Nautilus holds its two levels. Then it asks you to",
+            "close half of the position by hand in the terminal, and listens up to "
+            f"{close_wait_secs:g} s.",
+            "Afterwards the rest of the position STAYS OPEN with its levels: close it by hand in "
+            "the terminal.",
+        ],
+    )
+
+
 def format_report(result: Result) -> str:
     """The whole report: the findings, and what is left open. Names no identifier."""
-    lines = ["Commands on orders the node did not place (live check)", ""]
+    lines = [result.title, ""]
     if result.failure is not None:
         lines += [f"The run ended early on {result.failure}; below is what it reached.", ""]
     if result.refusal:
@@ -1651,6 +2317,8 @@ def format_report(result: Result) -> str:
     for finding in result.findings:
         lines.append(f"{finding.status:<8} {finding.item}. {finding.title}")
         lines.extend(f"         {line}" for line in finding.detail)
+        if finding.settles:
+            lines.append(f"         settles: {finding.settles}")
     if result.findings:
         counts = Counter(f.status for f in result.findings)
         lines += [
@@ -1686,17 +2354,32 @@ def exit_code(result: Result) -> int:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Cancel and amend the owner's orders on a LIVE account through the adapter.",
+        description=(
+            "Cancel and amend the owner's orders on a LIVE account through the adapter, or "
+            "watch the owner's partial close of a position."
+        ),
     )
     parser.add_argument(
         "--symbol",
         required=True,
         help="the broker's symbol name, as the terminal shows it",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--send-commands",
         action="store_true",
-        help="required: confirms that real orders are to be changed",
+        help="confirms that real orders are to be changed",
+    )
+    mode.add_argument(
+        "--watch-partial-close",
+        action="store_true",
+        help="watch a partial close made by hand; sends no command",
+    )
+    parser.add_argument(
+        "--close-wait-secs",
+        type=first_orders._positive_float,
+        default=120.0,
+        help="how long the watch waits for the partial close (default: 120)",
     )
     parser.add_argument(
         "--trailing-wait-secs",
@@ -1755,13 +2438,15 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 2
     # A presence check rather than `required=True`, so the refusal can say what it is for.
-    if not args.send_commands:
+    if not (args.send_commands or args.watch_partial_close):
         print(
-            "Refused: this script changes real orders. Add --send-commands to run it.",
+            "Refused: this script changes real orders. Add --send-commands to run it, or "
+            "--watch-partial-close to watch a partial close made by hand.",
             file=sys.stderr,
         )
         return 2
-    print(plan(args.symbol))
+    watch = args.watch_partial_close
+    print(watch_plan(args.symbol, args.close_wait_secs) if watch else plan(args.symbol))
     try:
         typed = input(f"Type {args.symbol} again to go on: ")
     except EOFError:
@@ -1789,12 +2474,16 @@ def main(argv: list[str] | None = None) -> int:
         symbol=args.symbol,
         trailing_wait_secs=args.trailing_wait_secs,
         answer_wait_secs=args.answer_wait_secs,
+        close_wait_secs=args.close_wait_secs,
         log_dir=args.log_dir,
     )
     try:
-        result = asyncio.run(run_check(settings, credentials, trader_login))
+        result = asyncio.run(run_check(settings, credentials, trader_login, watch=watch))
     except KeyboardInterrupt:
-        unread = left_open(None, symbol=args.symbol, pending_order_id=0, position_id=0)
+        if watch:
+            unread = left_open_watched(None, symbol=args.symbol, position_id=0)
+        else:
+            unread = left_open(None, symbol=args.symbol, pending_order_id=0, position_id=0)
         print(f"Stopped by hand. {unread[0]}")
         return 130
     except Exception as e:
