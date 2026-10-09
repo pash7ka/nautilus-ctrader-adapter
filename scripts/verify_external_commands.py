@@ -32,10 +32,11 @@ it reaches the socket. The position stays open with its stop-loss: the owner clo
     uv run python scripts/verify_external_commands.py --symbol EURUSD --send-commands
 
 With `--watch-partial-close` instead, the script changes nothing at the broker: its guard lets
-through only reads and authentication. The owner places one position of at least twice the
+through only reads and authentication. The owner places one position of at least three times the
 minimum volume with a stop-loss and a take-profit, and nothing else on the symbol. The script
 finds it as the commands do, checks that Nautilus holds its two legs, then asks the owner to
-close half of it by hand in the terminal and listens for up to `--close-wait-secs`. It reports
+close the minimum volume of it by hand in the terminal and listens for up to
+`--close-wait-secs`. It reports
 how the broker told of the close and of the protective order's smaller volume, and whether the
 legs in Nautilus followed. The rest of the position stays open: the owner closes it by hand.
 
@@ -84,7 +85,7 @@ from nautilus_trader.model.events import (
     OrderPendingUpdate,
     OrderUpdated,
 )
-from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, TraderId
+from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, PositionId, TraderId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders import Order
@@ -275,13 +276,11 @@ class Recorder:
 class Guard:
     """The one place every request of the session passes; it refuses all but what is allowed.
 
-    Before `targets` is set, no command passes at all; a guard given only `READ_REQUESTS` never
-    lets one pass.
+    `allowed` is the set of request classes it may let through. Before `targets` is set, no
+    command passes at all; a guard given only `READ_REQUESTS` never lets one pass.
     """
 
-    def __init__(
-        self, recorder: Recorder, allowed: frozenset[type[Message]] = ALLOWED_REQUESTS
-    ) -> None:
+    def __init__(self, recorder: Recorder, allowed: frozenset[type[Message]]) -> None:
         self.recorder = recorder
         self.allowed = allowed
         self.targets: Targets | None = None
@@ -482,16 +481,24 @@ class Found:
     take_profit: ClientOrderId
 
 
-def choose(
-    snapshot: oa.ProtoOAReconcileRes, *, symbol_id: int, min_volume: int
-) -> Choice | Refusal:
-    """The owner's pending order and position on the symbol, from the broker's snapshot."""
-    pending = [
+def _pending_on(snapshot: oa.ProtoOAReconcileRes, symbol_id: int) -> list[om.ProtoOAOrder]:
+    return [
         order
         for order in snapshot.order
         if order.tradeData.symbolId == symbol_id and order.orderType in PENDING_ORDER_TYPES
     ]
-    positions = [p for p in snapshot.position if p.tradeData.symbolId == symbol_id]
+
+
+def _positions_on(snapshot: oa.ProtoOAReconcileRes, symbol_id: int) -> list[om.ProtoOAPosition]:
+    return [p for p in snapshot.position if p.tradeData.symbolId == symbol_id]
+
+
+def choose(
+    snapshot: oa.ProtoOAReconcileRes, *, symbol_id: int, min_volume: int
+) -> Choice | Refusal:
+    """The owner's pending order and position on the symbol, from the broker's snapshot."""
+    pending = _pending_on(snapshot, symbol_id)
+    positions = _positions_on(snapshot, symbol_id)
     minimum = units_of(min_volume)
     reasons: list[str] = []
     if len(pending) != 1:
@@ -532,22 +539,18 @@ def choose_watched(
 ) -> om.ProtoOAPosition | Refusal:
     """The owner's position on the symbol to watch, from the broker's snapshot.
 
-    It must be at least twice the minimum, so that half of it can be closed, and alone on the
-    symbol: no pending order may fill while the close is watched.
+    It must be at least three times the minimum, so that closing the minimum leaves more than it
+    takes, and alone on the symbol: no pending order may fill while the close is watched.
     """
-    pending = [
-        order
-        for order in snapshot.order
-        if order.tradeData.symbolId == symbol_id and order.orderType in PENDING_ORDER_TYPES
-    ]
-    positions = [p for p in snapshot.position if p.tradeData.symbolId == symbol_id]
+    pending = _pending_on(snapshot, symbol_id)
+    positions = _positions_on(snapshot, symbol_id)
     reasons: list[str] = []
     if pending:
         reasons.append(f"{len(pending)} pending orders on the symbol, not none")
     reasons += _protected_position_reasons(positions)
-    if len(positions) == 1 and positions[0].tradeData.volume < 2 * min_volume:
-        volume, least = units_of(positions[0].tradeData.volume), units_of(2 * min_volume)
-        reasons.append(f"the position's volume is {volume}, under twice the minimum, {least}")
+    if len(positions) == 1 and positions[0].tradeData.volume < 3 * min_volume:
+        volume, least = units_of(positions[0].tradeData.volume), units_of(3 * min_volume)
+        reasons.append(f"the position's volume is {volume}, under three times the minimum, {least}")
     if reasons:
         return Refusal(tuple(reasons))
     return positions[0]
@@ -1034,18 +1037,36 @@ def left_open_watched(
     return (_still_open(position, symbol, volume=True),)
 
 
+def left_on_symbol(
+    snapshot: oa.ProtoOAReconcileRes | None, *, symbol: str, symbol_id: int
+) -> tuple[str, ...]:
+    """What the owner placed on the symbol, for a run that changed nothing, as lines to act on."""
+    if snapshot is None:
+        return (
+            f"Check {symbol} in the terminal, and close or cancel by hand what you placed there.",
+        )
+    lines = [_still_open(p, symbol, volume=True) for p in _positions_on(snapshot, symbol_id)]
+    lines += [
+        f"A pending order on {symbol} is still open: cancel it by hand."
+        for _ in _pending_on(snapshot, symbol_id)
+    ]
+    return tuple(lines) or (f"Nothing is open on {symbol}.",)
+
+
 # -- Watching a partial close --------------------------------------------------------------
 #
 # What the watch observed, picked out of the broker's pushed messages, and the verdicts on it;
 # no I/O, as above.
 
 _FILL_TYPES = (om.ORDER_FILLED, om.ORDER_PARTIAL_FILL)
+_AUTH_REQUESTS = (oa.ProtoOAApplicationAuthReq, oa.ProtoOAAccountAuthReq)
 
 # Where in the adapter each watch finding's answer is used.
 SETTLES_DEAL = (
-    "venue_book.py `_sync` TODO(verify): whether a fill always carries the position; and when "
-    "the protective order's smaller volume comes relative to the closing deal"
+    "the timing reference for the arrival finding; docs/protocol.md, 'Closing part of a "
+    "position': a hand close is a closing order's fill with its deal"
 )
+SETTLES_CARRIES = "venue_book.py `_sync` TODO(verify): whether a fill always carries the position"
 SETTLES_ARRIVAL = (
     "venue_book.py `_foreign_fill`: whether, and when, the protective order's smaller volume "
     "arrives after a partial close; `_protective` TODO(verify): whether the broker replaces the "
@@ -1057,17 +1078,15 @@ SETTLES_REMAINING = (
     "close (a partial trigger is still unrecorded)"
 )
 SETTLES_LEGS = (
-    "the same question as the arrival, end to end: the legs follow the protective order's "
-    "volume with no overfill"
+    "the arrival question end to end: the legs follow the protective order's volume, and "
+    "Nautilus took every fill (no overfill)"
 )
 SETTLES_POSITION = (
     "venue_book.py `_sync` TODO(verify): the event's position against the broker's own list"
 )
 
-
-def half_of(volume: int, step: int) -> int:
-    """Half of a venue volume, rounded down to a whole number of volume steps."""
-    return volume // 2 // step * step
+_RESTORED = "the connection was restored during the window; events may be missing"
+_TWINS = "the close left as much as it took; the two cannot be told apart"
 
 
 def _executions(inbound: Sequence[Inbound], since: float) -> list[Inbound]:
@@ -1079,11 +1098,20 @@ def _executions(inbound: Sequence[Inbound], since: float) -> list[Inbound]:
 
 
 def _is_closing_deal(event: oa.ProtoOAExecutionEvent, position_id: int) -> bool:
-    """A deal on the position by an order other than its protective one: a level did not fill."""
+    """A deal on the position by a closing order other than its protective one."""
     return (
         event.HasField("deal")
         and event.deal.positionId == position_id
+        and event.order.closingOrder
         and event.order.orderType != om.STOP_LOSS_TAKE_PROFIT
+    )
+
+
+def _is_level_fill(event: oa.ProtoOAExecutionEvent, position_id: int) -> bool:
+    return (
+        event.HasField("deal")
+        and event.deal.positionId == position_id
+        and event.order.orderType == om.STOP_LOSS_TAKE_PROFIT
     )
 
 
@@ -1117,6 +1145,14 @@ def closing_deal(inbound: Sequence[Inbound], *, position_id: int, since: float) 
     )
 
 
+def level_fill(inbound: Sequence[Inbound], *, position_id: int, since: float) -> Inbound | None:
+    """The first execution event since `since` with a fill of the position's protective order."""
+    return next(
+        (i for i in _executions(inbound, since) if _is_level_fill(i.message, position_id)),
+        None,
+    )
+
+
 def reduced_protective(
     inbound: Sequence[Inbound], *, position_id: int, start_volume: int, since: float
 ) -> Inbound | None:
@@ -1139,6 +1175,7 @@ def first_drop(
         event = i.message
         if (
             _is_closing_deal(event, position_id)
+            or _is_level_fill(event, position_id)
             or _is_reduction(event, position_id, start_volume)
             or _is_smaller(event, position_id, start_volume)
         ):
@@ -1157,13 +1194,25 @@ def last_position_volume(
     return volume
 
 
+def restored_since(exchanges: Sequence[Exchange], since: float) -> bool:
+    """Whether the session authenticated again since `since`, as it does on a reconnect."""
+    return any(isinstance(x.request, _AUTH_REQUESTS) and x.sent_at >= since for x in exchanges)
+
+
+def unless_restored(decision: Decision, restored: bool) -> Decision:
+    """`decision`, or UNKNOWN if a reconnect may have lost the events it rests on."""
+    if not restored:
+        return decision
+    return UNKNOWN, (_RESTORED, *decision[1])
+
+
 def _event_text(event: oa.ProtoOAExecutionEvent) -> str:
     order = event.order
     kind = om.ProtoOAExecutionType.Name(event.executionType)
     closing = " closing" if order.closingOrder else ""
     return (
         f"{kind} of a{closing} {om.ProtoOAOrderType.Name(order.orderType)} order, "
-        f"isServerEvent={event.isServerEvent}"
+        f"isServerEvent={event.isServerEvent}, isStopOut={order.isStopOut}"
     )
 
 
@@ -1171,33 +1220,67 @@ def _nothing_closed(wait_secs: float) -> str:
     return f"the position's volume did not drop within {wait_secs:g} s"
 
 
+def _twins(start_volume: int, remaining: int) -> bool:
+    return remaining == start_volume - remaining
+
+
 def decide_closing_deal(
-    deal: Inbound | None, *, start_volume: int, remaining: int | None, wait_secs: float
+    deal: Inbound | None,
+    triggered: Inbound | None,
+    *,
+    closed: bool,
+    start_volume: int,
+    remaining: int | None,
+    wait_secs: float,
 ) -> Decision:
-    """Whether the close arrived as an execution event carrying its deal, of the volume closed."""
+    """Whether the close arrived as an execution event carrying its deal, of the volume closed.
+
+    `triggered` is a fill of the position's protective order seen in the window.
+    """
     if deal is None:
-        if remaining is not None and remaining < start_volume:
-            return DIFFERS, (
-                f"the broker lists {units_of(remaining)} of {units_of(start_volume)} now, but no "
-                "execution event carried a closing deal",
+        if triggered is not None:
+            return UNKNOWN, (
+                f"a level filled during the window, not a hand close: t={triggered.t:.2f} s: "
+                f"{_event_text(triggered.message)}",
             )
-        return UNKNOWN, (_nothing_closed(wait_secs),)
+        if not closed:
+            return UNKNOWN, (_nothing_closed(wait_secs),)
+        listed = (
+            ""
+            if remaining is None
+            else f"; the broker lists {units_of(remaining)} of {units_of(start_volume)}"
+        )
+        return DIFFERS, (
+            f"the position became smaller, but no execution event carried a closing deal{listed}",
+        )
     event = deal.message
     lines = [
         f"t={deal.t:.2f} s: {_event_text(event)}",
         f"deal volume {units_of(event.deal.volume)}, filled {units_of(event.deal.filledVolume)}",
-        (
-            f"the event carries the position, at {units_of(event.position.tradeData.volume)}"
-            if event.HasField("position")
-            else "the event carries no position"
-        ),
     ]
-    if remaining is not None and event.deal.filledVolume != start_volume - remaining:
+    if remaining is None:
+        return UNKNOWN, (
+            *lines,
+            "the broker's list was not read at the end, so the deal's volume is not compared",
+        )
+    if event.deal.filledVolume != start_volume - remaining:
         lines.append(
             f"but the position went from {units_of(start_volume)} to {units_of(remaining)}"
         )
         return DIFFERS, tuple(lines)
     return OK, tuple(lines)
+
+
+def decide_deal_carries_position(deal: Inbound | None) -> Decision:
+    """Whether the closing deal's execution event carries the position."""
+    if deal is None:
+        return UNKNOWN, ("no closing deal arrived",)
+    event = deal.message
+    if not event.HasField("position"):
+        return DIFFERS, (
+            "the event carries no position; the adapter moves the volume it knows by the deal",
+        )
+    return OK, (f"the event carries the position, at {units_of(event.position.tradeData.volume)}",)
 
 
 def decide_reduction_arrives(
@@ -1207,7 +1290,6 @@ def decide_reduction_arrives(
     closed: bool,
     protective_id: int | None,
     listed: om.ProtoOAOrder | None,
-    settle_secs: float,
     wait_secs: float,
 ) -> Decision:
     """Whether the protective order's smaller volume arrived as ORDER_REPLACED after the deal.
@@ -1218,8 +1300,8 @@ def decide_reduction_arrives(
         return UNKNOWN, (_nothing_closed(wait_secs),)
     if reduced is None:
         return DIFFERS, (
-            "no execution event of the protective order with a smaller volume within "
-            f"{settle_secs:g} s of the close",
+            "no execution event of the protective order with a smaller volume before the "
+            f"{wait_secs:g} s window ended",
             (
                 f"the broker now lists it at {units_of(listed.tradeData.volume)}"
                 if listed is not None
@@ -1256,6 +1338,8 @@ def decide_reduced_total(
         return UNKNOWN, ("the position's remaining volume was not read",)
     volume = reduced.message.order.tradeData.volume
     line = f"tradeData.volume {units_of(volume)}; the position holds {units_of(remaining)}"
+    if _twins(start_volume, remaining):
+        return UNKNOWN, (line, _TWINS)
     if volume == remaining:
         return OK, (line, "the reduced total, not the volume closed")
     if volume == start_volume - remaining:
@@ -1268,6 +1352,7 @@ def decide_executed_volume(
     listed: om.ProtoOAOrder | None,
     *,
     closed: bool,
+    start_volume: int,
     remaining: int | None,
     wait_secs: float,
 ) -> Decision:
@@ -1295,6 +1380,8 @@ def decide_executed_volume(
         )
         lines.append(f"{where}: {executed}; the adapter reads {units_of(remaining_of(order))} left")
     lines.append(f"the position holds {units_of(remaining)}")
+    if _twins(start_volume, remaining):
+        return UNKNOWN, (*lines, _TWINS)
     agree = all(remaining_of(order) == remaining for _, order in orders)
     return (OK if agree else DIFFERS), tuple(lines)
 
@@ -1305,39 +1392,61 @@ class LegState:
 
     name: str
     quantity: Decimal | None
-    is_open: bool
+    filled: Decimal = Decimal(0)
+    is_open: bool = False
+    # The names of the leg's events that refused something, such as an `OrderModifyRejected`.
+    refused: tuple[str, ...] = ()
 
 
 def decide_legs_follow(
     legs: Sequence[LegState],
     *,
     closed: bool,
+    start_volume: int,
     remaining: int | None,
+    held: Decimal | None,
     errors: int,
     wait_secs: float,
 ) -> Decision:
-    """Whether each leg's quantity is the position's remaining volume, with no ERROR logged."""
+    """Whether the legs and the position in Nautilus hold what the broker left, with no overfill.
+
+    `held` is the position's quantity in Nautilus, `None` if Nautilus holds no such position. A
+    fill Nautilus refused as an overfill leaves it short of the broker's; the engine logs that
+    refusal through its own logger, which the script does not see.
+    """
     if not closed:
         return UNKNOWN, (_nothing_closed(wait_secs),)
     if remaining is None:
         return UNKNOWN, ("the position's remaining volume was not read",)
     expected = units_of(remaining)
-    lines = [
-        f"{leg.name}: "
-        + ("not held" if leg.quantity is None else f"quantity {leg.quantity}")
-        + ("" if leg.is_open else ", not open")
-        for leg in legs
-    ]
-    lines.append(f"the position holds {expected}")
-    lines.append(f"{errors} ERROR or overfill lines logged" + (" (see stderr)" if errors else ""))
+    lines = []
+    for leg in legs:
+        if leg.quantity is None:
+            lines.append(f"{leg.name}: not held")
+            continue
+        state = "" if leg.is_open else ", not open"
+        refused = f", {', '.join(leg.refused)}" if leg.refused else ""
+        lines.append(f"{leg.name}: quantity {leg.quantity}, filled {leg.filled}{state}{refused}")
+    lines.append(
+        f"the position holds {expected} at the broker, "
+        + ("none in Nautilus" if held is None else f"{held} in Nautilus")
+    )
+    lines.append(f"{errors} ERROR lines the adapter logged" + (" (see stderr)" if errors else ""))
+    overfilled = any(
+        leg.refused or (leg.quantity is not None and leg.filled > leg.quantity) for leg in legs
+    )
+    if overfilled or held != expected or errors:
+        return DIFFERS, tuple(lines)
+    if _twins(start_volume, remaining):
+        return UNKNOWN, (*lines, _TWINS)
     follow = all(leg.is_open and leg.quantity == expected for leg in legs)
-    return (OK if follow and errors == 0 else DIFFERS), tuple(lines)
+    return (OK if follow else DIFFERS), tuple(lines)
 
 
 def decide_remaining(
     *,
     start_volume: int,
-    half: int,
+    asked: int,
     closed: bool,
     remaining: int | None,
     last_event: int | None,
@@ -1347,7 +1456,7 @@ def decide_remaining(
     if remaining is None:
         return UNKNOWN, ("the broker's snapshot was not read at the end",)
     lines = [
-        f"from {units_of(start_volume)}, {units_of(half)} asked to close",
+        f"from {units_of(start_volume)}, {units_of(asked)} asked to close",
         (
             f"the broker lists {units_of(remaining)}"
             if remaining
@@ -1367,9 +1476,6 @@ def decide_remaining(
     return OK, tuple(lines)
 
 
-# -- The run -------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class Finding:
     item: int
@@ -1387,7 +1493,8 @@ class Settings:
     answer_wait_secs: float = 30.0
     # How long to watch for events after each command's answer.
     settle_secs: float = 2.0
-    # How long the watch waits for the owner's partial close, then for what follows it.
+    # The watch listens until the close's deal and the protective order's smaller volume have
+    # both arrived, then `close_settle_secs` more; without both, for all of `close_wait_secs`.
     close_wait_secs: float = 120.0
     close_settle_secs: float = 10.0
     log_dir: pathlib.Path = _REPO_ROOT / "tests" / "recordings"
@@ -1450,6 +1557,11 @@ class _Run:
         self._guard = guard
         self._recorder = guard.recorder
         self._status = status
+        # The broker's snapshot the objects were looked for in.
+        self._start: oa.ProtoOAReconcileRes | None = None
+
+    def _left_after_refusal(self) -> tuple[str, ...]:
+        return left_on_symbol(self._start, symbol=self._settings.symbol, symbol_id=self._symbol_id)
 
     def _min_quantity(self) -> Quantity:
         minimum = self._instrument.min_quantity
@@ -1513,6 +1625,7 @@ class Check(_Run):
         """Find the objects, carry out the steps, then say what is left open, however it ends."""
         found = await self._find(result)
         if found is None:
+            result.left_open = self._left_after_refusal()
             return
         self._status("Found the pending order and the position. Sending the commands.")
         try:
@@ -1532,7 +1645,7 @@ class Check(_Run):
     # -- finding --
 
     async def _find(self, result: Result) -> Found | None:
-        snapshot = await self._snapshot()
+        snapshot = self._start = await self._snapshot()
         if snapshot is None:
             result.refusal = ("the broker's snapshot could not be read",)
             return None
@@ -1883,6 +1996,7 @@ class Watch(_Run):
         """Find the position, watch its close, then say what is left open, however it ends."""
         watched = await self._find(result)
         if watched is None:
+            result.left_open = self._left_after_refusal()
             return
         symbol, position_id = self._settings.symbol, watched.position.positionId
         # What a break-off says, until the broker is read at the end.
@@ -1897,16 +2011,16 @@ class Watch(_Run):
         result.left_open = left_open_watched(final, symbol=symbol, position_id=position_id)
 
     async def _find(self, result: Result) -> Watched | None:
-        snapshot = await self._snapshot()
+        snapshot = self._start = await self._snapshot()
         if snapshot is None:
             result.refusal = ("the broker's snapshot could not be read",)
             return None
         try:
-            min_volume = volume_from_quantity(self._min_quantity())
+            self._min_volume = volume_from_quantity(self._min_quantity())
         except Unsupported as e:
             result.refusal = (f"the instrument's minimum volume: {e}",)
             return None
-        position = choose_watched(snapshot, symbol_id=self._symbol_id, min_volume=min_volume)
+        position = choose_watched(snapshot, symbol_id=self._symbol_id, min_volume=self._min_volume)
         if isinstance(position, Refusal):
             result.refusal = position.reasons
             return None
@@ -1931,29 +2045,41 @@ class Watch(_Run):
         settings = self._settings
         position_id = watched.position.positionId
         start_volume = watched.position.tradeData.volume
-        half = half_of(start_volume, volume_from_quantity(self._instrument.size_increment))
         logged_from = len(result.logger.lines) if result.logger is not None else 0
         self._status(
-            f"Found the position and its two legs. Now close {units_of(half)} of the position "
-            f"by hand in the terminal. Listening up to {settings.close_wait_secs:g} s.",
+            f"Found the position and its two legs. Now close {units_of(self._min_volume)} of the "
+            "position, the minimum volume, by hand in the terminal. Listening up to "
+            f"{settings.close_wait_secs:g} s.",
         )
         start = self._recorder.now()
         if listening is not None:
             listening.set()
+
+        # Until both the deal and the smaller protective order arrive, or the window ends.
         loop = asyncio.get_running_loop()
         deadline = loop.time() + settings.close_wait_secs
-        seen = None
-        while seen is None and loop.time() < deadline and self._blocked() is None:
+        seen, complete = None, False
+        while not complete and loop.time() < deadline and self._blocked() is None:
             await asyncio.sleep(_POLL_SECS)
-            seen = first_drop(
-                self._recorder.inbound,
-                position_id=position_id,
-                start_volume=start_volume,
-                since=start,
+            inbound = self._recorder.inbound
+            if seen is None:
+                seen = first_drop(
+                    inbound, position_id=position_id, start_volume=start_volume, since=start
+                )
+                if seen is not None:
+                    self._status("The position became smaller. Listening for what follows.")
+            complete = (
+                seen is not None
+                and closing_deal(inbound, position_id=position_id, since=start) is not None
+                and reduced_protective(
+                    inbound, position_id=position_id, start_volume=start_volume, since=start
+                )
+                is not None
             )
-        if seen is not None:
+        if complete:
             self._status(
-                f"The position became smaller. Listening {settings.close_settle_secs:g} s more.",
+                "The close and the protective order's smaller volume arrived. Listening "
+                f"{settings.close_settle_secs:g} s more.",
             )
             await asyncio.sleep(settings.close_settle_secs)
 
@@ -1963,6 +2089,7 @@ class Watch(_Run):
         reduced = reduced_protective(
             inbound, position_id=position_id, start_volume=start_volume, since=start
         )
+        restored = restored_since(self._guard.exchanges, start)
         remaining = None
         if after is not None:
             position = _position(after, position_id)
@@ -1976,29 +2103,45 @@ class Watch(_Run):
                 ("take-profit leg", watched.take_profit),
             )
         ]
+        held = self._cache.position(PositionId(str(position_id)))
         logged = result.logger.lines[logged_from:] if result.logger is not None else []
-        errors = sum(level == "error" or "overfill" in line.lower() for level, line in logged)
+        errors = sum(level == "error" for level, _ in logged)
         wait = settings.close_wait_secs
         protective_id = None if watched.protective is None else watched.protective.orderId
         decisions: list[tuple[str, str, Decision]] = [
             (
                 "The close arrives as an execution event carrying its deal",
                 SETTLES_DEAL,
-                decide_closing_deal(
-                    deal, start_volume=start_volume, remaining=remaining, wait_secs=wait
+                unless_restored(
+                    decide_closing_deal(
+                        deal,
+                        level_fill(inbound, position_id=position_id, since=start),
+                        closed=closed,
+                        start_volume=start_volume,
+                        remaining=remaining,
+                        wait_secs=wait,
+                    ),
+                    restored,
                 ),
+            ),
+            (
+                "The closing deal's event carries the position",
+                SETTLES_CARRIES,
+                unless_restored(decide_deal_carries_position(deal), restored),
             ),
             (
                 "The protective order's smaller volume arrives as ORDER_REPLACED after the deal",
                 SETTLES_ARRIVAL,
-                decide_reduction_arrives(
-                    reduced,
-                    deal,
-                    closed=closed,
-                    protective_id=protective_id,
-                    listed=listed,
-                    settle_secs=settings.close_settle_secs,
-                    wait_secs=wait,
+                unless_restored(
+                    decide_reduction_arrives(
+                        reduced,
+                        deal,
+                        closed=closed,
+                        protective_id=protective_id,
+                        listed=listed,
+                        wait_secs=wait,
+                    ),
+                    restored,
                 ),
             ),
             (
@@ -2010,14 +2153,25 @@ class Watch(_Run):
                 "executedVolume on the protective order, as remaining_of reads it",
                 SETTLES_REMAINING,
                 decide_executed_volume(
-                    reduced, listed, closed=closed, remaining=remaining, wait_secs=wait
+                    reduced,
+                    listed,
+                    closed=closed,
+                    start_volume=start_volume,
+                    remaining=remaining,
+                    wait_secs=wait,
                 ),
             ),
             (
-                "The legs in Nautilus hold the position's remaining volume, with no ERROR",
+                "The legs and the position in Nautilus hold what the broker left, no overfill",
                 SETTLES_LEGS,
                 decide_legs_follow(
-                    legs, closed=closed, remaining=remaining, errors=errors, wait_secs=wait
+                    legs,
+                    closed=closed,
+                    start_volume=start_volume,
+                    remaining=remaining,
+                    held=None if held is None else held.quantity.as_decimal(),
+                    errors=errors,
+                    wait_secs=wait,
                 ),
             ),
             (
@@ -2025,7 +2179,7 @@ class Watch(_Run):
                 SETTLES_POSITION,
                 decide_remaining(
                     start_volume=start_volume,
-                    half=half,
+                    asked=self._min_volume,
                     closed=closed,
                     remaining=remaining,
                     last_event=last_position_volume(inbound, position_id=position_id, since=start),
@@ -2041,8 +2195,16 @@ class Watch(_Run):
 
 def _leg_state(name: str, order: Order | None) -> LegState:
     if order is None:
-        return LegState(name, None, is_open=False)
-    return LegState(name, order.quantity.as_decimal(), is_open=order.is_open)
+        return LegState(name, None)
+    return LegState(
+        name,
+        order.quantity.as_decimal(),
+        filled=order.filled_qty.as_decimal(),
+        is_open=order.is_open,
+        refused=tuple(
+            type(e).__name__ for e in order.events if type(e).__name__.endswith("Rejected")
+        ),
+    )
 
 
 def _protective(
@@ -2187,6 +2349,8 @@ async def run_check(
             result.raw = _write_raw(recorder, settings.log_dir, account, trader_login, name)
             if result.raw is not None:
                 status(f"The broker's messages are kept in {result.raw}")
+    if not result.left_open:
+        result.left_open = left_on_symbol(None, symbol=settings.symbol, symbol_id=0)
     return result
 
 
@@ -2295,11 +2459,11 @@ def watch_plan(symbol: str, close_wait_secs: float) -> str:
             "the broker:",
             "it sends no order, amend, cancel or close; it only reads and listens.",
             "Place this by hand in the terminal first, and nothing else on that symbol:",
-            "- one position of at least twice the minimum volume, with a stop-loss and a",
+            "- one position of at least three times the minimum volume, with a stop-loss and a",
             "  take-profit.",
             "The run finds it and checks that Nautilus holds its two levels. Then it asks you to",
-            "close half of the position by hand in the terminal, and listens up to "
-            f"{close_wait_secs:g} s.",
+            "close exactly the minimum volume of the position by hand in the terminal, and",
+            f"listens up to {close_wait_secs:g} s.",
             "Afterwards the rest of the position STAYS OPEN with its levels: close it by hand in "
             "the terminal.",
         ],
