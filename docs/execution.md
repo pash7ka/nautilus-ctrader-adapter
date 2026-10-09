@@ -118,8 +118,10 @@ refused: it fills at once.
 
 **Modifying a leg** moves that level with an amend that keeps the other: `OrderUpdated`, or
 `OrderModifyRejected` with the reason. A stop-loss leg moves by its trigger price and a
-take-profit leg by its price. A quantity can only be set to what the leg already holds, which
-follows the position (the protective order's volume); anything else is refused.
+take-profit leg by its price; a modify naming the other price is refused. A quantity can only be
+set to what the leg already holds, which follows the position (the protective order's volume);
+anything else is refused. Whether the level moved is read from the broker's answer to the amend,
+so a trailing stop-loss that moves on right after it is not taken for a refusal.
 
 **Every level amend keeps what it does not change.** Besides both levels, it sends the position's
 stop-loss trigger method again, and, while a stop-loss stays, its trailing and guaranteed flags,
@@ -150,7 +152,9 @@ The orders of a position opened by a trader or another program, and the pending 
 place, reach Nautilus as external orders: through reports only, never through events made from the broker's
 news ([section 6](#6-account-activity)). Nautilus creates each one when it first sees it, under
 the strategy id `EXTERNAL`, or under the strategy that lists its instrument in
-`external_order_claims`.
+`external_order_claims`. With Nautilus's `filter_unclaimed_external_orders` on, Nautilus drops
+the reports of unclaimed external orders and never creates them, so nothing in this section
+applies to those orders.
 
 **The legs of a foreign position.** The levels of a position the node did not open are legs as
 well. A stop-loss is a reduce-only `STOP_MARKET` at its trigger price, a take-profit a reduce-only
@@ -166,7 +170,9 @@ the position id.
   generation of the name: `-SL-2`, then `-SL-3`, and so on. The earlier leg stays cancelled. At a
   start or a reconnect, a standing level takes the lowest generation that the Nautilus cache does
   not hold as a closed order. Without a persistent cache that is `-SL` again, a new order to that
-  cache; with one, it is the generation the cache already holds open.
+  cache; with one, it is the generation the cache already holds open. A level removed and put
+  back while the connection was down is not a new generation: at the reconnect the cache still
+  holds the earlier leg open, so the level is reported as a move of that same leg.
 - **Quantity.** A leg covers what the protective order has left, or the position's volume while
   no protective order has stated one, plus what the leg has already filled. It follows a partial
   close like the node's legs. When a fill reaches a leg before the protective order's smaller
@@ -219,9 +225,13 @@ adapter does not judge it.
   node's own legs keep their events, as described above.
 - **Refusals are events**: `OrderCancelRejected` or `OrderModifyRejected` with the broker's
   reason, or with "the broker kept the level", "the broker kept the order open" or "the broker did
-  not amend the order as asked" when its answer leaves the order as it was. They carry the
-  order's own strategy id, `EXTERNAL` or the claiming strategy's, not the id of the strategy that
-  sent the command.
+  not amend the order as asked" when its answer leaves the order as it was. Only an answer that
+  replaces the order is held against the amend; an answer that ends the order, or that is of
+  another kind, is reported as it stands and is no refusal. They carry the order's own strategy
+  id, `EXTERNAL` or the claiming strategy's, not the id of the strategy that sent the command.
+- **A command the adapter fails to carry out**, on input it did not foresee, is refused all the
+  same: `OrderCancelRejected` or `OrderModifyRejected` naming the error's type, with an ERROR
+  log line. The order never stays pending until Nautilus's in-flight check.
 - A cancel or an amend of a pending order that gets no answer is not sent again: a WARNING says
   so, and Nautilus's in-flight check asks about the order
   ([section 5](#5-order-queries-and-in-flight-settings)).
@@ -234,7 +244,10 @@ What is still refused, unsent:
 | A cancel or a modify of an order the broker does not hold open: a leg whose level is gone, a pending order that has ended | "the leg is already closed", "the order is not open at the venue" |
 | A quantity change of a leg, the node's or a foreign one | A level covers the whole position |
 | A new trigger price on a `LIMIT` order; a new limit price on a `STOP` or `STOP_LIMIT` order | The venue cannot set it: a stop-limit order's limit is a slippage distance there |
-| A pending order's price off the instrument's price grid, or a quantity finer than a hundredth of a unit | A rounded value is a different order |
+| A pending order's or a leg's price off the instrument's price grid, or a quantity finer than a hundredth of a unit | A rounded value is a different order |
+| A modify of a stop-loss leg by `price`, or of a take-profit leg by `trigger_price` | "a stop-loss leg moves by its trigger price", "a take-profit leg moves by its price" |
+| A modify of a pending order, or a cancel or a modify of a leg, whose instrument is not loaded | "... is not loaded": the adapter can neither express the request's prices nor read the answer |
+| Any command while not connected | "not connected to the venue"; a level amend first waits for the connection to come back, a few times |
 
 **Commanding an external order from a strategy.** Nautilus does not check which strategy owns an
 order when one cancels or modifies it. A strategy can command an external order in two ways:
