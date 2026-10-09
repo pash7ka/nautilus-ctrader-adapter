@@ -23,6 +23,7 @@ from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.account import AccountCredentials
 from nautilus_ctrader.common.connection import CTraderConnection
+from nautilus_ctrader.common.errors import CTraderConnectionError
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.account_venue import ACCOUNT_ID, TRADER_LOGIN
@@ -646,6 +647,23 @@ async def test_a_guarded_connection_refuses_before_the_socket_and_logs_every_ans
     ]
 
 
+async def test_a_request_lost_with_the_connection_keeps_its_error_on_the_exchange() -> None:
+    async def lost(_payload, **_kwargs):
+        raise CTraderConnectionError("connection lost")
+
+    connection = SimpleNamespace(request=lost, send=None)
+    checked = guard()
+    checked.instrument(connection)
+
+    with pytest.raises(CTraderConnectionError):
+        await connection.request(oa.ProtoOAReconcileReq(ctidTraderAccountId=ACCOUNT_ID))
+
+    (logged,) = checked.exchanges
+    assert logged.failed == "CTraderConnectionError"
+    assert vec.answer_text(logged) == "no answer: CTraderConnectionError"
+    assert vec.decide_details_of_ended(logged)[0] == vec.UNKNOWN
+
+
 # -- Finding the owner's orders ------------------------------------------------------------
 
 
@@ -806,6 +824,11 @@ def test_a_refusal_reason_loses_the_brokers_description() -> None:
         (
             vec.Exchange(cancel(1), 0.0, failed="CTraderConnectionError"),
             "not sent: CTraderConnectionError",
+            None,
+        ),
+        (
+            vec.Exchange(cancel(1), 0.0, failed="CTraderConnectionError", answered_at=0.1),
+            "no answer: CTraderConnectionError",
             None,
         ),
         (
@@ -1378,7 +1401,9 @@ async def test_a_connection_dropped_midway_still_ends_with_what_is_left_open(tmp
     assert [findings[item].status for item in (1, 2, 3)] == [vec.OK] * 3
     # The ended order's details were lost with the connection; the cancel of the missing id came
     # while the session was reconnecting.
-    assert findings[10].status == vec.DIFFERS
+    assert findings[10] == vec.Finding(
+        10, findings[10].title, vec.UNKNOWN, ("no answer: CTraderConnectionError",)
+    )
     assert findings[9] == vec.Finding(
         9, findings[9].title, vec.UNKNOWN, ("not sent: CTraderConnectionError",)
     )

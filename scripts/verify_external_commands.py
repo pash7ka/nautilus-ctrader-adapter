@@ -205,7 +205,8 @@ class Exchange:
     error_code: str | None = None
     timed_out: bool = False
     answered_at: float | None = None
-    # The error type, for a request that failed before the guard logged it.
+    # The error type, for a request that got no answer: one that failed before the guard logged
+    # it, or one the guard logged that was lost with the connection.
     failed: str | None = None
 
 
@@ -357,6 +358,9 @@ class Guard:
                 raise
             except CTraderTimeoutError:
                 exchange.timed_out = True
+                raise
+            except CTraderError as e:
+                exchange.failed = type(e).__name__
                 raise
             finally:
                 exchange.answered_at = self.recorder.now()
@@ -586,7 +590,9 @@ def answer_text(exchange: Exchange | None) -> str:
     if exchange is None:
         return "not sent"
     if exchange.failed is not None:
-        return f"not sent: {exchange.failed}"
+        # Only an exchange the guard logged has an end.
+        sent = exchange.answered_at is not None
+        return f"{'no answer' if sent else 'not sent'}: {exchange.failed}"
     if exchange.error_code is not None:
         return f"ProtoOAErrorRes {exchange.error_code}"
     if exchange.timed_out or exchange.answer is None:
@@ -1395,7 +1401,7 @@ class Check:
         try:
             await self._account.request(payload, timeout_secs=self._settings.answer_wait_secs)
         except CTraderError as e:
-            # The exchange keeps the answer or the error code; the guard's refusal still raises.
+            # The exchange keeps the answer or the error; the guard's refusal still raises.
             failed = type(e).__name__
         for exchange in reversed(self._guard.exchanges):
             if exchange.request is payload:
