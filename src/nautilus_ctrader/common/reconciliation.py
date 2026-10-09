@@ -18,6 +18,7 @@ from nautilus_ctrader.common.venue_book import (
     created_of,
     entry_of,
     levels_of,
+    opening_orders,
     remaining_of,
     which_level,
 )
@@ -139,10 +140,13 @@ def reconcile(
 
     What a taken position reports:
 
-    - Its entry, the one order neither closing nor protective, as filled with its own deals.
+    - Its entry, as filled with its own deals: of the orders neither closing nor protective, the
+      earliest created that carries the node's record, else the earliest (`entry_of`).
       `avg_price` is their volume-weighted price. When the entry's `label` is the node's record
       the report carries that id, contingency `OTO` and the legs named in `comment`. A foreign
       entry carries neither.
+    - Each other such order with a deal, one that raised the position, as filled with its own
+      deals and no client order id, the node's position included: the node never raises one.
     - Each closing order with a deal, as a reduce-only `MARKET`. Its client order id is the
       matched close from `known_closes`, else, for a close with a deal in `window_deals`, the
       node's close of the same volume on that position still in flight (`operations.closing`),
@@ -394,6 +398,11 @@ class _Position:
         for deal in self.deals:
             self.fills.setdefault(deal.orderId, []).append(_fill(deal, precision))
         self.entry_fills = self.fills.get(entry.orderId, [])
+        self.raises = [
+            order
+            for order in opening_orders(found.orders)
+            if order.orderId != entry.orderId and order.orderId in self.fills
+        ]
         self.orders = sorted(found.orders, key=lambda order: order.orderId)
         self.protective = [o for o in self.orders if o.orderType == om.STOP_LOSS_TAKE_PROFIT]
 
@@ -434,7 +443,17 @@ class _Position:
             entry = replace(
                 entry, linked_order_ids=tuple(leg_ids.values()), contingency=Contingency.OTO
             )
-        reports = [entry, *self._closes(known_closes, operations, claimed, in_window)]
+        raised = [
+            _order_report(
+                order,
+                self.precision,
+                tuple(self.fills[order.orderId]),
+                client_order_id=None,
+                reduce_only=False,
+            )
+            for order in self.raises
+        ]
+        reports = [entry, *raised, *self._closes(known_closes, operations, claimed, in_window)]
         # A foreign position's every level is a leg.
         leg_fills, external, said = self._triggers(_LEVELS if entry_id is None else leg_ids)
         notices += said
@@ -658,10 +677,11 @@ class _Position:
         else:
             source = self._closing_source(fills)
             levels = {} if source is None else levels_of(source, self.precision)
+            opened = [*self.entry_fills, *(f for o in self.raises for f in self.fills[o.orderId])]
             leg_units = (
                 units_of(source.tradeData.volume)
                 if source is not None
-                else sum((fill.units for fill in self.entry_fills), Decimal(0))
+                else sum((fill.units for fill in opened), Decimal(0))
             )
             units = max(leg_units, filled)
             # A protective order reduced by a partial close reports the total left (confirmed

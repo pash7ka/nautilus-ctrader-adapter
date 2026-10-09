@@ -101,7 +101,9 @@ exists, the adapter amends the position's levels to the exact prices requested.
 **Venue order ids of legs.** Both levels of a position live in one broker order, and Nautilus
 maps a venue order id to a single order. Each leg is therefore named after its entry order:
 `<entry order id>-SL` for the stop-loss and `<entry order id>-TP` for the take-profit, for
-example `6000001-SL`. The entry's order id never changes, so the names survive a restart. The
+example `6000001-SL`. The entry's order id never changes, so the names survive a restart. A trader
+can raise a position by hand, which gives it a second opening order; the entry is still the order
+carrying the node's record, and the raise is reported as an external order. The
 legs of a position the node did not open are named the same way
 ([below](#orders-the-node-did-not-place)).
 
@@ -170,7 +172,10 @@ the position id.
 - **Ids.** Each leg is named after the position's entry order, as the node's legs are:
   `<entry order id>-SL` and `<entry order id>-TP`. The position id would not do: the broker
   numbers positions and orders separately, so a name built from a position id could match the
-  name of one of the node's legs.
+  name of one of the node's legs. A position raised by hand has several opening orders, and its
+  entry is always the earliest of them, so a start, a reconnect and the live events name its legs
+  alike. Each later opening order is an external order filled with its own deals, and the legs'
+  quantity follows the protective order's raised volume.
 - **A level put back is a new order.** Nautilus cannot reopen an order it holds as closed. A level
   removed and then put back while the position stays open is therefore a new leg, under the next
   generation of the name: `-SL-2`, then `-SL-3`, and so on. The earlier leg stays cancelled. At a
@@ -388,6 +393,12 @@ For a position or an order that is not the node's, on a loaded instrument:
 
 A foreign position whose order list names no entry gets no legs, and a DEBUG line says so.
 
+**A position raised by hand** has several opening orders. Its entry is the earliest of them by
+creation time, never by the broker's list order (which is newest first), and for the node's
+position the earliest carrying the node's record. Every other opening order is reported as a
+filled order under the broker's id, with no client order id and its own fills, the node's
+position included. Nautilus therefore infers no order for the rest of the position.
+
 An open protective order is never reported as an order: it is its position's levels. **Every
 closing order reported to Nautilus from the broker's data is reduce-only and carries its position
 id**, whoever placed it; reported with Nautilus's default it would look like an opening order.
@@ -539,7 +550,9 @@ Notes on reading it:
 
 - A trader's close or partial close of the node's position is reported **twice**: as a
   `manual_change` activity and, because Nautilus needs it for its own bookkeeping, as an external
-  closing order. A trader's move, removal or addition of a level is the activity alone, plus the
+  closing order. So is a trader's raise of it: a `manual_change` with the action `opened` and the
+  volume added, and an external filled order. A trader's move, removal or addition of a level is
+  the activity alone, plus the
   node's leg events (`OrderUpdated` or `OrderCanceled`). A trader's change of a position the node
   did not open is no activity: it reaches Nautilus as reports of that position's orders and legs.
 - **In the broker's order.** What the adapter tells Nautilus follows the order in which the
@@ -806,7 +819,8 @@ saying what would settle it. The main groups:
   bytes, whether it truncates or rejects an over-long field, and whether it returns them verbatim.
 - **Events not yet seen**: a stop-out and how it is flagged; a trader-update and a margin-change
   event; a protective order that triggers partially, and whether a partly filled protective order
-  reports its total volume or its rest (one reduced by a partial close reports the total left).
+  reports its total volume or its rest (one reduced by a partial close reports the total left);
+  the events of a raise by hand, of which only the order and deal lists were recorded.
   Every fill recorded carried the position; that every fill does is not confirmed.
 - **Matching the node's close**: whether the broker's closing order carries the volume the node's
   close asked for. The match of a close to the node's order rests on it. Also, that a closing
@@ -814,7 +828,8 @@ saying what would settle it. The main groups:
   broker's one clock: the bound that keeps a trader's earlier close from being taken for the
   node's compares them.
 - **Rejected orders**: whether a rejected order carries a position id.
-- **History lists**: the order lists come in, which of an order's times the order list filters by,
+- **History lists**: the order lists come in (one position's order and deal lists were recorded
+  newest first; nothing relies on it), which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
   whether the edges of a window are inclusive, and whether the cash-flow list has no pages and
   takes at most a week.

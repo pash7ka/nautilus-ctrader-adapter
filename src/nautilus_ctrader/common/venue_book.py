@@ -12,7 +12,7 @@ does no I/O and holds no Nautilus object. What it relies on, from a recorded ses
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
@@ -108,6 +108,8 @@ class _Position:
     protective_opened_ms: int | None = None
     # When the entry first filled, if the model saw it.
     entry_filled_ms: int | None = None
+    # When the position opened, as the broker last stated it.
+    opened_ms: int | None = None
     # Protective orders replaced by a new id or cancelled: any later event of theirs is stale.
     retired_protective_ids: set[int] = field(default_factory=set)
     levels: dict[Level, Decimal] = field(default_factory=dict)
@@ -152,13 +154,23 @@ class PositionView:
     terms: LevelTerms | None = None
 
 
-def entry_of(orders: Sequence[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
-    """The entry among a position's orders."""
-    # The protective order and closing orders carry the entry's client order id too.
-    for order in orders:
-        if not order.closingOrder and order.orderType != om.STOP_LOSS_TAKE_PROFIT:
-            return order
-    return None
+def opening_orders(orders: Iterable[om.ProtoOAOrder]) -> list[om.ProtoOAOrder]:
+    """A position's orders that are neither closing nor protective, earliest created first.
+
+    A position raised by hand has more than one; the broker lists the newest first.
+    """
+    opening = (o for o in orders if not o.closingOrder and o.orderType != om.STOP_LOSS_TAKE_PROFIT)
+    return sorted(opening, key=lambda order: (created_of(order), order.orderId))
+
+
+def entry_of(orders: Iterable[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
+    """The entry among a position's orders: the earliest with the node's record, else the earliest.
+
+    Never the list's order: every path that names a position's legs must agree on the entry.
+    """
+    opening = opening_orders(orders)
+    named = (o for o in opening if order_record.parse_label(o.tradeData.label) is not None)
+    return next(named, opening[0] if opening else None)
 
 
 def created_of(order: om.ProtoOAOrder) -> int:
@@ -173,6 +185,12 @@ def created_of(order: om.ProtoOAOrder) -> int:
 def opened_of(order: om.ProtoOAOrder) -> int | None:
     """When the broker created `order`, in ms, if it says."""
     data = order.tradeData
+    return data.openTimestamp if data.HasField("openTimestamp") else None
+
+
+def _opened_ms(position: om.ProtoOAPosition) -> int | None:
+    """When `position` opened, in ms; a created position that never filled says nothing."""
+    data = position.tradeData
     return data.openTimestamp if data.HasField("openTimestamp") else None
 
 
@@ -409,6 +427,7 @@ class VenueBook:
             )
             position.open = True
             position.volume = venue_position.tradeData.volume
+            position.opened_ms = _opened_ms(venue_position)
             position.updated_ms = venue_position.utcLastUpdateTimestamp
             position.terms = terms_of(venue_position)
             precision = self._precision(position.symbol_id)
@@ -690,6 +709,7 @@ class VenueBook:
 
     def _sync(self, position: _Position, event: oa.ProtoOAExecutionEvent) -> None:
         if event.HasField("position"):
+            position.opened_ms = _opened_ms(event.position) or position.opened_ms
             updated = event.position.utcLastUpdateTimestamp
             # A response can be applied after a later event of its order: its older position
             # state must not undo the newer one.
@@ -959,7 +979,8 @@ class VenueBook:
             return []
         position = self._position_for(event)
         records: list[Record] = []
-        learnt = position.entry_order_id is None
+        # An order that raises a position is never its entry, even when the entry is not known.
+        learnt = position.entry_order_id is None and not self._raises(position, event)
         if learnt:
             records += self._adopt(position, order, restored=False)
         if ended:
@@ -982,6 +1003,17 @@ class VenueBook:
             records += self._entry_event(event, position, precision)
         else:
             records += self._external_event(event, precision, reduce_only=False)
+            if filled and position.ours and not event.isServerEvent and not order.isStopOut:
+                # A trader raised the node's position.
+                records.append(
+                    self._activity(
+                        ActivityKind.MANUAL_CHANGE,
+                        position,
+                        Action.OPENED,
+                        event.deal.executionTimestamp,
+                        units_of(event.deal.filledVolume),
+                    )
+                )
             if learnt and position.levels:
                 # Levels seen before their entry get their legs now, after the entry's report.
                 records += self._foreign_levels(position, {}, order.utcLastUpdateTimestamp)
@@ -999,6 +1031,18 @@ class VenueBook:
         if filled and (position.legs or position.foreign_legs) and not position.open:
             records += self._closed_by(position, event.deal)
         return records
+
+    @staticmethod
+    def _raises(position: _Position, event: oa.ProtoOAExecutionEvent) -> bool:
+        """Whether `event`'s opening order was created after its position opened."""
+        # Confirmed from a recorded order list and snapshot: a raise by hand was created after the
+        # position's open time, and the entry before it.
+        # TODO(verify): that a raise's own events carry its creation time and the position's open
+        # time as the lists do; none was recorded. Without them the model's open time decides.
+        opened = _opened_ms(event.position) if event.HasField("position") else None
+        if opened is None:
+            opened = position.opened_ms
+        return opened is not None and created_of(event.order) > opened
 
     def _entry_event(
         self,

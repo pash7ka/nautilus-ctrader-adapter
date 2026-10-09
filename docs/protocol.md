@@ -437,8 +437,14 @@ take-profit by hand, while a read-only connection listened. The scrubbed recordi
 - **All three carry a `clientMsgId`**, the one of the terminal's request, which matches no request
   of the listening connection (see §2).
 
+- **A position raised by hand has two opening orders.** The position had been opened by one market
+  order and raised later by another, both non-closing and under the one position id. Its order list
+  and its deal list name the newest first. The raise's `tradeData.openTimestamp` is later than the
+  position's own `tradeData.openTimestamp`, which is the first order's fill time. The protective
+  order kept its id and its creation time, and its volume was the raised total.
+
 **Unconfirmed**: a protective order that a level fills only in part, and whether its volume is then
-the total or the rest.
+the total or the rest. The execution events of a raise by hand were not recorded.
 
 ### A pending order
 

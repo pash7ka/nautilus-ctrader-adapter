@@ -12,7 +12,7 @@ import pytest
 
 from nautilus_ctrader.common.operations import OperationsInFlight
 from nautilus_ctrader.common.order_record import LegIds, encode_comment, encode_label
-from nautilus_ctrader.common.venue_book import VenueBook
+from nautilus_ctrader.common.venue_book import VenueBook, entry_of
 from nautilus_ctrader.common.venue_records import (
     Action,
     Activity,
@@ -3028,6 +3028,24 @@ def test_an_entry_found_in_the_order_list_gives_the_levels_their_legs() -> None:
     learnt = b.apply(foreign_entry_filled(), NOTHING)
     assert [type(r) for r in learnt] == [ExternalOrder]
     assert learnt[0].venue_order_id == str(FENTRY)
+
+
+def test_the_entry_is_the_earliest_opening_order_and_the_nodes_record_comes_first() -> None:
+    def opening(order_id: int, created: int, **kw) -> om.ProtoOAOrder:
+        order = make_order(order_id, P, utc=created + 5, **kw)
+        order.tradeData.openTimestamp = created
+        return order
+
+    closing = make_order(9_100_010, P, side=om.SELL, closing=True, utc=1)
+    early, late = opening(9_100_012, 10), opening(9_100_011, 30)
+    # Created in the same millisecond, the lower broker id first.
+    twin = opening(9_100_013, 10)
+    ours = our_entry(P, 9_100_014, utc=40)
+    ours.tradeData.openTimestamp = 35
+
+    assert entry_of([late, closing, twin, early]).orderId == early.orderId
+    assert entry_of([closing, protective(1)]) is None
+    assert entry_of([ours, late, early]).orderId == ours.orderId
 
 
 def test_an_order_list_without_the_entry_or_position_changes_nothing() -> None:
