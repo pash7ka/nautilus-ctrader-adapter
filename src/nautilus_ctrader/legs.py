@@ -18,11 +18,12 @@ def leg_position_id(cache: CacheFacade, order: Order) -> PositionId | None:
     - the order's own `position_id`, if set (a filled leg has one);
     - otherwise the entry order its venue order id names (`<entry>-SL`, `<entry>-TP`, then
       `-SL-2`, `-TP-3`, ...), looked up in `cache`, and that entry's `position_id`. The entry is
-      the position's earliest opening order.
+      the position's earliest opening order, and must be on the leg's instrument and, when both
+      orders carry an account id, the same account.
 
-    `None` when the order is not a leg, or its entry is not in `cache` or has no position yet.
-    Works the same for the node's own legs and for a foreign position's. Pure over `cache`;
-    never raises for an ordinary order.
+    `None` when the order is not a leg, or its entry is not in `cache`, is on another instrument
+    or account, or has no position yet. Works the same for the node's own legs and for a foreign
+    position's. Pure over `cache`; never raises for an ordinary order.
     """
     if order.position_id is not None:
         return order.position_id
@@ -36,4 +37,13 @@ def leg_position_id(cache: CacheFacade, order: Order) -> PositionId | None:
     if client_order_id is None:
         return None
     entry = cache.order(client_order_id)
-    return None if entry is None else entry.position_id
+    if entry is None or entry.instrument_id != order.instrument_id:
+        return None
+    # The venue id index is global; an order built from a report carries no account id.
+    if (
+        order.account_id is not None
+        and entry.account_id is not None
+        and order.account_id != entry.account_id
+    ):
+        return None
+    return entry.position_id

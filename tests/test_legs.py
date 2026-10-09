@@ -16,6 +16,7 @@ from nautilus_trader.model.identifiers import (
     TraderId,
     VenueOrderId,
 )
+from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders import Order
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
@@ -26,6 +27,7 @@ from nautilus_ctrader import CTRADER_VENUE, leg_position_id
 
 ACCOUNT_ID = AccountId("CTRADER-9000001")
 EURUSD = TestInstrumentProvider.default_fx_ccy("EURUSD", venue=CTRADER_VENUE)
+GBPUSD = TestInstrumentProvider.default_fx_ccy("GBPUSD", venue=CTRADER_VENUE)
 ENTRY_VENUE_ID = 6_000_001
 POSITION = PositionId("5000001")
 QUANTITY = Quantity.from_int(1000)
@@ -43,13 +45,15 @@ class Book:
             clock=TestClock(),
         )
 
-    def accept(self, order: Order, venue_order_id: str | None) -> Order:
+    def accept(
+        self, order: Order, venue_order_id: str | None, account_id: AccountId = ACCOUNT_ID
+    ) -> Order:
         """Cache `order`, submitted and accepted under `venue_order_id` (none: left submitted)."""
         self.cache.add_order(order)
-        order.apply(TestEventStubs.order_submitted(order, account_id=ACCOUNT_ID))
+        order.apply(TestEventStubs.order_submitted(order, account_id=account_id))
         if venue_order_id is not None:
             event = TestEventStubs.order_accepted(
-                order, account_id=ACCOUNT_ID, venue_order_id=VenueOrderId(venue_order_id)
+                order, account_id=account_id, venue_order_id=VenueOrderId(venue_order_id)
             )
             order.apply(event)
         self.cache.update_order(order)
@@ -59,8 +63,7 @@ class Book:
         order.apply(
             TestEventStubs.order_filled(
                 order,
-                EURUSD,
-                account_id=ACCOUNT_ID,
+                self.cache.instrument(order.instrument_id),
                 position_id=position_id,
                 last_px=Price.from_str("1.10000"),
             )
@@ -68,10 +71,17 @@ class Book:
         self.cache.update_order(order)
         return order
 
-    def entry(self, *, position_id: PositionId | None = POSITION) -> Order:
+    def entry(
+        self,
+        *,
+        position_id: PositionId | None = POSITION,
+        instrument: Instrument = EURUSD,
+        account_id: AccountId = ACCOUNT_ID,
+    ) -> Order:
         """A filled market entry, known to the broker as `ENTRY_VENUE_ID`."""
-        order = self.factory.market(EURUSD.id, OrderSide.BUY, QUANTITY)
-        self.accept(order, str(ENTRY_VENUE_ID))
+        self.cache.add_instrument(instrument)
+        order = self.factory.market(instrument.id, OrderSide.BUY, QUANTITY)
+        self.accept(order, str(ENTRY_VENUE_ID), account_id)
         return self.fill(order, position_id) if position_id is not None else order
 
     def stop(self, venue_order_id: str | None) -> Order:
@@ -147,6 +157,20 @@ def test_an_entry_under_another_venue_id_gives_none(book: Book) -> None:
     assert leg_position_id(book.cache, leg) is None
 
 
+def test_an_entry_on_another_instrument_gives_none(book: Book) -> None:
+    book.entry(instrument=GBPUSD)
+    leg = book.stop(f"{ENTRY_VENUE_ID}-SL")
+
+    assert leg_position_id(book.cache, leg) is None
+
+
+def test_an_entry_on_another_account_gives_none(book: Book) -> None:
+    book.entry(account_id=AccountId("CTRADER-9000002"))
+    leg = book.stop(f"{ENTRY_VENUE_ID}-SL")
+
+    assert leg_position_id(book.cache, leg) is None
+
+
 def test_an_entry_without_a_position_id_gives_none(book: Book) -> None:
     book.entry(position_id=None)
     leg = book.stop(f"{ENTRY_VENUE_ID}-SL")
@@ -164,7 +188,7 @@ def test_an_entry_without_a_position_id_gives_none(book: Book) -> None:
         pytest.param(
             lambda b: b.accept(
                 b.factory.limit(EURUSD.id, OrderSide.BUY, QUANTITY, Price.from_str("1.09000")),
-                str(ENTRY_VENUE_ID),
+                "78",
             ),
             id="pending-limit",
         ),

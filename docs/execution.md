@@ -178,9 +178,11 @@ the position id.
   quantity follows the protective order's raised volume.
 - **Finding a leg's position.** An open leg carries no position id of its own: Nautilus sets one
   only from a fill. `leg_position_id(cache, order)` reads it from the leg's venue order id, which
-  names the entry, and returns the entry's position id, or `None` when the order is not a leg or
-  the entry is not in the cache yet. A strategy ties each external stop to its position with
-  `leg_position_id(self.cache, order)`; it works for the node's legs and for foreign ones.
+  names the entry, and returns the entry's position id. An open leg resolves only once its entry
+  has a position id, which Nautilus sets from a fill. It returns `None` when the order is not a
+  leg, the entry is not in the cache or is on another instrument or account, or the entry has no
+  position id yet. A strategy ties each external stop to its position with
+  `leg_position_id(self.cache, order)`; it reads the node's legs and foreign ones alike.
 - **A level put back is a new order.** Nautilus cannot reopen an order it holds as closed. A level
   removed and then put back while the position stays open is therefore a new leg, under the next
   generation of the name: `-SL-2`, then `-SL-3`, and so on. The earlier leg stays cancelled. At a
