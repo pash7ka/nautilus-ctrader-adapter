@@ -65,7 +65,7 @@ import re
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -223,7 +223,7 @@ class Exchange:
 
 @dataclass(frozen=True)
 class Inbound:
-    """One message the broker sent; `pushed` when it answered no request."""
+    """One message the broker sent; `pushed` when it answered no request of this connection."""
 
     t: float
     message: Message
@@ -250,20 +250,24 @@ class Recorder:
         dispatch = connection._dispatch
 
         def tapped(envelope) -> None:
-            self._take(envelope)
+            # Read before `dispatch`, which takes the answered request off the pending ones.
+            self._take(envelope, connection._pending)
             dispatch(envelope)
 
         # The connection has no public hook for inbound frames; its read loop calls this.
         connection._dispatch = tapped
 
-    def _take(self, envelope) -> None:
+    def _take(self, envelope, pending: Mapping[str, asyncio.Future]) -> None:
         if envelope.payloadType == common_model.HEARTBEAT_EVENT:
             return
         try:
             message = codec.parse_payload(envelope)
         except CTraderProtocolError:
             return
-        pushed = not envelope.clientMsgId
+        # An answer only to a request this connection awaits, as the connection decides: events
+        # another client's request causes carry that client's `clientMsgId`.
+        awaiting = pending.get(envelope.clientMsgId) if envelope.clientMsgId else None
+        pushed = awaiting is None or awaiting.done()
         t = self.now()
         self.inbound.append(Inbound(t, message, pushed))
         self.recording.add(

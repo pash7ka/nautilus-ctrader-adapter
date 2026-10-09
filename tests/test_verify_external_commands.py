@@ -190,8 +190,12 @@ async def run(
     answer_wait_secs: float = 5.0,
     close_wait_secs: float = 10.0,
     watch: bool = False,
+    client_msg_id: str | None = None,
 ) -> vec.Result:
-    """One run against `venue`; `while_listening`, or what it makes, is pushed once it listens."""
+    """One run against `venue`; `while_listening`, or what it makes, is pushed once it listens.
+
+    The pushed messages carry `client_msg_id`, as events caused by another client's request do.
+    """
     server = venue.server
     await server.start()
     listening = asyncio.Event()
@@ -213,7 +217,7 @@ async def run(
             await wait_until(lambda: listening.is_set() or task.done(), timeout_secs=60.0)
             pushed = while_listening(venue) if callable(while_listening) else while_listening
             for message in pushed:
-                await server.push(message)
+                await server.push(message, client_msg_id)
         return await asyncio.wait_for(task, 60.0)
     finally:
         await server.stop()
@@ -656,6 +660,41 @@ async def test_a_guarded_connection_refuses_before_the_socket_and_logs_every_ans
         "request ProtoOAOrderDetailsReq",
         "request ProtoOACancelOrderReq",
     ]
+
+
+async def test_the_recorder_takes_for_an_answer_only_what_a_request_of_its_own_awaits() -> None:
+    # The broker sends the events another client's request causes with that client's own
+    # `clientMsgId`: they are pushed events here, as they are to the connection.
+    server = FakeCTraderServer()
+    server.on(
+        om.PROTO_OA_CANCEL_ORDER_REQ,
+        lambda _r: [execution(om.ORDER_CANCELLED), execution(om.ORDER_REPLACED)],
+    )
+    await server.start()
+    connection = CTraderConnection(server.host, server.port, logger=RecordingLogger(), tls=False)
+    checked = guard()
+    checked.instrument(connection)
+    checked.recorder.tap(connection)
+    await connection.connect()
+    try:
+        answer = await connection.request(cancel(PENDING))
+        await server.push(execution(om.ORDER_FILLED), "another-client-request")
+        await server.push(execution(om.ORDER_ACCEPTED))
+        await wait_until(lambda: len(checked.recorder.inbound) == 4)
+    finally:
+        await connection.close()
+        await server.stop()
+
+    assert answer.executionType == om.ORDER_CANCELLED
+    # The second message carrying the cancel's id came after its answer.
+    assert [(i.message.executionType, i.pushed) for i in checked.recorder.inbound] == [
+        (om.ORDER_CANCELLED, False),
+        (om.ORDER_REPLACED, True),
+        (om.ORDER_FILLED, True),
+        (om.ORDER_ACCEPTED, True),
+    ]
+    taken = [(e.kind, e.note) for e in checked.recorder.recording.timeline if e.kind != "marker"]
+    assert taken == [("snapshot", "answer"), ("event", ""), ("event", ""), ("event", "")]
 
 
 async def test_a_request_lost_with_the_connection_keeps_its_error_on_the_exchange() -> None:
@@ -1218,6 +1257,14 @@ async def test_a_run_carries_out_every_step_on_the_owners_orders(tmp_path) -> No
     assert (account_id, login) == (ACCOUNT_ID, TRADER_LOGIN)
     kinds = {type(m) for m in recording.messages()}
     assert {oa.ProtoOAOrderErrorEvent, oa.ProtoOATrailingSLChangedEvent} <= kinds
+    # Every command was answered by an execution or order error event, kept as its answer.
+    answers = [
+        (e.kind, e.note)
+        for e in recording.timeline
+        if isinstance(e.message, oa.ProtoOAExecutionEvent | oa.ProtoOAOrderErrorEvent)
+    ]
+    assert len(answers) == 6
+    assert set(answers) == {("snapshot", "answer")}
 
 
 def both_ways() -> list[Message]:
@@ -2221,6 +2268,35 @@ async def test_a_watch_reports_the_owners_partial_close(tmp_path) -> None:
     }
     assert {om.ORDER_FILLED, om.ORDER_REPLACED} <= kinds
     assert vec.format_report(result).startswith(vec._WATCH_TITLE)
+
+
+async def test_a_watch_sees_the_close_in_events_carrying_the_terminals_request_id(
+    tmp_path,
+) -> None:
+    # The events of a close made in the terminal carry the terminal's own `clientMsgId`.
+    venue = watch_venue()
+
+    result = await run(
+        venue,
+        tmp_path,
+        while_listening=owner_closes_the_minimum,
+        watch=True,
+        client_msg_id="terminal-request",
+    )
+
+    findings = by_item(result)
+    assert {item: f.status for item, f in findings.items()} == dict.fromkeys(FINDINGS, vec.OK), (
+        result.findings
+    )
+    assert findings[1].detail[1] == "deal volume 0.01, filled 0.01"
+    assert findings[3].detail[2] == "the same protective order id as at the start"
+    recording, _, _ = vec.record_execution.decode_raw(result.raw.read_bytes())
+    taken = [
+        (e.kind, e.note)
+        for e in recording.timeline
+        if isinstance(e.message, oa.ProtoOAExecutionEvent)
+    ]
+    assert taken == [("event", "")] * 3
 
 
 async def test_a_watch_where_the_protective_order_is_not_reduced_says_so(tmp_path) -> None:
