@@ -7,8 +7,9 @@ model maps onto Nautilus orders, how it recovers after a restart or a lost conne
 places where an application has to design around a difference.
 
 Read [Instruments](instruments.md) first for how a symbol becomes a Nautilus instrument, and
-[Protocol notes](protocol.md) (section 10) for what was observed on the wire. Nothing here has
-yet been confirmed with a live order: see [Not yet confirmed](#10-not-yet-confirmed-against-a-live-endpoint).
+[Protocol notes](protocol.md) (section 10) for what was observed on the wire. No new order has
+yet been sent through the adapter on a live account; its cancels and amends of orders placed by
+hand have been. See [Not yet confirmed](#10-not-yet-confirmed-against-a-live-endpoint).
 
 ## 1. What it trades
 
@@ -126,9 +127,11 @@ so a trailing stop-loss that moves on right after it is not taken for a refusal.
 **Every level amend keeps what it does not change.** Besides both levels, it sends the position's
 stop-loss trigger method again, and, while a stop-loss stays, its trailing and guaranteed flags,
 all as the broker last stated them. A trailing or guaranteed stop-loss therefore stays one when
-its level is moved or the take-profit is cancelled. An amend that removes the stop-loss sends no
-flags: there is no stop-loss left for them to describe. A position whose state the broker has not
-yet stated in any message the adapter received gets none of the three.
+its level is moved or the take-profit is cancelled (confirmed live for a trailing one). Both levels
+are always sent because a level left out is removed (confirmed live for the take-profit). An amend
+that removes the stop-loss sends no flags: there is no stop-loss left for them to describe. A
+position whose state the broker has not yet stated in any message the adapter received gets none
+of the three.
 
 **A partial close** leaves the position and its legs. The broker reduces the protective order to
 the position's new volume, and the adapter reports it: an `OrderUpdated` with the new quantity on
@@ -769,33 +772,28 @@ sign flipped to Nautilus's convention (a charge is positive).
 
 ## 10. Not yet confirmed against a live endpoint
 
-No order has yet been sent through the adapter on a live account, so everything about sending is
-read from the schema and the broker's own terminal's behaviour, not observed from the adapter.
-Each such point is marked in the source with a `TODO(verify):` comment saying what would settle
-it. The main groups:
+No new order has yet been sent through the adapter on a live account, so everything about
+sending one is read from the schema and the broker's own terminal's behaviour, not observed from
+the adapter. Cancels and amends have been sent through it, of a pending order and of a position's
+levels that were placed by hand: what they confirmed is listed in
+[Protocol notes](protocol.md), section 10. Each point still open is marked in the source with a
+`TODO(verify):` comment saying what would settle it. The main groups:
 
 - **Scales and defaults on a new order**: that volume in hundredths of a unit agrees with each
   instrument's quantity units; that relative levels are distances in 1/100000 of a price applied
   from the fill, in the direction assumed; that immediate-or-cancel fills a market order the way
   the broker's own terminal's does; which trigger method a stop-loss set by a relative distance
   uses.
-- **Amends**: that leaving a level out of an amend removes it; whether an accepted amend sends an
-  execution event besides its answer; what the venue does with an optional field an amend leaves
-  out, a position's trailing and guaranteed flags and trigger method, or a pending order's
-  attributes (it may keep the current value or apply the schema's default); that an amend
-  sending those values unchanged is accepted, and that a trailing stop-loss stays trailing after
-  one.
-- **Cancels and amends of pending orders**: that an accepted amend is answered as a replaced
-  order; how the venue refuses a cancel or an amend, with an order error or with a rejection
-  event; whether an amend's volume is the order's whole volume or its unfilled rest once partly
-  filled; and which form, a distance or a price, a pending order reports for an attached level
-  set as a distance, and whether it reports both.
-- **Order details**: whether the order details request answers an order that has ended, what it
-  answers for an unknown id, and which request limit it counts against. A query falls back to the
-  order list where the details cannot be read.
-- **Trailing stops**: whether a trailing stop's move also arrives as an execution event besides
-  its own trailing event. If it does, the second finds the level already moved and changes
-  nothing.
+- **Amends**: that leaving the stop-loss out of an amend removes it, as leaving the take-profit
+  out does; what the venue does with an optional field an amend leaves out, a position's trailing
+  and guaranteed flags and trigger method, or a pending order's attributes (it may keep the
+  current value or apply the schema's default). The adapter always sends them, so this matters
+  only where it cannot.
+- **Cancels and amends of pending orders**: how the venue refuses an amend, and a cancel for any
+  reason but an unknown order id; whether an amend's volume is the order's whole volume or its
+  unfilled rest once partly filled; whether an amend that sends the expiration again keeps it.
+- **Order details**: which request limit the order details request counts against. A query falls
+  back to the order list where the details cannot be read.
 - **The records in `label` and `comment`**: their limits, whether the venue counts characters or
   bytes, whether it truncates or rejects an over-long field, and whether it returns them verbatim.
 - **Events not yet seen**: a stop-out and how it is flagged; a trader-update and a margin-change

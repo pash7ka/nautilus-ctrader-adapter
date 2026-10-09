@@ -910,10 +910,9 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     async def _order_details(self, order_id: int) -> om.ProtoOAOrder:
         """Broker order `order_id` as it stands now, pending or ended."""
-        # TODO(verify): no order details request was recorded: that one answers an order that
-        # has ended, what it answers for an unknown id, and which request limit it counts against
-        # (taken as the historical one here). Where it fails, the order list over the fill
-        # window is searched instead.
+        # Confirmed live: an ended order is answered, and an unknown id is refused with
+        # ORDER_NOT_FOUND. Where it fails, the order list over the fill window is searched.
+        # TODO(verify): which request limit it counts against (taken as the historical one here).
         response = await self._request(
             oa.ProtoOAOrderDetailsReq(
                 ctidTraderAccountId=self._account.account_id, orderId=order_id
@@ -2356,9 +2355,11 @@ class CTraderExecutionClient(LiveExecutionClient):
             return outcome
         if not isinstance(outcome, oa.ProtoOAExecutionEvent):
             return _Answered([], None)
-        # TODO(verify): how the venue refuses a cancel or an amend of a pending order: with an
-        # order error, or with an execution event like this. Such an event is not applied to the
-        # model: the order it names still stands.
+        # A refusing execution event is not applied to the model: the order it names still
+        # stands. A cancel of an id the venue does not hold is refused with an order error
+        # instead (confirmed live).
+        # TODO(verify): how the venue refuses an amend, and whether it ever refuses with an
+        # execution event at all.
         if outcome.executionType in (om.ORDER_REJECTED, om.ORDER_CANCEL_REJECTED):
             code = outcome.errorCode or om.ProtoOAExecutionType.Name(outcome.executionType)
             return _Refused(code)
@@ -2749,8 +2750,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         return None if value is None else reports.price(value, instrument)
 
     async def _send_amend(self, request: oa.ProtoOAAmendPositionSLTPReq) -> Message | _Refused:
-        # TODO(verify): whether an accepted amend sends an execution event besides its answer; a
-        # later one would be read as a trader's change once the amend is no longer in flight.
+        # Confirmed live: an accepted amend sends no execution event besides its answer.
         outcome: Message | _Refused | None = None
         for _ in range(_AMEND_ATTEMPTS):
             outcome = await self._send(request)

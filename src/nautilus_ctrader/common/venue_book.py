@@ -467,8 +467,7 @@ class VenueBook:
         An event seen before, or one of a position or protective order the model does not hold,
         means nothing.
         """
-        # TODO(verify): whether a trailing move also arrives as an execution event; none was
-        # recorded. A second one finds the level already there and says nothing.
+        # Confirmed live: a trailing move arrives as this event alone, never as an execution event.
         position = self._positions.get(event.positionId)
         precision = None if position is None else self._precision(position.symbol_id)
         key = ("trailing", event.orderId, event.utcLastUpdateTimestamp, event.stopPrice)

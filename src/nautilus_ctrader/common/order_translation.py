@@ -322,9 +322,9 @@ def amend_levels(
     for a position whose state was never seen sends none. The trailing and guaranteed flags
     describe the stop-loss and go only with one.
     """
-    # TODO(verify): that leaving a level out removes it, rather than leaving it unchanged. A
-    # live amend on an open position settles it; if it does not remove, this is the one place
-    # to change.
+    # Leaving the take-profit out removes it (confirmed live).
+    # TODO(verify): the same for the stop-loss; if it does not remove, this is the one place to
+    # change.
     request = oa.ProtoOAAmendPositionSLTPReq(
         ctidTraderAccountId=account_id,
         positionId=position_id,
@@ -333,10 +333,10 @@ def amend_levels(
         request.stopLoss = stop_loss.as_double()
     if take_profit is not None:
         request.takeProfit = take_profit.as_double()
-    # TODO(verify): what the venue does with an omitted optional field: keeps the position's
-    # value, or applies the schema's default (`stopLossTriggerMethod` defaults to TRADE). Known
-    # values are always sent, so it matters only where they are not. A live amend of a trailing
-    # stop-loss also shows that sending them unchanged is accepted.
+    # Sent unchanged they are accepted, and a trailing stop-loss stays trailing (confirmed live).
+    # TODO(verify): what the venue does with an omitted one: keeps the position's value, or
+    # applies the schema's default (`stopLossTriggerMethod` defaults to TRADE). Known values are
+    # always sent, so it matters only where they are not.
     if terms is not None:
         request.stopLossTriggerMethod = terms.stop_loss_trigger_method
         if stop_loss is not None:
@@ -452,9 +452,10 @@ def amend_order(
         and stop == (order.stopPrice if order.HasField("stopPrice") else None)
     ):
         return None
-    # TODO(verify): what the venue does with an omitted optional field, and whether `volume` is
-    # the order's whole volume or its unfilled rest once partly filled. A live amend of a pending
-    # order with attached levels settles both; the answer is expected to be `ORDER_REPLACED`.
+    # Answered with `ORDER_REPLACED`, which keeps the attached levels sent again (confirmed live).
+    # TODO(verify): whether `volume` is the order's whole volume or its unfilled rest once partly
+    # filled; whether an expiration sent again is kept, and what the venue does with an omitted
+    # optional field.
     request = oa.ProtoOAAmendOrderReq(
         ctidTraderAccountId=account_id,
         orderId=order.orderId,
@@ -471,8 +472,8 @@ def amend_order(
         request.expirationTimestamp = order.expirationTimestamp
     if order.HasField("slippageInPoints"):
         request.slippageInPoints = order.slippageInPoints
-    # TODO(verify): which form the venue reports for a level set as a distance, and whether it
-    # reports both; the distance is preferred, as it is what follows a moved order price.
+    # A level set as a distance is reported as one, without a price (confirmed live). The
+    # distance is also what follows a moved order price.
     with_stop = True
     if order.HasField("relativeStopLoss"):
         request.relativeStopLoss = order.relativeStopLoss
