@@ -183,6 +183,55 @@ def test_scrub_miss_in_raw_bytes_is_caught_by_the_byte_level_check() -> None:
     raise AssertionError("scrub miss inside the raw serialized bytes was not detected")
 
 
+def test_scrub_keeps_no_unmapped_number_in_a_venue_text() -> None:
+    error = oa.ProtoOAErrorRes(
+        ctidTraderAccountId=REAL_ACCOUNT,
+        errorCode="ORDER_NOT_FOUND",
+        description=f"Order 4242 of account {REAL_ACCOUNT}, login {REAL_LOGIN}, trader 515151",
+    )
+
+    scrubbed = record_fixtures.scrub(error, REAL_ACCOUNT, REAL_LOGIN)
+
+    token = record_fixtures.NUMBER_PLACEHOLDER
+    assert scrubbed.description == (
+        f"Order {token} of account {record_fixtures.FAKE_ACCOUNT_ID}, "
+        f"login {record_fixtures.FAKE_TRADER_LOGIN}, trader {token}"
+    )
+    assert scrubbed.errorCode == "ORDER_NOT_FOUND"
+
+
+def test_scrub_replaces_owner_text_and_keeps_catalog_names() -> None:
+    order = om.ProtoOAOrder(
+        orderId=1,
+        tradeData=om.ProtoOATradeData(symbolId=1, volume=1, tradeSide=om.BUY, label="robot 7"),
+        orderType=om.MARKET,
+        orderStatus=om.ORDER_STATUS_FILLED,
+    )
+    symbol = om.ProtoOALightSymbol(symbolId=1, symbolName="US100", description="US Tech 100")
+
+    assert record_fixtures.scrub(order, REAL_ACCOUNT, REAL_LOGIN).tradeData.label == "scrubbed"
+    assert record_fixtures.scrub(symbol, REAL_ACCOUNT, REAL_LOGIN) == symbol
+
+
+def test_assert_free_text_clean_refuses_an_unmapped_number() -> None:
+    error = oa.ProtoOAErrorRes(errorCode="ORDER_NOT_FOUND", description="trader 515151")
+    allowed = {str(record_fixtures.FAKE_ACCOUNT_ID)}
+
+    with pytest.raises(record_fixtures.ScrubError) as raised:
+        record_fixtures.assert_free_text_clean(error, allowed)
+
+    assert "515151" not in str(raised.value)
+    error.description = f"account {record_fixtures.FAKE_ACCOUNT_ID}"
+    record_fixtures.assert_free_text_clean(error, allowed)
+
+
+def test_the_recorded_market_data_holds_no_number_in_a_venue_text() -> None:
+    allowed = {str(record_fixtures.FAKE_ACCOUNT_ID), str(record_fixtures.FAKE_TRADER_LOGIN)}
+    for messages in load_recorded().values():
+        for message in messages:
+            record_fixtures.assert_free_text_clean(message, allowed)
+
+
 def _recorded_under_the_old_rules() -> bytes:
     """A recorded file from before `_CLEARED_FIELDS` grew: ids and tokens already faked, the
     fields added to the set later still in place."""

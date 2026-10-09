@@ -23,6 +23,7 @@ import sys
 import time
 
 import pytest
+from google.protobuf import message_factory
 from google.protobuf.descriptor import FieldDescriptor
 
 from nautilus_ctrader.common import codec
@@ -739,6 +740,80 @@ def test_a_long_number_no_field_identified_is_taken_out_of_a_text() -> None:
     assert not any(char.isdigit() for char in r.NUMBER_PLACEHOLDER)
 
 
+# A made-up internal trader number of the venue, as short as a price or a volume.
+VENUE_TRADER = "515151"
+
+
+def rescrubbed(tmp_path: pathlib.Path, recording: r.Recording, name: str = "fixture") -> bytes:
+    """The fixture `--rescrub` builds from `recording`'s raw file."""
+    raw = tmp_path / f"{name}.raw.json"
+    raw.write_bytes(r.encode_raw(recording, account_id=ACCOUNT_ID, login=LOGIN))
+    output = tmp_path / f"{name}.json"
+    r.rescrub(raw, output, secrets=())
+    return output.read_bytes()
+
+
+def test_a_short_unmapped_number_in_a_venue_text_is_taken_out(tmp_path) -> None:
+    recording = recording_of(
+        execution_event(),
+        oa.ProtoOAErrorRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            errorCode="ORDER_NOT_FOUND",
+            description=f"Order {ORDER_ID} not found or not belong to trader {VENUE_TRADER}",
+        ),
+        oa.ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=ACCOUNT_ID,
+            errorCode="ORDER_NOT_FOUND",
+            description=f"Order not found with id {ORDER_ID}",
+        ),
+    )
+
+    data = rescrubbed(tmp_path, recording)
+
+    event, error, order_error = r.decode_recording(data)["timeline"]
+    fake = event["message"].order.orderId
+    assert fake == 6_000_001
+    assert error["message"].description == (
+        f"Order {fake} not found or not belong to trader {r.NUMBER_PLACEHOLDER}"
+    )
+    assert order_error["message"].description == f"Order not found with id {fake}"
+    assert VENUE_TRADER.encode() not in data
+    # The same raw file always gives the same fixture.
+    assert rescrubbed(tmp_path, recording, "again") == data
+
+
+def test_a_decimal_in_a_venue_text_is_taken_out_too() -> None:
+    error = oa.ProtoOAOrderErrorEvent(
+        ctidTraderAccountId=ACCOUNT_ID,
+        errorCode="TRADING_BAD_STOPS",
+        description="Stop 1.10501 is too close, 5 pips at least",
+    )
+
+    (decoded,) = clean_timeline(recording_of(error))
+
+    token = r.NUMBER_PLACEHOLDER
+    expected = f"Stop {token}.{token} is too close, {token} pips at least"
+    assert decoded["message"].description == expected
+
+
+def test_check_clean_refuses_an_unmapped_number_in_a_venue_text() -> None:
+    ids = r.IdMap()
+    error = scrubbed(oa.ProtoOAErrorRes(errorCode="ORDER_NOT_FOUND"), ids)
+    error.description = f"not belong to trader {VENUE_TRADER}"
+
+    with pytest.raises(r.record_fixtures.ScrubError) as raised:
+        r.check_clean(
+            fixture_of(error),
+            recording_of(oa.ProtoOAErrorRes(errorCode="ORDER_NOT_FOUND")),
+            account_id=ACCOUNT_ID,
+            login=LOGIN,
+            ids=ids,
+            secrets=(),
+        )
+
+    assert not any(char.isdigit() for char in str(raised.value))
+
+
 def test_owner_text_and_bonus_movements_are_gone_from_the_fixture() -> None:
     event = execution_event()
     event.order.clientOrderId = "my-robot-17"
@@ -1001,6 +1076,73 @@ def test_every_money_field_of_the_schema_is_classified() -> None:
     # The scrubber pairs single fields only.
     for owner, name in r._MONEY_FIELDS:
         assert not descriptors[owner].fields_by_name[name].is_repeated
+
+
+# The venue's free text in the schema today. Scrubbed by default, so a text field the schema
+# gains is scrubbed too; it is listed here so a reviewer sees it arrive.
+FREE_TEXT = {
+    ("ProtoErrorRes", "description"),
+    ("ProtoOAErrorRes", "description"),
+    ("ProtoOAOrderErrorEvent", "description"),
+    ("ProtoOAHoliday", "description"),
+    ("ProtoOAClientDisconnectEvent", "reason"),
+    ("ProtoOAAccountsTokenInvalidatedEvent", "reason"),
+}
+
+
+def test_every_text_field_of_the_schema_is_free_text_or_judged_safe() -> None:
+    """Each text field of every message any payload can hold, set to a text with numbers.
+
+    A field cleared, replaced whole or kept is so by the scrubber's own tables. Any other is
+    the venue's free text, and comes out with the known id mapped and no other number.
+    """
+    fx = r.record_fixtures
+    ids = r.IdMap()
+    fake_order = str(ids.fake("order", ORDER_ID))
+    text = f"order {ORDER_ID} of trader {VENUE_TRADER} at 1.5"
+    free: set[tuple[str, str]] = set()
+    judged: set = set()
+    for owner, descriptor in schema_descriptors().items():
+        for field in descriptor.fields:
+            if field.type != FieldDescriptor.TYPE_STRING:
+                continue
+            name = field.name
+            if name in fx._CLEARED_FIELDS:
+                # Cleared by name before any text rule applies.
+                judged.add(name)
+                continue
+            message = message_factory.GetMessageClass(descriptor)()
+            if field.is_repeated:
+                getattr(message, name).append(text)
+            else:
+                setattr(message, name, text)
+            clean = r.scrub_execution(
+                message,
+                account_id=ACCOUNT_ID,
+                login=LOGIN,
+                ids=ids,
+                shift_ms=0,
+                money_shift=MONEY_SHIFT,
+            )
+            (result,) = getattr(clean, name) if field.is_repeated else (getattr(clean, name),)
+            kept = next((k for k in ((owner, name), name) if k in fx._KEPT_TEXT_FIELDS), None)
+            if name in fx._TOKEN_FIELDS:
+                judged.add(name)
+                assert result == fx.FAKE_TOKEN, (owner, name)
+            elif name in fx._PRIVATE_TEXT_FIELDS:
+                judged.add(name)
+                assert result == r.SCRUBBED_TEXT, (owner, name)
+            elif kept is not None:
+                judged.add(kept)
+                assert result == text, (owner, name)
+            else:
+                free.add((owner, name))
+                assert re.findall(r"\d+", result) == [fake_order], (owner, name, result)
+
+    assert free == FREE_TEXT
+    # Nothing judged has left the schema: a stale name would hide a renamed field.
+    tables = fx._TOKEN_FIELDS | fx._PRIVATE_TEXT_FIELDS | fx._KEPT_TEXT_FIELDS
+    assert judged - fx._CLEARED_FIELDS == tables
 
 
 def history_deal(n: int, *, gross: int, swap: int, commission: int, fee: int, balance: int):

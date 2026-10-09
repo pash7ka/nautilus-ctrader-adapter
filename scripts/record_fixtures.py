@@ -3,8 +3,9 @@
 Records a scrubbed snapshot of what a real broker connection returns for trader info, assets,
 symbols, symbol specs, an EUR->USD conversion chain, trendbars and a short window of live spot
 ticks, plus the account list. Every recorded message is scrubbed of real account ids, trader
-logins, tokens and broker names before it ever reaches disk, and the final JSON is checked
-against every real identifying value observed during the run before it is written.
+logins, tokens, broker names and any other number in the venue's free text before it ever
+reaches disk, and the final JSON is checked against every real identifying value observed
+during the run before it is written.
 
 This is read-only against the broker: it authenticates and subscribes to public market data,
 places no orders and changes no account state.
@@ -32,9 +33,10 @@ import base64
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message
@@ -114,6 +116,36 @@ _CLEARED_FIELDS = frozenset(
     }
 )
 
+_TOKEN_FIELDS = frozenset({"accessToken", "refreshToken"})
+
+SCRUBBED_TEXT = "scrubbed"
+# Stands in for a number in free text that has no fake value to map to.
+NUMBER_PLACEHOLDER = "<number>"
+# Text replaced whole wherever it occurs: what the account's owner, a robot of theirs or the
+# application wrote.
+_PRIVATE_TEXT_FIELDS = frozenset(
+    {"label", "comment", "clientOrderId", "externalNote", "clientId", "clientSecret"},
+)
+# Text kept as the venue sent it, by field name or by message and field name: codes, and names
+# from the venue's catalog of symbols and assets, the same for every account. Any other text
+# field is the venue's free text, `description` or `reason` or one the schema gains later, and
+# keeps no number that has no fake value.
+_KEPT_TEXT_FIELDS: frozenset[str | tuple[str, str]] = frozenset(
+    {
+        "errorCode",
+        "tokenType",
+        "version",
+        "symbolName",
+        "name",
+        "displayName",
+        "measurementUnits",
+        "minCommissionAsset",
+        ("ProtoOALightSymbol", "description"),
+        ("ProtoOAArchivedSymbol", "description"),
+    },
+)
+_DIGIT_RUN = re.compile(r"\d+")
+
 _IDENTIFYING_INT_TYPES = (FieldDescriptor.TYPE_INT64, FieldDescriptor.TYPE_UINT64)
 
 
@@ -144,10 +176,15 @@ _FAKE_REQUIRED_VALUES: dict[str, object] = {}
 
 
 class ScrubError(RuntimeError):
-    """`assert_clean` found a forbidden identifier left in the data about to be written."""
+    """A forbidden identifier or number was found left in the data about to be written."""
 
 
-def scrub(message: Message, real_account_id: int, real_login: int | None) -> Message:
+def scrub(
+    message: Message,
+    real_account_id: int,
+    real_login: int | None,
+    clean_text: Callable[[str], str] | None = None,
+) -> Message:
     """Return a scrubbed copy of `message`.
 
     Recursively walks every field of a `CopyFrom` copy: any int64/uint64 field named
@@ -160,14 +197,70 @@ def scrub(message: Message, real_account_id: int, real_login: int | None) -> Mes
     exactly `real_account_id` or `real_login` is replaced too - including each element of a
     repeated int64/uint64 field - so a field this function does not yet know the name of can
     never carry a real identifier through unnoticed.
+
+    Text follows `_PRIVATE_TEXT_FIELDS` and `_KEPT_TEXT_FIELDS`; the venue's free text goes
+    through `clean_text`. By default that maps the account id and the trader login to their
+    fake values and every other number to `NUMBER_PLACEHOLDER`.
     """
+    if clean_text is None:
+        fakes = {
+            str(real): str(fake)
+            for real, fake in ((real_account_id, FAKE_ACCOUNT_ID), (real_login, FAKE_TRADER_LOGIN))
+            if real is not None
+        }
+
+        def clean_text(text: str) -> str:
+            return scrub_numbers(text, fakes)
+
     result = type(message)()
     result.CopyFrom(message)
-    _scrub_in_place(result, real_account_id, real_login)
+    _scrub_in_place(result, real_account_id, real_login, clean_text)
     return result
 
 
-def _scrub_in_place(message: Message, real_account_id: int, real_login: int | None) -> None:
+def scrub_numbers(text: str, fakes: Mapping[str, str]) -> str:
+    """`text` with each run of digits that `fakes` holds mapped, and any other one replaced.
+
+    Whatever its length and wherever it stands, inside a decimal too, an unmapped run becomes
+    `NUMBER_PLACEHOLDER`.
+    """
+    return _DIGIT_RUN.sub(lambda match: fakes.get(match.group(), NUMBER_PLACEHOLDER), text)
+
+
+def is_free_text(owner: str, name: str) -> bool:
+    """Whether the text field `name` of the message type `owner` is the venue's free text."""
+    judged = _CLEARED_FIELDS | _TOKEN_FIELDS | _PRIVATE_TEXT_FIELDS | _KEPT_TEXT_FIELDS
+    return name not in judged and (owner, name) not in _KEPT_TEXT_FIELDS
+
+
+def assert_free_text_clean(message: Message, allowed: Iterable[str]) -> None:
+    """Raise `ScrubError` if a free text of `message`, at any depth, has a number not `allowed`."""
+    allowed = set(allowed)
+    for field, value in message.ListFields():
+        items = value if field.is_repeated else (value,)
+        if field.type == FieldDescriptor.TYPE_MESSAGE:
+            for item in items:
+                assert_free_text_clean(item, allowed)
+        elif (
+            field.type == FieldDescriptor.TYPE_STRING
+            and is_free_text(message.DESCRIPTOR.name, field.name)
+            and any(set(_DIGIT_RUN.findall(item)) - allowed for item in items)
+        ):
+            raise ScrubError("an unmapped number was found in a venue text of the fixture")
+
+
+def _scrub_text(owner: str, name: str, text: str, clean_text: Callable[[str], str]) -> str:
+    if name in _PRIVATE_TEXT_FIELDS:
+        return SCRUBBED_TEXT
+    return clean_text(text) if is_free_text(owner, name) else text
+
+
+def _scrub_in_place(
+    message: Message,
+    real_account_id: int,
+    real_login: int | None,
+    clean_text: Callable[[str], str],
+) -> None:
     for field, value in list(message.ListFields()):
         name = field.name
         # Before the message branch below, so a cleared field can be a nested message too.
@@ -183,13 +276,20 @@ def _scrub_in_place(message: Message, real_account_id: int, real_login: int | No
         if field.type == FieldDescriptor.TYPE_MESSAGE:
             items = value if field.is_repeated else (value,)
             for item in items:
-                _scrub_in_place(item, real_account_id, real_login)
+                _scrub_in_place(item, real_account_id, real_login, clean_text)
             continue
 
         if name == "ctidTraderAccountId":
             setattr(message, name, FAKE_ACCOUNT_ID)
-        elif name in ("accessToken", "refreshToken"):
+        elif name in _TOKEN_FIELDS:
             setattr(message, name, FAKE_TOKEN)
+        elif field.type == FieldDescriptor.TYPE_STRING:
+            owner = message.DESCRIPTOR.name
+            if field.is_repeated:
+                for i, item in enumerate(value):
+                    value[i] = _scrub_text(owner, name, item, clean_text)
+            else:
+                setattr(message, name, _scrub_text(owner, name, value, clean_text))
         # The safety net for fields not named above: substituted rather than cleared, because
         # an unknown field may be `required`.
         elif field.type in _IDENTIFYING_INT_TYPES:
@@ -649,9 +749,11 @@ async def _run(trader_login: int, env: dict[str, str]) -> None:
     # base64-encoded JSON built below is checked separately, but a decimal identifier can
     # never appear literally inside base64, so that check alone would miss exactly this.
     raw_forbidden = result.secrets.forbidden_bytes(include_varints=True)
+    fakes = (str(FAKE_ACCOUNT_ID), str(FAKE_TRADER_LOGIN))
     for messages in scrubbed.values():
         for message in messages:
             assert_clean(message.SerializeToString(), raw_forbidden)
+            assert_free_text_clean(message, fakes)
 
     output = {key: [_encode(message) for message in messages] for key, messages in scrubbed.items()}
     output_bytes = json.dumps(output, indent=2).encode("utf-8")
