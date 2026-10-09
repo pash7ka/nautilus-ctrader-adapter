@@ -25,11 +25,14 @@ from nautilus_trader.model.identifiers import StrategyId, VenueOrderId
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders import Order
 
+from nautilus_ctrader.common.venue_book import VenueBook
 from nautilus_ctrader.common.venue_records import Level
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+from tests.execution_replay import NoOperations
 from tests.execution_venue import (
     EURUSD_ID,
+    EURUSD_SYMBOL_ID,
     STRATEGY_ID,
     TRADER_ID,
     ExecutionVenue,
@@ -39,6 +42,7 @@ from tests.execution_venue import (
     push,
     started,
 )
+from tests.fake_server import Pushed
 from tests.fixtures import load_external_commands_recording
 from tests.polling import wait_until
 
@@ -332,3 +336,52 @@ async def test_the_recorded_level_amends_and_trailing_moves_drive_the_foreign_le
         assert view.terms.trailing_stop_loss
         assert sent_about(h, stop) == sent_about(h, target) == []
         assert h.logger.errors() == []
+
+
+async def test_a_recorded_trailing_move_ahead_of_the_amends_answer_is_kept() -> None:
+    # The broker moved the stop-loss after it answered the take-profit's removal. Delivered the
+    # other way round, the answer's older stop-loss must not undo the move.
+    venue = live_venue()
+    removal, move = LEVEL_AMENDS[1], TRAILED[0]
+    assert move.utcLastUpdateTimestamp > removal.order.utcLastUpdateTimestamp
+    moved_to = Price(move.stopPrice, 5)
+    venue.server.on(
+        om.PROTO_OA_AMEND_POSITION_SLTP_REQ,
+        replay([LEVEL_AMENDS[0], [Pushed(move), removal]], []),
+    )
+    async with harness(execution_venue=venue, instruments=(EURUSD_ID,)) as h:
+        await started(h)
+        stop, target = by_venue_id(h, STOP), by_venue_id(h, TARGET)
+        await h.client._modify_order(modify(stop, trigger_price=Price.from_str("1.11778")))
+        await wait_until(lambda: by_venue_id(h, STOP).trigger_price == Price.from_str("1.11778"))
+
+        await h.client._cancel_order(cancel(target))
+        await wait_until(lambda: by_venue_id(h, TARGET).status == OrderStatus.CANCELED)
+
+        assert by_venue_id(h, STOP).trigger_price == moved_to
+        assert stop_moves(h) == [Price.from_str("1.11778"), moved_to]
+        assert reports_of(h, STOP)[-1].trigger_price == moved_to
+        assert h.client._book.view(POSITION).levels == {Level.STOP_LOSS: moved_to.as_decimal()}
+        assert sent_about(h, stop) == []
+        assert h.logger.errors() == []
+
+
+def test_the_model_keeps_a_trailing_move_newer_than_the_answer_applied_after_it() -> None:
+    book = VenueBook(lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None)
+    book.load(SNAPSHOTS[0], {})
+    book.apply(LEVEL_AMENDS[0], NoOperations())
+    removal, move = LEVEL_AMENDS[1], TRAILED[0]
+
+    book.trailing_stop_moved(move)
+    book.apply(removal, NoOperations())
+
+    assert book.view(POSITION).levels == {Level.STOP_LOSS: Decimal("1.11779")}
+
+    # A change the broker made after the move sets its own stop-loss (hand-built).
+    later = type(removal)()
+    later.CopyFrom(removal)
+    later.order.stopPrice = 1.1177
+    later.order.utcLastUpdateTimestamp = move.utcLastUpdateTimestamp + 1
+    book.apply(later, NoOperations())
+
+    assert book.view(POSITION).levels == {Level.STOP_LOSS: Decimal("1.11770")}

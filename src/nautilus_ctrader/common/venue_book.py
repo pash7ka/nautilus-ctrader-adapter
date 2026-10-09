@@ -116,6 +116,8 @@ class _Position:
     # The `utcLastUpdateTimestamp` of the position state last applied; a created position has
     # none and counts as 0.
     updated_ms: int = -1
+    # The broker's time of the last trailing move applied, -1 for none.
+    trailed_ms: int = -1
 
     @property
     def ours(self) -> bool:
@@ -479,6 +481,7 @@ class VenueBook:
         old_levels = dict(position.levels)
         position.levels[Level.STOP_LOSS] = price_of(event.stopPrice, precision)
         ts = event.utcLastUpdateTimestamp
+        position.trailed_ms = max(position.trailed_ms, ts)
         if position.ours:
             # The broker's own move: no trader's change.
             records = self._level_changes(position, old_levels, False, ts)
@@ -1072,7 +1075,18 @@ class VenueBook:
             position.protective_order_id = order.orderId
             position.protective_volume = remaining_of(order)
             position.protective_opened_ms = opened_of(order)
-            position.levels = levels_of(order, precision)
+            levels = levels_of(order, precision)
+            trailed = position.levels.get(Level.STOP_LOSS)
+            # A trailing move can overtake the answer to an amend made before it, whose older
+            # stop-loss must not undo the move.
+            if (
+                order.orderId == current
+                and order.utcLastUpdateTimestamp < position.trailed_ms
+                and trailed is not None
+                and Level.STOP_LOSS in levels
+            ):
+                levels[Level.STOP_LOSS] = trailed
+            position.levels = levels
             position.awaiting_protection = False
         elif kind == om.ORDER_CANCELLED:
             position.retired_protective_ids.add(order.orderId)

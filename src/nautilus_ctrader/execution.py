@@ -2447,8 +2447,12 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._modify_rejected(client_order_id, _not_moved(held_price))
             return
         if not _updated(outcome.records, client_order_id=client_order_id.value):
-            # The level stood there already, so no event says so; the modify still needs one.
-            self._leg_updated(client_order_id, level, wanted)
+            # The level stood there already, or a trailing move overtook the answer: no event
+            # says where it stands, and the modify still needs one.
+            view = self._book.view(found[0])
+            standing = None if view is None else view.levels.get(level)
+            if standing is not None:
+                self._leg_updated(client_order_id, level, standing)
 
     async def _modify_foreign_leg(
         self,
