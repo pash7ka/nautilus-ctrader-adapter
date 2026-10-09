@@ -118,6 +118,60 @@ holds.
 Historical requests are rate-limited separately from everything else and much more tightly, so
 a large warm-up cannot starve the subscriptions running beside it.
 
+## When a request fails
+
+Nautilus has no failure response: a request is answered with data or with none, and the
+callback receives only the request id. So a request this client cannot serve - bars, an
+instrument, or a kind of history the adapter does not provide - is answered twice over, in this
+order:
+
+1. a `CTraderRequestFailed` is published under `REQUEST_FAILED_TOPIC`;
+2. the request is answered with no data, so the callback fires and the request is complete.
+
+Every request gets exactly one answer: bars, or a failure and no bars. A failure part way
+through a request that needs several pages delivers none of the pages already served, because a
+silently shortened warm-up is worse than an obvious failure.
+
+A strategy that needs to tell "no bars" from "failed" records the failures and checks for one
+in its callback:
+
+```python
+from nautilus_trader.core.uuid import UUID4
+
+from nautilus_ctrader import REQUEST_FAILED_TOPIC, CTraderRequestFailed
+
+
+def on_start(self) -> None:
+    self.failed: dict[UUID4, CTraderRequestFailed] = {}
+    self.msgbus.subscribe(topic=REQUEST_FAILED_TOPIC, handler=self.on_request_failed)
+    self.request_bars(bar_type, start=start, limit=500, callback=self.on_bars_requested)
+
+
+def on_request_failed(self, failure: CTraderRequestFailed) -> None:
+    self.failed[failure.request_id] = failure
+
+
+def on_bars_requested(self, request_id: UUID4) -> None:
+    failure = self.failed.pop(request_id, None)
+    if failure is not None:
+        self.log.warning(f"Warm-up failed: {failure.reason}")
+```
+
+The failure always arrives before the callback, with the live and the plain data engine alike.
+`request_id` is the id `request_bars` returned and the callback receives;
+`data_type.metadata["bar_type"]` names the bar type. `reason` is short and fit to show a person:
+`venue refused: <error code>`, `timed out`, `connection lost`, `connection closed`,
+`instrument <id> is not loaded`, `no trendbar period for <bar type>`, `invalid venue response`,
+`<data> requests are not supported`, and `request failed` or `internal error` for anything else.
+It carries no venue text beyond an error code.
+
+Nautilus logs the empty answer at WARNING as `Received <Bar[]> data with no bar for <bar type>`;
+after a failure that line is expected. A subscriber that raises is logged and does not hold the
+answer back, but it can keep the failure from the subscribers after it.
+
+A request made with a `time_range_generator` param is split by Nautilus into requests of its
+own, and a failure then carries the id of one of those rather than the strategy's.
+
 ## Quotes, and the conversion symbols nobody asked for
 
 A quote subscription publishes a `QuoteTick` per spot event, once both sides are known. Spot

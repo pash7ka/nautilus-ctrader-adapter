@@ -19,15 +19,22 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.data.messages import (
     RequestBars,
+    RequestData,
+    RequestFundingRates,
     RequestInstrument,
     RequestInstruments,
+    RequestOrderBookDeltas,
+    RequestOrderBookDepth,
+    RequestOrderBookSnapshot,
+    RequestQuoteTicks,
+    RequestTradeTicks,
     SubscribeBars,
     SubscribeQuoteTicks,
     UnsubscribeBars,
     UnsubscribeQuoteTicks,
 )
 from nautilus_trader.live.data_client import LiveMarketDataClient
-from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import Bar, BarType, DataType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId
 from nautilus_trader.model.instruments import Instrument
 
@@ -38,6 +45,7 @@ from nautilus_ctrader.common.errors import (
     CTraderError,
     CTraderProtocolError,
     CTraderRequestError,
+    CTraderTimeoutError,
 )
 from nautilus_ctrader.common.parsing import (
     bar_boundary_secs,
@@ -49,6 +57,7 @@ from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.enums import PERIOD_SECS, trendbar_period_for
+from nautilus_ctrader.failures import REQUEST_FAILED_TOPIC, CTraderRequestFailed
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
@@ -100,6 +109,26 @@ def _trendbar(raw: RawBar) -> om.ProtoOATrendbar:
         deltaClose=raw.delta_close,
         utcTimestampInMinutes=raw.boundary_secs // 60,
     )
+
+
+def _failure_reason(error: Exception) -> str:
+    """The published reason for `error`: a fixed phrase or a venue error code, never its text."""
+    if isinstance(error, CTraderRequestError):
+        return f"venue refused: {error.error_code}"
+    if isinstance(error, CTraderTimeoutError):
+        return "timed out"
+    if isinstance(error, CTraderConnectionError):
+        return "connection lost"
+    if isinstance(error, CTraderProtocolError):
+        return "invalid venue response"
+    if isinstance(error, CTraderError):
+        return "request failed"
+    return "internal error"
+
+
+def _instrument_data_type(data_type: DataType, instrument_id: InstrumentId) -> DataType:
+    """`data_type` with the metadata Nautilus puts on a response for one instrument."""
+    return DataType(data_type.type, metadata={"instrument_id": instrument_id})
 
 
 @dataclass
@@ -340,6 +369,11 @@ class CTraderDataClient(LiveMarketDataClient):
         instrument = self._instrument_provider.find(request.instrument_id)
         if instrument is None:
             self._log.error(f"Cannot request instrument: {request.instrument_id} is not loaded")
+            self._request_failed(
+                request,
+                _instrument_data_type(request.data_type, request.instrument_id),
+                f"instrument {request.instrument_id} is not loaded",
+            )
             return
         self._handle_instrument(
             instrument,
@@ -363,6 +397,63 @@ class CTraderDataClient(LiveMarketDataClient):
         # The account has already dropped the chains through the changed symbol; whether a
         # conversion is prepared again is left to the generation check in `_prepare_conversion`.
         self._handle_data(instrument)
+
+    # -- Failed requests --------------------------------------------------------------------
+
+    def _request_failed(self, request: RequestData, data_type: DataType, reason: str) -> None:
+        """Publish `CTraderRequestFailed`, then answer `request` with no data.
+
+        Published first, so a subscriber knows of the failure before the requester's callback
+        fires. A raising subscriber is logged rather than allowed to keep the response back.
+        """
+        failure = CTraderRequestFailed(
+            # The engine hands the client a request of its own, carrying the requester's id
+            # as its correlation id.
+            request_id=request.correlation_id or request.id,
+            data_type=data_type,
+            reason=reason,
+        )
+        try:
+            self._msgbus.publish(topic=REQUEST_FAILED_TOPIC, msg=failure)
+        except Exception as e:
+            self._log.exception(f"A {REQUEST_FAILED_TOPIC} subscriber raised", e)
+        self._handle_data_response(
+            data_type,
+            [],
+            request.id,
+            request.start,
+            request.end,
+            request.params,
+        )
+
+    def _unsupported(self, request: RequestData, data_type: DataType) -> None:
+        name = data_type.type.__name__
+        self._log.error(f"Cannot request {name}: not supported by this adapter")
+        self._request_failed(request, data_type, f"{name} requests are not supported")
+
+    # Answered here because the base class raises `NotImplementedError`, which leaves the
+    # request pending for ever.
+
+    async def _request_quote_ticks(self, request: RequestQuoteTicks) -> None:
+        self._unsupported(request, _instrument_data_type(request.data_type, request.instrument_id))
+
+    async def _request_trade_ticks(self, request: RequestTradeTicks) -> None:
+        self._unsupported(request, _instrument_data_type(request.data_type, request.instrument_id))
+
+    async def _request_funding_rates(self, request: RequestFundingRates) -> None:
+        self._unsupported(request, _instrument_data_type(request.data_type, request.instrument_id))
+
+    async def _request_order_book_deltas(self, request: RequestOrderBookDeltas) -> None:
+        self._unsupported(request, _instrument_data_type(request.data_type, request.instrument_id))
+
+    async def _request_order_book_depth(self, request: RequestOrderBookDepth) -> None:
+        self._unsupported(request, _instrument_data_type(request.data_type, request.instrument_id))
+
+    async def _request_order_book_snapshot(self, request: RequestOrderBookSnapshot) -> None:
+        self._unsupported(request, _instrument_data_type(request.data_type, request.instrument_id))
+
+    async def _request(self, request: RequestData) -> None:
+        self._unsupported(request, request.data_type)
 
     # -- Conversion -------------------------------------------------------------------------
 
@@ -814,17 +905,61 @@ class CTraderDataClient(LiveMarketDataClient):
         )
 
     async def _request_bars(self, request: RequestBars) -> None:
+        """Answer `request` exactly once: with its bars, or failed and with none.
+
+        A failure part way through delivers none of the bars already served, so a requester
+        is never handed a shortened history that looks complete.
+        """
         bar_type = request.bar_type
+        data_type = DataType(Bar, metadata={"bar_type": bar_type})
         try:
             period = trendbar_period_for(bar_type)
         except ValueError as e:
             self._log.error(f"Cannot request bars: {e}")
+            self._request_failed(request, data_type, f"no trendbar period for {bar_type}")
             return
         instrument = self._instrument_provider.find(bar_type.instrument_id)
         if instrument is None:
             self._log.error(f"Cannot request bars: {bar_type.instrument_id} is not loaded")
+            self._request_failed(
+                request,
+                data_type,
+                f"instrument {bar_type.instrument_id} is not loaded",
+            )
             return
 
+        connection = self._connection_generation
+        try:
+            bars = await self._historical_bars(request, instrument, period)
+        except asyncio.CancelledError:
+            self._log.warning(f"Cannot request bars for {bar_type}: cancelled")
+            self._request_failed(request, data_type, "connection closed")
+            raise
+        except Exception as e:
+            reason = _failure_reason(e)
+            if isinstance(e, CTraderConnectionError) and connection != self._connection_generation:
+                # Closed by this client's own disconnect, not lost.
+                reason = "connection closed"
+            if isinstance(e, (CTraderTimeoutError, CTraderConnectionError)):
+                self._log.warning(f"Cannot request bars for {bar_type}: {e}")
+            elif isinstance(e, CTraderError):
+                self._log.error(f"Cannot request bars for {bar_type}: {e}")
+            self._request_failed(request, data_type, reason)
+            if not isinstance(e, CTraderError):
+                # A bug: Nautilus logs it with its traceback.
+                raise
+            return
+        # Outside the `try`: a response must never be followed by a failure for the same request.
+        self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)
+
+    async def _historical_bars(
+        self,
+        request: RequestBars,
+        instrument: Instrument,
+        period: int,
+    ) -> list[Bar]:
+        """`request`'s closed bars, ascending; nothing is recorded unless all are returned."""
+        bar_type = request.bar_type
         period_secs = PERIOD_SECS[period]
         now_secs = int(self._bar_clock.now())
         served = await self._page_trendbars(
@@ -844,23 +979,28 @@ class CTraderDataClient(LiveMarketDataClient):
             # One page of the newest bars, although a page asks the venue for two more.
             closed = closed[-self._page_size() :]
 
+        ts_init = self._clock.timestamp_ns()
+        try:
+            bars = [
+                bar_from_trendbar(
+                    _trendbar(raw),
+                    bar_type,
+                    instrument.price_precision,
+                    instrument.size_precision,
+                    ts_init,
+                )
+                for raw in closed
+            ]
+        except ValueError as e:
+            # Nautilus refuses a bar whose prices are inconsistent, such as a high below its open.
+            raise CTraderProtocolError(f"{bar_type}: unusable trendbar from history: {e}") from e
+        # Only once every bar converted: a request that fails delivers nothing, so the stream
+        # must still deliver these.
         sub = self._bars.get(bar_type)
         if sub is not None and closed:
             # What this request delivered must not go out a second time from the stream.
             sub.closer.mark_emitted(closed[-1].boundary_secs)
-
-        ts_init = self._clock.timestamp_ns()
-        bars = [
-            bar_from_trendbar(
-                _trendbar(raw),
-                bar_type,
-                instrument.price_precision,
-                instrument.size_precision,
-                ts_init,
-            )
-            for raw in closed
-        ]
-        self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)
+        return bars
 
     async def _page_trendbars(
         self,
