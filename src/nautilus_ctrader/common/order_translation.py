@@ -28,7 +28,7 @@ from nautilus_trader.model.orders import Order
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.parsing import PRICE_SCALE, VOLUME_SCALE
-from nautilus_ctrader.common.venue_records import LevelTerms, price_of
+from nautilus_ctrader.common.venue_records import Level, LevelTerms, price_of
 from nautilus_ctrader.constants import PENDING_ORDER_TYPES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -343,6 +343,29 @@ def amend_levels(
             request.trailingStopLoss = terms.trailing_stop_loss
             request.guaranteedStopLoss = terms.guaranteed_stop_loss
     return request
+
+
+def leg_price(
+    instrument: Instrument,
+    level: Level,
+    *,
+    price: Price | None,
+    trigger_price: Price | None,
+) -> Price | None:
+    """The price a modify moves a protective leg of `level` to; `None` when it moves nothing.
+
+    A stop-loss leg moves by its trigger price and a take-profit leg by its price. The other
+    price, or one off the instrument's grid, is refused.
+    """
+    stop = level == Level.STOP_LOSS
+    if stop and price is not None:
+        raise Unsupported("a stop-loss leg moves by its trigger price")
+    if not stop and trigger_price is not None:
+        raise Unsupported("a take-profit leg moves by its price")
+    wanted = trigger_price if stop else price
+    if wanted is not None:
+        _require_on_price_grid(instrument, wanted)
+    return wanted
 
 
 _STOP_TYPES = (om.STOP, om.STOP_LIMIT)

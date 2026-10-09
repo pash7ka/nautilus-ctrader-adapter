@@ -33,7 +33,7 @@ from nautilus_trader.model.orders import LimitOrder, MarketOrder, StopMarketOrde
 
 from nautilus_ctrader.common import order_translation as tr
 from nautilus_ctrader.common import parsing
-from nautilus_ctrader.common.venue_records import LevelTerms
+from nautilus_ctrader.common.venue_records import Level, LevelTerms
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.fixtures import load_recorded
@@ -1036,3 +1036,35 @@ def test_an_order_with_another_volume_does_not_carry_the_amend() -> None:
     assert not tr.carries(asked, order, EURUSD.price_precision)
     order.tradeData.volume = 200_000
     assert tr.carries(asked, order, EURUSD.price_precision)
+
+
+@pytest.mark.parametrize(
+    ("level", "change", "moved"),
+    [
+        (Level.STOP_LOSS, {"trigger_price": Price.from_str("1.10010")}, "1.10010"),
+        (Level.TAKE_PROFIT, {"price": Price.from_str("1.10020")}, "1.10020"),
+        (Level.STOP_LOSS, {}, None),
+    ],
+)
+def test_a_leg_moves_by_the_price_of_its_kind(level, change, moved) -> None:
+    prices = {"price": None, "trigger_price": None, **change}
+
+    wanted = tr.leg_price(EURUSD, level, **prices)
+
+    assert wanted == (None if moved is None else Price.from_str(moved))
+
+
+@pytest.mark.parametrize(
+    ("level", "change", "reason"),
+    [
+        (Level.STOP_LOSS, {"price": "1.10010"}, "a stop-loss leg moves by its trigger price"),
+        (Level.TAKE_PROFIT, {"trigger_price": "1.10020"}, "a take-profit leg moves by its price"),
+        (Level.STOP_LOSS, {"trigger_price": "1.100105"}, "finer than the instrument's price"),
+    ],
+)
+def test_a_leg_price_the_venue_cannot_set_is_refused(level, change, reason) -> None:
+    prices = {"price": None, "trigger_price": None}
+    prices.update({name: Price.from_str(value) for name, value in change.items()})
+
+    with pytest.raises(tr.Unsupported, match=reason):
+        tr.leg_price(EURUSD, level, **prices)

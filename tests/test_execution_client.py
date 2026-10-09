@@ -2501,3 +2501,236 @@ async def test_a_pending_orders_amend_lock_goes_once_the_order_has_ended() -> No
 
         assert h.client._book.open_order(RESTING) is None
         assert RESTING not in h.client._order_locks
+
+
+def answer_amend_with(execution_venue: ExecutionVenue, kind: int) -> None:
+    """The broker answers an amend of the pending order with an event of `kind`, unchanged.
+
+    `ORDER_EXPIRED` ends the order; any other kind leaves it open.
+    """
+
+    def answer(_request):
+        order = execution_venue.snapshot.order[0]
+        order.utcLastUpdateTimestamp += 1
+        stated = om.ProtoOAOrder()
+        stated.CopyFrom(order)
+        if kind == om.ORDER_EXPIRED:
+            stated.orderStatus = om.ORDER_STATUS_EXPIRED
+            del execution_venue.snapshot.order[:]
+        return pending_event(kind, stated)
+
+    execution_venue.server.on(om.PROTO_OA_AMEND_ORDER_REQ, answer)
+
+
+async def test_an_amend_answered_by_the_order_ending_is_no_refusal() -> None:
+    execution_venue = resting_venue()
+    answer_amend_with(execution_venue, om.ORDER_EXPIRED)
+    async with harness(execution_venue=execution_venue) as h:
+        order = await held_resting(h)
+        await h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.EXPIRED)
+        await sync(h)
+
+        assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+
+async def test_an_amend_answered_other_than_by_a_replace_is_no_refusal() -> None:
+    # Only a replace states the amended order; another answer's values are not the amend's.
+    execution_venue = resting_venue()
+    answer_amend_with(execution_venue, om.ORDER_ACCEPTED)
+    async with harness(execution_venue=execution_venue) as h:
+        order = await held_resting(h)
+        before = len(reports_of(h, str(RESTING)))
+        await h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        await wait_until(lambda: len(reports_of(h, str(RESTING))) > before)
+        await sync(h)
+
+        assert len(order_amends(h)) == 1
+        assert sent_about(h, order) == []
+        assert foreign_leg(h, str(RESTING)).status == OrderStatus.ACCEPTED
+
+
+# A modify that names the price the leg does not move by.
+WRONG_PRICE = [
+    pytest.param(
+        Level.STOP_LOSS,
+        {"price": "85150.00"},
+        "a stop-loss leg moves by its trigger price",
+        id="stop-loss",
+    ),
+    pytest.param(
+        Level.TAKE_PROFIT,
+        {"trigger_price": "85400.00"},
+        "a take-profit leg moves by its price",
+        id="take-profit",
+    ),
+]
+
+
+@pytest.mark.parametrize(("level", "change", "reason"), WRONG_PRICE)
+async def test_a_foreign_leg_modified_by_the_wrong_price_is_refused(level, change, reason) -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        legs = dict(zip((Level.STOP_LOSS, Level.TAKE_PROFIT), await foreign_legs(h), strict=True))
+        order = legs[level]
+        await h.client._modify_order(modify(order.client_order_id.value, **change))
+        await wait_until(lambda: sent_about(h, order))
+
+        (rejected,) = sent_about(h, order)
+        assert isinstance(rejected, OrderModifyRejected)
+        assert rejected.reason == reason
+        assert rejected.strategy_id == EXTERNAL
+        assert amends == []
+
+
+@pytest.mark.parametrize(("level", "change", "reason"), WRONG_PRICE)
+async def test_a_leg_modified_by_the_wrong_price_is_refused(level, change, reason) -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        leg = STOP if level == Level.STOP_LOSS else TARGET
+        await h.client._modify_order(modify(leg, **change))
+        await wait_until(lambda: last_kind(h, leg) == "OrderModifyRejected")
+
+        (rejected,) = [e for e in h.events_of(leg) if isinstance(e, OrderModifyRejected)]
+        assert rejected.reason == reason
+        assert amends == []
+
+
+def trailed_at(stop: float) -> oa.ProtoOATrailingSLChangedEvent:
+    """The broker's move of the first position's trailing stop-loss, after any amend's answer."""
+    return oa.ProtoOATrailingSLChangedEvent(
+        ctidTraderAccountId=ACCOUNT_ID,
+        positionId=FIRST,
+        orderId=FOREIGN_EVENTS[2].order.orderId,
+        stopPrice=stop,
+        utcLastUpdateTimestamp=AMEND_FROM + 100,
+    )
+
+
+@pytest.mark.parametrize("foreign", [True, False], ids=["foreign", "own"])
+async def test_a_trailing_move_after_the_amends_answer_is_no_refusal(
+    foreign, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execution_venue = ExecutionVenue() if foreign else answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        if foreign:
+            stop, _ = await foreign_legs(h, trailing=True)
+            leg = stop.client_order_id.value
+        else:
+            await opened_bracket(h)
+            leg = STOP
+        amend = h.client._amend
+
+        async def then_trailed(*args):
+            outcome = await amend(*args)
+            # The market moves the stop-loss before the modify reads the answer.
+            h.client._on_trailing_stop(trailed_at(85160.0))
+            return outcome
+
+        monkeypatch.setattr(h.client, "_amend", then_trailed)
+        await h.client._modify_order(modify(leg, trigger_price="85150.00"))
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(leg)).trigger_price == Price.from_str("85160.00"),
+            description="the trailing move reported",
+        )
+        await sync(h)
+
+        assert len(amends) == 1
+        assert not any(isinstance(e, OrderModifyRejected) for e in h.events_of(leg))
+
+
+def unload_us100(h) -> None:
+    h.client._instrument_provider.remove_failed(US100_ID, "unloaded for the test")
+
+
+async def test_commands_on_a_foreign_leg_of_an_unloaded_instrument_are_refused() -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, target = await foreign_legs(h)
+        unload_us100(h)
+        await h.client._modify_order(modify(stop.client_order_id.value, trigger_price="85150.00"))
+        await h.client._cancel_order(cancel(target.client_order_id.value))
+        await wait_until(lambda: sent_about(h, stop) and sent_about(h, target))
+
+        (modify_rejected,) = sent_about(h, stop)
+        (cancel_rejected,) = sent_about(h, target)
+        assert isinstance(modify_rejected, OrderModifyRejected)
+        assert isinstance(cancel_rejected, OrderCancelRejected)
+        for rejected in (modify_rejected, cancel_rejected):
+            assert "is not loaded" in rejected.reason
+        assert amends == []
+
+
+async def test_commands_on_a_leg_of_an_unloaded_instrument_are_refused() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        unload_us100(h)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+        await h.client._cancel_order(cancel(TARGET))
+        await wait_until(
+            lambda: (
+                last_kind(h, STOP) == "OrderModifyRejected"
+                and last_kind(h, TARGET) == "OrderCancelRejected"
+            ),
+        )
+
+        for leg in (STOP, TARGET):
+            (rejected,) = [
+                e
+                for e in h.events_of(leg)
+                if isinstance(e, (OrderModifyRejected, OrderCancelRejected))
+            ]
+            assert "is not loaded" in rejected.reason
+        assert amends == []
+
+
+@pytest.mark.parametrize("foreign", [True, False], ids=["foreign", "own"])
+async def test_a_leg_price_finer_than_the_instrument_is_refused_unsent(foreign) -> None:
+    # Sent to the client directly: Nautilus's risk engine would refuse it first.
+    execution_venue = ExecutionVenue() if foreign else answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        if foreign:
+            stop, _ = await foreign_legs(h)
+            leg = stop.client_order_id.value
+        else:
+            await opened_bracket(h)
+            leg = STOP
+        await h.client._modify_order(modify(leg, trigger_price="85150.005"))
+        await wait_until(lambda: last_kind(h, leg) == "OrderModifyRejected")
+
+        (rejected,) = [e for e in h.events_of(leg) if isinstance(e, OrderModifyRejected)]
+        assert "finer than the instrument's price precision" in rejected.reason
+        assert amends == []
+
+
+async def test_a_command_that_fails_unexpectedly_is_refused_with_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+
+        def broken(_order_id):
+            raise RuntimeError("broken for the test")
+
+        monkeypatch.setattr(h.client._book, "open_order", broken)
+        await h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+        await wait_until(lambda: len(sent_about(h, order)) == 2)
+
+        modify_rejected, cancel_rejected = sent_about(h, order)
+        assert isinstance(modify_rejected, OrderModifyRejected)
+        assert isinstance(cancel_rejected, OrderCancelRejected)
+        for rejected in (modify_rejected, cancel_rejected):
+            assert "RuntimeError" in rejected.reason
+            assert rejected.strategy_id == EXTERNAL
+        assert len(h.logger.errors()) == 2
+        assert all("RuntimeError" in line for line in h.logger.errors())
