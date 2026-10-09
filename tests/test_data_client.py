@@ -49,7 +49,8 @@ from nautilus_ctrader.common.errors import (
 )
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
-from nautilus_ctrader.data import CTraderDataClient, _conversion_message
+from nautilus_ctrader.data import CTraderDataClient, _conversion_message, _raw_bar
+from nautilus_ctrader.failures import REQUEST_FAILED_TOPIC
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
@@ -2196,6 +2197,62 @@ async def test_a_request_covering_a_live_subscription_suppresses_the_streamed_ba
 
         # The request already delivered the bar the stream would now close.
         assert not h.bars()
+
+
+async def test_a_closed_bar_with_impossible_prices_is_dropped_and_reported_once() -> None:
+    recorded = RECORDED_HISTORY[(EURUSD_SYMBOL_ID, M1)][FIRST_M1_MINUTE]
+    unusable = om.ProtoOATrendbar()
+    unusable.CopyFrom(recorded)
+    unusable.deltaOpen = recorded.deltaHigh + 1  # an open above the high
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        for _ in range(2):
+            h.client._emit_bar(EURUSD_M1, EURUSD_SYMBOL_ID, 60, _raw_bar(unusable))
+
+        assert not h.bars()
+        # Recorded once for the bar type, so a repeat is logged at DEBUG.
+        assert h.client._bar_errors == {EURUSD_M1}
+
+
+async def test_a_failed_request_covering_a_live_subscription_leaves_the_bar_to_the_stream() -> None:
+    recorded = RECORDED_HISTORY[(EURUSD_SYMBOL_ID, M1)][FIRST_M1_MINUTE]
+    unusable = om.ProtoOATrendbar()
+    unusable.CopyFrom(recorded)
+    unusable.deltaOpen = recorded.deltaHigh + 1  # an open above the high
+    server = trendbar_venue()
+    serve = server._handlers[om.PROTO_OA_GET_TRENDBARS_REQ]
+    # A closer fetches a single bar with `count=2`; only the warm-up request gets the bad one.
+    server.on(
+        om.PROTO_OA_GET_TRENDBARS_REQ,
+        lambda r: (
+            serve(r)
+            if r.count <= 2
+            else oa.ProtoOAGetTrendbarsRes(
+                ctidTraderAccountId=r.ctidTraderAccountId,
+                symbolId=r.symbolId,
+                period=r.period,
+                trendbar=[unusable],
+            )
+        ),
+    )
+    async with harness(server=server) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+
+        clock.t = (FIRST_M1_MINUTE + 1) * 60 + 5
+        failures: list = []
+        h.client._msgbus.subscribe(topic=REQUEST_FAILED_TOPIC, handler=failures.append)
+        served = await request_bars(h, EURUSD_M1, end=at_minute(FIRST_M1_MINUTE + 1))
+        assert served == []
+        assert [f.reason for f in failures] == ["invalid venue response"]
+
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+            await push_spot(h, event)
+
+        # The request delivered nothing, so the stream still owes the bar.
+        assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE, 60)]
 
 
 # -- Reconnect ------------------------------------------------------------------------------

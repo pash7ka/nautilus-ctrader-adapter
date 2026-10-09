@@ -7,7 +7,12 @@ H1, H4, H12, D1. W1 and MN1 exist in the protocol but are out of scope here.
 from __future__ import annotations
 
 from nautilus_trader.model.data import BarType
-from nautilus_trader.model.enums import AggregationSource, BarAggregation, PriceType
+from nautilus_trader.model.enums import (
+    AggregationSource,
+    BarAggregation,
+    PriceType,
+    bar_aggregation_to_str,
+)
 
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
@@ -53,15 +58,17 @@ def trendbar_period_for(bar_type: BarType) -> int:
     """ProtoOATrendbarPeriod for a bar type.
 
     Raises `ValueError` unless aggregation source is EXTERNAL, price type is BID, and
-    step/aggregation is one of 1,2,3,4,5,10,15,30-MINUTE, 1,4,12-HOUR, 1-DAY.
+    step/aggregation is one of 1,2,3,4,5,10,15,30-MINUTE, 1,4,12-HOUR, 1-DAY. Its text does not
+    name the bar type, and is short enough to show a person as it is.
     """
     spec = bar_type.spec
     if spec.price_type != PriceType.BID:
-        raise ValueError(f"{bar_type}: trendbars are only available for the BID price type")
+        raise ValueError("trendbars are only available for the BID price type")
     if bar_type.aggregation_source != AggregationSource.EXTERNAL:
-        raise ValueError(f"{bar_type}: trendbars are always EXTERNAL aggregation")
+        raise ValueError("trendbars are always EXTERNAL aggregation")
     steps = _STEPS_BY_AGGREGATION.get(spec.aggregation)
     period = steps.get(spec.step) if steps is not None else None
     if period is None:
-        raise ValueError(f"{bar_type}: step/aggregation combination is not supported")
+        aggregation = bar_aggregation_to_str(spec.aggregation)
+        raise ValueError(f"{spec.step}-{aggregation} trendbars are not supported")
     return period

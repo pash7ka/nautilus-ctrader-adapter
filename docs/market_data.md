@@ -118,6 +118,72 @@ holds.
 Historical requests are rate-limited separately from everything else and much more tightly, so
 a large warm-up cannot starve the subscriptions running beside it.
 
+## When a request fails
+
+Nautilus has no failure response: a request is answered with data or with none, and the
+callback receives only the request id. So a request this client cannot serve - bars, an
+instrument, or a kind of history the adapter does not provide - is answered in two steps, in
+this order:
+
+1. a `CTraderRequestFailed` is published under `REQUEST_FAILED_TOPIC`;
+2. the request is answered with no data, so the callback fires and the request is complete.
+
+Every request the client receives gets exactly one answer: bars, or a failure and no bars. This
+holds even for a request cancelled by a disconnect before it started. A failure part way through
+a request that needs several pages delivers none of the pages already served, because a
+silently shortened warm-up is worse than an obvious failure.
+
+Nautilus may split one strategy request into several client requests, for example when a data
+catalog already holds part of the range. The strategy can then get bars from one part and a
+failure from another, under the same id: treat any failure under an id as the whole request
+having failed.
+
+A strategy that needs to tell "no bars" from "failed" records the failures and checks for one
+in its callback:
+
+```python
+from nautilus_trader.core.uuid import UUID4
+
+from nautilus_ctrader import REQUEST_FAILED_TOPIC, CTraderRequestFailed
+
+
+def on_start(self) -> None:
+    self.failed: dict[UUID4, CTraderRequestFailed] = {}
+    self.msgbus.subscribe(topic=REQUEST_FAILED_TOPIC, handler=self.on_request_failed)
+    self.request_bars(bar_type, start=start, limit=500, callback=self.on_bars_requested)
+
+
+def on_request_failed(self, failure: CTraderRequestFailed) -> None:
+    self.failed[failure.request_id] = failure
+
+
+def on_bars_requested(self, request_id: UUID4) -> None:
+    failure = self.failed.pop(request_id, None)
+    if failure is not None:
+        self.log.warning(f"Warm-up failed: {failure.reason}")
+```
+
+The failure always arrives before the callback, with the live and the plain data engine alike.
+`request_id` is the id `request_bars` returned and the callback receives;
+`data_type.metadata["bar_type"]` names the bar type. `reason` is short and fit to show a person:
+`venue refused: <error code>`, `timed out`, `not connected`, `connection lost`,
+`connection closed`, `instrument <id> is not loaded`, `invalid venue response`,
+`<data> requests are not supported`, why a bar type has no trendbars (such as
+`trendbars are only available for the BID price type`), and `request failed` or
+`internal error` for anything else. It carries no venue text beyond an error code.
+
+Nautilus logs the empty answer at WARNING as `Received <Bar[]> data with no bar for <bar type>`;
+after a failure that line is expected. A subscriber that raises is logged and does not hold the
+answer back, but it can keep the failure from the subscribers after it.
+
+A request made with a `time_range_generator` param is split by Nautilus into a series of
+requests of its own, one interval each. A failure then carries the id of one of those rather
+than the strategy's, and several failures may arrive, one per failed interval. Nautilus cannot
+tell a failed interval from an empty one: its default generator tries the next of
+`durations_seconds`, and ends the series once every duration has come back empty, so a failure
+can end the request early. Bars from intervals already served are still delivered, so the
+guarantee against a shortened warm-up does not hold for such a request.
+
 ## Quotes, and the conversion symbols nobody asked for
 
 A quote subscription publishes a `QuoteTick` per spot event, once both sides are known. Spot

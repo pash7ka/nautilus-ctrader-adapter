@@ -17,17 +17,25 @@ from decimal import Decimal
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.messages import (
     RequestBars,
+    RequestData,
+    RequestFundingRates,
     RequestInstrument,
     RequestInstruments,
+    RequestOrderBookDeltas,
+    RequestOrderBookDepth,
+    RequestOrderBookSnapshot,
+    RequestQuoteTicks,
+    RequestTradeTicks,
     SubscribeBars,
     SubscribeQuoteTicks,
     UnsubscribeBars,
     UnsubscribeQuoteTicks,
 )
 from nautilus_trader.live.data_client import LiveMarketDataClient
-from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import Bar, BarType, DataType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId
 from nautilus_trader.model.instruments import Instrument
 
@@ -38,6 +46,7 @@ from nautilus_ctrader.common.errors import (
     CTraderError,
     CTraderProtocolError,
     CTraderRequestError,
+    CTraderTimeoutError,
 )
 from nautilus_ctrader.common.parsing import (
     bar_boundary_secs,
@@ -49,6 +58,7 @@ from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.enums import PERIOD_SECS, trendbar_period_for
+from nautilus_ctrader.failures import REQUEST_FAILED_TOPIC, CTraderRequestFailed
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
@@ -100,6 +110,39 @@ def _trendbar(raw: RawBar) -> om.ProtoOATrendbar:
         deltaClose=raw.delta_close,
         utcTimestampInMinutes=raw.boundary_secs // 60,
     )
+
+
+def _failure_reason(error: Exception) -> str:
+    """The published reason for `error`: a fixed phrase or a venue error code, never its text."""
+    if isinstance(error, CTraderRequestError):
+        return f"venue refused: {error.error_code}"
+    if isinstance(error, CTraderTimeoutError):
+        return "timed out"
+    if isinstance(error, CTraderConnectionError):
+        return "connection lost"
+    if isinstance(error, CTraderProtocolError):
+        return "invalid venue response"
+    if isinstance(error, CTraderError):
+        return "request failed"
+    return "internal error"
+
+
+def _bars_data_type(bar_type: BarType) -> DataType:
+    return DataType(Bar, metadata={"bar_type": bar_type})
+
+
+def _answer_data_type(request: RequestData) -> DataType:
+    """The `data_type` Nautilus puts on a response to `request`.
+
+    Not `request.data_type`, which carries no metadata for the built-in requests.
+    """
+    if isinstance(request, RequestBars):
+        return _bars_data_type(request.bar_type)
+    if isinstance(request, RequestInstruments):
+        return DataType(Instrument, metadata={"venue": request.venue})
+    if type(request) is RequestData:
+        return request.data_type
+    return DataType(request.data_type.type, metadata={"instrument_id": request.instrument_id})
 
 
 @dataclass
@@ -238,6 +281,9 @@ class CTraderDataClient(LiveMarketDataClient):
         # Advanced by every `_connect` and `_disconnect`, so a subscribe that awaited across one
         # knows its preparation belongs to a connection that is gone.
         self._connection_generation = 0
+        # Requests handed to a task whose handler has not begun yet, by id; see `_submit`.
+        self._unanswered: dict[UUID4, RequestData] = {}
+        self._task_count_warned = False
         self._bars: dict[BarType, _BarSub] = {}
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
@@ -337,9 +383,15 @@ class CTraderDataClient(LiveMarketDataClient):
     # -- Instruments ------------------------------------------------------------------------
 
     async def _request_instrument(self, request: RequestInstrument) -> None:
+        self._claim(request)
         instrument = self._instrument_provider.find(request.instrument_id)
         if instrument is None:
             self._log.error(f"Cannot request instrument: {request.instrument_id} is not loaded")
+            self._request_failed(
+                request,
+                _answer_data_type(request),
+                f"instrument {request.instrument_id} is not loaded",
+            )
             return
         self._handle_instrument(
             instrument,
@@ -350,6 +402,7 @@ class CTraderDataClient(LiveMarketDataClient):
         )
 
     async def _request_instruments(self, request: RequestInstruments) -> None:
+        self._claim(request)
         self._handle_instruments(
             request.venue,
             self._instrument_provider.list_all(),
@@ -363,6 +416,142 @@ class CTraderDataClient(LiveMarketDataClient):
         # The account has already dropped the chains through the changed symbol; whether a
         # conversion is prepared again is left to the generation check in `_prepare_conversion`.
         self._handle_data(instrument)
+
+    # -- Failed requests --------------------------------------------------------------------
+
+    def _request_failed(self, request: RequestData, data_type: DataType, reason: str) -> None:
+        """Publish `CTraderRequestFailed`, then answer `request` with no data.
+
+        Published first, so a subscriber knows of the failure before the requester's callback
+        fires. A raising subscriber is logged rather than allowed to keep the response back.
+        """
+        failure = CTraderRequestFailed(
+            # The engine hands the client a request of its own, carrying the requester's id
+            # as its correlation id.
+            request_id=request.correlation_id or request.id,
+            data_type=data_type,
+            reason=reason,
+        )
+        try:
+            self._msgbus.publish(topic=REQUEST_FAILED_TOPIC, msg=failure)
+        except Exception as e:
+            self._log.exception(f"A {REQUEST_FAILED_TOPIC} subscriber raised", e)
+        self._handle_data_response(
+            data_type,
+            [],
+            request.id,
+            request.start,
+            request.end,
+            request.params,
+        )
+
+    def _submit(self, submit: Callable[[RequestData], None], request: RequestData) -> None:
+        """Hand `request` to the base class's `submit`, which runs its handler in a task.
+
+        A task cancelled before its first step never runs its coroutine at all, so the
+        handler's own cancellation path cannot answer it. This happens when a disconnect
+        cancels the client's tasks in the same loop turn the request arrived in. The task's
+        done-callback answers such a request instead.
+
+        The handler takes `request` out of `_unanswered` on its first line; a done-callback
+        answers only a request still there. So the cancellation path never adds a second
+        answer: a task's first step is queued when it is created, ahead of the done-callback of
+        any task cancelled afterwards. Nautilus 1.231 creates one task per request; with several
+        whose handlers all ran, each handler would answer.
+        """
+        self._unanswered[request.id] = request
+        before = set(self._tasks)
+        submit(request)
+        tasks = set(self._tasks) - before
+        if len(tasks) != 1 and request.id in self._unanswered and not self._task_count_warned:
+            self._task_count_warned = True
+            if tasks:
+                self._log.warning(
+                    f"Request {request.id} was given {len(tasks)} tasks instead of one; each "
+                    "handler that runs answers it",
+                )
+            else:
+                self._log.warning(
+                    f"Request {request.id} was given no task; it may go unanswered",
+                )
+        if not tasks:
+            # Never scheduled: nothing will claim it.
+            self._unanswered.pop(request.id, None)
+        for task in tasks:
+            task.add_done_callback(functools.partial(self._on_request_done, request.id))
+
+    def _claim(self, request: RequestData) -> None:
+        """Take `request` for its handler, which answers it from here on."""
+        self._unanswered.pop(request.id, None)
+
+    def _on_request_done(self, request_id: UUID4, task: asyncio.Task) -> None:
+        if not task.cancelled():
+            return
+        request = self._unanswered.pop(request_id, None)
+        if request is not None:
+            self._log.warning(f"Request {request_id} was cancelled before it started")
+            self._request_failed(request, _answer_data_type(request), "connection closed")
+
+    def request_instrument(self, request: RequestInstrument) -> None:
+        self._submit(super().request_instrument, request)
+
+    def request_instruments(self, request: RequestInstruments) -> None:
+        self._submit(super().request_instruments, request)
+
+    def request_bars(self, request: RequestBars) -> None:
+        self._submit(super().request_bars, request)
+
+    def request_quote_ticks(self, request: RequestQuoteTicks) -> None:
+        self._submit(super().request_quote_ticks, request)
+
+    def request_trade_ticks(self, request: RequestTradeTicks) -> None:
+        self._submit(super().request_trade_ticks, request)
+
+    def request_funding_rates(self, request: RequestFundingRates) -> None:
+        self._submit(super().request_funding_rates, request)
+
+    def request_order_book_deltas(self, request: RequestOrderBookDeltas) -> None:
+        self._submit(super().request_order_book_deltas, request)
+
+    def request_order_book_depth(self, request: RequestOrderBookDepth) -> None:
+        self._submit(super().request_order_book_depth, request)
+
+    def request_order_book_snapshot(self, request: RequestOrderBookSnapshot) -> None:
+        self._submit(super().request_order_book_snapshot, request)
+
+    def request(self, request: RequestData) -> None:
+        self._submit(super().request, request)
+
+    # The handlers below are answered here because the base class raises
+    # `NotImplementedError`, which leaves the request pending for ever.
+
+    def _unsupported(self, request: RequestData) -> None:
+        self._claim(request)
+        data_type = _answer_data_type(request)
+        name = data_type.type.__name__
+        self._log.error(f"Cannot request {name}: not supported by this adapter")
+        self._request_failed(request, data_type, f"{name} requests are not supported")
+
+    async def _request_quote_ticks(self, request: RequestQuoteTicks) -> None:
+        self._unsupported(request)
+
+    async def _request_trade_ticks(self, request: RequestTradeTicks) -> None:
+        self._unsupported(request)
+
+    async def _request_funding_rates(self, request: RequestFundingRates) -> None:
+        self._unsupported(request)
+
+    async def _request_order_book_deltas(self, request: RequestOrderBookDeltas) -> None:
+        self._unsupported(request)
+
+    async def _request_order_book_depth(self, request: RequestOrderBookDepth) -> None:
+        self._unsupported(request)
+
+    async def _request_order_book_snapshot(self, request: RequestOrderBookSnapshot) -> None:
+        self._unsupported(request)
+
+    async def _request(self, request: RequestData) -> None:
+        self._unsupported(request)
 
     # -- Conversion -------------------------------------------------------------------------
 
@@ -668,7 +857,7 @@ class CTraderDataClient(LiveMarketDataClient):
         try:
             period = trendbar_period_for(bar_type)
         except ValueError as e:
-            self._log.error(f"Cannot subscribe bars: {e}")
+            self._log.error(f"Cannot subscribe bars {bar_type}: {e}")
             return
         instrument = self._instrument_provider.find(bar_type.instrument_id)
         if instrument is None:
@@ -814,17 +1003,68 @@ class CTraderDataClient(LiveMarketDataClient):
         )
 
     async def _request_bars(self, request: RequestBars) -> None:
+        """Answer `request` exactly once: with its bars, or failed and with none.
+
+        A failure part way through delivers none of the bars already served, so a requester
+        is never handed a shortened history that looks complete.
+        """
+        self._claim(request)
         bar_type = request.bar_type
+        data_type = _bars_data_type(bar_type)
         try:
             period = trendbar_period_for(bar_type)
         except ValueError as e:
-            self._log.error(f"Cannot request bars: {e}")
+            self._log.error(f"Cannot request bars {bar_type}: {e}")
+            # The text is this adapter's own: short, and with nothing secret in it.
+            self._request_failed(request, data_type, str(e))
+            return
+        if self._session is None:
+            # Before the instrument check: the instruments may not be loaded yet either.
+            self._log.warning(f"Cannot request bars {bar_type}: not connected")
+            self._request_failed(request, data_type, "not connected")
             return
         instrument = self._instrument_provider.find(bar_type.instrument_id)
         if instrument is None:
             self._log.error(f"Cannot request bars: {bar_type.instrument_id} is not loaded")
+            self._request_failed(
+                request,
+                data_type,
+                f"instrument {bar_type.instrument_id} is not loaded",
+            )
             return
 
+        connection = self._connection_generation
+        try:
+            bars = await self._historical_bars(request, instrument, period)
+        except asyncio.CancelledError:
+            self._log.warning(f"Cannot request bars for {bar_type}: cancelled")
+            self._request_failed(request, data_type, "connection closed")
+            raise
+        except Exception as e:
+            reason = _failure_reason(e)
+            if isinstance(e, CTraderConnectionError) and connection != self._connection_generation:
+                # Closed by this client's own disconnect, not lost.
+                reason = "connection closed"
+            if isinstance(e, (CTraderTimeoutError, CTraderConnectionError)):
+                self._log.warning(f"Cannot request bars for {bar_type}: {e}")
+            elif isinstance(e, CTraderError):
+                self._log.error(f"Cannot request bars for {bar_type}: {e}")
+            self._request_failed(request, data_type, reason)
+            if not isinstance(e, CTraderError):
+                # A bug: Nautilus logs it with its traceback.
+                raise
+            return
+        # Outside the `try`: a response must never be followed by a failure for the same request.
+        self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)
+
+    async def _historical_bars(
+        self,
+        request: RequestBars,
+        instrument: Instrument,
+        period: int,
+    ) -> list[Bar]:
+        """`request`'s closed bars, ascending; nothing is recorded unless all are returned."""
+        bar_type = request.bar_type
         period_secs = PERIOD_SECS[period]
         now_secs = int(self._bar_clock.now())
         served = await self._page_trendbars(
@@ -844,11 +1084,6 @@ class CTraderDataClient(LiveMarketDataClient):
             # One page of the newest bars, although a page asks the venue for two more.
             closed = closed[-self._page_size() :]
 
-        sub = self._bars.get(bar_type)
-        if sub is not None and closed:
-            # What this request delivered must not go out a second time from the stream.
-            sub.closer.mark_emitted(closed[-1].boundary_secs)
-
         ts_init = self._clock.timestamp_ns()
         bars = [
             bar_from_trendbar(
@@ -860,7 +1095,13 @@ class CTraderDataClient(LiveMarketDataClient):
             )
             for raw in closed
         ]
-        self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)
+        # Only once every bar converted: a request that fails delivers nothing, so the stream
+        # must still deliver these.
+        sub = self._bars.get(bar_type)
+        if sub is not None and closed:
+            # What this request delivered must not go out a second time from the stream.
+            sub.closer.mark_emitted(closed[-1].boundary_secs)
+        return bars
 
     async def _page_trendbars(
         self,
