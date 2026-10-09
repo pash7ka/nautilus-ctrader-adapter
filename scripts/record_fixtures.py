@@ -126,22 +126,30 @@ NUMBER_PLACEHOLDER = "<number>"
 _PRIVATE_TEXT_FIELDS = frozenset(
     {"label", "comment", "clientOrderId", "externalNote", "clientId", "clientSecret"},
 )
-# Text kept as the venue sent it, by field name or by message and field name: codes, and names
-# from the venue's catalog of symbols and assets, the same for every account. Any other text
-# field is the venue's free text, `description` or `reason` or one the schema gains later, and
-# keeps no number that has no fake value.
-_KEPT_TEXT_FIELDS: frozenset[str | tuple[str, str]] = frozenset(
+# Text kept as the venue sent it, by message and field name: codes, and names from the venue's
+# catalog of symbols and assets, the same for every account. Any other text field is the venue's
+# free text, `description` or `reason`, or one the schema gains later even under a name kept
+# here, and keeps no number that has no fake value.
+_KEPT_TEXT_FIELDS: frozenset[tuple[str, str]] = frozenset(
     {
-        "errorCode",
-        "tokenType",
-        "version",
-        "symbolName",
-        "name",
-        "displayName",
-        "measurementUnits",
-        "minCommissionAsset",
+        ("ProtoErrorRes", "errorCode"),
+        ("ProtoOAErrorRes", "errorCode"),
+        ("ProtoOAOrderErrorEvent", "errorCode"),
+        ("ProtoOAExecutionEvent", "errorCode"),
+        ("ProtoOARefreshTokenRes", "tokenType"),
+        ("ProtoOAVersionRes", "version"),
+        ("ProtoOALightSymbol", "symbolName"),
         ("ProtoOALightSymbol", "description"),
+        ("ProtoOAArchivedSymbol", "name"),
         ("ProtoOAArchivedSymbol", "description"),
+        ("ProtoOAAsset", "name"),
+        ("ProtoOAAsset", "displayName"),
+        ("ProtoOAAssetClass", "name"),
+        ("ProtoOASymbolCategory", "name"),
+        ("ProtoOAHoliday", "name"),
+        ("ProtoOASymbol", "measurementUnits"),
+        ("ProtoOASymbol", "minCommissionAsset"),
+        ("ProtoOATradeData", "measurementUnits"),
     },
 )
 _DIGIT_RUN = re.compile(r"\d+")
@@ -229,7 +237,7 @@ def scrub_numbers(text: str, fakes: Mapping[str, str]) -> str:
 
 def is_free_text(owner: str, name: str) -> bool:
     """Whether the text field `name` of the message type `owner` is the venue's free text."""
-    judged = _CLEARED_FIELDS | _TOKEN_FIELDS | _PRIVATE_TEXT_FIELDS | _KEPT_TEXT_FIELDS
+    judged = _CLEARED_FIELDS | _TOKEN_FIELDS | _PRIVATE_TEXT_FIELDS
     return name not in judged and (owner, name) not in _KEPT_TEXT_FIELDS
 
 

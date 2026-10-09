@@ -1088,6 +1088,28 @@ FREE_TEXT = {
     ("ProtoOAClientDisconnectEvent", "reason"),
     ("ProtoOAAccountsTokenInvalidatedEvent", "reason"),
 }
+# The text kept as sent today. Kept by message and field, so a text field the schema gains under
+# one of these names is free text.
+KEPT_TEXT = {
+    ("ProtoErrorRes", "errorCode"),
+    ("ProtoOAErrorRes", "errorCode"),
+    ("ProtoOAOrderErrorEvent", "errorCode"),
+    ("ProtoOAExecutionEvent", "errorCode"),
+    ("ProtoOARefreshTokenRes", "tokenType"),
+    ("ProtoOAVersionRes", "version"),
+    ("ProtoOALightSymbol", "symbolName"),
+    ("ProtoOALightSymbol", "description"),
+    ("ProtoOAArchivedSymbol", "name"),
+    ("ProtoOAArchivedSymbol", "description"),
+    ("ProtoOAAsset", "name"),
+    ("ProtoOAAsset", "displayName"),
+    ("ProtoOAAssetClass", "name"),
+    ("ProtoOASymbolCategory", "name"),
+    ("ProtoOAHoliday", "name"),
+    ("ProtoOASymbol", "measurementUnits"),
+    ("ProtoOASymbol", "minCommissionAsset"),
+    ("ProtoOATradeData", "measurementUnits"),
+}
 
 
 def test_every_text_field_of_the_schema_is_free_text_or_judged_safe() -> None:
@@ -1101,6 +1123,7 @@ def test_every_text_field_of_the_schema_is_free_text_or_judged_safe() -> None:
     fake_order = str(ids.fake("order", ORDER_ID))
     text = f"order {ORDER_ID} of trader {VENUE_TRADER} at 1.5"
     free: set[tuple[str, str]] = set()
+    kept: set[tuple[str, str]] = set()
     judged: set = set()
     for owner, descriptor in schema_descriptors().items():
         for field in descriptor.fields:
@@ -1125,24 +1148,24 @@ def test_every_text_field_of_the_schema_is_free_text_or_judged_safe() -> None:
                 money_shift=MONEY_SHIFT,
             )
             (result,) = getattr(clean, name) if field.is_repeated else (getattr(clean, name),)
-            kept = next((k for k in ((owner, name), name) if k in fx._KEPT_TEXT_FIELDS), None)
             if name in fx._TOKEN_FIELDS:
                 judged.add(name)
                 assert result == fx.FAKE_TOKEN, (owner, name)
             elif name in fx._PRIVATE_TEXT_FIELDS:
                 judged.add(name)
                 assert result == r.SCRUBBED_TEXT, (owner, name)
-            elif kept is not None:
-                judged.add(kept)
+            elif (owner, name) in fx._KEPT_TEXT_FIELDS:
+                kept.add((owner, name))
                 assert result == text, (owner, name)
             else:
                 free.add((owner, name))
                 assert re.findall(r"\d+", result) == [fake_order], (owner, name, result)
 
     assert free == FREE_TEXT
+    assert kept == KEPT_TEXT
     # Nothing judged has left the schema: a stale name would hide a renamed field.
-    tables = fx._TOKEN_FIELDS | fx._PRIVATE_TEXT_FIELDS | fx._KEPT_TEXT_FIELDS
-    assert judged - fx._CLEARED_FIELDS == tables
+    assert fx._KEPT_TEXT_FIELDS == KEPT_TEXT
+    assert judged - fx._CLEARED_FIELDS == fx._TOKEN_FIELDS | fx._PRIVATE_TEXT_FIELDS
 
 
 def history_deal(n: int, *, gross: int, swap: int, commission: int, fee: int, balance: int):

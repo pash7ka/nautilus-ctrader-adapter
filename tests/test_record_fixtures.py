@@ -213,6 +213,12 @@ def test_scrub_replaces_owner_text_and_keeps_catalog_names() -> None:
     assert record_fixtures.scrub(symbol, REAL_ACCOUNT, REAL_LOGIN) == symbol
 
 
+def test_a_kept_name_is_kept_only_in_the_message_it_was_judged_in() -> None:
+    assert not record_fixtures.is_free_text("ProtoOAAsset", "name")
+    assert record_fixtures.is_free_text("ProtoOAUnknownMessage", "name")
+    assert record_fixtures.is_free_text("ProtoOAUnknownMessage", "errorCode")
+
+
 def test_assert_free_text_clean_refuses_an_unmapped_number() -> None:
     error = oa.ProtoOAErrorRes(errorCode="ORDER_NOT_FOUND", description="trader 515151")
     allowed = {str(record_fixtures.FAKE_ACCOUNT_ID)}
