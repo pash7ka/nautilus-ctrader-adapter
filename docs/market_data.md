@@ -178,9 +178,11 @@ answer back, but it can keep the failure from the subscribers after it.
 
 A request made with a `time_range_generator` param is split by Nautilus into a series of
 requests of its own, one interval each. A failure then carries the id of one of those rather
-than the strategy's, and several failures may arrive, one per failed interval. A failed interval
-does not stop the later ones, and the bars of the intervals that succeeded are still delivered,
-so the guarantee against a shortened warm-up does not hold for such a request.
+than the strategy's, and several failures may arrive, one per failed interval. Nautilus cannot
+tell a failed interval from an empty one: its default generator tries the next of
+`durations_seconds`, and ends the series once every duration has come back empty, so a failure
+can end the request early. Bars from intervals already served are still delivered, so the
+guarantee against a shortened warm-up does not hold for such a request.
 
 ## Quotes, and the conversion symbols nobody asked for
 

@@ -281,8 +281,9 @@ class CTraderDataClient(LiveMarketDataClient):
         # Advanced by every `_connect` and `_disconnect`, so a subscribe that awaited across one
         # knows its preparation belongs to a connection that is gone.
         self._connection_generation = 0
-        # Ids of the requests whose handler has begun, until their task is done; see `_submit`.
-        self._requests_started: set[UUID4] = set()
+        # Requests handed to a task whose handler has not begun yet, by id; see `_submit`.
+        self._unanswered: dict[UUID4, RequestData] = {}
+        self._task_count_warned = False
         self._bars: dict[BarType, _BarSub] = {}
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
@@ -382,7 +383,7 @@ class CTraderDataClient(LiveMarketDataClient):
     # -- Instruments ------------------------------------------------------------------------
 
     async def _request_instrument(self, request: RequestInstrument) -> None:
-        self._requests_started.add(request.id)
+        self._claim(request)
         instrument = self._instrument_provider.find(request.instrument_id)
         if instrument is None:
             self._log.error(f"Cannot request instrument: {request.instrument_id} is not loaded")
@@ -401,7 +402,7 @@ class CTraderDataClient(LiveMarketDataClient):
         )
 
     async def _request_instruments(self, request: RequestInstruments) -> None:
-        self._requests_started.add(request.id)
+        self._claim(request)
         self._handle_instruments(
             request.venue,
             self._instrument_provider.list_all(),
@@ -450,22 +451,40 @@ class CTraderDataClient(LiveMarketDataClient):
         A task cancelled before its first step never runs its coroutine at all, so the
         handler's own cancellation path cannot answer it. This happens when a disconnect
         cancels the client's tasks in the same loop turn the request arrived in. The task's
-        done-callback answers such a request instead; a handler that began has answered itself.
+        done-callback answers such a request instead.
+
+        Whoever takes `request` out of `_unanswered` first answers it: the handler on its first
+        line, or a done-callback of a task cancelled before that. So it is answered once, however
+        many tasks the base class creates: their first steps are queued as they are created,
+        ahead of any done-callback of one of them cancelled afterwards.
         """
+        self._unanswered[request.id] = request
         before = set(self._tasks)
         submit(request)
         tasks = set(self._tasks) - before
+        if len(tasks) != 1 and request.id in self._unanswered and not self._task_count_warned:
+            # Nautilus 1.231 creates exactly one task per request.
+            self._task_count_warned = True
+            self._log.warning(
+                f"Request {request.id} was given {len(tasks)} tasks instead of one; a request "
+                "cancelled before it starts may go unanswered",
+            )
         if not tasks:
-            # Run to completion synchronously, or never scheduled: nothing left to watch.
-            self._requests_started.discard(request.id)
+            # Never scheduled: nothing will claim it.
+            self._unanswered.pop(request.id, None)
         for task in tasks:
-            task.add_done_callback(functools.partial(self._on_request_done, request))
+            task.add_done_callback(functools.partial(self._on_request_done, request.id))
 
-    def _on_request_done(self, request: RequestData, task: asyncio.Task) -> None:
-        started = request.id in self._requests_started
-        self._requests_started.discard(request.id)
-        if task.cancelled() and not started:
-            self._log.warning(f"Request {request.id} was cancelled before it started")
+    def _claim(self, request: RequestData) -> None:
+        """Take `request` for its handler, which answers it from here on."""
+        self._unanswered.pop(request.id, None)
+
+    def _on_request_done(self, request_id: UUID4, task: asyncio.Task) -> None:
+        if not task.cancelled():
+            return
+        request = self._unanswered.pop(request_id, None)
+        if request is not None:
+            self._log.warning(f"Request {request_id} was cancelled before it started")
             self._request_failed(request, _answer_data_type(request), "connection closed")
 
     def request_instrument(self, request: RequestInstrument) -> None:
@@ -502,7 +521,7 @@ class CTraderDataClient(LiveMarketDataClient):
     # `NotImplementedError`, which leaves the request pending for ever.
 
     def _unsupported(self, request: RequestData) -> None:
-        self._requests_started.add(request.id)
+        self._claim(request)
         data_type = _answer_data_type(request)
         name = data_type.type.__name__
         self._log.error(f"Cannot request {name}: not supported by this adapter")
@@ -984,7 +1003,7 @@ class CTraderDataClient(LiveMarketDataClient):
         A failure part way through delivers none of the bars already served, so a requester
         is never handed a shortened history that looks complete.
         """
-        self._requests_started.add(request.id)
+        self._claim(request)
         bar_type = request.bar_type
         data_type = _bars_data_type(bar_type)
         try:

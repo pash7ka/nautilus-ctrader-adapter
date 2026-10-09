@@ -20,6 +20,7 @@ from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.core.data import Data
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
+from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.live.data_engine import LiveDataEngine
 from nautilus_trader.model.data import Bar, BarType, DataType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol
@@ -45,6 +46,7 @@ from tests.test_data_client import (
     at_minute,
     close_ns,
     config,
+    harness,
     trendbar_venue,
 )
 
@@ -320,6 +322,62 @@ async def test_a_request_cancelled_before_its_handler_started_fails(what: str) -
 
         assert n.assert_failed_once(request_id).reason == "connection closed"
         assert not received(n.server, oa.ProtoOAGetTrendbarsReq)
+
+
+def raw_bar_request(bar_type: BarType) -> RequestBars:
+    return RequestBars(
+        bar_type=bar_type,
+        start=None,
+        end=None,
+        limit=0,
+        client_id=None,
+        venue=CTRADER_VENUE,
+        callback=None,
+        request_id=UUID4(),
+        ts_init=0,
+        params=None,
+    )
+
+
+@pytest.mark.parametrize("cancelled", [(0,), (1,), (0, 1)], ids=["first", "second", "both"])
+async def test_a_request_given_two_tasks_is_answered_once(cancelled: tuple[int, ...]) -> None:
+    # Nautilus gives a request one task; two stand in for an upgrade that changes that.
+    async with harness() as h:
+        await h.client._connect()
+        failures: list = []
+        h.client._msgbus.subscribe(topic=REQUEST_FAILED_TOPIC, handler=failures.append)
+        request = raw_bar_request(EURUSD_LAST)
+        tasks: list[asyncio.Task] = []
+
+        def twice(r: RequestBars) -> None:
+            for _ in range(2):
+                tasks.append(h.client.create_task(h.client._request_bars(r)))
+
+        h.client._submit(twice, request)
+        for index in cancelled:
+            tasks[index].cancel()
+        await wait_until(lambda: all(task.done() for task in tasks), description="tasks done")
+        await asyncio.sleep(0)  # the done-callbacks run one loop turn later
+
+        expected = (
+            "connection closed"
+            if len(cancelled) == 2
+            else "trendbars are only available for the BID price type"
+        )
+        assert [f.reason for f in failures] == [expected]
+        assert len(h.responses) == 1
+        assert h.client._task_count_warned
+        assert not h.client._unanswered
+
+
+async def test_a_handler_called_directly_leaves_no_request_behind() -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        await h.client._request_bars(raw_bar_request(EURUSD_H1))
+
+        assert len(h.responses) == 1
+        assert not h.client._unanswered
 
 
 async def test_a_bar_request_in_flight_when_the_client_disconnects_fails() -> None:

@@ -292,39 +292,31 @@ def bar_from_trendbar(
     the enclosing `ProtoOAGetTrendbarsRes`), so reading it here would silently default to M1.
     Live bars (from a spot event subscription) do set `tb.period`; when they do, it must agree
     with `bar_type`, or `CTraderProtocolError` is raised rather than silently trusting one over
-    the other. A bar whose high and low do not enclose its open and close raises it too.
+    the other. So does a value Nautilus refuses: a price or volume out of its range, or a high
+    and low that do not enclose the open and close. The error's text does not name the bar type.
     """
     period = trendbar_period_for(bar_type)
     if tb.HasField("period") and tb.period != period:
         raise CTraderProtocolError(
-            f"{bar_type}: trendbar period {tb.period} does not match the bar type's period "
-            f"{period}",
+            f"trendbar period {tb.period} does not match the bar type's period {period}",
         )
-
-    open_price = price_from_raw(tb.low + tb.deltaOpen, price_precision)
-    high_price = price_from_raw(tb.low + tb.deltaHigh, price_precision)
-    low_price = price_from_raw(tb.low, price_precision)
-    close_price = price_from_raw(tb.low + tb.deltaClose, price_precision)
-    # TODO(verify): trendbar volume is a tick count, not scaled.
-    volume = Quantity(tb.volume, size_precision)
 
     period_secs = PERIOD_SECS[period]
     ts_event = (bar_boundary_secs(tb.utcTimestampInMinutes) + period_secs) * 1_000_000_000
-
     try:
         return Bar(
             bar_type,
-            open_price,
-            high_price,
-            low_price,
-            close_price,
-            volume,
+            price_from_raw(tb.low + tb.deltaOpen, price_precision),
+            price_from_raw(tb.low + tb.deltaHigh, price_precision),
+            price_from_raw(tb.low, price_precision),
+            price_from_raw(tb.low + tb.deltaClose, price_precision),
+            # TODO(verify): trendbar volume is a tick count, not scaled.
+            Quantity(tb.volume, size_precision),
             ts_event,
             ts_init,
         )
     except ValueError as e:
-        # Nautilus checks that the high and low enclose the open and the close.
-        raise CTraderProtocolError(f"{bar_type}: trendbar has inconsistent prices ({e})") from e
+        raise CTraderProtocolError(f"trendbar refused by Nautilus: {e}") from e
 
 
 def quote_from_prices(
