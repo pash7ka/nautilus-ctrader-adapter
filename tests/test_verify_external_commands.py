@@ -166,11 +166,11 @@ def owner_venue() -> ExecutionVenue:
     return venue
 
 
-def settings(tmp_path: pathlib.Path) -> vec.Settings:
+def settings(tmp_path: pathlib.Path, *, answer_wait_secs: float = 5.0) -> vec.Settings:
     return vec.Settings(
         symbol=SYMBOL,
         trailing_wait_secs=0.3,
-        answer_wait_secs=5.0,
+        answer_wait_secs=answer_wait_secs,
         settle_secs=0.05,
         log_dir=tmp_path,
     )
@@ -181,6 +181,7 @@ async def run(
     tmp_path: pathlib.Path,
     *,
     while_listening: list[Message] = (),
+    answer_wait_secs: float = 5.0,
 ) -> vec.Result:
     """One run of the check against `venue`; `while_listening` is pushed once it listens."""
     server = venue.server
@@ -189,7 +190,7 @@ async def run(
     try:
         task = asyncio.create_task(
             vec.run_check(
-                settings(tmp_path),
+                settings(tmp_path, answer_wait_secs=answer_wait_secs),
                 CREDENTIALS,
                 TRADER_LOGIN,
                 address=vec.Address(server.host, server.host, server.port, tls=False),
@@ -366,6 +367,14 @@ def test_a_failed_run_prints_only_the_errors_type(
         (vec.Result(findings=[vec.Finding(1, "t", vec.OK), vec.Finding(2, "t", vec.UNKNOWN)]), 0),
         (vec.Result(findings=[vec.Finding(1, "t", vec.DIFFERS)]), 1),
         (vec.Result(refusal=("0 positions on the symbol, not exactly one",)), 1),
+        (
+            vec.Result(
+                findings=[vec.Finding(1, "t", vec.OK)],
+                failure="CTraderConnectionError",
+                left_open=("The position on US100.cash stays open. Close it by hand.",),
+            ),
+            1,
+        ),
     ],
 )
 def test_main_prints_the_report_and_exits_by_it(
@@ -391,6 +400,22 @@ def test_main_prints_the_report_and_exits_by_it(
     # No refresh: a rotated token would not be written back.
     assert credentials.refresh_token is None
     assert vec.format_report(result) in capsys.readouterr().out
+
+
+def test_a_run_stopped_by_hand_says_what_to_check(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(builtins, "input", lambda _prompt="": SYMBOL)
+    monkeypatch.setattr(vec.get_tokens, "load_env", lambda _path: dict(FAKE_ENV))
+    monkeypatch.setattr(vec, "run_check", interrupted)
+
+    assert vec.main(["--symbol", SYMBOL, "--send-commands"]) == 130
+    out = capsys.readouterr().out
+    assert "Stopped by hand" in out
+    assert "close the position by hand" in out
 
 
 def test_the_plan_says_what_changes_and_that_the_position_stays_open() -> None:
@@ -423,6 +448,9 @@ TARGETS = vec.Targets(
     max_volume=RAISED,
     pending_is_buy=True,
     start_limit_price=84000.0,
+    position_is_long=True,
+    start_stop_loss=84900.0,
+    start_take_profit=85100.0,
 )
 
 
@@ -511,6 +539,11 @@ def test_the_guard_lets_through_the_commands_on_the_owners_objects(request_: Mes
         (amend(orderId=PENDING, volume=MINIMUM, limitPrice=84000.1), "toward the market"),
         (levels(positionId=POSITION + 1, stopLoss=84899.9), "other than the owner's"),
         (levels(positionId=POSITION, takeProfit=85100.0), "removing the stop-loss"),
+        (levels(positionId=POSITION, stopLoss=84900.1), "stop-loss toward the market"),
+        (
+            levels(positionId=POSITION, stopLoss=84899.9, takeProfit=85200.0),
+            "changing the take-profit",
+        ),
     ],
 )
 def test_the_guard_refuses_commands_beyond_the_owners_objects(
@@ -520,12 +553,42 @@ def test_the_guard_refuses_commands_beyond_the_owners_objects(
         guard().check(request_)
 
 
+def test_a_short_positions_stop_loss_may_only_move_up() -> None:
+    short = guard(vec.Targets(**{**TARGETS.__dict__, "position_is_long": False}))
+
+    short.check(levels(positionId=POSITION, stopLoss=84900.1))
+    with pytest.raises(vec.CommandRefused, match="stop-loss toward the market"):
+        short.check(levels(positionId=POSITION, stopLoss=84899.9))
+
+
+def test_a_stop_loss_the_broker_trailed_may_be_sent_back_where_it_stands() -> None:
+    checked = guard()
+    checked.recorder.inbound.append(vec.Inbound(0.0, trailing_move(84950.0), pushed=True))
+
+    checked.check(levels(positionId=POSITION, stopLoss=84950.0))
+    with pytest.raises(vec.CommandRefused, match="stop-loss toward the market"):
+        checked.check(levels(positionId=POSITION, stopLoss=84950.1))
+
+
 def test_a_sell_limit_may_only_move_up() -> None:
     selling = guard(vec.Targets(**{**TARGETS.__dict__, "pending_is_buy": False}))
 
     selling.check(amend(orderId=PENDING, volume=MINIMUM, limitPrice=84000.1))
     with pytest.raises(vec.CommandRefused, match="toward the market"):
         selling.check(amend(orderId=PENDING, volume=MINIMUM, limitPrice=83999.9))
+
+
+def test_the_guard_knows_whether_a_connection_still_sends_through_it() -> None:
+    connection = CTraderConnection("127.0.0.1", 1, logger=RecordingLogger(), tls=False)
+    checked = guard()
+    assert not checked.covers(connection)
+
+    checked.instrument(connection)
+    assert checked.covers(connection)
+    assert not guard().covers(connection)
+
+    connection.request = CTraderConnection.request.__get__(connection)
+    assert not checked.covers(connection)
 
 
 async def test_a_guarded_connection_refuses_before_the_socket_and_logs_every_answer() -> None:
@@ -741,6 +804,11 @@ def test_a_refusal_reason_loses_the_brokers_description() -> None:
     [
         (None, "not sent", None),
         (
+            vec.Exchange(cancel(1), 0.0, failed="CTraderConnectionError"),
+            "not sent: CTraderConnectionError",
+            None,
+        ),
+        (
             exchange(error_code="ORDER_NOT_FOUND"),
             "ProtoOAErrorRes ORDER_NOT_FOUND",
             "ORDER_NOT_FOUND",
@@ -820,6 +888,7 @@ def amended(**fields) -> om.ProtoOAOrder:
         (amended(relativeStopLoss=None, stopLoss=83950.0), vec.DIFFERS, "relativeStopLoss"),
         (amended(timeInForce=om.GOOD_TILL_CANCEL), vec.DIFFERS, "timeInForce"),
         (amended(trailingStopLoss=True), vec.DIFFERS, "trailingStopLoss"),
+        (amended(relativeStopLoss=4_000_000), vec.DIFFERS, "relativeStopLoss"),
         (None, vec.UNKNOWN, "not listed"),
     ],
 )
@@ -828,6 +897,19 @@ def test_an_amend_should_keep_what_it_re_sent(after, status: str, named: str) ->
 
     assert decided == status
     assert any(named in line for line in detail), detail
+
+
+def test_a_price_held_next_to_its_distance_may_follow_the_moved_limit_price() -> None:
+    before = pending_order(OPENED, stopLoss=83950.0, takeProfit=84100.0)
+    after = amended(stopLoss=83949.9, takeProfit=84099.9)
+
+    decided, detail = vec.decide_order_kept(before, after, amended=True)
+
+    assert decided == vec.OK
+    assert "stopLoss not compared: it follows the moved limit price" in detail
+    assert "takeProfit not compared: it follows the moved limit price" in detail
+    lost = amended(relativeTakeProfit=None, stopLoss=83949.9, takeProfit=84099.9)
+    assert vec.decide_order_kept(before, lost, amended=True)[0] == vec.DIFFERS
 
 
 def test_an_order_with_nothing_optional_to_keep_settles_nothing() -> None:
@@ -864,6 +946,7 @@ def test_the_form_of_attached_levels_is_read_off_the_order(fields, status, line)
         (exchange(timed_out=True), vec.DIFFERS),
         (exchange(answer=execution(om.ORDER_CANCELLED)), vec.DIFFERS),
         (None, vec.UNKNOWN),
+        (vec.Exchange(cancel(1), 0.0, failed="CTraderConnectionError"), vec.UNKNOWN),
     ],
 )
 def test_each_way_the_adapter_reads_a_refusal_is_ok(made, status: str) -> None:
@@ -883,6 +966,7 @@ DETAILS = oa.ProtoOAOrderDetailsRes(
         (exchange(error_code="ORDER_NOT_FOUND"), vec.DIFFERS, vec.OK),
         (exchange(timed_out=True), vec.DIFFERS, vec.DIFFERS),
         (None, vec.UNKNOWN, vec.UNKNOWN),
+        (vec.Exchange(cancel(1), 0.0, failed="CTraderConnectionError"), vec.UNKNOWN, vec.UNKNOWN),
     ],
 )
 def test_order_details_of_ended_and_unknown_orders(made, ended: str, unknown: str) -> None:
@@ -1020,6 +1104,22 @@ def test_what_is_left_open_tells_the_owner_what_to_close() -> None:
     )
     unread = vec.left_open(None, symbol=SYMBOL, pending_order_id=PENDING, position_id=POSITION)
     assert "close the position by hand" in unread[0]
+
+
+def test_a_position_left_without_a_stop_loss_is_said_loudly() -> None:
+    bare = snapshot(orders=[], positions=[position_after(stop=None)])
+
+    (line,) = vec.left_open(bare, symbol=SYMBOL, pending_order_id=PENDING, position_id=POSITION)
+
+    assert line == f"The position on {SYMBOL} stays open WITHOUT a stop-loss: close it by hand now."
+
+
+def test_a_failed_run_is_said_first_in_the_report() -> None:
+    text = vec.format_report(vec.Result(failure="RuntimeError", left_open=("left",)))
+
+    assert "The run ended early on RuntimeError" in text
+    assert text.rstrip().endswith("left")
+    assert vec.exit_code(vec.Result(failure="RuntimeError")) == 1
 
 
 def test_the_report_counts_the_findings_and_says_how_to_scrub_the_recording(tmp_path) -> None:
@@ -1220,6 +1320,112 @@ async def test_a_run_refuses_to_act_unless_it_finds_exactly_the_owners_objects(
     for command in vec.COMMAND_REQUESTS:
         assert received(venue, command) == []
     assert "Refused to act; nothing was changed at the broker:" in vec.format_report(result)
+
+
+def commands_received(venue: ExecutionVenue) -> list[Message]:
+    return [m for m in venue.server.received if type(m) in vec.COMMAND_REQUESTS]
+
+
+async def test_a_run_that_fails_midway_still_says_what_is_left_open(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command = vec.Check._command
+
+    async def failing(self, label, *args, **kwargs):
+        if label == "stop-loss move":
+            raise RuntimeError("the run broke")
+        return await command(self, label, *args, **kwargs)
+
+    monkeypatch.setattr(vec.Check, "_command", failing)
+
+    result = await run(owner_venue(), tmp_path)
+
+    assert result.failure == "RuntimeError"
+    assert [f.item for f in result.findings] == [1, 2, 3]
+    assert any("stays open with its stop-loss at 84900.0" in line for line in result.left_open)
+    assert vec.exit_code(result) == 1
+    assert "The run ended early on RuntimeError" in vec.format_report(result)
+
+
+def dropping_venue() -> ExecutionVenue:
+    """The owner's objects at a venue that drops the connection on the first order details read.
+
+    The session then reconnects, and a request made meanwhile fails before the guard sees it.
+    """
+    venue = owner_venue()
+    answer = venue.replies[om.PROTO_OA_ORDER_DETAILS_REQ]
+    dropped: list[bool] = []
+
+    def drop_once(request):
+        if dropped:
+            return answer(request)
+        dropped.append(True)
+        asyncio.get_running_loop().create_task(venue.server.drop_connections())
+        return None
+
+    venue.server.on(om.PROTO_OA_ORDER_DETAILS_REQ, drop_once)
+    return venue
+
+
+async def test_a_connection_dropped_midway_still_ends_with_what_is_left_open(tmp_path) -> None:
+    venue = dropping_venue()
+
+    result = await run(venue, tmp_path, answer_wait_secs=2.0)
+
+    assert result.failure is None
+    findings = by_item(result)
+    assert sorted(findings) == list(range(1, 19))
+    assert [findings[item].status for item in (1, 2, 3)] == [vec.OK] * 3
+    # The ended order's details were lost with the connection; the cancel of the missing id came
+    # while the session was reconnecting.
+    assert findings[10].status == vec.DIFFERS
+    assert findings[9] == vec.Finding(
+        9, findings[9].title, vec.UNKNOWN, ("not sent: CTraderConnectionError",)
+    )
+    assert any("stays open with its stop-loss" in line for line in result.left_open)
+
+
+async def test_a_connection_no_longer_behind_the_guard_stops_every_command(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(vec.Guard, "covers", lambda _self, _connection: False)
+    venue = owner_venue()
+
+    result = await run(venue, tmp_path)
+
+    assert commands_received(venue) == []
+    assert result.guard.refused == ["the session's connection no longer sends through the guard"]
+    assert all(by_item(result)[item].status == vec.UNKNOWN for item in range(1, 6))
+    assert any("pending order" in line for line in result.left_open)
+    assert vec.exit_code(result) == 1
+
+
+async def test_the_first_guard_refusal_stops_the_commands(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refusal = vec.Guard._refusal
+
+    def refusing_amends(self, payload):
+        if isinstance(payload, oa.ProtoOAAmendOrderReq):
+            return "ProtoOAAmendOrderReq refused for the test"
+        return refusal(self, payload)
+
+    monkeypatch.setattr(vec.Guard, "_refusal", refusing_amends)
+    venue = owner_venue()
+
+    result = await run(venue, tmp_path, answer_wait_secs=1.0)
+
+    assert commands_received(venue) == []
+    assert result.guard.refused == ["ProtoOAAmendOrderReq refused for the test"]
+    findings = by_item(result)
+    for item in range(2, 6):
+        assert findings[item].detail == (
+            "not run: the guard refused a request; no further command is sent",
+        )
+    assert findings[9].status == vec.UNKNOWN
+    assert any("pending order" in line for line in result.left_open)
+    assert any("stays open with its stop-loss" in line for line in result.left_open)
+    assert vec.exit_code(result) == 1
 
 
 async def test_no_secret_is_printed_logged_or_recorded(tmp_path, capsys) -> None:

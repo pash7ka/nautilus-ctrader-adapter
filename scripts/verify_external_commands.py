@@ -38,7 +38,8 @@ under `--log-dir` (by default `tests/recordings/`, which git ignores);
 
 Credentials and the trader login come from `.env` in the repository root. The script does no
 token refresh, so it refuses to start with an access token whose `CTRADER_TOKEN_EXPIRES_AT` has
-passed. No token, client id or secret is ever printed; account identifiers are not printed either.
+passed. No token, client id or secret is ever printed. The report and the progress lines name no
+account identifier; warnings the adapter itself logs are relayed to stderr as they are.
 """
 
 from __future__ import annotations
@@ -48,7 +49,6 @@ import asyncio
 import contextlib
 import datetime
 import importlib.util
-import math
 import pathlib
 import re
 import sys
@@ -74,7 +74,7 @@ from nautilus_trader.model.events import (
     OrderPendingUpdate,
     OrderUpdated,
 )
-from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Symbol, TraderId
+from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, TraderId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders import Order
@@ -96,7 +96,6 @@ from nautilus_ctrader.common.venue_book import entry_of
 from nautilus_ctrader.common.venue_records import Level, parse_leg_venue_order_id, units_of
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
-    CTRADER_VENUE,
     DEMO_HOST,
     LIVE_HOST,
     PENDING_ORDER_TYPES,
@@ -111,7 +110,10 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _load_sibling(name: str):
-    """scripts/ is not a package: a sibling script is loaded by file path."""
+    """scripts/ is not a package: a sibling script is loaded by file path.
+
+    `record_execution` has the same helper, but loading that module needs this one first.
+    """
     spec = importlib.util.spec_from_file_location(
         name,
         pathlib.Path(__file__).resolve().with_name(f"{name}.py"),
@@ -128,29 +130,20 @@ get_tokens = _load_sibling("get_tokens")
 
 _TRADER_LOGIN_KEY = "CTRADER_TRADER_LOGIN"
 
-# What the session may send besides the commands below. Each reads, authenticates or subscribes
-# to prices; none changes the account.
-READ_REQUESTS: frozenset[type[Message]] = frozenset(
-    {
-        oa.ProtoOAApplicationAuthReq,
-        oa.ProtoOAAccountAuthReq,
-        oa.ProtoOAGetAccountListByAccessTokenReq,
-        oa.ProtoOATraderReq,
-        oa.ProtoOAAssetListReq,
-        oa.ProtoOASymbolsListReq,
-        oa.ProtoOASymbolByIdReq,
-        oa.ProtoOASymbolsForConversionReq,
-        oa.ProtoOAReconcileReq,
-        oa.ProtoOAOrderListReq,
-        oa.ProtoOADealListReq,
-        oa.ProtoOAOrderListByPositionIdReq,
-        oa.ProtoOADealListByPositionIdReq,
-        oa.ProtoOAOrderDetailsReq,
-        oa.ProtoOACashFlowHistoryListReq,
-        oa.ProtoOASubscribeSpotsReq,
-        oa.ProtoOAUnsubscribeSpotsReq,
-    },
-)
+# What the session may send besides the commands below: the recorder's reads, less the account
+# list (read only on the account client's pre-connection), plus the reads the clients make at
+# connect. Each reads, authenticates or subscribes to prices; none changes the account.
+READ_REQUESTS: frozenset[type[Message]] = (
+    record_execution.READ_ONLY_REQUESTS - {oa.ProtoOAGetAccountListByAccessTokenReq}
+) | {
+    oa.ProtoOAAssetListReq,
+    oa.ProtoOASymbolsListReq,
+    oa.ProtoOASymbolByIdReq,
+    oa.ProtoOASymbolsForConversionReq,
+    oa.ProtoOAOrderDetailsReq,
+    oa.ProtoOASubscribeSpotsReq,
+    oa.ProtoOAUnsubscribeSpotsReq,
+}
 # Allowed only once `Guard.targets` is set, and only on those targets.
 COMMAND_REQUESTS: frozenset[type[Message]] = frozenset(
     {oa.ProtoOACancelOrderReq, oa.ProtoOAAmendOrderReq, oa.ProtoOAAmendPositionSLTPReq},
@@ -168,6 +161,8 @@ _MOVE_STEPS = 10
 # Added to the highest order id seen to name an order that does not exist yet.
 _NO_SUCH_ORDER_OFFSET = 1_000_000_000
 _POLL_SECS = 0.05
+# Relative slack for comparing prices the venue sent as doubles with ones sent back.
+_EPSILON = 1e-9
 _TRADER_ID = TraderId("CHECK-001")
 # An adapter-made refusal reason starts with the broker's code; the description after it is
 # the broker's free text, which this script does not print.
@@ -193,6 +188,11 @@ class Targets:
     pending_is_buy: bool
     # The pending order's price at the start: an amend may only move it away from the market.
     start_limit_price: float
+    position_is_long: bool
+    # The position's levels at the start. The stop-loss may only move away from the market from
+    # where the broker last reported it; the take-profit may only stay or go.
+    start_stop_loss: float
+    start_take_profit: float
 
 
 @dataclass
@@ -205,6 +205,8 @@ class Exchange:
     error_code: str | None = None
     timed_out: bool = False
     answered_at: float | None = None
+    # The error type, for a request that failed before the guard logged it.
+    failed: str | None = None
 
 
 @dataclass(frozen=True)
@@ -295,21 +297,49 @@ class Guard:
                 return f"{name} of an order other than the owner's pending one"
             if payload.HasField("volume") and payload.volume > targets.max_volume:
                 return f"{name} raising the volume above the minimum plus one step"
-            if payload.HasField("limitPrice"):
-                limit = payload.limitPrice
-                toward = (
-                    limit > targets.start_limit_price
-                    if targets.pending_is_buy
-                    else limit < targets.start_limit_price
-                )
-                if toward:
-                    return f"{name} moving the limit price toward the market"
+            if payload.HasField("limitPrice") and _toward(
+                payload.limitPrice, targets.start_limit_price, up=targets.pending_is_buy
+            ):
+                return f"{name} moving the limit price toward the market"
             return None
         if payload.positionId != targets.position_id:
             return f"{name} of a position other than the owner's"
         if not payload.HasField("stopLoss"):
             return f"{name} removing the stop-loss"
+        if _toward(payload.stopLoss, self._reported_stop(targets), up=targets.position_is_long):
+            return f"{name} moving the stop-loss toward the market"
+        if payload.HasField("takeProfit") and not _same(
+            payload.takeProfit, targets.start_take_profit
+        ):
+            return f"{name} changing the take-profit"
         return None
+
+    def _reported_stop(self, targets: Targets) -> float:
+        """The position's stop-loss as the broker last reported it: a trailing stop moves."""
+        stop = targets.start_stop_loss
+        for inbound in self.recorder.inbound:
+            message = inbound.message
+            if isinstance(message, oa.ProtoOATrailingSLChangedEvent):
+                if message.positionId == targets.position_id:
+                    stop = message.stopPrice
+                continue
+            if isinstance(message, oa.ProtoOAExecutionEvent) and message.HasField("position"):
+                positions = [message.position]
+            elif isinstance(message, oa.ProtoOAReconcileRes):
+                positions = list(message.position)
+            else:
+                continue
+            for position in positions:
+                if position.positionId == targets.position_id and position.HasField("stopLoss"):
+                    stop = position.stopLoss
+        return stop
+
+    def covers(self, connection: CTraderConnection) -> bool:
+        """Whether `connection` still sends through this guard."""
+        return all(
+            getattr(method, "guarded_by", None) is self
+            for method in (connection.request, connection.send)
+        )
 
     def instrument(self, connection: CTraderConnection) -> None:
         """Make `connection` check every request and send through this guard, and log them."""
@@ -337,8 +367,21 @@ class Guard:
             self.recorder.mark(f"send {type(payload).__name__}")
             await send(payload, **kwargs)
 
+        guarded_request.guarded_by = self
+        guarded_send.guarded_by = self
         connection.request = guarded_request
         connection.send = guarded_send
+
+
+def _same(price: float, other: float) -> bool:
+    return abs(price - other) <= _EPSILON * max(1.0, abs(other))
+
+
+def _toward(price: float, bound: float, *, up: bool) -> bool:
+    """Whether `price` lies past `bound` upward when `up`, else downward."""
+    if _same(price, bound):
+        return False
+    return price > bound if up else price < bound
 
 
 class GuardedAccount(CTraderAccountClient):
@@ -542,6 +585,8 @@ def answer_text(exchange: Exchange | None) -> str:
     """What the broker answered a request, by type and code only."""
     if exchange is None:
         return "not sent"
+    if exchange.failed is not None:
+        return f"not sent: {exchange.failed}"
     if exchange.error_code is not None:
         return f"ProtoOAErrorRes {exchange.error_code}"
     if exchange.timed_out or exchange.answer is None:
@@ -645,20 +690,37 @@ def decide_order_kept(
         return UNKNOWN, ("no amend of the pending order was accepted",)
     if before is None or after is None:
         return UNKNOWN, ("the pending order was not listed after its amends",)
+    # A level held as a distance is what the adapter re-sends; its price follows the moved limit
+    # price, so only the distance must stay.
+    following = [
+        absolute
+        for relative, absolute in (
+            ("relativeStopLoss", "stopLoss"),
+            ("relativeTakeProfit", "takeProfit"),
+        )
+        if before.HasField(relative)
+    ]
+    compared = [name for name in (*_OPTIONAL_KEPT, *_DEFAULTED_KEPT) if name not in following]
     changed = [
         f"{name}: {_field(before, name)} -> {_field(after, name)}"
-        for name in (*_OPTIONAL_KEPT, *_DEFAULTED_KEPT)
+        for name in compared
         if _field(before, name) != _field(after, name)
     ]
     if changed:
         return DIFFERS, tuple(changed)
-    held = [name for name in _OPTIONAL_KEPT if before.HasField(name)]
+    held = [name for name in _OPTIONAL_KEPT if name in compared and before.HasField(name)]
     if not held:
         return UNKNOWN, (
             "the order carried no expiration and no attached level, so the amends kept "
             "only the time in force and the trigger method",
         )
-    return OK, (f"kept: {', '.join(held)} and the order's other fields",)
+    lines = [f"kept: {', '.join(held)} and the order's other fields"]
+    lines += [
+        f"{name} not compared: it follows the moved limit price"
+        for name in following
+        if before.HasField(name)
+    ]
+    return OK, tuple(lines)
 
 
 def decide_level_form(order: om.ProtoOAOrder | None) -> Decision:
@@ -682,8 +744,8 @@ def decide_level_form(order: om.ProtoOAOrder | None) -> Decision:
 
 def decide_refusal_form(exchange: Exchange | None) -> Decision:
     """How the broker refuses a cancel: an order error, a rejection event, or an error answer."""
-    if exchange is None:
-        return UNKNOWN, ("the cancel was not sent",)
+    if exchange is None or exchange.failed is not None:
+        return UNKNOWN, (answer_text(exchange),)
     text = answer_text(exchange)
     if refusal_of(exchange) is not None:
         return OK, (f"refused with {text}",)
@@ -696,6 +758,8 @@ def decide_details_of_ended(exchange: Exchange | None) -> Decision:
     """Whether the order details request answers an order that has ended."""
     if exchange is None:
         return UNKNOWN, ("the pending order was not cancelled, so not asked",)
+    if exchange.failed is not None:
+        return UNKNOWN, (answer_text(exchange),)
     if isinstance(exchange.answer, oa.ProtoOAOrderDetailsRes):
         return OK, (f"answered: {answer_text(exchange)}",)
     return DIFFERS, (
@@ -706,8 +770,8 @@ def decide_details_of_ended(exchange: Exchange | None) -> Decision:
 
 def decide_details_of_unknown(exchange: Exchange | None) -> Decision:
     """What the order details request answers for an id no order has."""
-    if exchange is None:
-        return UNKNOWN, ("not asked",)
+    if exchange is None or exchange.failed is not None:
+        return UNKNOWN, (answer_text(exchange),)
     if refusal_of(exchange) is not None:
         return OK, (f"refused with {answer_text(exchange)}",)
     return DIFFERS, (f"answered: {answer_text(exchange)}",)
@@ -839,19 +903,21 @@ def left_open(
         )
     lines = []
     for position in snapshot.position:
-        if position.positionId == position_id:
-            has_stop = position.HasField("stopLoss")
-            stop = (
-                f"stop-loss at {position.stopLoss}" if has_stop else "position, with NO stop-loss"
-            )
-            trailing = ", trailing" if position.trailingStopLoss else ""
-            target = (
-                f", take-profit at {position.takeProfit}" if position.HasField("takeProfit") else ""
-            )
+        if position.positionId != position_id:
+            continue
+        if not position.HasField("stopLoss"):
             lines.append(
-                f"The position on {symbol} stays open with its {stop}{trailing}{target}. "
-                "Close it by hand in the terminal.",
+                f"The position on {symbol} stays open WITHOUT a stop-loss: close it by hand now.",
             )
+            continue
+        trailing = ", trailing" if position.trailingStopLoss else ""
+        target = (
+            f", take-profit at {position.takeProfit}" if position.HasField("takeProfit") else ""
+        )
+        lines.append(
+            f"The position on {symbol} stays open with its stop-loss at {position.stopLoss}"
+            f"{trailing}{target}. Close it by hand in the terminal.",
+        )
     if any(order.orderId == pending_order_id for order in snapshot.order):
         lines.append(f"The pending order on {symbol} is still open: cancel it by hand.")
     if not lines:
@@ -896,14 +962,12 @@ class Result:
     raw: pathlib.Path | None = None
     guard: Guard | None = None
     logger: ScriptLogger | None = None
+    # The type of the error that ended the run early, if one did.
+    failure: str | None = None
 
 
 def _say(text: str) -> None:
     print(f">>> {text}")
-
-
-def instrument_id_of(symbol: str) -> InstrumentId:
-    return InstrumentId(Symbol(symbol), CTRADER_VENUE)
 
 
 class Check:
@@ -938,13 +1002,18 @@ class Check:
         self._accepted: list[tuple[str, Exchange]] = []
 
     async def run(self, result: Result, listening: asyncio.Event | None) -> None:
+        """Find the objects, carry out the steps, then say what is left open, however it ends."""
         found = await self._find(result)
         if found is None:
             return
         self._status("Found the pending order and the position. Sending the commands.")
-        findings = await self._steps(found, listening)
-        final = await self._snapshot()
-        result.findings = findings
+        try:
+            await self._steps(found, listening, result)
+        except Exception as e:
+            result.failure = type(e).__name__
+        final = None
+        with contextlib.suppress(Exception):
+            final = await self._snapshot()
         result.left_open = left_open(
             final,
             symbol=self._settings.symbol,
@@ -994,6 +1063,9 @@ class Check:
             max_volume=max_volume,
             pending_is_buy=found.pending.tradeData.tradeSide == om.BUY,
             start_limit_price=found.pending.limitPrice,
+            position_is_long=found.position.tradeData.tradeSide == om.BUY,
+            start_stop_loss=found.position.stopLoss,
+            start_take_profit=found.position.takeProfit,
         )
         return found
 
@@ -1007,8 +1079,13 @@ class Check:
 
     # -- the steps --
 
-    async def _steps(self, found: Found, listening: asyncio.Event | None) -> list[Finding]:
+    async def _steps(self, found: Found, listening: asyncio.Event | None, result: Result) -> None:
+        """The steps; each step's finding is added to `result` as soon as the step ends."""
         targets = self._guard.targets
+
+        def step(item: int, title: str, sent: tuple[Outcome, Exchange | None], done: str) -> None:
+            result.findings.append(Finding(item, title, *decide_step(*sent, done)))
+
         position_id = found.position.positionId
         increment = self._instrument.price_increment.as_decimal()
         trailing_at_start = found.position.trailingStopLoss
@@ -1023,10 +1100,12 @@ class Check:
             price=None if price is None else self._instrument.make_price(price),
             skip=None if price is not None else "the moved price would not be positive",
         )
+        step(1, "The pending order's limit price moves away", priced, f"price {price}")
         raised = self._raised_quantity()
         sized = await self._command(
             "volume amend", found.pending_order, oa.ProtoOAAmendOrderReq, quantity=raised
         )
+        step(2, "The pending order's volume rises one step", sized, f"quantity {raised}")
         after_amends = await self._snapshot()
         amended_pending = _order(after_amends, found.pending.orderId)
 
@@ -1034,6 +1113,7 @@ class Check:
         cancelled = await self._command(
             "cancel", found.pending_order, oa.ProtoOACancelOrderReq, cancel=True
         )
+        step(3, "The pending order is cancelled", cancelled, "CANCELED")
         details_ended = None
         if cancelled[0].done:
             details_ended = await self._ask(
@@ -1044,13 +1124,15 @@ class Check:
             )
 
         # 4. A cancel the broker refuses, and the details of the same missing order.
-        self._status("Asking the broker to cancel an order id that does not exist.")
-        refused = await self._ask(
-            oa.ProtoOACancelOrderReq(
-                ctidTraderAccountId=self._account.account_id,
-                orderId=targets.no_such_order_id,
-            ),
-        )
+        refused = None
+        if self._blocked() is None:
+            self._status("Asking the broker to cancel an order id that does not exist.")
+            refused = await self._ask(
+                oa.ProtoOACancelOrderReq(
+                    ctidTraderAccountId=self._account.account_id,
+                    orderId=targets.no_such_order_id,
+                ),
+            )
         details_unknown = await self._ask(
             oa.ProtoOAOrderDetailsReq(
                 ctidTraderAccountId=self._account.account_id,
@@ -1069,24 +1151,28 @@ class Check:
             trigger_price=None if trigger is None else self._instrument.make_price(trigger),
             skip=None if trigger is not None else "the moved stop-loss would not be positive",
         )
+        step(4, "The stop-loss moves away", moved, f"trigger price {trigger}")
         after_move = _position(await self._snapshot(), position_id)
 
         # 6. Remove the take-profit.
         removed = await self._command(
             "take-profit removal", found.take_profit, oa.ProtoOAAmendPositionSLTPReq, cancel=True
         )
+        step(5, "The take-profit is removed", removed, "take-profit leg CANCELED")
         after_removal = _position(await self._snapshot(), position_id)
 
-        # 7. Listen for the broker moving the trailing stop.
-        self._status(
-            f"Listening {self._settings.trailing_wait_secs:g} s for trailing stop moves. "
-            "Change nothing in the terminal meanwhile.",
-        )
-        start = self._recorder.now()
-        if listening is not None:
-            listening.set()
-        await asyncio.sleep(self._settings.trailing_wait_secs)
-        window = [i for i in self._recorder.inbound if i.pushed and i.t >= start]
+        # 7. Listen for the broker moving the trailing stop, unless the run was stopped.
+        window = []
+        if self._blocked() is None:
+            self._status(
+                f"Listening {self._settings.trailing_wait_secs:g} s for trailing stop moves. "
+                "Change nothing in the terminal meanwhile.",
+            )
+            start = self._recorder.now()
+            if listening is not None:
+                listening.set()
+            await asyncio.sleep(self._settings.trailing_wait_secs)
+            window = [i for i in self._recorder.inbound if i.pushed and i.t >= start]
         trailing_events = sum(
             isinstance(i.message, oa.ProtoOATrailingSLChangedEvent)
             and i.message.positionId == position_id
@@ -1097,18 +1183,7 @@ class Check:
         )
 
         sent_amends = [x for _, x in (priced, sized) if x is not None]
-        steps = [
-            ("The pending order's limit price moves away", priced, f"price {price}"),
-            ("The pending order's volume rises one step", sized, f"quantity {raised}"),
-            ("The pending order is cancelled", cancelled, "CANCELED"),
-            ("The stop-loss moves away", moved, f"trigger price {trigger}"),
-            ("The take-profit is removed", removed, "take-profit leg CANCELED"),
-        ]
         decisions: list[tuple[str, Decision]] = [
-            (title, decide_step(outcome, exchange, done))
-            for title, (outcome, exchange), done in steps
-        ]
-        decisions += [
             (
                 "A pending order's amend is answered ORDER_REPLACED",
                 decide_order_replaced(sent_amends),
@@ -1174,9 +1249,9 @@ class Check:
                 decide_volume_after_partial_fill(),
             ),
         ]
-        return [
+        result.findings += [
             Finding(item, title, status, detail)
-            for item, (title, (status, detail)) in enumerate(decisions, start=1)
+            for item, (title, (status, detail)) in enumerate(decisions, start=6)
         ]
 
     def _besides_answers(self, found: Found) -> list[tuple[str, list[str]]]:
@@ -1213,6 +1288,9 @@ class Check:
         skip: str | None = None,
     ) -> tuple[Outcome, Exchange | None]:
         """A cancel, or else a modify, of the order, sent as a strategy sends it."""
+        blocked = self._blocked()
+        if blocked is not None:
+            return Outcome(skipped=blocked), None
         order = self._cache.order(client_order_id)
         if skip is not None:
             return Outcome(skipped=skip), None
@@ -1298,17 +1376,32 @@ class Check:
             self._accepted.append((label, exchange))
         return outcome, exchange
 
+    def _blocked(self) -> str | None:
+        """Why no further command may be sent, if one may not."""
+        if self._guard.refused:
+            return "the guard refused a request; no further command is sent"
+        session = self._account.session
+        if session is None or not self._guard.covers(session._connection):
+            reason = "the session's connection no longer sends through the guard"
+            self._guard.refused.append(reason)
+            return reason
+        return None
+
     # -- reads --
 
     async def _ask(self, payload: Message) -> Exchange:
         """Send `payload` through the guard; its exchange, however the broker answered."""
-        # The exchange keeps the answer or the error code; the guard's refusal still raises.
-        with contextlib.suppress(CTraderError):
+        failed = None
+        try:
             await self._account.request(payload, timeout_secs=self._settings.answer_wait_secs)
+        except CTraderError as e:
+            # The exchange keeps the answer or the error code; the guard's refusal still raises.
+            failed = type(e).__name__
         for exchange in reversed(self._guard.exchanges):
             if exchange.request is payload:
                 return exchange
-        raise AssertionError("unreachable: every request through the guard is logged")
+        # Failed before the guard saw it, as when the session is reconnecting.
+        return Exchange(payload, self._recorder.now(), failed=failed or "no request sent")
 
     async def _snapshot(self) -> oa.ProtoOAReconcileRes | None:
         exchange = await self._ask(
@@ -1365,7 +1458,7 @@ async def run_check(
     guard = Guard(recorder)
     logger = ScriptLogger()
     result = Result(guard=guard, logger=logger)
-    instrument_id = instrument_id_of(settings.symbol)
+    instrument_id = first_orders.instrument_id_of(settings.symbol)
     account = GuardedAccount(
         guard=guard,
         trader_login=trader_login,
@@ -1413,31 +1506,27 @@ async def run_check(
     engine.register_client(client)
     engine.start()
     try:
-        status("Connecting and reconciling the account.")
-        await client._connect()
-        for instrument in provider.list_all():
-            cache.add_instrument(instrument)
-        instrument = cache.instrument(instrument_id)
-        if instrument is None:
-            result.refusal = (f"{settings.symbol} did not load",)
-            return result
-        mass_status = await client.generate_mass_status()
-        if mass_status is not None:
-            engine.reconcile_execution_mass_status(mass_status)
-        await asyncio.sleep(settings.settle_secs)
-        check = Check(
-            settings=settings,
+        await _connect_and_check(
+            settings,
+            status,
+            listening,
+            result=result,
             account=account,
             client=client,
             engine=engine,
             cache=cache,
-            instrument=instrument,
-            symbol_id=provider.symbol_id(instrument_id),
-            guard=guard,
             clock=clock,
-            status=status,
+            instrument_id=instrument_id,
         )
-        await check.run(result, listening)
+    except Exception as e:
+        result.failure = type(e).__name__
+        if guard.targets is not None and not result.left_open:
+            result.left_open = left_open(
+                None,
+                symbol=settings.symbol,
+                pending_order_id=guard.targets.pending_order_id,
+                position_id=guard.targets.position_id,
+            )
     finally:
         try:
             await client._disconnect()
@@ -1448,6 +1537,49 @@ async def run_check(
             if result.raw is not None:
                 status(f"The broker's messages are kept in {result.raw}")
     return result
+
+
+async def _connect_and_check(
+    settings: Settings,
+    status: Callable[[str], None],
+    listening: asyncio.Event | None,
+    *,
+    result: Result,
+    account: GuardedAccount,
+    client: _Client,
+    engine: LiveExecutionEngine,
+    cache: Cache,
+    clock: LiveClock,
+    instrument_id: InstrumentId,
+) -> None:
+    """Connect, let Nautilus reconcile the account, then run the check."""
+    provider = account.instrument_provider
+    guard = result.guard
+    status("Connecting and reconciling the account.")
+    await client._connect()
+    for instrument in provider.list_all():
+        cache.add_instrument(instrument)
+    instrument = cache.instrument(instrument_id)
+    if instrument is None:
+        result.refusal = (f"{settings.symbol} did not load",)
+        return
+    mass_status = await client.generate_mass_status()
+    if mass_status is not None:
+        engine.reconcile_execution_mass_status(mass_status)
+    await asyncio.sleep(settings.settle_secs)
+    check = Check(
+        settings=settings,
+        account=account,
+        client=client,
+        engine=engine,
+        cache=cache,
+        instrument=instrument,
+        symbol_id=provider.symbol_id(instrument_id),
+        guard=guard,
+        clock=clock,
+        status=status,
+    )
+    await check.run(result, listening)
 
 
 def _write_raw(
@@ -1505,6 +1637,8 @@ def plan(symbol: str) -> str:
 def format_report(result: Result) -> str:
     """The whole report: the findings, and what is left open. Names no identifier."""
     lines = ["Commands on orders the node did not place (live check)", ""]
+    if result.failure is not None:
+        lines += [f"The run ended early on {result.failure}; below is what it reached.", ""]
     if result.refusal:
         lines.append("Refused to act; nothing was changed at the broker:")
         lines.extend(f"- {reason}" for reason in result.refusal)
@@ -1534,22 +1668,14 @@ def format_report(result: Result) -> str:
 
 
 def exit_code(result: Result) -> int:
-    if result.refusal or (result.guard is not None and result.guard.refused):
+    if result.failure is not None or result.refusal:
+        return 1
+    if result.guard is not None and result.guard.refused:
         return 1
     return 1 if any(f.status == DIFFERS for f in result.findings) else 0
 
 
 # -- Command line --------------------------------------------------------------------------
-
-
-def _positive_float(text: str) -> float:
-    try:
-        value = float(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError(f"must be positive: {text!r}")
-    return value
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1568,13 +1694,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--trailing-wait-secs",
-        type=_positive_float,
+        type=first_orders._positive_float,
         default=60.0,
         help="how long to listen for trailing stop moves at the end (default: 60)",
     )
     parser.add_argument(
         "--answer-wait-secs",
-        type=_positive_float,
+        type=first_orders._positive_float,
         default=30.0,
         help="how long to wait for each command's outcome (default: 30)",
     )
@@ -1604,7 +1730,9 @@ def _credentials(env: dict[str, str]) -> tuple[AccountCredentials, int]:
     except ValueError:
         raise missing_credentials(f"{_TRADER_LOGIN_KEY} in .env is not a number") from None
     # No refresh token: a refresh would rotate it, and this script does not write the new pair
-    # back, so the one in .env would stop working. A run is minutes long.
+    # back, so the one in .env would stop working. A run is minutes long. It also keeps the
+    # account client's pre-connection, which the guard does not cover, to its application auth
+    # and account list: only a refresh token would add a token refresh to it.
     credentials = AccountCredentials(
         client_id=env[get_tokens.CLIENT_ID_KEY],
         client_secret=env[get_tokens.CLIENT_SECRET_KEY],
@@ -1659,6 +1787,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         result = asyncio.run(run_check(settings, credentials, trader_login))
+    except KeyboardInterrupt:
+        unread = left_open(None, symbol=args.symbol, pending_order_id=0, position_id=0)
+        print(f"Stopped by hand. {unread[0]}")
+        return 130
     except Exception as e:
         # The exception's own message could carry the broker's free text: only its type.
         print(f"error: {type(e).__name__}: the run failed; check the terminal", file=sys.stderr)
