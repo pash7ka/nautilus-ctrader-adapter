@@ -29,6 +29,7 @@ from nautilus_ctrader.data import CTraderDataClient
 from nautilus_ctrader.discovery import GrantedAccount, SymbolInfo, list_accounts, list_symbols
 from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.factories import CTraderLiveDataClientFactory, CTraderLiveExecClientFactory
+from nautilus_ctrader.legs import leg_position_id
 from nautilus_ctrader.oauth import (
     RedirectUriError,
     TokenPair,
@@ -79,6 +80,7 @@ __all__ = [
     "build_authorization_url",
     "exchange_code",
     "get_cached_ctrader_account_client",
+    "leg_position_id",
     "list_accounts",
     "list_symbols",
     "wait_for_authorization_code",
