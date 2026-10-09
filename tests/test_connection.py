@@ -270,8 +270,8 @@ async def test_an_unsolicited_message_reaches_the_event_handler() -> None:
 
 
 async def test_a_message_whose_id_no_request_awaits_is_an_event() -> None:
-    # The broker sends the events another client's request causes with that client's own
-    # `clientMsgId`.
+    # Events of a close made elsewhere were seen carrying a `clientMsgId` this connection never
+    # sent.
     server = FakeCTraderServer()
     await server.start()
     connection = await _connected(server)

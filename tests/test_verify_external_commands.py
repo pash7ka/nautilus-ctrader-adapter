@@ -21,7 +21,7 @@ import pytest
 from google.protobuf.message import Message
 from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 
-from nautilus_ctrader.common import order_record
+from nautilus_ctrader.common import codec, order_record
 from nautilus_ctrader.common.account import AccountCredentials
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderConnectionError
@@ -194,7 +194,7 @@ async def run(
 ) -> vec.Result:
     """One run against `venue`; `while_listening`, or what it makes, is pushed once it listens.
 
-    The pushed messages carry `client_msg_id`, as events caused by another client's request do.
+    The pushed messages carry `client_msg_id`, as events of a close made elsewhere were seen to.
     """
     server = venue.server
     await server.start()
@@ -663,8 +663,8 @@ async def test_a_guarded_connection_refuses_before_the_socket_and_logs_every_ans
 
 
 async def test_the_recorder_takes_for_an_answer_only_what_a_request_of_its_own_awaits() -> None:
-    # The broker sends the events another client's request causes with that client's own
-    # `clientMsgId`: they are pushed events here, as they are to the connection.
+    # Events of a close made elsewhere were seen carrying a `clientMsgId` this connection never
+    # sent: they are pushed events here, as they are to the connection.
     server = FakeCTraderServer()
     server.on(
         om.PROTO_OA_CANCEL_ORDER_REQ,
@@ -695,6 +695,21 @@ async def test_the_recorder_takes_for_an_answer_only_what_a_request_of_its_own_a
     ]
     taken = [(e.kind, e.note) for e in checked.recorder.recording.timeline if e.kind != "marker"]
     assert taken == [("snapshot", "answer"), ("event", ""), ("event", ""), ("event", "")]
+
+
+async def test_a_message_for_a_request_already_settled_is_an_event() -> None:
+    # A request that timed out stays pending until its own task runs again.
+    recorder = guard().recorder
+    loop = asyncio.get_running_loop()
+    settled, waiting = loop.create_future(), loop.create_future()
+    settled.cancel()
+    pending = {"settled": settled, "waiting": waiting}
+
+    for client_msg_id in pending:
+        sent = codec.encode_envelope(execution(om.ORDER_ACCEPTED), client_msg_id)
+        recorder._take(codec.decode_envelope(sent), pending)
+
+    assert [i.pushed for i in recorder.inbound] == [True, False]
 
 
 async def test_a_request_lost_with_the_connection_keeps_its_error_on_the_exchange() -> None:

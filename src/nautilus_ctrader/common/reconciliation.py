@@ -684,11 +684,10 @@ class _Position:
                 else sum((fill.units for fill in opened), Decimal(0))
             )
             units = max(leg_units, filled)
-            # A protective order reduced by a partial close reports the total left (confirmed
-            # live).
             # TODO(verify): whether a partly filled protective order's `volume` is its total or
-            # its rest, the question `remaining_of` has; read as the total here. A level that
-            # closes part of a position would settle it.
+            # its rest, the question `remaining_of` has; read as the total here, as one reduced
+            # by a partial close reports it (confirmed live). A level that closes part of a
+            # position would settle it.
             if fills and filled >= leg_units:
                 status, ts_ms = ReportStatus.FILLED, fills[-1].ts_ms
             else:

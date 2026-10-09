@@ -51,10 +51,11 @@ error rather than sitting until its own timeout: the error is matched to the pen
 by `clientMsgId` exactly like a normal response would be, and delivered as an exception
 instead of a result.
 
-A `clientMsgId` does not by itself make a message a response. The execution events that another
-client's request causes, such as a close made in the broker's terminal, arrive carrying that
-client's `clientMsgId` (confirmed). A message whose `clientMsgId` matches no request the
-connection is waiting for is therefore an event, delivered as one.
+A `clientMsgId` does not by itself make a message a response. The execution events of a close
+made in the broker's terminal arrived carrying a non-empty `clientMsgId` that no request of the
+listening connection had sent. This was observed once and is inferred, not stored: a recorder
+took those events for answers. Whose id it was is not recorded. A message whose `clientMsgId` matches no request the connection is waiting for is
+therefore an event, delivered as one.
 
 ## 3. Heartbeat
 
@@ -434,8 +435,9 @@ take-profit by hand, while a read-only connection listened. The scrubbed recordi
   volume left on the position, the reduced total, not the volume closed, and `executedVolume` is
   0. The event carries the position at the volume left, and its `utcLastUpdateTimestamp` is 10 ms
   after the deal's execution.
-- **All three carry a `clientMsgId`**, the one of the terminal's request, which matches no request
-  of the listening connection (see §2).
+- **All three carry a non-empty `clientMsgId`** that no request of the listening connection had
+  sent (see §2). This is inferred: the fixture does not store the id, but the recorder of the time
+  had taken the three for answers. Whose id it was is not recorded.
 
 - **A position raised by hand has two opening orders.** The position had been opened by one market
   order and raised later by another, both non-closing and under the one position id. Its order list

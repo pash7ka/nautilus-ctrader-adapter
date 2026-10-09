@@ -795,9 +795,10 @@ levels that were placed by hand: what they confirmed is listed in
 [Protocol notes](protocol.md), section 10. A partial close made by hand was watched as well, and
 confirmed there: it arrives as the closing order's `ORDER_ACCEPTED` then `ORDER_FILLED`, the fill
 carrying the position; after the fill comes an `ORDER_REPLACED` of the protective order under the
-same id, its `tradeData.volume` the reduced total and its `executedVolume` 0. Events caused by
-another client's request carry that client's `clientMsgId`, so only an id the adapter is waiting
-for marks an answer. Each point still open is marked in the source with a `TODO(verify):` comment
+same id, its `tradeData.volume` the reduced total and its `executedVolume` 0. Those events
+carried a `clientMsgId` the listening connection had not sent (observed once, and inferred from a
+recorder's mislabel: whose id it was is not recorded), so only an id the adapter is waiting for
+marks an answer. Each point still open is marked in the source with a `TODO(verify):` comment
 saying what would settle it. The main groups:
 
 - **Scales and defaults on a new order**: that volume in hundredths of a unit agrees with each

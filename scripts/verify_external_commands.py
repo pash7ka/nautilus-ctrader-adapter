@@ -265,7 +265,7 @@ class Recorder:
         except CTraderProtocolError:
             return
         # An answer only to a request this connection awaits, as the connection decides: events
-        # another client's request causes carry that client's `clientMsgId`.
+        # of a close made elsewhere were seen carrying a `clientMsgId` this connection never sent.
         awaiting = pending.get(envelope.clientMsgId) if envelope.clientMsgId else None
         pushed = awaiting is None or awaiting.done()
         t = self.now()
