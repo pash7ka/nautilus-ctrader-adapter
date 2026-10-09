@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 from decimal import Decimal
 
+import pytest
+
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.reconciliation import (
     PositionHistory,
@@ -18,6 +20,7 @@ from nautilus_ctrader.common.reconciliation import (
 from nautilus_ctrader.common.venue_book import VenueBook, levels_of
 from nautilus_ctrader.common.venue_records import (
     Contingency,
+    ExternalOrder,
     ExternalType,
     Level,
     ReportedOrder,
@@ -33,6 +36,8 @@ from tests.execution_replay import (
     NoOperations,
     as_ours,
     entry_id,
+    events,
+    first_n,
     history,
     make_deal,
     make_order,
@@ -707,3 +712,59 @@ def test_a_foreign_protective_fill_with_no_level_known_keeps_its_own_id() -> Non
     assert [r.venue_order_id for r in result.orders] == ["6000160", "6000161"]
     assert result.orders[1].order_type == ExternalType.MARKET
     assert result.orders[1].reduce_only
+
+
+def protective_changed(orders, change) -> list[om.ProtoOAOrder]:
+    """Copies of `orders`, each protective order changed by `change`."""
+    copies = []
+    for order in orders:
+        copied = copy.deepcopy(order)
+        if copied.orderType == om.STOP_LOSS_TAKE_PROFIT:
+            change(copied)
+        copies.append(copied)
+    return copies
+
+
+def live_events_changed(change) -> list[oa.ProtoOAExecutionEvent]:
+    found = [copy.deepcopy(event) for event in first_n(events(), FIRST)]
+    for event in found:
+        if event.order.orderType == om.STOP_LOSS_TAKE_PROFIT:
+            change(event.order)
+    return found
+
+
+def _created_before_the_fill(order: om.ProtoOAOrder) -> None:
+    order.tradeData.openTimestamp = 1600000124700
+
+
+def _creation_unstated(order: om.ProtoOAOrder) -> None:
+    order.tradeData.ClearField("openTimestamp")
+
+
+@pytest.mark.parametrize(
+    "change",
+    [lambda _order: None, _created_before_the_fill, _creation_unstated],
+    ids=["as-recorded", "created-before-the-fill", "creation-unstated"],
+)
+def test_a_foreign_leg_is_accepted_at_the_same_time_live_and_reconciled(change) -> None:
+    book = VenueBook(precision)
+    live = [
+        record
+        for event in live_events_changed(change)
+        for record in book.apply(event, NOTHING)
+        if isinstance(record, ExternalOrder) and record.venue_order_id == "6000001-SL"
+    ]
+    snapshot, histories, deals = open_first(mine=False)
+    snapshot = copy.deepcopy(snapshot)
+    changed = protective_changed(snapshot.order, change)
+    del snapshot.order[:]
+    snapshot.order.extend(changed)
+    found = histories[FIRST]
+    histories = {
+        FIRST: PositionHistory(tuple(protective_changed(found.orders, change)), found.deals)
+    }
+
+    reconciled = foreign_legs(run(snapshot, histories, deals))["6000001-SL"]
+
+    (first_seen,) = live
+    assert first_seen.ts_accepted_ms == reconciled.ts_accepted_ms

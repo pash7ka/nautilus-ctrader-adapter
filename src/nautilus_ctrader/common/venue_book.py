@@ -106,6 +106,8 @@ class _Position:
     protective_order_id: int | None = None
     protective_volume: int = 0
     protective_opened_ms: int | None = None
+    # When the entry first filled, if the model saw it.
+    entry_filled_ms: int | None = None
     # Protective orders replaced by a new id or cancelled: any later event of theirs is stale.
     retired_protective_ids: set[int] = field(default_factory=set)
     levels: dict[Level, Decimal] = field(default_factory=dict)
@@ -223,7 +225,7 @@ def foreign_leg(
 
     A stop-loss is a reduce-only `STOP_MARKET` at its `trigger_price`, a take-profit a reduce-only
     `LIMIT` at its `price`, both against the position, good till cancelled. `volume` is a venue
-    volume; `accepted_ms` is when the protective order holding the level was created.
+    volume; `accepted_ms` is when the level was set, never before the entry filled.
     """
     stop = level == Level.STOP_LOSS
     return ExternalOrder(
@@ -956,6 +958,8 @@ class VenueBook:
                 leg.alive = False
         was_open, volume_before = position.open, position.volume
         self._sync(position, event)
+        if filled and not was_open and position.entry_order_id == order.orderId:
+            position.entry_filled_ms = event.deal.executionTimestamp
         reduced = was_open and (not position.open or position.volume < volume_before)
         # A triggered pending order is a server event too; only one that took volume away is
         # a close.
@@ -1227,7 +1231,7 @@ class VenueBook:
             venue_order_id = leg_venue_order_id(position.entry_order_id, level, generation)
         leg = _ForeignLeg(venue_order_id, generation, self._foreign_rest(position))
         position.foreign_legs[level] = leg
-        accepted = ts if position.protective_opened_ms is None else position.protective_opened_ms
+        accepted = self._leg_accepted_ms(position, ts)
         return foreign_leg(
             venue_order_id,
             level,
@@ -1239,6 +1243,19 @@ class VenueBook:
             ts_ms=max(ts, accepted),
             accepted_ms=accepted,
         )
+
+    @staticmethod
+    def _leg_accepted_ms(position: _Position, ts: int) -> int:
+        """When a foreign leg was accepted: once its level was set, never before the entry filled.
+
+        The same as reconciliation reads from the broker's lists, but where the model lacks what
+        they hold: without the entry's fill, as for a position loaded open, the protective order's
+        creation stands alone; without either, the event's time `ts`.
+        """
+        opened, filled = position.protective_opened_ms, position.entry_filled_ms
+        if opened is None:
+            return ts if filled is None else filled
+        return opened if filled is None else max(opened, filled)
 
     @staticmethod
     def _foreign_event(
