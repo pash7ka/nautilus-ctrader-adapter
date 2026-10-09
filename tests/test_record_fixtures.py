@@ -16,7 +16,12 @@ import pytest
 
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.fixtures import FAKE_ACCOUNT_ID, load_external_commands_recording, load_recorded
+from tests.fixtures import (
+    FAKE_ACCOUNT_ID,
+    load_external_commands_recording,
+    load_partial_close_recording,
+    load_recorded,
+)
 
 _SPEC = importlib.util.spec_from_file_location(
     "record_fixtures",
@@ -251,8 +256,8 @@ def _ids(message) -> set[str]:
     return found
 
 
-def test_the_recorded_commands_hold_no_unmapped_number_in_a_venue_text() -> None:
-    recording = load_external_commands_recording()
+def _venue_texts_checked(recording: dict) -> list:
+    """Check every venue text of `recording` for an unmapped number; returns its messages."""
     found = [item["message"] for item in recording["timeline"] if item["message"] is not None]
     found += [message for items in recording["closing"].values() for message in items]
     # The scrubber maps each id it knows to its fake, which a venue text may then name.
@@ -261,7 +266,19 @@ def test_the_recorded_commands_hold_no_unmapped_number_in_a_venue_text() -> None
 
     for message in found:
         record_fixtures.assert_free_text_clean(message, allowed)
+    return found
+
+
+def test_the_recorded_commands_hold_no_unmapped_number_in_a_venue_text() -> None:
+    found = _venue_texts_checked(load_external_commands_recording())
+
     assert any(isinstance(m, oa.ProtoOAErrorRes) and m.description for m in found)
+
+
+def test_the_recorded_partial_close_holds_no_unmapped_number_in_a_venue_text() -> None:
+    found = _venue_texts_checked(load_partial_close_recording())
+
+    assert any(isinstance(m, oa.ProtoOAExecutionEvent) for m in found)
 
 
 def _recorded_under_the_old_rules() -> bytes:

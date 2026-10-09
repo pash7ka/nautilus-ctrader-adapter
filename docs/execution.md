@@ -779,8 +779,13 @@ No new order has yet been sent through the adapter on a live account, so everyth
 sending one is read from the schema and the broker's own terminal's behaviour, not observed from
 the adapter. Cancels and amends have been sent through it, of a pending order and of a position's
 levels that were placed by hand: what they confirmed is listed in
-[Protocol notes](protocol.md), section 10. Each point still open is marked in the source with a
-`TODO(verify):` comment saying what would settle it. The main groups:
+[Protocol notes](protocol.md), section 10. A partial close made by hand was watched as well, and
+confirmed there: it arrives as the closing order's `ORDER_ACCEPTED` then `ORDER_FILLED`, the fill
+carrying the position; after the fill comes an `ORDER_REPLACED` of the protective order under the
+same id, its `tradeData.volume` the reduced total and its `executedVolume` 0. Events caused by
+another client's request carry that client's `clientMsgId`, so only an id the adapter is waiting
+for marks an answer. Each point still open is marked in the source with a `TODO(verify):` comment
+saying what would settle it. The main groups:
 
 - **Scales and defaults on a new order**: that volume in hundredths of a unit agrees with each
   instrument's quantity units; that relative levels are distances in 1/100000 of a price applied
@@ -801,7 +806,8 @@ levels that were placed by hand: what they confirmed is listed in
   bytes, whether it truncates or rejects an over-long field, and whether it returns them verbatim.
 - **Events not yet seen**: a stop-out and how it is flagged; a trader-update and a margin-change
   event; a protective order that triggers partially, and whether a partly filled protective order
-  reports its total volume or its rest.
+  reports its total volume or its rest (one reduced by a partial close reports the total left).
+  Every fill recorded carried the position; that every fill does is not confirmed.
 - **Matching the node's close**: whether the broker's closing order carries the volume the node's
   close asked for. The match of a close to the node's order rests on it. Also, that a closing
   order's creation time, the execution events' times and a spot's `timestamp` are all on the

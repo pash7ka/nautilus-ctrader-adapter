@@ -207,6 +207,8 @@ def _copied(order: om.ProtoOAOrder) -> om.ProtoOAOrder:
 
 def remaining_of(order: om.ProtoOAOrder) -> int:
     """What is left of an order, as a venue volume."""
+    # Confirmed live for a protective order reduced by a partial close: its volume is the total
+    # left, with `executedVolume` 0.
     # TODO(verify): whether the broker reports a partly filled protective order's total volume or
     # its rest; none was recorded. A replace after a partial trigger would settle it.
     executed = order.executedVolume if order.HasField("executedVolume") else 0
@@ -706,6 +708,7 @@ class VenueBook:
             if event.deal.dealId in self._synced_deals:
                 return
             self._synced_deals.add(event.deal.dealId)
+            # Every fill recorded carried the position, a partial close by hand included.
             # TODO(verify): whether a fill always carries the position; until then the deal's
             # volume moves the one known.
             filled = event.deal.filledVolume
@@ -1067,9 +1070,11 @@ class VenueBook:
                     )
                 )
             return notices + self._triggered(event, position, precision)
+        # The broker keeps the id when the levels change and when a partial close reduces the
+        # order (confirmed live).
         # TODO(verify): that a replaced or cancelled protective id has no later live event but a
-        # fill, and whether the broker ever replaces the id at all. If it does, an out-of-order
-        # ACCEPTED of an id never current leaves stale levels until the next event.
+        # fill, and whether the broker replaces the id in any other case. If it does, an
+        # out-of-order ACCEPTED of an id never current leaves stale levels until the next event.
         if retired:
             return []
         current = position.protective_order_id

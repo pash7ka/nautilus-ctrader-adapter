@@ -51,6 +51,11 @@ error rather than sitting until its own timeout: the error is matched to the pen
 by `clientMsgId` exactly like a normal response would be, and delivered as an exception
 instead of a result.
 
+A `clientMsgId` does not by itself make a message a response. The execution events that another
+client's request causes, such as a close made in the broker's terminal, arrive carrying that
+client's `clientMsgId` (confirmed). A message whose `clientMsgId` matches no request the
+connection is waiting for is therefore an event, delivered as one.
+
 ## 3. Heartbeat
 
 The venue requires a heartbeat if the connection would otherwise be idle for more than 30
@@ -416,6 +421,24 @@ volume. The position's `price` stays the original entry price.
 `closingOrder` is `true` on a partial close and on the protective order (confirmed).
 **Unconfirmed**: a full manual close of a position from the terminal, and a stop-out; neither
 happened in the session.
+
+A later recording on EURUSD watched a person close part of a position with a stop-loss and a
+take-profit by hand, while a read-only connection listened. The scrubbed recording is the fixture
+`tests/fixtures/partial_close_live.json`. It confirmed, in more detail:
+
+- **Exactly three execution events**, in this order: the closing order's `ORDER_ACCEPTED`, carrying
+  the position at its volume before the close; its `ORDER_FILLED`, carrying the deal and the
+  position already at the volume left; then the protective order's `ORDER_REPLACED`. The first two
+  have `isServerEvent = false`, the last `true`.
+- **The protective order keeps its `orderId`.** In the `ORDER_REPLACED`, `tradeData.volume` is the
+  volume left on the position, the reduced total, not the volume closed, and `executedVolume` is
+  0. The event carries the position at the volume left, and its `utcLastUpdateTimestamp` is 10 ms
+  after the deal's execution.
+- **All three carry a `clientMsgId`**, the one of the terminal's request, which matches no request
+  of the listening connection (see §2).
+
+**Unconfirmed**: a protective order that a level fills only in part, and whether its volume is then
+the total or the rest.
 
 ### A pending order
 

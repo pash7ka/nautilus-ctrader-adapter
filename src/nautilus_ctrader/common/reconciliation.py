@@ -664,6 +664,8 @@ class _Position:
                 else sum((fill.units for fill in self.entry_fills), Decimal(0))
             )
             units = max(leg_units, filled)
+            # A protective order reduced by a partial close reports the total left (confirmed
+            # live).
             # TODO(verify): whether a partly filled protective order's `volume` is its total or
             # its rest, the question `remaining_of` has; read as the total here. A level that
             # closes part of a position would settle it.
