@@ -13,8 +13,9 @@ While it runs, type a short note and press Enter to mark what you just did in th
 
 The fixture never holds the account id, the trader login, a token, the broker's name, or the
 broker's own order, position, deal and balance-operation ids: those are replaced consistently,
-so a position still lines up with its orders and deals. A wall time in milliseconds or seconds
-is shifted by one constant, which keeps every interval; a bar's time in minutes keeps its value.
+so a position still lines up with its orders and deals; any other number in the venue's own
+wording is replaced by a placeholder. A wall time in milliseconds or seconds is shifted by one
+constant, which keeps every interval; a bar's time in minutes keeps its value.
 Every balance, and the amount of an operation made on a balance of zero, is raised by one
 secret random amount, kept only in the unscrubbed files: what each deal or operation changed
 stays exact, and the real balance cannot be read back. A real balance quoted in text is taken
@@ -116,9 +117,9 @@ READ_ONLY_REQUESTS: frozenset[type[Message]] = frozenset(
     },
 )
 
-SCRUBBED_TEXT = "scrubbed"
-# Stands in for a long number in free text that no field identified.
-NUMBER_PLACEHOLDER = "<number>"
+SCRUBBED_TEXT = record_fixtures.SCRUBBED_TEXT
+# Stands in for a number in free text that no field identified.
+NUMBER_PLACEHOLDER = record_fixtures.NUMBER_PLACEHOLDER
 # Stands in for the broker's name in free text.
 BROKER_PLACEHOLDER = "<broker>"
 # Stands in for a real balance in free text.
@@ -203,10 +204,6 @@ _ID_BASES = {
     "deal": 7_000_000,
     "balance operation": 8_000_000,
 }
-# Free text the account's owner, or a robot of theirs, may have written.
-_TEXT_FIELDS = frozenset({"label", "comment", "clientOrderId", "externalNote"})
-# The venue's own wording: kept as evidence, with the numbers that identify taken out.
-_VENUE_TEXT_FIELDS = frozenset({"description", "reason"})
 # A bonus is kept apart from the balance, and its message names the introducing broker.
 _CLEARED_MESSAGES = frozenset({"bonusDepositWithdraw"})
 
@@ -388,6 +385,7 @@ def clean_text(
     ids: IdMap,
     names: Iterable[str] = (),
     amounts: Iterable[str] = (),
+    venue: bool = False,
 ) -> str:
     """Free text with the names and numbers that could identify the account taken out.
 
@@ -399,9 +397,13 @@ def clean_text(
       `AMOUNT_PLACEHOLDER`, as a whole number: not the end of a longer number or of a fraction;
     - a known order, position or deal id becomes its fake id;
     - the account id and the trader login become the fake values their own fields get;
-    - any other run of `_LONG_NUMBER_DIGITS` digits or more becomes `NUMBER_PLACEHOLDER`: an id
-      quoted only in text was never seen in a field, so it cannot be mapped. A run that is the
-      integer or the fractional part of a decimal number is a price or a rate, and is kept.
+    - with `venue`, for the venue's own wording, any other run of digits becomes
+      `NUMBER_PLACEHOLDER`: the venue may quote an identifier of its own, of any length, that no
+      field carries;
+    - without it, for a note, any other run of `_LONG_NUMBER_DIGITS` digits or more becomes
+      `NUMBER_PLACEHOLDER`: an id quoted only in text was never seen in a field, so it cannot be
+      mapped. A run that is the integer or the fractional part of a decimal number is a price or
+      a rate, and is kept.
     """
     pattern = _names_pattern(names)
     if pattern is not None:
@@ -413,6 +415,8 @@ def clean_text(
     fakes.setdefault(str(account_id), str(record_fixtures.FAKE_ACCOUNT_ID))
     if login is not None:
         fakes.setdefault(str(login), str(record_fixtures.FAKE_TRADER_LOGIN))
+    if venue:
+        return record_fixtures.scrub_numbers(text, fakes)
     known_fakes = set(fakes.values())
 
     def replace(match: re.Match[str]) -> str:
@@ -439,12 +443,12 @@ def scrub_execution(
 ) -> Message:
     """`record_fixtures.scrub()`, then what execution messages add to it.
 
-    Amounts follow `_MONEY_FIELDS`, with `money_shift` as the shift. `amounts` are the real
-    balances as text may write them, which venue text loses as `clean_text()` says.
+    Amounts follow `_MONEY_FIELDS`, with `money_shift` as the shift. The venue's free text is
+    cleaned by `clean_text()` as venue text; `amounts` are the real balances as text may write
+    them.
+
+    A text maps only the ids `ids` already holds: `encode_recording()` fills it first.
     """
-    result = record_fixtures.scrub(message, account_id, login)
-    # A field newer than these bindings is scrubbed by nothing here, and may hold anything.
-    result.DiscardUnknownFields()
 
     def clean(text: str) -> str:
         return clean_text(
@@ -454,11 +458,15 @@ def scrub_execution(
             ids=ids,
             names=names,
             amounts=amounts,
+            venue=True,
         )
 
+    result = record_fixtures.scrub(message, account_id, login, clean)
+    # A field newer than these bindings is scrubbed by nothing here, and may hold anything.
+    result.DiscardUnknownFields()
     # From the original: the base scrubbing has cleared or zeroed the balances by then.
     _shift_money(message, result, money_shift)
-    _scrub_in_place(result, ids, shift_ms, clean)
+    _scrub_in_place(result, ids, shift_ms)
     return result
 
 
@@ -552,12 +560,7 @@ def _written_forms(value: int, digits: int | None) -> set[str]:
     return forms
 
 
-def _scrub_in_place(
-    message: Message,
-    ids: IdMap,
-    shift_ms: int,
-    clean: Callable[[str], str],
-) -> None:
+def _scrub_in_place(message: Message, ids: IdMap, shift_ms: int) -> None:
     for descriptor, value in list(message.ListFields()):
         name = descriptor.name
         if name in _CLEARED_MESSAGES:
@@ -565,7 +568,7 @@ def _scrub_in_place(
         elif descriptor.type == FieldDescriptor.TYPE_MESSAGE:
             items = value if descriptor.is_repeated else (value,)
             for item in items:
-                _scrub_in_place(item, ids, shift_ms, clean)
+                _scrub_in_place(item, ids, shift_ms)
         elif descriptor.is_repeated:
             if name in _ACCOUNT_ID_LISTS:
                 # Cut to the one fake id: how many accounts the owner has is theirs to tell.
@@ -577,10 +580,6 @@ def _scrub_in_place(
             # Zero or less stands for "no id": mapping it would replace every 0 in a text.
             if value > 0:
                 setattr(message, name, ids.fake(_ID_KINDS[name], value))
-        elif descriptor.type == FieldDescriptor.TYPE_STRING and name in _TEXT_FIELDS:
-            setattr(message, name, SCRUBBED_TEXT)
-        elif descriptor.type == FieldDescriptor.TYPE_STRING and name in _VENUE_TEXT_FIELDS:
-            setattr(message, name, clean(value))
         elif descriptor.type in _INT_TYPES and (name == "timestamp" or name.endswith("Timestamp")):
             in_seconds = (message.DESCRIPTOR.name, name) in _SECONDS_TIMESTAMPS
             shift = shift_ms // 1000 if in_seconds else shift_ms
@@ -988,6 +987,7 @@ def check_clean(
 
     Checked twice: each scrubbed message's own serialized bytes, where an int64 is a varint and
     no decimal search can see it, and the final JSON, where a text field or a note could hold it.
+    A number in the venue's free text must be one of the fake values scrubbing gives.
 
     The broker's names are looked for in every note and every text field instead, the way
     `clean_text()` matches them: in the JSON or the bytes, a short name would turn up by chance
@@ -1015,8 +1015,14 @@ def check_clean(
         raise record_fixtures.ScrubError("the encoded recording lost a message")
     # First: its refusals say what went wrong, where the search below would only find the shift.
     _check_amounts_hidden(recording, messages)
+    fakes = {
+        *ids.text_fakes().values(),
+        str(record_fixtures.FAKE_ACCOUNT_ID),
+        str(record_fixtures.FAKE_TRADER_LOGIN),
+    }
     for message in messages:
         record_fixtures.assert_clean(message.SerializeToString(), text + varints)
+        record_fixtures.assert_free_text_clean(message, fakes)
 
     texts = [item["note"] for item in decoded["timeline"]]
     for message in messages:

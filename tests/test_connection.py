@@ -269,6 +269,40 @@ async def test_an_unsolicited_message_reaches_the_event_handler() -> None:
         await server.stop()
 
 
+async def test_a_message_whose_id_no_request_awaits_is_an_event() -> None:
+    # Events of a close made elsewhere were seen carrying a `clientMsgId` this connection never
+    # sent.
+    server = FakeCTraderServer()
+    await server.start()
+    connection = await _connected(server)
+    seen: list[object] = []
+    connection.set_event_handler(seen.append)
+    filled = oa.ProtoOAExecutionEvent(ctidTraderAccountId=1, executionType=oa_model.ORDER_FILLED)
+    try:
+        await server.wait_for_connections()
+        await server.push(filled, "another-client-1")
+        await wait_until(lambda: len(seen) == 1)
+
+        # No handler: the request waits until the test answers it.
+        waiting = asyncio.create_task(
+            connection.request(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=1)),
+        )
+        await wait_until(lambda: len(server.received_client_msg_ids) == 1)
+        await server.push(filled, "another-client-2")
+        await wait_until(lambda: len(seen) == 2)
+        assert not waiting.done()
+
+        (ours,) = server.received_client_msg_ids
+        await server.push(oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=1), ours)
+        answer = await asyncio.wait_for(waiting, 2.0)
+    finally:
+        await connection.close()
+        await server.stop()
+
+    assert isinstance(answer, oa.ProtoOASubscribeSpotsRes)
+    assert seen == [filled, filled]
+
+
 async def test_a_lost_connection_rejects_pending_requests_and_notifies() -> None:
     server = FakeCTraderServer()
     await server.start()

@@ -3,7 +3,13 @@
 - `m2_recorded.json`: market data, made by `scripts/record_fixtures.py`;
 - `m3_execution_recorded.json`: a manual trading session, made by `scripts/record_execution.py`;
 - `m3_stage2_recorded.json`: a session of the node's own orders on EURUSD, one of its positions
-  partly and then fully closed by hand, made by the same script.
+  partly and then fully closed by hand, made by the same script;
+- `external_commands_live.json`: cancels and amends, sent through the adapter, of a pending order
+  and of a position's levels that a person placed by hand, then the broker moving the position's
+  trailing stop-loss; made by `scripts/verify_external_commands.py` and scrubbed by
+  `scripts/record_execution.py`;
+- `partial_close_live.json`: a position with a stop-loss and a take-profit, part of it closed by
+  hand in the broker's terminal while the same script only listened.
 
 All are produced offline against a real broker connection and scrubbed; they are not generated
 as part of the test suite.
@@ -23,6 +29,8 @@ FAKE_TRADER_LOGIN = 2_000_002
 _M2 = pathlib.Path(__file__).with_name("m2_recorded.json")
 _M3_EXECUTION = pathlib.Path(__file__).with_name("m3_execution_recorded.json")
 _M3_STAGE2 = pathlib.Path(__file__).with_name("m3_stage2_recorded.json")
+_EXTERNAL_COMMANDS = pathlib.Path(__file__).with_name("external_commands_live.json")
+_PARTIAL_CLOSE = pathlib.Path(__file__).with_name("partial_close_live.json")
 
 
 def load_recorded() -> dict[str, list]:
@@ -78,3 +86,13 @@ def load_execution_recording(path: pathlib.Path = _M3_EXECUTION) -> dict:
 def load_stage2_recording() -> dict:
     """`m3_stage2_recorded.json`, shaped as `load_execution_recording()` returns it."""
     return load_execution_recording(_M3_STAGE2)
+
+
+def load_external_commands_recording() -> dict:
+    """`external_commands_live.json`, shaped as `load_execution_recording()` returns it."""
+    return load_execution_recording(_EXTERNAL_COMMANDS)
+
+
+def load_partial_close_recording() -> dict:
+    """`partial_close_live.json`, shaped as `load_execution_recording()` returns it."""
+    return load_execution_recording(_PARTIAL_CLOSE)

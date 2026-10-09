@@ -16,7 +16,12 @@ import pytest
 
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.fixtures import FAKE_ACCOUNT_ID, load_recorded
+from tests.fixtures import (
+    FAKE_ACCOUNT_ID,
+    load_external_commands_recording,
+    load_partial_close_recording,
+    load_recorded,
+)
 
 _SPEC = importlib.util.spec_from_file_location(
     "record_fixtures",
@@ -181,6 +186,99 @@ def test_scrub_miss_in_raw_bytes_is_caught_by_the_byte_level_check() -> None:
     except record_fixtures.ScrubError:
         return
     raise AssertionError("scrub miss inside the raw serialized bytes was not detected")
+
+
+def test_scrub_keeps_no_unmapped_number_in_a_venue_text() -> None:
+    error = oa.ProtoOAErrorRes(
+        ctidTraderAccountId=REAL_ACCOUNT,
+        errorCode="ORDER_NOT_FOUND",
+        description=f"Order 4242 of account {REAL_ACCOUNT}, login {REAL_LOGIN}, trader 515151",
+    )
+
+    scrubbed = record_fixtures.scrub(error, REAL_ACCOUNT, REAL_LOGIN)
+
+    token = record_fixtures.NUMBER_PLACEHOLDER
+    assert scrubbed.description == (
+        f"Order {token} of account {record_fixtures.FAKE_ACCOUNT_ID}, "
+        f"login {record_fixtures.FAKE_TRADER_LOGIN}, trader {token}"
+    )
+    assert scrubbed.errorCode == "ORDER_NOT_FOUND"
+
+
+def test_scrub_replaces_owner_text_and_keeps_catalog_names() -> None:
+    order = om.ProtoOAOrder(
+        orderId=1,
+        tradeData=om.ProtoOATradeData(symbolId=1, volume=1, tradeSide=om.BUY, label="robot 7"),
+        orderType=om.MARKET,
+        orderStatus=om.ORDER_STATUS_FILLED,
+    )
+    symbol = om.ProtoOALightSymbol(symbolId=1, symbolName="US100", description="US Tech 100")
+
+    assert record_fixtures.scrub(order, REAL_ACCOUNT, REAL_LOGIN).tradeData.label == "scrubbed"
+    assert record_fixtures.scrub(symbol, REAL_ACCOUNT, REAL_LOGIN) == symbol
+
+
+def test_a_kept_name_is_kept_only_in_the_message_it_was_judged_in() -> None:
+    assert not record_fixtures.is_free_text("ProtoOAAsset", "name")
+    assert record_fixtures.is_free_text("ProtoOAUnknownMessage", "name")
+    assert record_fixtures.is_free_text("ProtoOAUnknownMessage", "errorCode")
+
+
+def test_assert_free_text_clean_refuses_an_unmapped_number() -> None:
+    error = oa.ProtoOAErrorRes(errorCode="ORDER_NOT_FOUND", description="trader 515151")
+    allowed = {str(record_fixtures.FAKE_ACCOUNT_ID)}
+
+    with pytest.raises(record_fixtures.ScrubError) as raised:
+        record_fixtures.assert_free_text_clean(error, allowed)
+
+    assert "515151" not in str(raised.value)
+    error.description = f"account {record_fixtures.FAKE_ACCOUNT_ID}"
+    record_fixtures.assert_free_text_clean(error, allowed)
+
+
+def test_the_recorded_market_data_holds_no_number_in_a_venue_text() -> None:
+    allowed = {str(record_fixtures.FAKE_ACCOUNT_ID), str(record_fixtures.FAKE_TRADER_LOGIN)}
+    for messages in load_recorded().values():
+        for message in messages:
+            record_fixtures.assert_free_text_clean(message, allowed)
+
+
+def _ids(message) -> set[str]:
+    """Every order, position and deal id `message` holds, at any depth."""
+    found: set[str] = set()
+    for field, value in message.ListFields():
+        items = value if field.is_repeated else (value,)
+        if field.message_type is not None:
+            for item in items:
+                found |= _ids(item)
+        elif field.name in ("orderId", "positionId", "dealId"):
+            found.update(str(item) for item in items)
+    return found
+
+
+def _venue_texts_checked(recording: dict) -> list:
+    """Check every venue text of `recording` for an unmapped number; returns its messages."""
+    found = [item["message"] for item in recording["timeline"] if item["message"] is not None]
+    found += [message for items in recording["closing"].values() for message in items]
+    # The scrubber maps each id it knows to its fake, which a venue text may then name.
+    ids = set().union(*(_ids(message) for message in found))
+    allowed = {str(record_fixtures.FAKE_ACCOUNT_ID), str(record_fixtures.FAKE_TRADER_LOGIN), *ids}
+
+    for message in found:
+        record_fixtures.assert_free_text_clean(message, allowed)
+    return found
+
+
+def test_the_recorded_commands_hold_no_unmapped_number_in_a_venue_text() -> None:
+    found = _venue_texts_checked(load_external_commands_recording())
+
+    assert any(isinstance(m, oa.ProtoOAErrorRes) and m.description for m in found)
+
+
+def test_the_recorded_partial_close_holds_no_unmapped_number_in_a_venue_text() -> None:
+    found = _venue_texts_checked(load_partial_close_recording())
+
+    assert any(isinstance(m, oa.ProtoOAExecutionEvent) for m in found)
 
 
 def _recorded_under_the_old_rules() -> bytes:

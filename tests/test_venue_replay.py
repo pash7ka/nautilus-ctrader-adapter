@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
+
+import pytest
 
 from nautilus_ctrader.common.venue_book import PositionView, VenueBook
 from nautilus_ctrader.common.venue_records import (
@@ -14,9 +17,11 @@ from nautilus_ctrader.common.venue_records import (
     ExternalType,
     Fill,
     Level,
+    LevelTerms,
     OrderEvent,
     OrderEventKind,
 )
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.execution_replay import (
     FIRST,
     PENDING,
@@ -189,8 +194,47 @@ def test_the_second_position_as_the_nodes_take_profit_moved_through_the_market()
     assert run(first_n(as_ours(events(), [SECOND]), SECOND)) == SECOND_AS_OURS
 
 
-def test_the_first_position_as_recorded_is_foreign() -> None:
-    assert run(first_n(events(), FIRST)) == [
+def ext_sl(ts, price, units="1", *, generation="", entry=6000001, position=FIRST) -> ExternalOrder:
+    """A foreign position's stop-loss, first seen at `ts`."""
+    return ExternalOrder(
+        f"{entry}-SL{generation}",
+        SYMBOL,
+        "SELL",
+        ExternalType.STOP_MARKET,
+        d(units),
+        True,
+        str(position),
+        ts,
+        trigger_price=d(price),
+        time_in_force="GOOD_TILL_CANCEL",
+        ts_accepted_ms=OPENED[position],
+    )
+
+
+def ext_tp(ts, price, units="1", *, generation="", entry=6000001, position=FIRST) -> ExternalOrder:
+    """A foreign position's take-profit, first seen at `ts`."""
+    return ExternalOrder(
+        f"{entry}-TP{generation}",
+        SYMBOL,
+        "SELL",
+        ExternalType.LIMIT,
+        d(units),
+        True,
+        str(position),
+        ts,
+        price=d(price),
+        time_in_force="GOOD_TILL_CANCEL",
+        ts_accepted_ms=OPENED[position],
+    )
+
+
+# When each position's protective order was created: its legs' acceptance time.
+OPENED = {FIRST: 1600000124775, SECOND: 1600000442969}
+
+
+def foreign_first(take_profit_again: str) -> list:
+    """The first position as recorded; `take_profit_again` is the re-added take-profit's id."""
+    return [
         ExternalOrder(
             "6000001",
             SYMBOL,
@@ -209,6 +253,17 @@ def test_the_first_position_as_recorded_is_foreign() -> None:
             None,
             1600000124772,
             fill=fill(7000001, FIRST, "BUY", "1", "85287.21", "-27.72", 1600000124772),
+        ),
+        ext_sl(1600000124775, "85197.20"),
+        ext_tp(1600000124775, "85387.22"),
+        OrderEvent(
+            U, "6000001-SL", None, 1600000168184, quantity=d("1"), trigger_price=d("85200.20")
+        ),
+        OrderEvent(C, "6000001-TP", None, 1600000226406),
+        # Put back after its leg was cancelled: a new order.
+        replace(
+            ext_tp(1600000254312, "85353.42"),
+            venue_order_id=take_profit_again,
         ),
         ExternalOrder(
             "6000003",
@@ -229,24 +284,48 @@ def test_the_first_position_as_recorded_is_foreign() -> None:
             1600000355547,
             fill=fill(7000002, FIRST, "SELL", "0.01", "85219.06", "-0.28", 1600000355547),
         ),
-        ExternalOrder(
-            "6000002",
-            SYMBOL,
-            "SELL",
-            ExternalType.STOP_MARKET,
-            d("0.99"),
-            True,
-            str(FIRST),
-            1600000406510,
-            trigger_price=d("85206.20"),
-            fills=(fill(7000003, FIRST, "SELL", "0.99", "85205.58", "-27.41", 1600000406510),),
-            time_in_force="GOOD_TILL_CANCEL",
-            ts_accepted_ms=1600000124775,
+        OrderEvent(U, "6000001-SL", None, 1600000355553, quantity=d("0.99")),
+        OrderEvent(U, take_profit_again, None, 1600000355553, quantity=d("0.99")),
+        OrderEvent(
+            U, "6000001-SL", None, 1600000405318, quantity=d("0.99"), trigger_price=d("85206.20")
         ),
+        # The stop-loss filled with the real deal, the take-profit cancelled; the protective
+        # order's own id is never reported.
+        OrderEvent(
+            F,
+            "6000001-SL",
+            None,
+            1600000406510,
+            fill=fill(7000003, FIRST, "SELL", "0.99", "85205.58", "-27.41", 1600000406510),
+        ),
+        OrderEvent(C, take_profit_again, None, 1600000406510),
     ]
 
 
-def test_the_second_positions_take_profit_as_recorded_is_a_foreign_limit_close() -> None:
+@pytest.mark.parametrize(
+    ("held_closed", "take_profit_again"),
+    [
+        (set(), "6000001-TP-2"),
+        # A persistent cache already holds the second generation closed.
+        ({"6000001-TP-2"}, "6000001-TP-3"),
+    ],
+)
+def test_the_first_position_as_recorded_has_foreign_legs(held_closed, take_profit_again) -> None:
+    book = VenueBook(precision, held_closed=held_closed.__contains__)
+    records = []
+    for message in first_n(events(), FIRST):
+        records += book.apply(message, NOTHING)
+
+    assert records == foreign_first(take_profit_again)
+
+
+def test_the_second_position_as_recorded_has_foreign_legs_and_its_take_profit_fills() -> None:
+    def sl(ts, price):
+        return OrderEvent(U, "6000004-SL", None, ts, quantity=d("1"), trigger_price=d(price))
+
+    def tp(ts, price):
+        return OrderEvent(U, "6000004-TP", None, ts, quantity=d("1"), price=d(price))
+
     assert run(first_n(events(), SECOND)) == [
         ExternalOrder(
             "6000004",
@@ -267,20 +346,23 @@ def test_the_second_positions_take_profit_as_recorded_is_a_foreign_limit_close()
             1600000442966,
             fill=fill(7000004, SECOND, "BUY", "1", "85209.10", "-27.69", 1600000442966),
         ),
-        ExternalOrder(
-            "6000005",
-            SYMBOL,
-            "SELL",
-            ExternalType.LIMIT,
-            d("1"),
-            True,
-            str(SECOND),
+        ext_sl(1600000442969, "85119.09", entry=6000004, position=SECOND),
+        ext_tp(1600000442969, "85309.11", entry=6000004, position=SECOND),
+        sl(1600000480280, "85089.09"),
+        sl(1600000486155, "85031.14"),
+        tp(1600000502124, "85224.52"),
+        tp(1600000516910, "85220.52"),
+        tp(1600000620673, "85168.40"),
+        tp(1600000622601, "85206.52"),
+        tp(1600000657476, "85179.30"),
+        OrderEvent(
+            F,
+            "6000004-TP",
+            None,
             1600000658056,
-            price=d("85179.30"),
-            fills=(fill(7000005, SECOND, "SELL", "1", "85187.89", "-27.69", 1600000658056),),
-            time_in_force="GOOD_TILL_CANCEL",
-            ts_accepted_ms=1600000442969,
+            fill=fill(7000005, SECOND, "SELL", "1", "85187.89", "-27.69", 1600000658056),
         ),
+        OrderEvent(C, "6000004-SL", None, 1600000658056),
     ]
 
 
@@ -320,6 +402,11 @@ def test_a_model_loaded_mid_session_continues_like_one_that_saw_it_all() -> None
         levels={Level.STOP_LOSS: d("85197.20"), Level.TAKE_PROFIT: d("85387.22")},
         legs={Level.STOP_LOSS: (stop_id(FIRST), True), Level.TAKE_PROFIT: (target_id(FIRST), True)},
         leg_units={Level.STOP_LOSS: d("1"), Level.TAKE_PROFIT: d("1")},
+        terms=LevelTerms(
+            trailing_stop_loss=False,
+            guaranteed_stop_loss=False,
+            stop_loss_trigger_method=om.TRADE,
+        ),
     )
 
     later = [
@@ -331,3 +418,33 @@ def test_a_model_loaded_mid_session_continues_like_one_that_saw_it_all() -> None
     for message in later:
         records += book.apply(message, NOTHING)
     assert records == FIRST_AFTER_PROTECTION
+
+
+@pytest.mark.parametrize(
+    ("held_closed", "stop_loss"),
+    [
+        (set(), "6000001-SL"),
+        # The cache a restarted node reloads holds the first stop-loss leg closed.
+        ({"6000001-SL"}, "6000001-SL-2"),
+    ],
+)
+def test_a_foreign_position_loaded_mid_session_continues_with_its_legs(
+    held_closed, stop_loss
+) -> None:
+    book = VenueBook(precision, held_closed=held_closed.__contains__)
+
+    assert book.load(snapshot_with_protection(127.187), position_orders()) == []
+    view = book.view(FIRST)
+    assert not view.ours and view.entry_order_id == 6000001
+    assert view.foreign_legs == {Level.STOP_LOSS: stop_loss, Level.TAKE_PROFIT: "6000001-TP"}
+    assert view.leg_units == {Level.STOP_LOSS: d("1"), Level.TAKE_PROFIT: d("1")}
+
+    records = []
+    for message in first_n(events(), FIRST):
+        if message.order.utcLastUpdateTimestamp > OPENED[FIRST]:
+            records += book.apply(message, NOTHING)
+    expected = [
+        replace(r, venue_order_id=stop_loss) if r.venue_order_id == "6000001-SL" else r
+        for r in foreign_first("6000001-TP-2")[4:]
+    ]
+    assert records == expected

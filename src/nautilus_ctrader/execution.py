@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import partial
@@ -71,7 +71,7 @@ from nautilus_trader.model.orders import Order
 
 from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
 from nautilus_ctrader.common import execution_reports as reports
-from nautilus_ctrader.common import history, order_translation
+from nautilus_ctrader.common import history, order_translation, venue_book
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.balance_checkpoint import BalanceCheckpoint
 from nautilus_ctrader.common.errors import (
@@ -100,6 +100,7 @@ from nautilus_ctrader.common.venue_records import (
     Activity,
     ActivityKind,
     AwaitProtection,
+    EntryUnknown,
     ExternalOrder,
     Level,
     Notice,
@@ -109,6 +110,7 @@ from nautilus_ctrader.common.venue_records import (
     Record,
     ReportedOrder,
     money_of,
+    parse_leg_venue_order_id,
 )
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
@@ -175,13 +177,65 @@ def check_account(trader: om.ProtoOATrader) -> None:
         )
 
 
+def _open_reports(status: ExecutionMassStatus) -> list[OrderStatusReport]:
+    return [report for report in status.order_reports.values() if report.order_status in _OPEN]
+
+
 def _ms(moment) -> int:
     """A datetime as Unix milliseconds."""
     return int(moment.timestamp() * 1000)
 
 
+def _with_id(orders: Iterable[om.ProtoOAOrder], order_id: int) -> om.ProtoOAOrder | None:
+    return next((order for order in orders if order.orderId == order_id), None)
+
+
 def _reason(code: str, description: str | None) -> str:
     return f"{code}: {description}" if description else code
+
+
+def _foreign_live(view: PositionView | None, level: Level, venue_order_id: str) -> bool:
+    """Whether `venue_order_id` is the live leg of `level` of the foreign position `view`."""
+    return view is not None and view.foreign_legs.get(level) == venue_order_id
+
+
+def _updated(
+    records: Iterable[Record],
+    *,
+    client_order_id: str | None = None,
+    venue_order_id: str | None = None,
+) -> bool:
+    """Whether `records` update the order the given id names."""
+    return any(
+        isinstance(r, OrderEvent)
+        and r.kind == OrderEventKind.UPDATED
+        and (client_order_id is None or r.client_order_id == client_order_id)
+        and (venue_order_id is None or r.venue_order_id == venue_order_id)
+        for r in records
+    )
+
+
+def _answered_levels(
+    event: oa.ProtoOAExecutionEvent, precision: int
+) -> dict[Level, Decimal] | None:
+    """The levels an amend's answer states through its protective order; `None` if it states none.
+
+    A cancelled protective order states that no level is left.
+    """
+    if not event.HasField("order") or event.order.orderType != om.STOP_LOSS_TAKE_PROFIT:
+        return None
+    if event.executionType == om.ORDER_CANCELLED:
+        return {}
+    if event.executionType not in (om.ORDER_ACCEPTED, om.ORDER_REPLACED):
+        return None
+    return venue_book.levels_of(event.order, precision)
+
+
+def _not_moved(held: Decimal | None) -> str:
+    """Why a level is not at the price a modify asked for, given the price the broker holds."""
+    return (
+        "the broker holds no such level" if held is None else f"the broker kept the level at {held}"
+    )
 
 
 def _with_positions(
@@ -217,6 +271,43 @@ class BrokerState:
     requests: int
 
 
+class _HeldLegs:
+    """What Nautilus's cache holds of legs, as reconciliation asks it; read for one pass.
+
+    `closed` is the client's own test of a closed order, so the venue model and reconciliation
+    pick a leg's generation alike; `order` finds the order Nautilus holds for a venue order id.
+    """
+
+    def __init__(
+        self,
+        cache: Cache,
+        account_id: AccountId,
+        closed: Callable[[str], bool],
+        order: Callable[[str], Order | None],
+    ) -> None:
+        self.closed = closed
+        self._order = order
+        self._open: dict[int, list[str]] = {}
+        for held in cache.orders_open(venue=CTRADER_VENUE):
+            # An order Nautilus made from a report holds no account id.
+            if held.account_id not in (None, account_id) or held.venue_order_id is None:
+                continue
+            parsed = parse_leg_venue_order_id(held.venue_order_id.value)
+            if parsed is not None:
+                self._open.setdefault(parsed[0], []).append(held.venue_order_id.value)
+
+    def trade_ids(self, venue_order_id: str) -> set[str]:
+        order = self._order(venue_order_id)
+        return set() if order is None else {trade_id.value for trade_id in order.trade_ids}
+
+    def open_legs(self, entry_order_id: int) -> tuple[str, ...]:
+        return tuple(self._open.get(entry_order_id, ()))
+
+
+# The pushed events that change the venue model.
+_ModelEvent = oa.ProtoOAExecutionEvent | oa.ProtoOATrailingSLChangedEvent
+
+
 class _Buffered:
     """An execution event held while the venue model is rebuilt; it is applied later."""
 
@@ -229,6 +320,36 @@ class _Deferred:
     """An order event the client made itself while records were held, sent in its turn."""
 
     event: NautilusOrderEvent
+
+
+@dataclass(frozen=True)
+class _Resent:
+    """An open order's report sent again after a mass status, in its turn."""
+
+    report: OrderStatusReport
+
+
+@dataclass(frozen=True)
+class _Answered:
+    """The broker's answer to a cancel or an amend of a pending order.
+
+    `replaced` is the order as an `ORDER_REPLACED` answer states it; `None` for any other answer.
+    """
+
+    records: list[Record]
+    replaced: om.ProtoOAOrder | None
+
+
+@dataclass(frozen=True)
+class _Amended:
+    """The broker's answer to a level amend.
+
+    `levels` are the position's levels as the answer itself states them; `None` when nothing was
+    sent or the answer states none.
+    """
+
+    records: list[Record]
+    levels: dict[Level, Decimal] | None
 
 
 @dataclass(frozen=True)
@@ -314,7 +435,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         # Scopes this client's spot holds in the registry every client of the account shares.
         self._owner = f"exec:{self.id}"
         self._session: CTraderSession | None = None
-        self._book = VenueBook(self._price_precision)
+        self._book = VenueBook(self._price_precision, held_closed=self._held_closed)
         self._currency: Currency | None = None
         self._balance = Decimal(0)
         self._balance_version = -1
@@ -328,9 +449,11 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._brackets = PendingBrackets()
         # One amend of a position at a time, so each computes from what the last one left.
         self._amend_locks: dict[int, asyncio.Lock] = {}
+        # Likewise for a pending order, by broker order id.
+        self._order_locks: dict[int, asyncio.Lock] = {}
         self._protection_timers: set[asyncio.TimerHandle] = set()
-        # Execution events held while the model is rebuilt, or `None` when it stands.
-        self._buffer: list[oa.ProtoOAExecutionEvent] | None = None
+        # Events held while the model is rebuilt, or `None` when it stands.
+        self._buffer: list[_ModelEvent] | None = None
         # Set whenever no buffer is held, so an amend whose answer was held can wait for it.
         self._model_standing = asyncio.Event()
         self._model_standing.set()
@@ -338,8 +461,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._broker_ms = -1
         # Closes whose answer the connection lost: in flight until the next reconnect pass.
         self._lost_closes: set[str] = set()
-        # The start's mass status the held events wait on, and how long they wait at most.
+        # The start's mass status the held events wait on, its open orders, and how long they
+        # wait at most.
         self._awaited_report: UUID4 | None = None
+        self._awaited_open: list[OrderStatusReport] = []
         self._release_timer: asyncio.TimerHandle | None = None
         self._reconciled_wait_secs = config.connect_timeout_secs
         # The fill window Nautilus asked for at start, which a reconnect reuses.
@@ -361,7 +486,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._expired_held = 0
         # Records and the client's own events held behind those events, in order, and the task
         # that delivers them; set while it does.
-        self._outbox: deque[Record | _Deferred] = deque()
+        self._outbox: deque[Record | _Resent | _Deferred] = deque()
         self._outbox_task: asyncio.Task | None = None
         self._delivering = False
 
@@ -383,6 +508,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._session = session
             self._msgbus.subscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
             session.add_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
+            session.add_event_handler(oa.ProtoOATrailingSLChangedEvent, self._on_trailing_stop)
             session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
             session.add_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
             session.add_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
@@ -463,6 +589,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             return
         self._msgbus.unsubscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
         session.remove_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
+        session.remove_event_handler(oa.ProtoOATrailingSLChangedEvent, self._on_trailing_stop)
         session.remove_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
         session.remove_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
         session.remove_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
@@ -491,7 +618,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             status = await self._reconcile_pass(self._since_ms(self._lookback_mins))
             # Reported under the node's id if it reached the broker; never in flight past this.
             self._end_lost_closes()
+            opened = _open_reports(status)
+            # Nautilus reconciles it before this returns.
             self._send_mass_status_report(status)
+            self._resend_changed(opened)
         except BaseException:
             # Lost closes stay in flight: the retried pass may still find them.
             self._release_buffer()
@@ -566,7 +696,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             raise
         if self._margins != margins:
             self._emit_account_state(self._clock.timestamp_ns())
-        self._await_reconciliation(status.id)
+        self._await_reconciliation(status)
         return status
 
     async def _reconcile_pass(self, since_ms: int) -> ExecutionMassStatus:
@@ -606,24 +736,33 @@ class CTraderExecutionClient(LiveExecutionClient):
         client_order_id: ClientOrderId | None,
         venue_order_id: VenueOrderId | None,
     ) -> tuple[OrderStatusReport | None, bool]:
-        """The broker's report of one of the node's orders, and whether it was sent already.
+        """The broker's report of one order Nautilus holds, and whether it was sent already.
 
         The order is looked up by what it is:
 
-        - a leg: its position in the venue model;
-        - a close: its broker order once the model has matched it, else, while it is still in
-          flight, its position, where the lists name it by the close in flight;
-        - an entry or a market order: the broker's pending orders, then its order list over
-          the fill window.
+        - the node's leg: its position in the venue model;
+        - any other leg, such as a level of a position the node did not open: by its venue order
+          id, in the position its entry opened, which the venue model or the entry's details name;
+        - the node's close: its broker order once the model has matched it, else, while it is
+          still in flight, its position, where the lists name it by the close in flight;
+        - any other order the broker has numbered, external or the node's: by its venue order
+          id, among the broker's pending orders, else in the order's own details, else in the
+          order list over the fill window;
+        - the node's entry or market order the broker has not numbered yet: by the node's record,
+          among the broker's pending orders, then in its order list over the fill window.
 
-        The report is built from that position's own lists. One with fills is sent at once as
-        a one-order mass status carrying them: a bare filled report would make Nautilus infer a
-        fill of its own. Nothing is answered while the connection is down, while a leg's entry
-        is still in flight, or when nothing matches; a DEBUG line says which.
+        The report is built from that position's own lists, and carries the client order id
+        Nautilus holds the order under. One with fills is sent at once as a one-order mass status
+        carrying them: a bare filled report would make Nautilus infer a fill of its own. Nothing
+        is answered while the connection is down, while a leg's entry is still in flight, or
+        when nothing matches; a DEBUG line says which.
         """
-        if client_order_id is None and venue_order_id is not None:
-            client_order_id = self._cache.client_order_id(venue_order_id)
-        order = None if client_order_id is None else self._cache.order(client_order_id)
+        if client_order_id is not None:
+            order = self._cache.order(client_order_id)
+        elif venue_order_id is not None:
+            order = self._order_by_venue_id(venue_order_id.value)
+        else:
+            order = None
 
         def unanswered(reason: str) -> tuple[None, bool]:
             self._log.debug(f"Query of {client_order_id or venue_order_id} not answered: {reason}")
@@ -636,42 +775,60 @@ class CTraderExecutionClient(LiveExecutionClient):
         if self._instrument_provider.find(order.instrument_id) is None:
             return unanswered(f"{order.instrument_id} is not loaded")
         order_id = order.client_order_id.value
+        if order.venue_order_id is not None:
+            venue_order_id = order.venue_order_id
+        venue_id = None if venue_order_id is None else venue_order_id.value
         leg = self._book.leg_position(order_id)
         if leg is None and self._brackets.by_leg(order_id) is not None:
             return unanswered("its entry is still in flight")
         close = self._book.close_order(order_id)
+        other_leg = None
+        numbered = False
+        if leg is None and close is None and venue_id is not None:
+            other_leg = parse_leg_venue_order_id(venue_id)
+            # A broker order id: the only key to an external order, whose client id no list holds.
+            numbered = venue_id.isascii() and venue_id.isdigit()
+        by_venue_id = False
+
+        def wanted(record: ReportedOrder) -> bool:
+            if by_venue_id:
+                return record.venue_order_id == venue_id
+            return record.client_order_id == order_id
+
+        closing: int | None = None
         listed: om.ProtoOAOrder | None = None
         record: ReportedOrder | None = None
         try:
             if leg is not None or close is not None:
                 position_id = leg[0] if leg is not None else close[1]
-            elif order.is_reduce_only:
-                # Not matched yet: its position's lists name it by the close still in flight.
-                position_id = self._operations.close_position(order_id)
+            elif other_leg is not None:
+                by_venue_id = True
+                position_id = await self._entry_position(other_leg[0])
                 if position_id is None:
-                    return unanswered("not found at the venue")
-            else:
+                    return unanswered("its entry names no position at the venue")
+            elif (
+                order.is_reduce_only
+                and (closing := self._operations.close_position(order_id)) is not None
+            ):
+                # Not matched yet: its position's lists name it by the close still in flight.
+                position_id = closing
+            elif numbered or not order.is_reduce_only:
+                by_venue_id = numbered
                 pending = await self._request(
                     oa.ProtoOAReconcileReq(ctidTraderAccountId=self._account.account_id),
                 )
-                listed = entry_named(pending.order, order_id)
+                if by_venue_id:
+                    listed = _with_id(pending.order, int(venue_id))
+                else:
+                    listed = entry_named(pending.order, order_id)
                 position_id = None
                 if listed is None:
-                    windows = history.weekly_windows(
-                        self._since_ms(self._lookback_mins), self._clock.timestamp_ms()
-                    )
-                    # TODO(verify): that the order list holds an order the broker rejected;
-                    # none was recorded.
-                    for start, end in reversed(windows):
-                        found = await history.orders_between(
-                            partial(self._request, bucket=BUCKET_HISTORICAL),
-                            self._account.account_id,
-                            start,
-                            end,
+                    if by_venue_id:
+                        listed = await self._numbered_order(int(venue_id))
+                    else:
+                        listed = await self._order_in_history(
+                            partial(entry_named, client_order_id=order_id)
                         )
-                        listed = entry_named(found, order_id)
-                        if listed is not None:
-                            break
                     if listed is None:
                         return unanswered("not found at the venue")
                     if listed.HasField("positionId"):
@@ -679,6 +836,8 @@ class CTraderExecutionClient(LiveExecutionClient):
                 elif listed.executedVolume and listed.HasField("positionId"):
                     # Partly filled: answered from its position, with its fills.
                     position_id = listed.positionId
+            else:
+                return unanswered("not found at the venue")
             if position_id is not None:
                 state = await self._read_broker(since_ms=None, positions=[position_id])
                 found = state.histories.get(position_id)
@@ -690,14 +849,10 @@ class CTraderExecutionClient(LiveExecutionClient):
                         self._price_precision,
                         self._book.known_closes(),
                         self._operations,
+                        self._held_legs(),
                     )
-                    record = next((r for r in built.orders if r.client_order_id == order_id), None)
-                    if (
-                        record is not None
-                        and leg is None
-                        and close is None
-                        and order.is_reduce_only
-                    ):
+                    record = next(filter(wanted, built.orders), None)
+                    if record is not None and closing is not None:
                         # Its late events, after the close's timeout, stay the node's close's.
                         self._book.match_close(int(record.venue_order_id), position_id, order_id)
         except CTraderError as e:
@@ -719,17 +874,72 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._currency,
             self._clock.timestamp_ns(),
             held_price=self._held_price,
+            known_id=self._known_id,
         )
         if not status.order_reports:
             return unanswered("no price or instrument to report it at")
         (report,) = status.order_reports.values()
         if not record.fills:
-            return report, False
+            return self._named(report), False
         self._send_mass_status_report(status)
         bracket = self._brackets.by_entry(order_id)
         if bracket is not None and self._bracket_position(bracket) is None:
             await self._learn_position(order_id)
-        return report, True
+        return self._named(report), True
+
+    async def _entry_position(self, entry_order_id: int) -> int | None:
+        """The position broker order `entry_order_id` opened: the venue model's, else its details'.
+
+        The model holds no position closed before it was last rebuilt.
+        """
+        position_id = self._book.entry_position(entry_order_id)
+        if position_id is not None:
+            return position_id
+        entry = await self._order_details(entry_order_id)
+        return entry.positionId if entry.HasField("positionId") else None
+
+    async def _numbered_order(self, order_id: int) -> om.ProtoOAOrder | None:
+        """Broker order `order_id`: its own details, else the order list over the fill window."""
+        try:
+            return await self._order_details(order_id)
+        except (CTraderRequestError, CTraderTimeoutError) as e:
+            self._log.debug(
+                f"Order {order_id}: its details could not be read; searching the order list: {e}"
+            )
+        return await self._order_in_history(partial(_with_id, order_id=order_id))
+
+    async def _order_details(self, order_id: int) -> om.ProtoOAOrder:
+        """Broker order `order_id` as it stands now, pending or ended."""
+        # Confirmed live: an ended order is answered, and an unknown id is refused with
+        # ORDER_NOT_FOUND. Where it fails, the order list over the fill window is searched.
+        # TODO(verify): which request limit it counts against (taken as the historical one here).
+        response = await self._request(
+            oa.ProtoOAOrderDetailsReq(
+                ctidTraderAccountId=self._account.account_id, orderId=order_id
+            ),
+            bucket=BUCKET_HISTORICAL,
+        )
+        return response.order
+
+    async def _order_in_history(
+        self, find: Callable[[Iterable[om.ProtoOAOrder]], om.ProtoOAOrder | None]
+    ) -> om.ProtoOAOrder | None:
+        """The order `find` picks from the account's order list over the fill window."""
+        windows = history.weekly_windows(
+            self._since_ms(self._lookback_mins), self._clock.timestamp_ms()
+        )
+        # TODO(verify): that the order list holds an order the broker rejected; none was recorded.
+        for start, end in reversed(windows):
+            found = await history.orders_between(
+                partial(self._request, bucket=BUCKET_HISTORICAL),
+                self._account.account_id,
+                start,
+                end,
+            )
+            listed = find(found)
+            if listed is not None:
+                return listed
+        return None
 
     async def _learn_position(self, entry_id: str) -> None:
         """Rebuild the model after a query found bracket `entry_id`'s entry filled.
@@ -762,14 +972,15 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Every open order and live leg; with `open_only` false, also those that ended unfilled.
 
         A filled order reaches Nautilus only inside a mass status: without its fills Nautilus
-        would infer one with no commission.
+        would infer one with no commission. An external order Nautilus holds is reported under
+        the client order id it gave it.
         """
         since_ms = None if command.open_only else self._command_since_ms(command.start)
         status = await self._reports(since_ms)
         if status is None:
             return []
         return [
-            report
+            self._named(report)
             for report in status.order_reports.values()
             if command.instrument_id in (None, report.instrument_id)
             and (
@@ -790,7 +1001,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             return []
         until = None if command.end is None else reports.nanos(_ms(command.end))
         return [
-            fill
+            self._named(fill)
             for venue_order_id, fills in status.fill_reports.items()
             if command.venue_order_id in (None, venue_order_id)
             for fill in fills
@@ -831,6 +1042,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._price_precision,
             self._book.known_closes(),
             self._operations,
+            self._held_legs(),
         )
         for notice in found.notices:
             self._log.warning(notice.text)
@@ -843,12 +1055,13 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._currency,
             self._clock.timestamp_ns(),
             held_price=self._held_price,
+            known_id=self._known_id,
         )
         for record in left_out:
             # Normal after a restart without a persistent cache.
             self._log.debug(
-                f"Leg {record.client_order_id} is not reported: its level is gone and Nautilus "
-                "holds no price for it",
+                f"Leg {record.client_order_id or record.venue_order_id} is not reported: its "
+                "level is gone and Nautilus holds no price for it",
             )
         return status
 
@@ -863,6 +1076,41 @@ class CTraderExecutionClient(LiveExecutionClient):
             with contextlib.suppress(ValueError):
                 found.append(int(position.id.value))
         return found
+
+    def _order_by_venue_id(self, venue_order_id: str) -> Order | None:
+        """The order Nautilus holds under `venue_order_id`, the node's or an external one."""
+        client_order_id = self._cache.client_order_id(VenueOrderId(venue_order_id))
+        return None if client_order_id is None else self._cache.order(client_order_id)
+
+    def _held_legs(self) -> _HeldLegs:
+        return _HeldLegs(self._cache, self.account_id, self._held_closed, self._order_by_venue_id)
+
+    def _held_closed(self, venue_order_id: str) -> bool:
+        """Whether Nautilus holds `venue_order_id` as a closed order."""
+        order = self._order_by_venue_id(venue_order_id)
+        return order is not None and order.is_closed
+
+    def _known_id(self, venue_order_id: str) -> str | None:
+        """The client order id Nautilus gave the external order `venue_order_id`, if it holds it.
+
+        Nautilus's check of its open orders looks for a report under this id: an open order with
+        none is taken for missing.
+        """
+        order = self._order_by_venue_id(venue_order_id)
+        return None if order is None else order.client_order_id.value
+
+    def _named[R: (OrderStatusReport, FillReport)](self, report: R) -> R:
+        """`report` under the client order id Nautilus gave its external order, if it holds it.
+
+        Nautilus's check of its open orders looks for a report under that id. A mass status is
+        left as it is: Nautilus names its reports itself, and drops one already named whose
+        status it holds, a price change with it.
+        """
+        if report.client_order_id is None:
+            known = self._known_id(report.venue_order_id.value)
+            if known is not None:
+                report.client_order_id = ClientOrderId(known)
+        return report
 
     def _held_price(self, client_order_id: str) -> Decimal | None:
         """The price Nautilus holds for a leg: a stop's trigger price, a limit's price."""
@@ -889,9 +1137,11 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._buffer = []
         self._model_standing.clear()
 
-    def _await_reconciliation(self, report_id: UUID4) -> None:
+    def _await_reconciliation(self, status: ExecutionMassStatus) -> None:
         self._stop_awaiting()
-        self._awaited_report = report_id
+        self._awaited_report = status.id
+        # Taken now: Nautilus removes from the mass status the reports it skips.
+        self._awaited_open = _open_reports(status)
         self._release_timer = self._loop.call_later(
             self._reconciled_wait_secs, self._reconciliation_waited
         )
@@ -901,10 +1151,12 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._release_timer.cancel()
             self._release_timer = None
         self._awaited_report = None
+        self._awaited_open = []
 
     def _on_reconciled(self, mass_status: ExecutionMassStatus) -> None:
         # Nautilus publishes a mass status more than once; the first match releases.
         if self._awaited_report is not None and mass_status.id == self._awaited_report:
+            self._resend_changed(self._awaited_open)
             self._release_safely()
 
     def _reconciliation_waited(self) -> None:
@@ -913,7 +1165,38 @@ class CTraderExecutionClient(LiveExecutionClient):
             "Nautilus did not reconcile the mass status within "
             f"{self._reconciled_wait_secs:g}s; applying the execution events held meanwhile",
         )
+        self._resend_changed(self._awaited_open)
         self._release_safely()
+
+    def _resend_changed(self, opened: Iterable[OrderStatusReport]) -> None:
+        """Send again each open order whose quantity or price differs from what Nautilus holds.
+
+        Nautilus skips a mass status's report whose status and fills match the order it holds,
+        whatever its price: a level moved, or a quantity reduced, while the node was not
+        listening would never reach it. Sent alone, the report becomes an `OrderUpdated`.
+        """
+        # Runs inside the engine's publish or a timer callback, as the release does.
+        try:
+            changed = []
+            for report in opened:
+                order = self._held_order(report)
+                if order is None or not order.is_open:
+                    continue
+                if reports.changes_terms(order, report):
+                    self._log.info(
+                        f"Order {order.client_order_id} changed at the venue while Nautilus was "
+                        "not listening; reported again",
+                    )
+                    changed.append(_Resent(self._named(report)))
+            self._handle_records(changed)
+        except Exception as e:
+            self._log.exception("Reporting the orders changed meanwhile failed", e)
+
+    def _held_order(self, report: OrderStatusReport) -> Order | None:
+        """The order Nautilus holds for `report`: the node's by its id, another by venue id."""
+        if report.client_order_id is not None:
+            return self._cache.order(report.client_order_id)
+        return self._order_by_venue_id(report.venue_order_id.value)
 
     def _release_safely(self) -> None:
         # Runs inside the engine's publish or a timer callback: a raise there would end the
@@ -934,7 +1217,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             if held is None or self._session is None:
                 return
             for event in held:
-                self._on_execution_event(event)
+                if isinstance(event, oa.ProtoOATrailingSLChangedEvent):
+                    self._on_trailing_stop(event)
+                else:
+                    self._on_execution_event(event)
             # A protective order that came during an outage arrives with the rebuild, no event.
             self._settle_brackets()
         finally:
@@ -1093,7 +1379,15 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _stand(self, state: BrokerState) -> None:
         """Rebuild the venue model and the margins from `state`'s snapshot."""
         orders = {position_id: found.orders for position_id, found in state.histories.items()}
-        self._handle_records(self._book.load(state.snapshot, orders))
+        records = self._book.load(state.snapshot, orders)
+        for record in records:
+            # Its order list was just read: reading it again would find no entry either.
+            if isinstance(record, EntryUnknown):
+                self._log.debug(
+                    f"Position {record.position_id} has levels but its order list names no "
+                    "entry; it has no legs",
+                )
+        self._handle_records(r for r in records if not isinstance(r, EntryUnknown))
         self._margins = {}
         self._margin_times = {}
         for position in state.snapshot.position:
@@ -1118,7 +1412,9 @@ class CTraderExecutionClient(LiveExecutionClient):
             # one page was recorded.
             payload.toTimestamp = min(order.utcLastUpdateTimestamp for order in new)
         else:
-            self._log.warning(
+            # The earliest orders are the ones left out, and the entry among them: the node's
+            # own position can then be taken for a foreign one.
+            self._log.error(
                 f"Position {position_id}: its order list did not end within "
                 f"{_MAX_ORDER_PAGES} pages; its entry may be missing",
             )
@@ -1273,6 +1569,19 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._drop_amend_locks()
         return records
 
+    def _on_trailing_stop(self, event: oa.ProtoOATrailingSLChangedEvent) -> None:
+        """A trailing stop-loss the broker moved: its leg follows."""
+        if self._buffer is not None:
+            self._buffer.append(event)
+            return
+        try:
+            records = self._book.trailing_stop_moved(event)
+        except Exception as e:
+            self._log.exception("A trailing stop move could not be applied to the venue model", e)
+            records = []
+        self._handle_records(records)
+        self._saw_broker_time(event.utcLastUpdateTimestamp)
+
     def _saw_broker_time(self, *times_ms: int) -> None:
         # Unset fields read as 0, which never moves the newest time.
         self._broker_ms = max(self._broker_ms, *times_ms)
@@ -1349,13 +1658,13 @@ class CTraderExecutionClient(LiveExecutionClient):
                 )
 
     @staticmethod
-    def _applied_at_once(record: Record | _Deferred) -> bool:
+    def _applied_at_once(record: Record | _Resent | _Deferred) -> bool:
         """Whether Nautilus applies what the record becomes at once: a report or an activity."""
         if isinstance(record, OrderEvent):
             return record.client_order_id is None
-        return isinstance(record, (ExternalOrder, Activity))
+        return isinstance(record, (ExternalOrder, Activity, _Resent))
 
-    def _handle_records(self, records: Iterable[Record]) -> None:
+    def _handle_records(self, records: Iterable[Record | _Resent]) -> None:
         """Deliver the records in order, each behind the events this client sent before it.
 
         A report or an activity would overtake an event still in Nautilus's queue, so it waits,
@@ -1417,10 +1726,12 @@ class CTraderExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.exception("A held order event could not be sent", e)
 
-    def _handle_record(self, record: Record) -> None:
+    def _handle_record(self, record: Record | _Resent) -> None:
         try:
             if isinstance(record, OrderEvent):
                 self._order_event(record)
+            elif isinstance(record, _Resent):
+                self._send_order_status_report(record.report)
             elif isinstance(record, ExternalOrder):
                 self._external_order(record)
             elif isinstance(record, Activity):
@@ -1429,10 +1740,40 @@ class CTraderExecutionClient(LiveExecutionClient):
                 self._log.warning(record.text)
             elif isinstance(record, (AwaitProtection, ProtectionMissing)):
                 self._on_protection(record)
+            elif isinstance(record, EntryUnknown):
+                self._log.debug(
+                    f"Position {record.position_id} has levels but no known entry; its legs wait "
+                    "until the entry is known",
+                )
+                self.create_task(
+                    self._find_entry(record.position_id),
+                    log_msg=f"read the orders of position {record.position_id}",
+                )
             else:
                 self._log.warning(f"{type(record).__name__} is not a known record; ignored")
         except Exception as e:
             self._log.exception(f"{type(record).__name__} could not be reported", e)
+
+    async def _find_entry(self, position_id: int) -> None:
+        """Read the order list of a position whose entry the model lacks, and hand it over.
+
+        Read once the model stands. A rebuild under way when the list arrives reads every list
+        itself, so this one is then dropped.
+        """
+        await self._model_standing.wait()
+        try:
+            orders = await self._position_orders(
+                position_id, partial(self._request, bucket=BUCKET_HISTORICAL)
+            )
+        except CTraderError as e:
+            self._log.warning(
+                f"Position {position_id}: its order list could not be read, so its levels stay "
+                f"without legs: {e}",
+            )
+            return
+        if self._session is None or self._buffer is not None:
+            return
+        self._handle_records(self._book.entry_found(position_id, orders))
 
     def _nautilus_order(self, record: OrderEvent) -> Order | None:
         """The order a record is about: the node's by its own id, an external one by venue id."""
@@ -1440,8 +1781,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             return self._cache.order(ClientOrderId(record.client_order_id))
         if record.venue_order_id is None:
             return None
-        client_order_id = self._cache.client_order_id(VenueOrderId(record.venue_order_id))
-        return None if client_order_id is None else self._cache.order(client_order_id)
+        return self._order_by_venue_id(record.venue_order_id)
 
     def _order_event(self, record: OrderEvent) -> None:
         order = self._nautilus_order(record)
@@ -1520,6 +1860,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self.account_id,
                     self._currency,
                     ts_init,
+                    client_order_id=order.client_order_id.value,
                 ),
             )
         elif order.is_closed:
@@ -1541,7 +1882,13 @@ class CTraderExecutionClient(LiveExecutionClient):
             return
         ts_init = self._clock.timestamp_ns()
         self._send_order_status_report(
-            reports.order_status_report(record, instrument, self.account_id, ts_init),
+            reports.order_status_report(
+                record,
+                instrument,
+                self.account_id,
+                ts_init,
+                client_order_id=self._known_id(record.venue_order_id),
+            ),
         )
         for fill in record.fills:
             self._send_external_fill(
@@ -1552,6 +1899,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self.account_id,
                     self._currency,
                     ts_init,
+                    client_order_id=self._known_id(record.venue_order_id),
                 ),
             )
 
@@ -1560,8 +1908,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         # TODO(verify): that the deals of one order arrive in time order. Nautilus skips a
         # reconciliation fill older than one it applied to the same order.
         self._send_fill_report(report)
-        client_order_id = self._cache.client_order_id(report.venue_order_id)
-        order = None if client_order_id is None else self._cache.order(client_order_id)
+        order = self._order_by_venue_id(report.venue_order_id.value)
         if order is None or report.trade_id not in order.trade_ids:
             self._log.error(
                 f"Nautilus did not apply fill {report.trade_id} of order "
@@ -1816,7 +2163,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         for level in sorted(bracket.modified - bracket.cancels, key=lambda lv: lv.value):
             self._modify_rejected(ClientOrderId(bracket.legs[level]), reason)
 
-    # -- Legs -------------------------------------------------------------------------------------
+    # -- Cancel and modify ------------------------------------------------------------------------
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         await self._cancel([command.client_order_id])
@@ -1835,29 +2182,80 @@ class CTraderExecutionClient(LiveExecutionClient):
         await self._cancel([cancel.client_order_id for cancel in command.cancels])
 
     async def _cancel(self, client_order_ids: list[ClientOrderId]) -> None:
-        """Cancel legs, one amend per position; anything else is refused."""
+        """Cancel legs, one amend per position, and pending orders; anything else is refused."""
         by_position: dict[int, dict[Level, ClientOrderId]] = {}
+        foreign: dict[int, dict[Level, tuple[ClientOrderId, str]]] = {}
+        orders: list[tuple[ClientOrderId, om.ProtoOAOrder]] = []
         for client_order_id in client_order_ids:
-            pending = self._brackets.by_leg(client_order_id.value)
-            if pending is not None:
-                bracket, level = pending
-                # Carried by the bracket's correcting amend.
-                bracket.cancels.add(level)
-                continue
-            found = self._book.leg_position(client_order_id.value)
-            if found is None:
-                self._cancel_rejected(
-                    client_order_id,
-                    "only a protective leg can be cancelled; a market order fills at once",
+            try:
+                self._sort_cancel(client_order_id, by_position, foreign, orders)
+            except Exception as e:
+                self._cancel_rejected(client_order_id, self._failed("Cancel", [client_order_id], e))
+        await asyncio.gather(
+            *(
+                self._cancel_guarded(self._remove_levels(position_id, legs), legs.values())
+                for position_id, legs in by_position.items()
+            ),
+            *(
+                self._cancel_guarded(
+                    self._remove_foreign_levels(position_id, legs),
+                    [client_order_id for client_order_id, _ in legs.values()],
                 )
-            elif not self._leg_alive(client_order_id.value):
-                self._cancel_rejected(client_order_id, "the leg is already closed")
-            else:
+                for position_id, legs in foreign.items()
+            ),
+            *(
+                self._cancel_guarded(self._cancel_pending(client_order_id, held), [client_order_id])
+                for client_order_id, held in orders
+            ),
+        )
+
+    def _sort_cancel(
+        self,
+        client_order_id: ClientOrderId,
+        by_position: dict[int, dict[Level, ClientOrderId]],
+        foreign: dict[int, dict[Level, tuple[ClientOrderId, str]]],
+        orders: list[tuple[ClientOrderId, om.ProtoOAOrder]],
+    ) -> None:
+        """Add the cancel of `client_order_id` to what goes out, or refuse it."""
+        pending = self._brackets.by_leg(client_order_id.value)
+        if pending is not None:
+            bracket, level = pending
+            # Carried by the bracket's correcting amend.
+            bracket.cancels.add(level)
+            return
+        found = self._book.leg_position(client_order_id.value)
+        if found is not None:
+            if self._leg_alive(client_order_id.value):
                 position_id, level = found
                 by_position.setdefault(position_id, {})[level] = client_order_id
-        await asyncio.gather(
-            *(self._remove_levels(position_id, legs) for position_id, legs in by_position.items()),
-        )
+            else:
+                self._cancel_rejected(client_order_id, "the leg is already closed")
+            return
+        foreign_leg = self._foreign_leg(client_order_id)
+        if foreign_leg is None:
+            held = self._open_order(client_order_id, "cancelled")
+            if isinstance(held, str):
+                self._cancel_rejected(client_order_id, held)
+            else:
+                orders.append((client_order_id, held))
+            return
+        position_id, level, venue_order_id = foreign_leg
+        if _foreign_live(self._book.view(position_id), level, venue_order_id):
+            foreign.setdefault(position_id, {})[level] = (client_order_id, venue_order_id)
+        else:
+            self._cancel_rejected(client_order_id, "the leg is already closed")
+
+    async def _cancel_guarded(
+        self, work: Awaitable[None], client_order_ids: Iterable[ClientOrderId]
+    ) -> None:
+        """Run `work`, the cancel of `client_order_ids`; refuse them if it fails in the adapter."""
+        client_order_ids = list(client_order_ids)
+        try:
+            await work
+        except Exception as e:
+            reason = self._failed("Cancel", client_order_ids, e)
+            for client_order_id in client_order_ids:
+                self._cancel_rejected(client_order_id, reason)
 
     async def _remove_levels(self, position_id: int, legs: dict[Level, ClientOrderId]) -> None:
         outcome = await self._amend(
@@ -1878,17 +2276,136 @@ class CTraderExecutionClient(LiveExecutionClient):
                 # A level the broker did not hold was not in its answer: nothing cancelled the leg.
                 self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
 
+    async def _remove_foreign_levels(
+        self,
+        position_id: int,
+        legs: dict[Level, tuple[ClientOrderId, str]],
+    ) -> None:
+        """Remove the levels of foreign legs; the broker's answer reports each one cancelled."""
+
+        def levels_of(view: PositionView) -> dict[Level, Decimal]:
+            # A level put back since the command is a new leg, not the one cancelled.
+            gone = {
+                level
+                for level, (_, venue_order_id) in legs.items()
+                if _foreign_live(view, level, venue_order_id)
+            }
+            return {lv: p for lv, p in view.levels.items() if lv not in gone}
+
+        outcome = await self._amend(position_id, levels_of)
+        if isinstance(outcome, _Refused):
+            for client_order_id, _ in legs.values():
+                self._cancel_rejected(client_order_id, outcome.reason)
+            return
+        view = self._book.view(position_id)
+        for level, (client_order_id, venue_order_id) in legs.items():
+            if _foreign_live(view, level, venue_order_id):
+                self._cancel_rejected(client_order_id, "the broker kept the level")
+
+    def _foreign_leg(self, client_order_id: ClientOrderId) -> tuple[int, Level, str] | None:
+        """The position, level and venue order id of a leg of a position the node did not open."""
+        order = self._cache.order(client_order_id)
+        if order is None or order.venue_order_id is None:
+            return None
+        venue_order_id = order.venue_order_id.value
+        found = self._book.foreign_leg_position(venue_order_id)
+        return None if found is None else (*found, venue_order_id)
+
+    def _open_order(self, client_order_id: ClientOrderId, done: str) -> om.ProtoOAOrder | str:
+        """The broker's pending order behind `client_order_id`, or why it cannot be `done`."""
+        order = self._cache.order(client_order_id)
+        if order is not None and order.order_type == OrderType.MARKET:
+            return order_translation.market_refusal(done)
+        venue_order_id = (
+            None if order is None or order.venue_order_id is None else order.venue_order_id.value
+        )
+        held = (
+            self._book.open_order(int(venue_order_id))
+            if venue_order_id is not None and venue_order_id.isdigit()
+            else None
+        )
+        return "the order is not open at the venue" if held is None else held
+
+    async def _cancel_pending(self, client_order_id: ClientOrderId, held: om.ProtoOAOrder) -> None:
+        """Cancel a pending order; the broker's answer reports it cancelled."""
+        try:
+            request = order_translation.cancel_order(self._account.account_id, held)
+        except Unsupported as e:
+            self._cancel_rejected(client_order_id, str(e))
+            return
+        outcome = await self._change_order(request)
+        if outcome is None:
+            self._log.warning(
+                f"Cancel of {client_order_id}: no answer, so its outcome is unknown; "
+                "it is not resent",
+            )
+        elif isinstance(outcome, _Refused):
+            self._cancel_rejected(client_order_id, outcome.reason)
+        elif self._book.open_order(held.orderId) is not None:
+            self._cancel_rejected(client_order_id, "the broker kept the order open")
+
+    async def _change_order(
+        self,
+        request: oa.ProtoOACancelOrderReq | oa.ProtoOAAmendOrderReq,
+    ) -> _Answered | _Refused | None:
+        """Send a cancel or an amend of a pending order.
+
+        Returns the broker's answer, its refusal, or `None` when the outcome is unknown.
+        """
+        outcome = await self._send(request)
+        if outcome is None or isinstance(outcome, _Refused):
+            return outcome
+        if not isinstance(outcome, oa.ProtoOAExecutionEvent):
+            return _Answered([], None)
+        # A refusing execution event is not applied to the model: the order it names still
+        # stands. A cancel of an id the venue does not hold is refused with an order error
+        # instead (confirmed live).
+        # TODO(verify): how the venue refuses an amend, and whether it ever refuses with an
+        # execution event at all.
+        if outcome.executionType in (om.ORDER_REJECTED, om.ORDER_CANCEL_REJECTED):
+            code = outcome.errorCode or om.ProtoOAExecutionType.Name(outcome.executionType)
+            return _Refused(code)
+        records = self._on_execution_event(outcome)
+        if isinstance(records, _Buffered):
+            await self._wait_for_model()
+            records = []
+        replaced = outcome.executionType == om.ORDER_REPLACED and outcome.HasField("order")
+        return _Answered(records, outcome.order if replaced else None)
+
     async def _modify_order(self, command: ModifyOrder) -> None:
+        try:
+            await self._modify(command)
+        except Exception as e:
+            reason = self._failed("Modify", [command.client_order_id], e)
+            self._modify_rejected(command.client_order_id, reason)
+
+    async def _modify(self, command: ModifyOrder) -> None:
         client_order_id = command.client_order_id
         order = self._cache.order(client_order_id)
         pending = self._brackets.by_leg(client_order_id.value)
         found = self._book.leg_position(client_order_id.value)
+        foreign_leg = (
+            self._foreign_leg(client_order_id)
+            if order is not None and pending is None and found is None
+            else None
+        )
+        if foreign_leg is not None:
+            await self._modify_foreign_leg(command, order, *foreign_leg)
+            return
         if order is None or (pending is None and found is None):
-            self._modify_rejected(client_order_id, "only a protective leg can be modified")
+            held = self._open_order(client_order_id, "modified")
+            if isinstance(held, str):
+                self._modify_rejected(client_order_id, held)
+            else:
+                await self._modify_pending(command, held.orderId)
             return
         level = pending[1] if pending is not None else found[1]
         if pending is None and not self._leg_alive(client_order_id.value):
             self._modify_rejected(client_order_id, "the leg is already closed")
+            return
+        instrument = self._instrument_provider.find(order.instrument_id)
+        if instrument is None:
+            self._modify_rejected(client_order_id, f"{order.instrument_id} is not loaded")
             return
         held = self._leg_quantity(order, found)
         if command.quantity is not None and command.quantity != held:
@@ -1897,7 +2414,13 @@ class CTraderExecutionClient(LiveExecutionClient):
                 f"a protective leg's quantity follows its position ({held}) and cannot be set",
             )
             return
-        price = command.trigger_price if level == Level.STOP_LOSS else command.price
+        try:
+            price = order_translation.leg_price(
+                instrument, level, price=command.price, trigger_price=command.trigger_price
+            )
+        except Unsupported as e:
+            self._modify_rejected(client_order_id, str(e))
+            return
         if price is None:
             # Only the quantity the leg already has: nothing to send.
             self.generate_order_updated(
@@ -1921,25 +2444,177 @@ class CTraderExecutionClient(LiveExecutionClient):
         if isinstance(outcome, _Refused):
             self._modify_rejected(client_order_id, outcome.reason)
             return
-        view = self._book.view(found[0])
-        held_price = None if view is None else view.levels.get(level)
+        held_price = self._held_level(outcome, found[0], level)
         if held_price != wanted:
-            reason = (
-                "the broker holds no such level"
-                if held_price is None
-                else f"the broker kept the level at {held_price}"
-            )
-            self._modify_rejected(client_order_id, reason)
+            self._modify_rejected(client_order_id, _not_moved(held_price))
             return
-        updated = any(
-            isinstance(r, OrderEvent)
-            and r.kind == OrderEventKind.UPDATED
-            and r.client_order_id == client_order_id.value
-            for r in outcome
+        if not _updated(outcome.records, client_order_id=client_order_id.value):
+            # The level stood there already, or a trailing move overtook the answer: no event
+            # says where it stands, and the modify still needs one.
+            view = self._book.view(found[0])
+            standing = None if view is None else view.levels.get(level)
+            if standing is not None:
+                self._leg_updated(client_order_id, level, standing)
+
+    async def _modify_foreign_leg(
+        self,
+        command: ModifyOrder,
+        order: Order,
+        position_id: int,
+        level: Level,
+        venue_order_id: str,
+    ) -> None:
+        """Move the level of a foreign leg; the broker's answer reports the leg moved."""
+        client_order_id = command.client_order_id
+        view = self._book.view(position_id)
+        if not _foreign_live(view, level, venue_order_id):
+            self._modify_rejected(client_order_id, "the leg is already closed")
+            return
+        instrument = self._instrument_provider.find(order.instrument_id)
+        if instrument is None:
+            self._modify_rejected(client_order_id, f"{order.instrument_id} is not loaded")
+            return
+        held = reports.quantity(view.leg_units[level], instrument)
+        if command.quantity is not None and command.quantity != held:
+            self._modify_rejected(
+                client_order_id,
+                f"a protective level covers the whole position ({held}); its quantity cannot "
+                "be set",
+            )
+            return
+        try:
+            price = order_translation.leg_price(
+                instrument, level, price=command.price, trigger_price=command.trigger_price
+            )
+        except Unsupported as e:
+            self._modify_rejected(client_order_id, str(e))
+            return
+        if price is not None:
+            wanted = price.as_decimal()
+
+            def levels_of(view: PositionView) -> dict[Level, Decimal]:
+                if not _foreign_live(view, level, venue_order_id):
+                    return view.levels
+                return {**view.levels, level: wanted}
+
+            outcome = await self._amend(position_id, levels_of)
+            if isinstance(outcome, _Refused):
+                self._modify_rejected(client_order_id, outcome.reason)
+                return
+            if outcome.levels is None and not _foreign_live(
+                self._book.view(position_id), level, venue_order_id
+            ):
+                self._modify_rejected(client_order_id, "the leg is already closed")
+                return
+            held_price = self._held_level(outcome, position_id, level)
+            if held_price != wanted:
+                self._modify_rejected(client_order_id, _not_moved(held_price))
+                return
+            if _updated(outcome.records, venue_order_id=venue_order_id):
+                return
+        # Nothing changed at the broker, so no answer reports the leg; the report says how it
+        # stands, which ends Nautilus's pending update.
+        view = self._book.view(position_id)
+        if not _foreign_live(view, level, venue_order_id):
+            # Ended since: the record that ended it tells Nautilus.
+            return
+        stop = level == Level.STOP_LOSS
+        standing = view.levels.get(level)
+        if standing is None:
+            self._modify_rejected(client_order_id, _not_moved(standing))
+            return
+        self._handle_records(
+            [
+                OrderEvent(
+                    OrderEventKind.UPDATED,
+                    venue_order_id,
+                    None,
+                    self._clock.timestamp_ms(),
+                    quantity=view.leg_units[level],
+                    price=None if stop else standing,
+                    trigger_price=standing if stop else None,
+                ),
+            ],
         )
-        if not updated:
-            # The level stood there already, so no event says so; the modify still needs one.
-            self._leg_updated(client_order_id, level, wanted)
+
+    def _held_level(self, outcome: _Amended, position_id: int, level: Level) -> Decimal | None:
+        """The level as the amend's answer states it, else as the model holds it now.
+
+        The answer, not the model: a trailing move applied after it is no refusal.
+        """
+        if outcome.levels is not None:
+            return outcome.levels.get(level)
+        view = self._book.view(position_id)
+        return None if view is None else view.levels.get(level)
+
+    def _failed(self, what: str, client_order_ids: Iterable[ClientOrderId], e: Exception) -> str:
+        """Log a command the adapter failed to carry out; returns the reason it is refused."""
+        ids = ", ".join(client_order_id.value for client_order_id in client_order_ids)
+        name = type(e).__name__
+        self._log.exception(f"{what} of {ids} failed in the adapter ({name}); refused", e)
+        return f"the adapter failed to carry out the command ({name})"
+
+    async def _modify_pending(self, command: ModifyOrder, order_id: int) -> None:
+        """Amend pending order `order_id`, one amend of it at a time.
+
+        Each amend starts from the order as the one before it left it, so it never undoes it.
+        """
+        async with self._order_locks.setdefault(order_id, asyncio.Lock()):
+            await self._amend_pending(command, order_id)
+
+    async def _amend_pending(self, command: ModifyOrder, order_id: int) -> None:
+        """Amend a pending order; the broker's answer reports it amended."""
+        client_order_id = command.client_order_id
+        held = self._book.open_order(order_id)
+        if held is None:
+            self._modify_rejected(client_order_id, "the order is not open at the venue")
+            return
+        instrument = self._instrument_provider.instrument_for_symbol_id(held.tradeData.symbolId)
+        if instrument is None:
+            self._modify_rejected(
+                client_order_id, f"symbol {held.tradeData.symbolId} is not loaded"
+            )
+            return
+        try:
+            request = order_translation.amend_order(
+                self._account.account_id,
+                instrument,
+                held,
+                quantity=command.quantity,
+                price=command.price,
+                trigger_price=command.trigger_price,
+            )
+        except Unsupported as e:
+            self._modify_rejected(client_order_id, str(e))
+            return
+        if request is not None:
+            outcome = await self._change_order(request)
+            if outcome is None:
+                self._log.warning(
+                    f"Modify of {client_order_id}: no answer, so its outcome is unknown; "
+                    "it is not resent",
+                )
+                return
+            if isinstance(outcome, _Refused):
+                self._modify_rejected(client_order_id, outcome.reason)
+                return
+            if self._book.open_order(order_id) is None:
+                # Ended meanwhile: the record that ended it tells Nautilus.
+                return
+            # Judged by the answer itself: a trader's change applied after it is not a refusal.
+            # Only a replace states the amended order.
+            if outcome.replaced is not None and not order_translation.carries(
+                request, outcome.replaced, instrument.price_precision
+            ):
+                self._modify_rejected(
+                    client_order_id, "the broker did not amend the order as asked"
+                )
+                return
+            if _updated(outcome.records, venue_order_id=str(order_id)):
+                return
+        # Nothing changed at the broker, so no answer reports the order; the report says how it
+        # stands, which ends Nautilus's pending update.
+        self._handle_records(self._book.standing_order(held.orderId, self._clock.timestamp_ms()))
 
     def _leg_alive(self, leg_id: str) -> bool:
         found = self._book.leg_position(leg_id)
@@ -2010,8 +2685,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         self,
         position_id: int,
         levels_of: Callable[[PositionView], dict[Level, Decimal]],
-    ) -> list[Record] | _Refused:
-        """Set the position's levels to `levels_of(view)`; returns the records of the answer.
+    ) -> _Amended | _Refused:
+        """Set the position's levels to `levels_of(view)`; returns the broker's answer.
 
         `levels_of` runs once the amends of the position before it are answered, so it sees
         the levels they left and never undoes them.
@@ -2022,27 +2697,31 @@ class CTraderExecutionClient(LiveExecutionClient):
                 return _Refused(f"position {position_id} is not open at the venue")
             levels = levels_of(view)
             if levels == view.levels:
-                return []
+                return _Amended([], None)
             instrument = self._instrument_provider.instrument_for_symbol_id(view.symbol_id)
+            if instrument is None:
+                return _Refused(f"symbol {view.symbol_id} is not loaded")
             request = order_translation.amend_levels(
                 self._account.account_id,
                 position_id,
                 stop_loss=self._level_price(levels, Level.STOP_LOSS, instrument),
                 take_profit=self._level_price(levels, Level.TAKE_PROFIT, instrument),
+                terms=view.terms,
             )
             self._operations.begin_amend(position_id)
             try:
                 outcome = await self._send_amend(request)
                 if isinstance(outcome, _Refused):
                     return outcome
-                if isinstance(outcome, oa.ProtoOAExecutionEvent):
-                    records = self._on_execution_event(outcome)
-                    if isinstance(records, _Buffered):
-                        # Still in flight while it waits, so the answer is read as the node's.
-                        await self._wait_for_model()
-                        return []
-                    return records
-                return []
+                if not isinstance(outcome, oa.ProtoOAExecutionEvent):
+                    return _Amended([], None)
+                answered = _answered_levels(outcome, instrument.price_precision)
+                records = self._on_execution_event(outcome)
+                if isinstance(records, _Buffered):
+                    # Still in flight while it waits, so the answer is read as the node's.
+                    await self._wait_for_model()
+                    records = []
+                return _Amended(records, answered)
             finally:
                 self._operations.end_amend(position_id)
 
@@ -2058,11 +2737,14 @@ class CTraderExecutionClient(LiveExecutionClient):
             )
 
     def _drop_amend_locks(self) -> None:
-        """Forget the lock of each position no longer open; an amend there is refused anyway."""
+        """Forget the lock of each position or order no longer open; an amend there is refused."""
         for position_id, lock in list(self._amend_locks.items()):
             view = self._book.view(position_id)
             if not lock.locked() and (view is None or not view.open):
                 del self._amend_locks[position_id]
+        for order_id, lock in list(self._order_locks.items()):
+            if not lock.locked() and self._book.open_order(order_id) is None:
+                del self._order_locks[order_id]
 
     @staticmethod
     def _level_price(
@@ -2074,8 +2756,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         return None if value is None else reports.price(value, instrument)
 
     async def _send_amend(self, request: oa.ProtoOAAmendPositionSLTPReq) -> Message | _Refused:
-        # TODO(verify): whether an accepted amend sends an execution event besides its answer; a
-        # later one would be read as a trader's change once the amend is no longer in flight.
+        # Confirmed live: an accepted amend sends no execution event besides its answer.
         outcome: Message | _Refused | None = None
         for _ in range(_AMEND_ATTEMPTS):
             outcome = await self._send(request)

@@ -51,6 +51,13 @@ error rather than sitting until its own timeout: the error is matched to the pen
 by `clientMsgId` exactly like a normal response would be, and delivered as an exception
 instead of a result.
 
+A `clientMsgId` does not by itself make a message a response. The execution events of a close
+made in the broker's terminal arrived carrying a non-empty `clientMsgId` that no request of the
+listening connection had sent. This was inferred once, from a recorder's mislabel: the id was
+not stored, but the recorder took those events for answers. Whose id it was is not recorded. A
+message whose `clientMsgId` matches no request the connection is waiting for is therefore an
+event, delivered as one.
+
 ## 3. Heartbeat
 
 The venue requires a heartbeat if the connection would otherwise be idle for more than 30
@@ -331,11 +338,12 @@ it.
 
 ## 10. Execution events
 
-Everything in this section was observed in one recorded session on a hedging account, in which
-a person traded one symbol priced near 85,000 with 2-decimal prices by hand in the broker's
-terminal while a read-only connection listened; the history lists also hold one earlier trade
-on another symbol. The scrubbed recording is the fixture
-`tests/fixtures/m3_execution_recorded.json`. What it did not exercise is marked **unconfirmed**.
+Everything in this section up to [Commands on orders placed by hand](#commands-on-orders-placed-by-hand)
+was observed in one recorded session on a hedging account, in which a person traded one symbol
+priced near 85,000 with 2-decimal prices by hand in the broker's terminal while a read-only
+connection listened; the history lists also hold one earlier trade on another symbol. The
+scrubbed recording is the fixture `tests/fixtures/m3_execution_recorded.json`. What it did not
+exercise is marked **unconfirmed**.
 
 ### Delivery
 
@@ -416,6 +424,30 @@ volume. The position's `price` stays the original entry price.
 **Unconfirmed**: a full manual close of a position from the terminal, and a stop-out; neither
 happened in the session.
 
+A later recording on EURUSD watched a person close part of a position with a stop-loss and a
+take-profit by hand, while a read-only connection listened. The scrubbed recording is the fixture
+`tests/fixtures/partial_close_live.json`. It confirmed, in more detail:
+
+- **Exactly three execution events**, in this order: the closing order's `ORDER_ACCEPTED`, carrying
+  the position at its volume before the close; its `ORDER_FILLED`, carrying the deal and the
+  position already at the volume left; then the protective order's `ORDER_REPLACED`. The first two
+  have `isServerEvent = false`, the last `true`.
+- **The protective order keeps its `orderId`.** In the `ORDER_REPLACED`, `tradeData.volume` is the
+  volume left on the position, the reduced total, not the volume closed, and `executedVolume` is
+  0. The event carries the position at the volume left, and its `utcLastUpdateTimestamp` is 10 ms
+  after the deal's execution.
+- **All three carry a non-empty `clientMsgId`** that no request of the listening connection had
+  sent (see §2). This is inferred: the fixture does not store the id, but the recorder of the time
+  had taken the three for answers. Whose id it was is not recorded.
+- **A position raised by hand has two opening orders.** The position had been opened by one market
+  order and raised later by another, both non-closing and under the one position id. Its order list
+  and its deal list name the newest first. The raise's `tradeData.openTimestamp` is later than the
+  position's own `tradeData.openTimestamp`, which is the first order's fill time. The protective
+  order kept its id and its creation time, and its volume was the raised total.
+
+**Unconfirmed**: a protective order that a level fills only in part, and whether its volume is then
+the total or the rest. The execution events of a raise by hand were not recorded.
+
 ### A pending order
 
 A `LIMIT` order placed from the terminal arrives as `ORDER_ACCEPTED` with `GOOD_TILL_CANCEL`
@@ -477,10 +509,51 @@ The orders a trader placed in the recorded session carry no `label`, because the
 none, so every recorded position is foreign. That the venue returns the adapter's own `label` and
 `comment` fields unchanged is **unconfirmed**; so is whether a rejected order is listed.
 
+### Commands on orders placed by hand
+
+A second recorded run, on EURUSD on a hedging account, sent cancels and amends through the
+adapter. A person had placed by hand a pending `LIMIT` order with a stop-loss and a take-profit
+attached, and opened a position with a trailing stop-loss and a take-profit. The scrubbed
+recording is the fixture `tests/fixtures/external_commands_live.json`. All of the following is
+confirmed:
+
+- **An amend of a pending order** (`ProtoOAAmendOrderReq`) is answered by an `ORDER_REPLACED`
+  execution event carrying the amended order, under the same `orderId`. **A cancel**
+  (`ProtoOACancelOrderReq`) is answered by `ORDER_CANCELLED`, with the order's position in
+  `POSITION_STATUS_CLOSED`. No other execution event follows an accepted command.
+- **A pending order reports its attached levels as distances**, in `relativeStopLoss` and
+  `relativeTakeProfit`, with no `stopLoss` or `takeProfit`. An amend that sends the distances
+  again keeps them.
+- **A level amend** (`ProtoOAAmendPositionSLTPReq`) carrying `stopLossTriggerMethod`,
+  `trailingStopLoss = true` and `guaranteedStopLoss = false` explicitly is accepted, and is
+  answered by `ORDER_REPLACED` on the same protective order. The stop-loss stays trailing after
+  its level is moved and after the take-profit is removed. **Leaving `takeProfit` out of the
+  amend removes the take-profit**, so an amend that changes one level has to send the other
+  again.
+- **Refusals.** A cancel of an order id that does not exist is refused with a
+  `ProtoOAOrderErrorEvent`, `ORDER_NOT_FOUND`. An order details request (`ProtoOAOrderDetailsReq`)
+  for such an id is refused with a `ProtoOAErrorRes`, `ORDER_NOT_FOUND`.
+- **The order details request answers an order that has ended**: `ProtoOAOrderDetailsRes` with a
+  cancelled order in `ORDER_STATUS_CANCELLED` and no deals.
+- **A trailing stop-loss's moves arrive only as `ProtoOATrailingSLChangedEvent`**, never as
+  execution events; one run saw 15 of them in 60 seconds. A move changes neither the protective
+  order's nor the position's `utcLastUpdateTimestamp`: a snapshot taken after several moves
+  showed the trailed stop-loss under the time of the last amend.
+
+In the recording, the trailing event's `utcLastUpdateTimestamp` was in milliseconds and agreed
+within a few tens of milliseconds with the times of the execution events and spots around it.
+That the spots share the execution events' clock is still **unconfirmed** (see
+[Execution](execution.md), section 10).
+
+**Unconfirmed**: whether an amend's `volume` is the order's whole volume or its unfilled rest once
+it has partly filled; whether an amend keeps an expiration it sends again (the order had none);
+what the venue does with an optional field an amend leaves out; and that leaving `stopLoss` out
+of a level amend removes the stop-loss.
+
 ### Messages not seen
 
-No margin-change, trader-update, margin-call or order-error event arrived in the session; their
-shapes are **unconfirmed**.
+No margin-change, trader-update or margin-call event has arrived in any recorded session; their
+shapes are **unconfirmed**. The order error event's shape is the one recorded above.
 
 ### Fields beyond the published schema
 

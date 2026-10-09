@@ -8,6 +8,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from nautilus_trader.common.component import TestClock
+from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import (
     AccountType,
@@ -25,7 +29,9 @@ from nautilus_trader.model.identifiers import (
     ClientId,
     ClientOrderId,
     PositionId,
+    StrategyId,
     TradeId,
+    TraderId,
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money, Price, Quantity
@@ -543,3 +549,83 @@ def test_exposure_json_is_sorted_and_plain() -> None:
         {"symbol": "US100.cash", "subject": "position", "side": "BUY", "volume": "2"},
     ]
     assert b'"volume": "0.01"' in encoded
+
+
+FACTORY = OrderFactory(
+    trader_id=TraderId("TESTER-001"), strategy_id=StrategyId("S-001"), clock=TestClock()
+)
+
+
+def held_report(order, **overrides) -> OrderStatusReport:
+    """`order` as a report would give it back, with `overrides` changed."""
+    values = {
+        "quantity": order.quantity,
+        "filled_qty": order.filled_qty,
+        "price": getattr(order, "price", None),
+        "trigger_price": getattr(order, "trigger_price", None),
+    }
+    values.update(overrides)
+    if values["trigger_price"] is not None:
+        values["trigger_type"] = TriggerType.DEFAULT
+    return OrderStatusReport(
+        account_id=ACCOUNT,
+        instrument_id=US100.id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("6000001"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.ACCEPTED,
+        report_id=UUID4(),
+        ts_accepted=0,
+        ts_last=0,
+        ts_init=0,
+        **values,
+    )
+
+
+def held_orders():
+    quantity = Quantity.from_str("1.00")
+    return (
+        FACTORY.limit(US100.id, OrderSide.SELL, quantity, Price.from_str("85353.42")),
+        FACTORY.stop_market(US100.id, OrderSide.SELL, quantity, Price.from_str("85200.20")),
+        FACTORY.market(US100.id, OrderSide.BUY, quantity),
+    )
+
+
+def test_a_report_matching_the_held_order_changes_no_terms() -> None:
+    for order in held_orders():
+        assert not reports.changes_terms(order, held_report(order))
+
+
+def test_another_quantity_price_or_trigger_price_changes_the_terms() -> None:
+    target, stop, market = held_orders()
+    other = Price.from_str("85000.00")
+
+    for order in (target, stop, market):
+        assert reports.changes_terms(order, held_report(order, quantity=Quantity.from_str("0.99")))
+    assert reports.changes_terms(target, held_report(target, price=other))
+    assert reports.changes_terms(stop, held_report(stop, trigger_price=other))
+
+
+def test_a_price_the_order_does_not_have_changes_no_terms() -> None:
+    target, stop, market = held_orders()
+    other = Price.from_str("85000.00")
+
+    assert not reports.changes_terms(target, held_report(target, trigger_price=other))
+    assert not reports.changes_terms(stop, held_report(stop, price=other))
+    assert not reports.changes_terms(market, held_report(market, price=other, trigger_price=other))
+
+
+def test_a_report_with_other_fills_never_changes_the_terms() -> None:
+    target, _, _ = held_orders()
+
+    report = held_report(
+        target,
+        quantity=Quantity.from_str("0.99"),
+        filled_qty=Quantity.from_str("0.50"),
+        price=Price.from_str("85000.00"),
+        avg_px=Decimal("85000.00"),
+    )
+
+    assert not reports.changes_terms(target, report)

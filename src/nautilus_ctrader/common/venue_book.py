@@ -12,7 +12,7 @@ does no I/O and holds no Nautilus object. What it relies on, from a recorded ses
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
@@ -23,11 +23,13 @@ from nautilus_ctrader.common.venue_records import (
     Activity,
     ActivityKind,
     AwaitProtection,
+    EntryUnknown,
     Exposure,
     ExternalOrder,
     ExternalType,
     Fill,
     Level,
+    LevelTerms,
     Notice,
     Operations,
     OrderEvent,
@@ -36,9 +38,11 @@ from nautilus_ctrader.common.venue_records import (
     Record,
     leg_venue_order_id,
     money_of,
+    parse_leg_venue_order_id,
     price_of,
     units_of,
 )
+from nautilus_ctrader.constants import PENDING_ORDER_TYPES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
@@ -71,6 +75,20 @@ class _Leg:
 
 
 @dataclass
+class _ForeignLeg:
+    """A level of a position the node did not open, as the external order Nautilus holds.
+
+    `quantity` and `filled` are venue volumes.
+    """
+
+    venue_order_id: str
+    generation: int
+    quantity: int
+    alive: bool = True
+    filled: int = 0
+
+
+@dataclass
 class _Position:
     position_id: int
     symbol_id: int
@@ -81,15 +99,29 @@ class _Position:
     entry_client_order_id: str | None = None
     entry_accepted: bool = False
     legs: dict[Level, _Leg] = field(default_factory=dict)
+    # A foreign position's current or last leg of each level.
+    foreign_legs: dict[Level, _ForeignLeg] = field(default_factory=dict)
+    entry_unknown_told: bool = False
     awaiting_protection: bool = False
     protective_order_id: int | None = None
     protective_volume: int = 0
+    protective_opened_ms: int | None = None
+    # When the entry first filled, if the model saw it.
+    entry_filled_ms: int | None = None
+    # When the position opened, as the broker last stated it.
+    opened_ms: int | None = None
     # Protective orders replaced by a new id or cancelled: any later event of theirs is stale.
     retired_protective_ids: set[int] = field(default_factory=set)
     levels: dict[Level, Decimal] = field(default_factory=dict)
+    # `None` until a state of the position is seen.
+    terms: LevelTerms | None = None
     # The `utcLastUpdateTimestamp` of the position state last applied; a created position has
     # none and counts as 0.
     updated_ms: int = -1
+    # The broker's time of the last trailing move applied, -1 for none.
+    trailed_ms: int = -1
+    # The broker's time of the newest protective order state applied, -1 for none.
+    protective_ms: int = -1
 
     @property
     def ours(self) -> bool:
@@ -100,7 +132,10 @@ class _Position:
 class PositionView:
     """A read-only copy of what the model holds for one position.
 
-    `leg_units` holds the quantity Nautilus has for each accepted live leg.
+    - `legs`: the node's legs, by client order id and whether each is alive.
+    - `leg_units`: the quantity Nautilus has for each accepted live leg, the node's or foreign.
+    - `foreign_legs`: the venue order id of each live leg of a position the node did not open.
+    - `terms`: how the levels work, from the last position state seen; `None` before any.
     """
 
     position_id: int
@@ -115,15 +150,27 @@ class PositionView:
     levels: dict[Level, Decimal]
     legs: dict[Level, tuple[str, bool]]
     leg_units: dict[Level, Decimal]
+    foreign_legs: dict[Level, str] = field(default_factory=dict)
+    terms: LevelTerms | None = None
 
 
-def entry_of(orders: Sequence[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
-    """The entry among a position's orders."""
-    # The protective order and closing orders carry the entry's client order id too.
-    for order in orders:
-        if not order.closingOrder and order.orderType != om.STOP_LOSS_TAKE_PROFIT:
-            return order
-    return None
+def opening_orders(orders: Iterable[om.ProtoOAOrder]) -> list[om.ProtoOAOrder]:
+    """A position's orders that are neither closing nor protective, earliest created first.
+
+    A position raised by hand has more than one; the broker lists the newest first.
+    """
+    opening = (o for o in orders if not o.closingOrder and o.orderType != om.STOP_LOSS_TAKE_PROFIT)
+    return sorted(opening, key=lambda order: (created_of(order), order.orderId))
+
+
+def entry_of(orders: Iterable[om.ProtoOAOrder]) -> om.ProtoOAOrder | None:
+    """The entry among a position's orders: the earliest with the node's record, else the earliest.
+
+    Never the list's order: every path that names a position's legs must agree on the entry.
+    """
+    opening = opening_orders(orders)
+    named = (o for o in opening if order_record.parse_label(o.tradeData.label) is not None)
+    return next(named, opening[0] if opening else None)
 
 
 def created_of(order: om.ProtoOAOrder) -> int:
@@ -133,6 +180,18 @@ def created_of(order: om.ProtoOAOrder) -> int:
     if order.tradeData.HasField("openTimestamp"):
         return order.tradeData.openTimestamp
     return order.utcLastUpdateTimestamp
+
+
+def opened_of(order: om.ProtoOAOrder) -> int | None:
+    """When the broker created `order`, in ms, if it says."""
+    data = order.tradeData
+    return data.openTimestamp if data.HasField("openTimestamp") else None
+
+
+def _opened_ms(position: om.ProtoOAPosition) -> int | None:
+    """When `position` opened, in ms; a created position that never filled says nothing."""
+    data = position.tradeData
+    return data.openTimestamp if data.HasField("openTimestamp") else None
 
 
 def _opposite(side: int) -> int:
@@ -149,12 +208,64 @@ def levels_of(order: om.ProtoOAOrder, precision: int) -> dict[Level, Decimal]:
     return levels
 
 
+def terms_of(position: om.ProtoOAPosition) -> LevelTerms:
+    """How `position`'s levels work; a field the venue leaves out is the schema's default."""
+    return LevelTerms(
+        trailing_stop_loss=position.trailingStopLoss,
+        guaranteed_stop_loss=position.guaranteedStopLoss,
+        stop_loss_trigger_method=position.stopLossTriggerMethod,
+    )
+
+
+def _copied(order: om.ProtoOAOrder) -> om.ProtoOAOrder:
+    copy = om.ProtoOAOrder()
+    copy.CopyFrom(order)
+    return copy
+
+
 def remaining_of(order: om.ProtoOAOrder) -> int:
     """What is left of an order, as a venue volume."""
+    # Confirmed live for a protective order reduced by a partial close: its volume is the total
+    # left, with `executedVolume` 0.
     # TODO(verify): whether the broker reports a partly filled protective order's total volume or
     # its rest; none was recorded. A replace after a partial trigger would settle it.
     executed = order.executedVolume if order.HasField("executedVolume") else 0
     return max(order.tradeData.volume - executed, 0)
+
+
+def foreign_leg(
+    venue_order_id: str,
+    level: Level,
+    *,
+    symbol_id: int,
+    position_id: int,
+    position_side: str,
+    price: Decimal,
+    volume: int,
+    ts_ms: int,
+    accepted_ms: int,
+) -> ExternalOrder:
+    """A level of a position the node did not open, as the external order Nautilus learns.
+
+    A stop-loss is a reduce-only `STOP_MARKET` at its `trigger_price`, a take-profit a reduce-only
+    `LIMIT` at its `price`, both against the position, good till cancelled. `volume` is a venue
+    volume; `accepted_ms` is when the level was set, never before the entry filled.
+    """
+    stop = level == Level.STOP_LOSS
+    return ExternalOrder(
+        venue_order_id=venue_order_id,
+        symbol_id=symbol_id,
+        side="SELL" if position_side == "BUY" else "BUY",
+        order_type=ExternalType.STOP_MARKET if stop else ExternalType.LIMIT,
+        units=units_of(volume),
+        reduce_only=True,
+        venue_position_id=str(position_id),
+        ts_ms=ts_ms,
+        price=None if stop else price,
+        trigger_price=price if stop else None,
+        time_in_force="GOOD_TILL_CANCEL",
+        ts_accepted_ms=accepted_ms,
+    )
 
 
 def which_level(
@@ -186,12 +297,20 @@ def which_level(
 class VenueBook:
     """What the broker holds for one account, and what each of its events means to Nautilus.
 
-    `price_precision` gives a symbol's price precision, or `None` for a symbol the node has not
-    loaded: activity there becomes an `Activity`, never an order record.
+    - `price_precision` gives a symbol's price precision, or `None` for a symbol the node has not
+      loaded: activity there becomes an `Activity`, never an order record.
+    - `held_closed` says whether Nautilus holds a venue order id as a closed order. A leg of a
+      position the node did not open takes the first generation of its id that Nautilus does not
+      hold closed, and that this model has not ended since it was last loaded.
     """
 
-    def __init__(self, price_precision: Callable[[int], int | None]) -> None:
+    def __init__(
+        self,
+        price_precision: Callable[[int], int | None],
+        held_closed: Callable[[str], bool] = lambda _venue_order_id: False,
+    ) -> None:
         self._precision = price_precision
+        self._held_closed = held_closed
         self._positions: dict[int, _Position] = {}
         # Broker orders Nautilus knows besides the node's entries: its closes, by broker id, and
         # external orders reported once.
@@ -204,6 +323,9 @@ class VenueBook:
         # Never-opened entries that ended, dropped from `_positions`.
         self._ended_entries: set[int] = set()
         self._reported: set[int] = set()
+        # The last known state of each pending order among them while open, by broker order id:
+        # an amend sends it again.
+        self._open_orders: dict[int, om.ProtoOAOrder] = {}
         self._seen: set[tuple] = set()
         self._synced_deals: set[int] = set()
 
@@ -224,10 +346,23 @@ class VenueBook:
             levels=dict(position.levels),
             legs={level: (leg.client_order_id, leg.alive) for level, leg in position.legs.items()},
             leg_units={
-                level: units_of(leg.quantity)
-                for level, leg in position.legs.items()
-                if leg.alive and leg.accepted
+                **{
+                    level: units_of(leg.quantity)
+                    for level, leg in position.legs.items()
+                    if leg.alive and leg.accepted
+                },
+                **{
+                    level: units_of(leg.quantity)
+                    for level, leg in position.foreign_legs.items()
+                    if leg.alive
+                },
             },
+            foreign_legs={
+                level: leg.venue_order_id
+                for level, leg in position.foreign_legs.items()
+                if leg.alive
+            },
+            terms=position.terms,
         )
 
     def exposure(self) -> tuple[Exposure, ...]:
@@ -276,11 +411,13 @@ class VenueBook:
         """Rebuild the model from a snapshot asked with protection orders.
 
         `position_orders` holds each open position's own order list. Reporting the rebuilt state
-        to Nautilus is reconciliation's job; this returns only notices.
+        to Nautilus is reconciliation's job; this returns only notices, and an `EntryUnknown` for
+        each foreign position with a level whose order list names no entry.
         """
         self._positions = {}
         self._unloaded_orders = {}
         self._reported = set()
+        self._open_orders = {}
         notices: list[Record] = []
         for venue_position in snapshot.position:
             position = self._new_position(
@@ -290,7 +427,9 @@ class VenueBook:
             )
             position.open = True
             position.volume = venue_position.tradeData.volume
+            position.opened_ms = _opened_ms(venue_position)
             position.updated_ms = venue_position.utcLastUpdateTimestamp
+            position.terms = terms_of(venue_position)
             precision = self._precision(position.symbol_id)
             if precision is not None:
                 if venue_position.HasField("stopLoss"):
@@ -308,6 +447,9 @@ class VenueBook:
                 if position is not None:
                     position.protective_order_id = order.orderId
                     position.protective_volume = remaining_of(order)
+                    position.protective_opened_ms = opened_of(order)
+                    if order.HasField("utcLastUpdateTimestamp"):
+                        position.protective_ms = order.utcLastUpdateTimestamp
                     for leg in position.legs.values():
                         if leg.accepted:
                             leg.quantity = position.protective_volume
@@ -316,6 +458,17 @@ class VenueBook:
                 self._reported.add(order.orderId)
                 if self._precision(order.tradeData.symbolId) is None:
                     self._unloaded_orders[order.orderId] = self._pending(order)
+                elif order.orderType in PENDING_ORDER_TYPES:
+                    self._open_orders[order.orderId] = _copied(order)
+        for position in self._positions.values():
+            if not position.ours and position.levels:
+                # Reconciliation reports the standing levels' legs, at the generation chosen here
+                # from the same cache, so this says nothing of them.
+                notices += [
+                    record
+                    for record in self._foreign_levels(position, {}, position.updated_ms)
+                    if isinstance(record, EntryUnknown)
+                ]
         return notices
 
     def apply(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
@@ -333,6 +486,54 @@ class VenueBook:
         records = self._handle(event, operations)
         # Marked only once handled, so an event whose handling raised can be applied again.
         self._seen.add(key)
+        return records
+
+    def trailing_stop_moved(self, event: oa.ProtoOATrailingSLChangedEvent) -> list[Record]:
+        """A trailing stop-loss the broker moved: the stop-loss leg follows it.
+
+        An event seen before, or one of a position or protective order the model does not hold,
+        means nothing.
+        """
+        # Confirmed live: a trailing move arrives as this event alone, never as an execution event.
+        position = self._positions.get(event.positionId)
+        precision = None if position is None else self._precision(position.symbol_id)
+        key = ("trailing", event.orderId, event.utcLastUpdateTimestamp, event.stopPrice)
+        if precision is None or key in self._seen:
+            return []
+        # A retired id is never current.
+        if event.orderId != position.protective_order_id:
+            return []
+        ts = event.utcLastUpdateTimestamp
+        # Made before a protective order state already applied, which states a newer stop-loss.
+        if ts < position.protective_ms:
+            self._seen.add(key)
+            return []
+        old_levels = dict(position.levels)
+        position.levels[Level.STOP_LOSS] = price_of(event.stopPrice, precision)
+        position.trailed_ms = max(position.trailed_ms, ts)
+        if position.ours:
+            # The broker's own move: no trader's change.
+            records = self._level_changes(position, old_levels, False, ts)
+        else:
+            records = self._foreign_levels(position, old_levels, ts)
+        self._seen.add(key)
+        return records
+
+    def entry_found(self, position_id: int, orders: Sequence[om.ProtoOAOrder]) -> list[Record]:
+        """The order list of a position whose entry the model did not know, read afterwards.
+
+        A foreign position's standing levels get their legs. The node's own entry is taken as
+        its opening event would take it, and its legs wait for that entry's events. Nothing
+        changes for a position the model does not hold, one whose entry it knows, or a list
+        that names no entry.
+        """
+        position = self._positions.get(position_id)
+        entry = entry_of(orders)
+        if position is None or position.entry_order_id is not None or entry is None:
+            return []
+        records = self._adopt(position, entry, restored=False)
+        if not position.ours:
+            records += self._foreign_levels(position, {}, entry.utcLastUpdateTimestamp)
         return records
 
     @staticmethod
@@ -411,6 +612,41 @@ class VenueBook:
                     return position.position_id, level
         return None
 
+    def foreign_leg_position(self, venue_order_id: str) -> tuple[int, Level] | None:
+        """The position and level of a leg of a position the node did not open, by venue order id.
+
+        Any generation of the leg's id is found, alive or not: whether it is the live one is
+        `view().foreign_legs`' to say.
+        """
+        parsed = parse_leg_venue_order_id(venue_order_id)
+        if parsed is None:
+            return None
+        entry_order_id, level, _generation = parsed
+        position_id = self.entry_position(entry_order_id)
+        if position_id is None or self._positions[position_id].ours:
+            return None
+        return position_id, level
+
+    def open_order(self, order_id: int) -> om.ProtoOAOrder | None:
+        """The last known state of an open pending order Nautilus knows from reports."""
+        order = self._open_orders.get(order_id)
+        return None if order is None else _copied(order)
+
+    def standing_order(self, order_id: int, ts_ms: int) -> list[Record]:
+        """An open pending order Nautilus knows from reports, as held; nothing if not held."""
+        order = self._open_orders.get(order_id)
+        precision = None if order is None else self._precision(order.tradeData.symbolId)
+        if precision is None:
+            return []
+        return [self._order_updated(order, precision, ts_ms)]
+
+    def entry_position(self, entry_order_id: int) -> int | None:
+        """The position broker order `entry_order_id` opened, open or closed since the last load."""
+        for position in self._positions.values():
+            if position.entry_order_id == entry_order_id:
+                return position.position_id
+        return None
+
     def cancel_leg(self, position_id: int, level: Level, ts_ms: int) -> list[Record]:
         """The node cancels a live leg whose level the broker does not hold: no request is needed.
 
@@ -473,6 +709,7 @@ class VenueBook:
 
     def _sync(self, position: _Position, event: oa.ProtoOAExecutionEvent) -> None:
         if event.HasField("position"):
+            position.opened_ms = _opened_ms(event.position) or position.opened_ms
             updated = event.position.utcLastUpdateTimestamp
             # A response can be applied after a later event of its order: its older position
             # state must not undo the newer one.
@@ -482,6 +719,7 @@ class VenueBook:
             if updated < position.updated_ms:
                 return
             position.updated_ms = updated
+            position.terms = terms_of(event.position)
             position.volume = event.position.tradeData.volume
             position.open = event.position.positionStatus == om.POSITION_STATUS_OPEN
         elif event.executionType in _FILLS and event.HasField("deal"):
@@ -490,6 +728,7 @@ class VenueBook:
             if event.deal.dealId in self._synced_deals:
                 return
             self._synced_deals.add(event.deal.dealId)
+            # Every fill recorded carried the position, a partial close by hand included.
             # TODO(verify): whether a fill always carries the position; until then the deal's
             # volume moves the one known.
             filled = event.deal.filledVolume
@@ -503,11 +742,11 @@ class VenueBook:
     def _adopt(
         self, position: _Position, entry: om.ProtoOAOrder, *, restored: bool
     ) -> list[Record]:
-        """Make `position` the node's if its entry carries the node's record."""
+        """Take `entry` as `position`'s; the position is the node's if `entry` has its record."""
+        position.entry_order_id = entry.orderId
         entry_id = order_record.parse_label(entry.tradeData.label)
         if entry_id is None:
             return []
-        position.entry_order_id = entry.orderId
         position.entry_client_order_id = entry_id
         position.entry_accepted = restored
         legs = order_record.parse_comment(entry.tradeData.comment)
@@ -587,7 +826,13 @@ class VenueBook:
         position.protective_order_id = None
         position.levels = {}
         # The deal is what ended the legs, so their cancels take its time, as reconciliation's do.
-        return self._cancel_legs(position, deal.executionTimestamp)
+        ts = deal.executionTimestamp
+        records = self._cancel_legs(position, ts)
+        for leg in position.foreign_legs.values():
+            if leg.alive:
+                leg.alive = False
+                records.append(OrderEvent(OrderEventKind.CANCELED, leg.venue_order_id, None, ts))
+        return records
 
     @staticmethod
     def _activity(
@@ -662,6 +907,7 @@ class VenueBook:
         order, kind = event.order, event.executionType
         venue_order_id, ts = str(order.orderId), order.utcLastUpdateTimestamp
         known = order.orderId in self._reported
+        taken = self._keep_open_order(event, known)
         if kind == om.ORDER_ACCEPTED:
             if known:
                 return []
@@ -678,23 +924,50 @@ class VenueBook:
         if not known:
             return []
         if kind == om.ORDER_REPLACED:
-            report = self._external_report(order, precision, reduce_only=reduce_only)
-            return [
-                OrderEvent(
-                    OrderEventKind.UPDATED,
-                    venue_order_id,
-                    None,
-                    ts,
-                    quantity=report.units,
-                    price=report.price,
-                    trigger_price=report.trigger_price,
-                ),
-            ]
+            # A pending order's state older than the one held, or of an order since ended,
+            # would take Nautilus back.
+            if order.orderType in PENDING_ORDER_TYPES and not taken:
+                return []
+            return [self._order_updated(order, precision, ts)]
         if kind in _ENDED:
             return [
                 OrderEvent(_ENDED[kind], venue_order_id, None, ts, reason=event.errorCode or None),
             ]
         return []
+
+    def _order_updated(self, order: om.ProtoOAOrder, precision: int, ts_ms: int) -> OrderEvent:
+        report = self._external_report(order, precision, reduce_only=False)
+        return OrderEvent(
+            OrderEventKind.UPDATED,
+            str(order.orderId),
+            None,
+            ts_ms,
+            quantity=report.units,
+            price=report.price,
+            trigger_price=report.trigger_price,
+        )
+
+    def _keep_open_order(self, event: oa.ProtoOAExecutionEvent, known: bool) -> bool:
+        """Keep the latest state of a pending order reported to Nautilus while it is open.
+
+        Returns whether the event's state was taken as the latest.
+        """
+        order, kind = event.order, event.executionType
+        if order.orderType not in PENDING_ORDER_TYPES:
+            return False
+        if kind == om.ORDER_FILLED or kind in _ENDED:
+            self._open_orders.pop(order.orderId, None)
+            return False
+        if kind in (om.ORDER_ACCEPTED, om.ORDER_PARTIAL_FILL) and not known:
+            self._open_orders[order.orderId] = _copied(order)
+            return True
+        if kind in (om.ORDER_REPLACED, om.ORDER_PARTIAL_FILL):
+            held = self._open_orders.get(order.orderId)
+            # An ended order is not held, so a late event never brings it back.
+            if held is not None and order.utcLastUpdateTimestamp >= held.utcLastUpdateTimestamp:
+                self._open_orders[order.orderId] = _copied(order)
+                return True
+        return False
 
     # Event kinds
 
@@ -706,7 +979,9 @@ class VenueBook:
             return []
         position = self._position_for(event)
         records: list[Record] = []
-        if position.entry_order_id is None:
+        # An order that raises a position is never its entry, even when the entry is not known.
+        learnt = position.entry_order_id is None and not self._raises(position, event)
+        if learnt:
             records += self._adopt(position, order, restored=False)
         if ended:
             # A fill is never dropped. Nautilus holds the entry and its legs ended: the fill is
@@ -717,6 +992,8 @@ class VenueBook:
                 leg.alive = False
         was_open, volume_before = position.open, position.volume
         self._sync(position, event)
+        if filled and not was_open and position.entry_order_id == order.orderId:
+            position.entry_filled_ms = event.deal.executionTimestamp
         reduced = was_open and (not position.open or position.volume < volume_before)
         # A triggered pending order is a server event too; only one that took volume away is
         # a close.
@@ -726,6 +1003,20 @@ class VenueBook:
             records += self._entry_event(event, position, precision)
         else:
             records += self._external_event(event, precision, reduce_only=False)
+            if filled and position.ours and not event.isServerEvent and not order.isStopOut:
+                # A trader raised the node's position.
+                records.append(
+                    self._activity(
+                        ActivityKind.MANUAL_CHANGE,
+                        position,
+                        Action.OPENED,
+                        event.deal.executionTimestamp,
+                        units_of(event.deal.filledVolume),
+                    )
+                )
+            if learnt and position.levels:
+                # Levels seen before their entry get their legs now, after the entry's report.
+                records += self._foreign_levels(position, {}, order.utcLastUpdateTimestamp)
         if filled and order.isStopOut:
             action = Action.PARTIALLY_CLOSED if position.open else Action.CLOSED
             records.append(
@@ -737,9 +1028,29 @@ class VenueBook:
                     units_of(event.deal.filledVolume),
                 )
             )
-        if filled and position.legs and not position.open:
+        if filled and (position.legs or position.foreign_legs) and not position.open:
             records += self._closed_by(position, event.deal)
         return records
+
+    @staticmethod
+    def _raises(position: _Position, event: oa.ProtoOAExecutionEvent) -> bool:
+        """Whether `event`'s opening order was created after its position opened.
+
+        Never an order with the node's record, nor one that does not say when it was created.
+        """
+        order = event.order
+        # The node never raises a position.
+        if order_record.parse_label(order.tradeData.label) is not None:
+            return False
+        # Confirmed from a recorded order list and snapshot: a raise by hand was created after the
+        # position's open time, and the entry before it.
+        # TODO(verify): that a raise's own events carry its creation time and the position's open
+        # time as the lists do; none was recorded. Without them the model's open time decides.
+        created = opened_of(order)
+        opened = _opened_ms(event.position) if event.HasField("position") else None
+        if opened is None:
+            opened = position.opened_ms
+        return created is not None and opened is not None and created > opened
 
     def _entry_event(
         self,
@@ -811,9 +1122,11 @@ class VenueBook:
                     )
                 )
             return notices + self._triggered(event, position, precision)
+        # The broker keeps the id when the levels change and when a partial close reduces the
+        # order (confirmed live).
         # TODO(verify): that a replaced or cancelled protective id has no later live event but a
-        # fill, and whether the broker ever replaces the id at all. If it does, an out-of-order
-        # ACCEPTED of an id never current leaves stale levels until the next event.
+        # fill, and whether the broker replaces the id in any other case. If it does, an
+        # out-of-order ACCEPTED of an id never current leaves stale levels until the next event.
         if retired:
             return []
         current = position.protective_order_id
@@ -826,7 +1139,23 @@ class VenueBook:
                 position.retired_protective_ids.add(current)
             position.protective_order_id = order.orderId
             position.protective_volume = remaining_of(order)
-            position.levels = levels_of(order, precision)
+            position.protective_opened_ms = opened_of(order)
+            levels = levels_of(order, precision)
+            trailed = position.levels.get(Level.STOP_LOSS)
+            stamped = order.HasField("utcLastUpdateTimestamp")
+            # A trailing move can overtake the answer to an amend made before it, whose older
+            # stop-loss must not undo the move.
+            if (
+                order.orderId == current
+                and stamped
+                and order.utcLastUpdateTimestamp < position.trailed_ms
+                and trailed is not None
+                and Level.STOP_LOSS in levels
+            ):
+                levels[Level.STOP_LOSS] = trailed
+            if stamped:
+                position.protective_ms = max(position.protective_ms, order.utcLastUpdateTimestamp)
+            position.levels = levels
             position.awaiting_protection = False
         elif kind == om.ORDER_CANCELLED:
             position.retired_protective_ids.add(order.orderId)
@@ -836,7 +1165,7 @@ class VenueBook:
             return []
         self._sync(position, event)
         if not position.ours:
-            return []
+            return self._foreign_levels(position, old_levels, order.utcLastUpdateTimestamp)
         manual = not event.isServerEvent and not operations.amending(position.position_id)
         return self._level_changes(position, old_levels, manual, order.utcLastUpdateTimestamp)
 
@@ -916,6 +1245,148 @@ class VenueBook:
                 )
         return records
 
+    def _foreign_levels(
+        self,
+        position: _Position,
+        old_levels: dict[Level, Decimal],
+        ts: int,
+    ) -> list[Record]:
+        """A foreign position's level changes, as its legs: external orders reported once.
+
+        A level seen with no live leg opens a new one; a moved level updates it, a removed one
+        cancels it. Each live leg's quantity follows the protective order's volume.
+        """
+        if position.entry_order_id is None:
+            if not position.levels or position.entry_unknown_told:
+                return []
+            position.entry_unknown_told = True
+            return [EntryUnknown(position.position_id)]
+        records: list[Record] = []
+        for level in _LEVELS:
+            old, new = old_levels.get(level), position.levels.get(level)
+            leg = position.foreign_legs.get(level)
+            live = leg is not None and leg.alive
+            if new is not None and not live:
+                records.append(self._new_foreign_leg(position, level, new, ts))
+            elif new is None and live:
+                leg.alive = False
+                records.append(OrderEvent(OrderEventKind.CANCELED, leg.venue_order_id, None, ts))
+            elif live and new != old:
+                leg.quantity = leg.filled + self._foreign_rest(position)
+                records.append(
+                    self._foreign_event(
+                        OrderEventKind.UPDATED, leg, level, ts, units_of(leg.quantity), new
+                    )
+                )
+        for leg in position.foreign_legs.values():
+            quantity = leg.filled + self._foreign_rest(position)
+            if leg.alive and leg.quantity != quantity:
+                leg.quantity = quantity
+                records.append(
+                    OrderEvent(
+                        OrderEventKind.UPDATED,
+                        leg.venue_order_id,
+                        None,
+                        ts,
+                        quantity=units_of(quantity),
+                    )
+                )
+        return records
+
+    @staticmethod
+    def _foreign_rest(position: _Position) -> int:
+        """What a foreign leg covers besides its fills: the whole position's protection."""
+        if position.protective_order_id is None:
+            return position.volume
+        return position.protective_volume
+
+    def _new_foreign_leg(
+        self, position: _Position, level: Level, price: Decimal, ts: int
+    ) -> ExternalOrder:
+        assert position.entry_order_id is not None
+        last = position.foreign_legs.get(level)
+        # A generation this model ended may not have reached Nautilus's cache yet.
+        generation = 1 if last is None else last.generation + 1
+        venue_order_id = leg_venue_order_id(position.entry_order_id, level, generation)
+        while self._held_closed(venue_order_id):
+            generation += 1
+            venue_order_id = leg_venue_order_id(position.entry_order_id, level, generation)
+        leg = _ForeignLeg(venue_order_id, generation, self._foreign_rest(position))
+        position.foreign_legs[level] = leg
+        accepted = self._leg_accepted_ms(position, ts)
+        return foreign_leg(
+            venue_order_id,
+            level,
+            symbol_id=position.symbol_id,
+            position_id=position.position_id,
+            position_side=position.side,
+            price=price,
+            volume=leg.quantity,
+            ts_ms=max(ts, accepted),
+            accepted_ms=accepted,
+        )
+
+    @staticmethod
+    def _leg_accepted_ms(position: _Position, ts: int) -> int:
+        """When a foreign leg was accepted: once its level was set, never before the entry filled.
+
+        The same as reconciliation reads from the broker's lists, but where the model lacks what
+        they hold: without the entry's fill, as for a position loaded open, the protective order's
+        creation stands alone; without either, the event's time `ts`.
+        """
+        opened, filled = position.protective_opened_ms, position.entry_filled_ms
+        if opened is None:
+            return ts if filled is None else filled
+        return opened if filled is None else max(opened, filled)
+
+    @staticmethod
+    def _foreign_event(
+        kind: OrderEventKind,
+        leg: _ForeignLeg,
+        level: Level,
+        ts: int,
+        quantity: Decimal,
+        price: Decimal,
+    ) -> OrderEvent:
+        stop = level == Level.STOP_LOSS
+        return OrderEvent(
+            kind,
+            leg.venue_order_id,
+            None,
+            ts,
+            quantity=quantity,
+            price=None if stop else price,
+            trigger_price=price if stop else None,
+        )
+
+    @staticmethod
+    def _foreign_fill(leg: _ForeignLeg, volume: int, fill: Fill) -> list[Record]:
+        """A foreign leg's fill; its quantity is raised to cover it first.
+
+        The protective order's smaller volume after a partial close can come after the trigger,
+        and a fill above the leg's quantity would be an overfill to Nautilus.
+        """
+        records: list[Record] = []
+        if leg.filled + volume > leg.quantity:
+            leg.quantity = leg.filled + volume
+            records.append(
+                OrderEvent(
+                    OrderEventKind.UPDATED,
+                    leg.venue_order_id,
+                    None,
+                    fill.ts_ms,
+                    quantity=units_of(leg.quantity),
+                )
+            )
+        records.append(
+            OrderEvent(OrderEventKind.FILLED, leg.venue_order_id, None, fill.ts_ms, fill=fill)
+        )
+        leg.filled += volume
+        # A leg left with a remainder lives while the position does.
+        if leg.filled >= leg.quantity:
+            leg.alive = False
+        return records
+
     def _triggered(
         self,
         event: oa.ProtoOAExecutionEvent,
@@ -939,6 +1410,7 @@ class VenueBook:
         # TODO(verify): whether a protective order can fill partially; none was recorded.
         position.protective_volume = max(position.protective_volume - deal.filledVolume, 0)
         leg = position.legs.get(level) if level is not None else None
+        foreign = position.foreign_legs.get(level) if level is not None else None
         if position.ours and leg is not None and leg.alive:
             records.append(
                 self._leg_event(OrderEventKind.FILLED, position, level, fill.ts_ms, fill=fill)
@@ -947,6 +1419,8 @@ class VenueBook:
             # A leg left with a remainder lives while the position does.
             if leg.filled >= leg.quantity:
                 leg.alive = False
+        elif not position.ours and foreign is not None and foreign.alive:
+            records += self._foreign_fill(foreign, deal.filledVolume, fill)
         elif order.orderId in self._reported:
             records.append(
                 OrderEvent(OrderEventKind.FILLED, str(order.orderId), None, fill.ts_ms, fill=fill)

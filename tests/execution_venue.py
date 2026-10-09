@@ -43,7 +43,7 @@ from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.reconciliation import PositionHistory
 from nautilus_ctrader.config import CTraderExecClientConfig
-from nautilus_ctrader.constants import CTRADER_VENUE
+from nautilus_ctrader.constants import CTRADER_VENUE, PENDING_ORDER_TYPES
 from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -107,6 +107,26 @@ def on_fake_account(messages: Iterable[Message]) -> list[Message]:
     return moved
 
 
+def shifted(messages: Iterable[Message], by_ms: int) -> list[Message]:
+    """Copies of `messages` with every timestamp they carry `by_ms` later."""
+
+    def shift(message: Message) -> None:
+        for field, value in message.ListFields():
+            if field.message_type is not None:
+                for item in value if field.is_repeated else [value]:
+                    shift(item)
+            elif field.name.endswith("Timestamp"):
+                setattr(message, field.name, value + by_ms)
+
+    moved = []
+    for message in messages:
+        copy = type(message)()
+        copy.CopyFrom(message)
+        shift(copy)
+        moved.append(copy)
+    return moved
+
+
 def on_us100(messages: Iterable[Message]) -> list[Message]:
     """Copies of recorded messages, orders and deals, on `US100.cash` and the fake account."""
     moved = []
@@ -153,7 +173,10 @@ class ExecutionVenue:
     A request whose payload type is in `fail` is answered with an error. `replies` holds each
     served payload type's answer, for a test that holds it back.
 
-    Order requests have no handler until a test registers one with `server.on`.
+    A cancel or an amend of a pending order acts on the snapshot's orders and is answered as the
+    broker answers it: the order cancelled or replaced, or an order error for an order it does not
+    hold pending. Other order requests have no handler until a test registers one with
+    `server.on`.
     """
 
     def __init__(self) -> None:
@@ -196,7 +219,10 @@ class ExecutionVenue:
                 oa.ProtoOAOrderListRes, "order", _between(self.orders, r, _last_update)
             ),
         )
+        self._serve(om.PROTO_OA_ORDER_DETAILS_REQ, self._details)
         self._serve(om.PROTO_OA_CASH_FLOW_HISTORY_LIST_REQ, self._cash_flow)
+        self.server.on(om.PROTO_OA_CANCEL_ORDER_REQ, self._cancel_order)
+        self.server.on(om.PROTO_OA_AMEND_ORDER_REQ, self.replies_to_amend)
         self.server.on(
             om.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
             lambda r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=r.ctidTraderAccountId),
@@ -231,12 +257,86 @@ class ExecutionVenue:
             depositWithdraw=_between(self.cash_flow, request, _changed),
         )
 
+    def _details(self, request: oa.ProtoOAOrderDetailsReq) -> Message:
+        """The order as last changed in any list the venue holds, with its deals."""
+        listed = [
+            order
+            for order in (
+                *self.snapshot.order,
+                *self.orders,
+                *(o for found in self.position_orders.values() for o in found),
+            )
+            if order.orderId == request.orderId
+        ]
+        if not listed:
+            return oa.ProtoOAErrorRes(
+                ctidTraderAccountId=ACCOUNT_ID,
+                errorCode="ORDER_NOT_FOUND",
+                description="no such order",
+            )
+        deals = {
+            deal.dealId: deal
+            for deal in (*self.deals, *(d for found in self.position_deals.values() for d in found))
+            if deal.orderId == request.orderId
+        }
+        return oa.ProtoOAOrderDetailsRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            order=max(listed, key=_last_update),
+            deal=sorted(deals.values(), key=_executed),
+        )
+
+    def _pending_order(self, order_id: int) -> om.ProtoOAOrder | Message:
+        """The snapshot's pending order `order_id`, or the broker's error for any other id."""
+        for order in self.snapshot.order:
+            if order.orderId == order_id and order.orderType in PENDING_ORDER_TYPES:
+                return order
+        return oa.ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=ACCOUNT_ID,
+            errorCode="ORDER_NOT_FOUND",
+            orderId=order_id,
+            description="Order not found",
+        )
+
+    def _cancel_order(self, request: oa.ProtoOACancelOrderReq) -> Message:
+        order = self._pending_order(request.orderId)
+        if not isinstance(order, om.ProtoOAOrder):
+            return order
+        cancelled = om.ProtoOAOrder()
+        cancelled.CopyFrom(order)
+        self.snapshot.order.remove(order)
+        cancelled.orderStatus = om.ORDER_STATUS_CANCELLED
+        cancelled.utcLastUpdateTimestamp += 1
+        self.orders.append(cancelled)
+        return pending_event(om.ORDER_CANCELLED, cancelled)
+
+    def replies_to_amend(self, request: oa.ProtoOAAmendOrderReq) -> Message:
+        """Apply an amend to the snapshot's pending order; the broker's answer to it."""
+        order = self._pending_order(request.orderId)
+        if not isinstance(order, om.ProtoOAOrder):
+            return order
+        for field, value in request.ListFields():
+            if field.name == "guaranteedStopLoss":
+                order.tradeData.guaranteedStopLoss = value
+            elif field.name == "volume":
+                order.tradeData.volume = value
+            elif field.name not in ("payloadType", "ctidTraderAccountId", "orderId"):
+                setattr(order, field.name, value)
+        order.utcLastUpdateTimestamp += 1
+        return pending_event(om.ORDER_REPLACED, order)
+
     def _page(self, response: type[Message], field: str, items: list) -> Message:
         return response(
             ctidTraderAccountId=ACCOUNT_ID,
             hasMore=len(items) > self.page_size,
             **{field: items[: self.page_size]},
         )
+
+
+def pending_event(kind: int, order: om.ProtoOAOrder) -> oa.ProtoOAExecutionEvent:
+    """An execution event of a pending order, as the broker sends one about it (hand-built)."""
+    event = oa.ProtoOAExecutionEvent(ctidTraderAccountId=ACCOUNT_ID, executionType=kind)
+    event.order.CopyFrom(order)
+    return event
 
 
 def _executed(deal: om.ProtoOADeal) -> int:
@@ -488,6 +588,8 @@ ENTRY, STOP, TARGET = "O-E-5000001", "O-SL-5000001", "O-TP-5000001"
 # The recorded first position, made the node's, on US100.cash: accepted, filled, protected,
 # both levels changed by hand, partly closed by hand, then closed by its stop-loss.
 FIRST_EVENTS = on_us100(first_n(as_ours(events(), [FIRST]), FIRST))
+# The same position as traded by hand: its levels are external legs.
+FOREIGN_EVENTS = on_us100(first_n(events(), FIRST))
 
 
 async def submitted(h: Harness, orders: OrderList | None = None) -> OrderList:
@@ -534,13 +636,19 @@ def broker_lists(
     return on_us100([snapshot])[0], {FIRST: moved}, deals
 
 
-def serve(venue: ExecutionVenue, at: float) -> None:
-    """Make the venue's snapshot and lists the node's first position at timeline time `at`."""
-    snapshot, histories, deals = broker_lists(at)
-    venue.snapshot = snapshot
-    venue.position_orders = {pid: list(found.orders) for pid, found in histories.items()}
-    venue.position_deals = {pid: list(found.deals) for pid, found in histories.items()}
-    venue.deals = list(deals)
+def serve(venue: ExecutionVenue, at: float, *, mine: bool = True, later_ms: int = 0) -> None:
+    """Make the venue's snapshot and lists the first position at timeline time `at`.
+
+    The position is the node's when `mine`, else as traded by hand; every time is `later_ms`
+    later than recorded.
+    """
+    snapshot, histories, deals = broker_lists(at, mine=mine)
+    (venue.snapshot,) = shifted([snapshot], later_ms)
+    venue.position_orders = {
+        pid: shifted(found.orders, later_ms) for pid, found in histories.items()
+    }
+    venue.position_deals = {pid: shifted(found.deals, later_ms) for pid, found in histories.items()}
+    venue.deals = shifted(deals, later_ms)
 
 
 async def started(h: Harness) -> ExecutionMassStatus:

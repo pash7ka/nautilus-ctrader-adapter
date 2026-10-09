@@ -15,6 +15,7 @@ Conventions across the records:
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from enum import Enum
@@ -28,13 +29,46 @@ class Level(Enum):
     TAKE_PROFIT = "TP"
 
 
-def leg_venue_order_id(entry_order_id: int, level: Level) -> str:
-    """A leg's venue order id.
+@dataclass(frozen=True)
+class LevelTerms:
+    """How a position's levels work besides their prices, as its last known state says.
+
+    An amend sends them again, so that it changes only the prices it means to change.
+    `stop_loss_trigger_method` is the protocol's `ProtoOAOrderTriggerMethod` value.
+    """
+
+    trailing_stop_loss: bool
+    guaranteed_stop_loss: bool
+    stop_loss_trigger_method: int
+
+
+def leg_venue_order_id(entry_order_id: int, level: Level, generation: int = 1) -> str:
+    """A leg's venue order id: `<entry>-SL`, then `<entry>-SL-2`, `<entry>-SL-3`, ...
 
     Both of a position's levels live in one broker order, and Nautilus maps a venue order id to
-    a single order, so each leg is named after its entry, whose id never changes.
+    a single order, so each leg is named after its entry, whose id never changes. A level put
+    back after its leg closed is a new order, since Nautilus cannot reopen a closed one: the
+    next `generation`.
     """
-    return f"{entry_order_id}-{level.value}"
+    if generation < 1:
+        raise ValueError(f"a leg's generation starts at 1, got {generation}")
+    suffix = "" if generation == 1 else f"-{generation}"
+    return f"{entry_order_id}-{level.value}{suffix}"
+
+
+_LEG_ID = re.compile(r"([1-9][0-9]*)-(SL|TP)(?:-([2-9]|[1-9][0-9]+))?")
+
+
+def parse_leg_venue_order_id(text: str) -> tuple[int, Level, int] | None:
+    """The entry order id, level and generation of a leg's venue order id; `None` for any other.
+
+    Strict: only exactly what `leg_venue_order_id()` writes is read.
+    """
+    found = _LEG_ID.fullmatch(text)
+    if found is None:
+        return None
+    entry, level, generation = found.groups()
+    return int(entry), Level(level), 1 if generation is None else int(generation)
 
 
 def price_of(value: float, precision: int) -> Decimal:
@@ -287,7 +321,26 @@ class Notice:
     text: str
 
 
-Record = OrderEvent | ExternalOrder | Activity | AwaitProtection | ProtectionMissing | Notice
+@dataclass(frozen=True)
+class EntryUnknown:
+    """A position the node did not open has a level, but the model knows no entry for it.
+
+    Its legs are named after the entry, so it has none until the entry is known: the position's
+    own order list names it.
+    """
+
+    position_id: int
+
+
+Record = (
+    OrderEvent
+    | ExternalOrder
+    | Activity
+    | AwaitProtection
+    | ProtectionMissing
+    | Notice
+    | EntryUnknown
+)
 
 
 @runtime_checkable

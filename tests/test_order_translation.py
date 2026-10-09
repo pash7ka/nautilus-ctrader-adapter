@@ -33,6 +33,8 @@ from nautilus_trader.model.orders import LimitOrder, MarketOrder, StopMarketOrde
 
 from nautilus_ctrader.common import order_translation as tr
 from nautilus_ctrader.common import parsing
+from nautilus_ctrader.common.venue_records import Level, LevelTerms
+from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.fixtures import load_recorded
 
@@ -622,12 +624,20 @@ def test_a_close_with_a_time_in_force_other_than_gtc_or_ioc_is_refused() -> None
         tr.close_position(ACCOUNT_ID, 5_000_001, order, position_side=PositionSide.LONG)
 
 
+TRAILING = LevelTerms(
+    trailing_stop_loss=True,
+    guaranteed_stop_loss=False,
+    stop_loss_trigger_method=om.OPPOSITE,
+)
+
+
 def test_an_amend_sets_the_levels_it_is_given() -> None:
     request = tr.amend_levels(
         ACCOUNT_ID,
         5_000_001,
         stop_loss=Price.from_str("1.10000"),
         take_profit=Price.from_str("1.12000"),
+        terms=None,
     )
 
     assert request.positionId == 5_000_001
@@ -641,6 +651,7 @@ def test_an_amend_leaves_out_a_level_that_is_to_be_removed() -> None:
         5_000_001,
         stop_loss=None,
         take_profit=Price.from_str("1.12000"),
+        terms=None,
     )
 
     assert not request.HasField("stopLoss")
@@ -648,11 +659,74 @@ def test_an_amend_leaves_out_a_level_that_is_to_be_removed() -> None:
 
 
 def test_an_amend_with_no_level_removes_both() -> None:
-    request = tr.amend_levels(ACCOUNT_ID, 5_000_001, stop_loss=None, take_profit=None)
+    request = tr.amend_levels(ACCOUNT_ID, 5_000_001, stop_loss=None, take_profit=None, terms=None)
 
     assert request.positionId == 5_000_001
     assert not request.HasField("stopLoss")
     assert not request.HasField("takeProfit")
+
+
+@pytest.mark.parametrize(
+    "terms",
+    [
+        TRAILING,
+        LevelTerms(
+            trailing_stop_loss=False,
+            guaranteed_stop_loss=True,
+            stop_loss_trigger_method=om.DOUBLE_TRADE,
+        ),
+        # The schema's defaults are sent too: an omitted field may read as a change.
+        LevelTerms(
+            trailing_stop_loss=False,
+            guaranteed_stop_loss=False,
+            stop_loss_trigger_method=om.TRADE,
+        ),
+    ],
+)
+def test_an_amend_keeps_how_the_positions_stop_loss_works(terms: LevelTerms) -> None:
+    request = tr.amend_levels(
+        ACCOUNT_ID,
+        5_000_001,
+        stop_loss=Price.from_str("1.10000"),
+        take_profit=None,
+        terms=terms,
+    )
+
+    assert request.HasField("trailingStopLoss")
+    assert request.HasField("guaranteedStopLoss")
+    assert request.HasField("stopLossTriggerMethod")
+    assert request.trailingStopLoss == terms.trailing_stop_loss
+    assert request.guaranteedStopLoss == terms.guaranteed_stop_loss
+    assert request.stopLossTriggerMethod == terms.stop_loss_trigger_method
+
+
+def test_an_amend_removing_the_stop_loss_sends_no_trailing_or_guaranteed_stop() -> None:
+    request = tr.amend_levels(
+        ACCOUNT_ID,
+        5_000_001,
+        stop_loss=None,
+        take_profit=Price.from_str("1.12000"),
+        terms=TRAILING,
+    )
+
+    assert not request.HasField("trailingStopLoss")
+    assert not request.HasField("guaranteedStopLoss")
+    # It applies to the take-profit as well.
+    assert request.stopLossTriggerMethod == om.OPPOSITE
+
+
+def test_an_amend_of_a_position_never_seen_sends_no_terms() -> None:
+    request = tr.amend_levels(
+        ACCOUNT_ID,
+        5_000_001,
+        stop_loss=Price.from_str("1.10000"),
+        take_profit=None,
+        terms=None,
+    )
+
+    assert not request.HasField("trailingStopLoss")
+    assert not request.HasField("guaranteedStopLoss")
+    assert not request.HasField("stopLossTriggerMethod")
 
 
 def test_an_id_too_long_for_the_venue_is_refused() -> None:
@@ -734,3 +808,263 @@ def test_a_close_with_ioc_is_accepted() -> None:
     request = tr.close_position(ACCOUNT_ID, 5_000_001, order, position_side=PositionSide.LONG)
 
     assert request.positionId == 5_000_001
+
+
+# -- Pending orders held at the broker -----------------------------------------------------------
+
+PENDING_ID = 6_800_001
+
+
+def pending(kind: int, **fields) -> om.ProtoOAOrder:
+    """A broker's pending EURUSD buy of 1000 units; `fields` set on the order or its trade data."""
+    order = om.ProtoOAOrder(
+        orderId=PENDING_ID,
+        orderType=kind,
+        orderStatus=om.ORDER_STATUS_ACCEPTED,
+    )
+    order.tradeData.symbolId = EURUSD.info["symbol_id"]
+    order.tradeData.volume = 100_000
+    order.tradeData.tradeSide = om.BUY
+    for name, value in fields.items():
+        target = order.tradeData if name == "guaranteedStopLoss" else order
+        setattr(target, name, value)
+    return order
+
+
+def amend(order: om.ProtoOAOrder, *, quantity=None, price=None, trigger_price=None):
+    return tr.amend_order(
+        ACCOUNT_ID,
+        EURUSD,
+        order,
+        quantity=None if quantity is None else Quantity.from_str(quantity),
+        price=None if price is None else Price.from_str(price),
+        trigger_price=None if trigger_price is None else Price.from_str(trigger_price),
+    )
+
+
+def amend_request(**fields) -> oa.ProtoOAAmendOrderReq:
+    return oa.ProtoOAAmendOrderReq(ctidTraderAccountId=ACCOUNT_ID, orderId=PENDING_ID, **fields)
+
+
+@pytest.mark.parametrize("kind", [om.LIMIT, om.STOP, om.STOP_LIMIT])
+def test_a_cancel_names_the_pending_order(kind) -> None:
+    request = tr.cancel_order(ACCOUNT_ID, pending(kind))
+
+    assert request == oa.ProtoOACancelOrderReq(ctidTraderAccountId=ACCOUNT_ID, orderId=PENDING_ID)
+
+
+@pytest.mark.parametrize("kind", [om.MARKET, om.MARKET_RANGE])
+def test_a_cancel_of_a_market_order_is_refused(kind) -> None:
+    with pytest.raises(tr.Unsupported, match="a market order fills at once"):
+        tr.cancel_order(ACCOUNT_ID, pending(kind))
+
+
+@pytest.mark.parametrize(
+    ("order", "change", "expected"),
+    [
+        pytest.param(
+            pending(om.LIMIT, limitPrice=1.1),
+            {"price": "1.10500"},
+            amend_request(volume=100_000, limitPrice=1.105),
+            id="limit-price",
+        ),
+        pytest.param(
+            pending(om.LIMIT, limitPrice=1.1),
+            {"quantity": "2000"},
+            amend_request(volume=200_000, limitPrice=1.1),
+            id="limit-quantity",
+        ),
+        pytest.param(
+            pending(om.STOP, stopPrice=1.12, stopTriggerMethod=om.OPPOSITE),
+            {"trigger_price": "1.12500"},
+            amend_request(volume=100_000, stopPrice=1.125, stopTriggerMethod=om.OPPOSITE),
+            id="stop-trigger",
+        ),
+        pytest.param(
+            # The trigger method the schema defaults to is sent too.
+            pending(om.STOP, stopPrice=1.12),
+            {"quantity": "500"},
+            amend_request(volume=50_000, stopPrice=1.12, stopTriggerMethod=om.TRADE),
+            id="stop-quantity",
+        ),
+        pytest.param(
+            pending(om.STOP_LIMIT, stopPrice=1.12, slippageInPoints=30),
+            {"trigger_price": "1.12500"},
+            amend_request(
+                volume=100_000, stopPrice=1.125, slippageInPoints=30, stopTriggerMethod=om.TRADE
+            ),
+            id="stop-limit-trigger",
+        ),
+        pytest.param(
+            pending(
+                om.LIMIT,
+                limitPrice=1.1,
+                expirationTimestamp=1_700_000_000_000,
+                stopLoss=1.09,
+                takeProfit=1.13,
+                trailingStopLoss=True,
+                guaranteedStopLoss=True,
+            ),
+            {"price": "1.10500"},
+            amend_request(
+                volume=100_000,
+                limitPrice=1.105,
+                expirationTimestamp=1_700_000_000_000,
+                stopLoss=1.09,
+                takeProfit=1.13,
+                trailingStopLoss=True,
+                guaranteedStopLoss=True,
+            ),
+            id="attached-absolute",
+        ),
+        pytest.param(
+            pending(om.STOP, stopPrice=1.12, relativeStopLoss=500, relativeTakeProfit=1000),
+            {"trigger_price": "1.12500"},
+            amend_request(
+                volume=100_000,
+                stopPrice=1.125,
+                stopTriggerMethod=om.TRADE,
+                relativeStopLoss=500,
+                relativeTakeProfit=1000,
+                trailingStopLoss=False,
+                guaranteedStopLoss=False,
+            ),
+            id="attached-relative",
+        ),
+        pytest.param(
+            # The trailing flag describes a stop-loss, so with none it is not sent.
+            pending(om.LIMIT, limitPrice=1.1, takeProfit=1.13, trailingStopLoss=True),
+            {"price": "1.10500"},
+            amend_request(volume=100_000, limitPrice=1.105, takeProfit=1.13),
+            id="take-profit-only",
+        ),
+    ],
+)
+def test_an_order_amend_changes_what_is_asked_and_sends_the_rest_again(
+    order, change, expected
+) -> None:
+    assert amend(order, **change) == expected
+
+
+@pytest.mark.parametrize(
+    ("order", "change"),
+    [
+        pytest.param(pending(om.LIMIT, limitPrice=1.1), {}, id="nothing"),
+        pytest.param(pending(om.LIMIT, limitPrice=1.1), {"price": "1.10000"}, id="same-price"),
+        pytest.param(pending(om.LIMIT, limitPrice=1.1), {"quantity": "1000"}, id="same-quantity"),
+        pytest.param(
+            pending(om.STOP, stopPrice=1.12), {"trigger_price": "1.12"}, id="same-trigger"
+        ),
+    ],
+)
+def test_an_order_amend_that_changes_nothing_is_none(order, change) -> None:
+    assert amend(order, **change) is None
+
+
+@pytest.mark.parametrize(
+    ("order", "change", "reason"),
+    [
+        pytest.param(
+            pending(om.LIMIT, limitPrice=1.1),
+            {"price": "1.105001"},
+            "finer than the instrument's price precision",
+            id="off-grid",
+        ),
+        pytest.param(
+            pending(om.STOP, stopPrice=1.12),
+            {"trigger_price": "1.125001"},
+            "finer than the instrument's price precision",
+            id="trigger-off-grid",
+        ),
+        pytest.param(
+            pending(om.LIMIT, limitPrice=1.1),
+            {"quantity": "0.001"},
+            "hundredths of a unit",
+            id="quantity-off-grid",
+        ),
+        pytest.param(
+            pending(om.LIMIT, limitPrice=1.1),
+            {"trigger_price": "1.12000"},
+            "cannot set the trigger price of a LIMIT order",
+            id="trigger-on-limit",
+        ),
+        pytest.param(
+            pending(om.STOP_LIMIT, stopPrice=1.12, slippageInPoints=30),
+            {"price": "1.12100"},
+            "cannot set the limit price of a STOP_LIMIT order",
+            id="price-on-stop-limit",
+        ),
+        pytest.param(
+            pending(om.MARKET),
+            {"quantity": "2000"},
+            "a market order fills at once",
+            id="market",
+        ),
+        pytest.param(
+            pending(om.MARKET_RANGE, slippageInPoints=30),
+            {"quantity": "2000"},
+            "a market order fills at once",
+            id="market-range",
+        ),
+    ],
+)
+def test_an_order_amend_the_venue_cannot_express_is_refused(order, change, reason) -> None:
+    with pytest.raises(tr.Unsupported, match=reason):
+        amend(order, **change)
+
+
+@pytest.mark.parametrize(
+    ("order", "carried"),
+    [
+        pytest.param(pending(om.LIMIT, limitPrice=1.105), True, id="as-asked"),
+        # A double the venue sends may carry noise past the price's digits.
+        pytest.param(pending(om.LIMIT, limitPrice=1.1050000000001), True, id="noise"),
+        pytest.param(pending(om.LIMIT, limitPrice=1.1), False, id="other-price"),
+        pytest.param(pending(om.LIMIT), False, id="no-price"),
+    ],
+)
+def test_an_order_carries_the_price_an_amend_asks_for(order, carried) -> None:
+    asked = amend(pending(om.LIMIT, limitPrice=1.1), price="1.10500")
+
+    assert tr.carries(asked, order, EURUSD.price_precision) is carried
+
+
+def test_an_order_with_another_volume_does_not_carry_the_amend() -> None:
+    asked = amend(pending(om.STOP, stopPrice=1.12), quantity="2000")
+    order = pending(om.STOP, stopPrice=1.12)
+
+    assert not tr.carries(asked, order, EURUSD.price_precision)
+    order.tradeData.volume = 200_000
+    assert tr.carries(asked, order, EURUSD.price_precision)
+
+
+@pytest.mark.parametrize(
+    ("level", "change", "moved"),
+    [
+        (Level.STOP_LOSS, {"trigger_price": Price.from_str("1.10010")}, "1.10010"),
+        (Level.TAKE_PROFIT, {"price": Price.from_str("1.10020")}, "1.10020"),
+        (Level.STOP_LOSS, {}, None),
+    ],
+)
+def test_a_leg_moves_by_the_price_of_its_kind(level, change, moved) -> None:
+    prices = {"price": None, "trigger_price": None, **change}
+
+    wanted = tr.leg_price(EURUSD, level, **prices)
+
+    assert wanted == (None if moved is None else Price.from_str(moved))
+
+
+@pytest.mark.parametrize(
+    ("level", "change", "reason"),
+    [
+        (Level.STOP_LOSS, {"price": "1.10010"}, "a stop-loss leg moves by its trigger price"),
+        (Level.TAKE_PROFIT, {"trigger_price": "1.10020"}, "a take-profit leg moves by its price"),
+        (Level.STOP_LOSS, {"trigger_price": "1.100105"}, "finer than the instrument's price"),
+    ],
+)
+def test_a_leg_price_the_venue_cannot_set_is_refused(level, change, reason) -> None:
+    prices = {"price": None, "trigger_price": None}
+    prices.update({name: Price.from_str(value) for name, value in change.items()})
+
+    with pytest.raises(tr.Unsupported, match=reason):
+        tr.leg_price(EURUSD, level, **prices)

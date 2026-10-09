@@ -7,8 +7,9 @@ model maps onto Nautilus orders, how it recovers after a restart or a lost conne
 places where an application has to design around a difference.
 
 Read [Instruments](instruments.md) first for how a symbol becomes a Nautilus instrument, and
-[Protocol notes](protocol.md) (section 10) for what was observed on the wire. Nothing here has
-yet been confirmed with a live order: see [Not yet confirmed](#10-not-yet-confirmed-against-a-live-endpoint).
+[Protocol notes](protocol.md) (section 10) for what was observed on the wire. No new order has
+yet been sent through the adapter on a live account; its cancels and amends of orders placed by
+hand have been. See [Not yet confirmed](#10-not-yet-confirmed-against-a-live-endpoint).
 
 ## 1. What it trades
 
@@ -26,6 +27,9 @@ yet been confirmed with a live order: see [Not yet confirmed](#10-not-yet-confir
   stop-loss and a `LIMIT` take-profit (see [Brackets and legs](#2-brackets-and-legs)).
 - **Closing a position**: a reduce-only `MARKET` order that names the position it closes, for the
   whole position or part of it.
+- **Cancelling and modifying orders it did not place**: the levels of a position a trader or
+  another program opened, and their pending orders (see
+  [Orders the node did not place](#orders-the-node-did-not-place)).
 
 Everything else is refused before anything is sent, with a reason. The order is rejected, and the
 legs of a refused bracket are cancelled, so a refused bracket is one rejection and not three.
@@ -52,7 +56,7 @@ An order or a close that was sent and got **no answer** within `order_request_ti
 never sent again: the lost answer may hide a fill. It stays in flight, with a WARNING, until
 Nautilus's own in-flight check or a reconnect settles it ([section 5](#5-order-queries-and-in-flight-settings)).
 A level amend, which sets the whole state of a position's levels, is the one request that is
-repeated, up to three times.
+repeated, up to three times. A cancel or an amend of a pending order is not repeated either.
 
 A refusal by the broker is an `OrderRejected` (or `OrderCancelRejected`, `OrderModifyRejected`)
 whose reason is the broker's error code and description, as the broker gave them.
@@ -91,12 +95,17 @@ exists, the adapter amends the position's levels to the exact prices requested.
 | The protective order appears | none | `OrderAccepted` for each level present, at the broker's price, after the entry's fill: the levels exist only from then on |
 | Entry cancelled or expired without a fill | `OrderCanceled` / `OrderExpired` | `OrderCanceled` |
 | Entry refused | `OrderRejected` | `OrderCanceled` |
+| A trailing stop-loss moves | none | the stop-loss leg `OrderUpdated`, for each move |
 | A level triggers | none | the triggered leg `OrderFilled` for the volume actually closed; the other leg `OrderCanceled` |
 
 **Venue order ids of legs.** Both levels of a position live in one broker order, and Nautilus
 maps a venue order id to a single order. Each leg is therefore named after its entry order:
 `<entry order id>-SL` for the stop-loss and `<entry order id>-TP` for the take-profit, for
-example `6000001-SL`. The entry's order id never changes, so the names survive a restart.
+example `6000001-SL`. The entry's order id never changes, so the names survive a restart. A trader
+can raise a position by hand, which gives it a second opening order; the entry is still the order
+carrying the node's record, and the raise is reported as an external order. The
+legs of a position the node did not open are named the same way
+([below](#orders-the-node-did-not-place)).
 
 **Which level triggered.** No field says so; the protective order's semantics do. For a position
 that is long (the protective order sells), a fill at or above the take-profit price is the
@@ -111,8 +120,23 @@ cleaning up the remaining legs afterwards is the application's job. Cancelling a
 refused: it fills at once.
 
 **Modifying a leg** moves that level with an amend that keeps the other: `OrderUpdated`, or
-`OrderModifyRejected` with the reason. A quantity can only be set to what the leg already holds,
-which follows the position (the protective order's volume); anything else is refused.
+`OrderModifyRejected` with the reason. A stop-loss leg moves by its trigger price and a
+take-profit leg by its price; a modify naming the other price is refused. A quantity can only be
+set to what the leg already holds, which follows the position (the protective order's volume);
+anything else is refused. Whether the level moved is read from the broker's answer to the amend,
+so a trailing stop-loss that moves on right after it is not taken for a refusal. A trailing move
+that reaches the adapter before that answer, but was made after it, is kept: the answer's older
+stop-loss does not set the leg back. A trailing move made before the amend that arrives after its
+answer is dropped, for the same reason.
+
+**Every level amend keeps what it does not change.** Besides both levels, it sends the position's
+stop-loss trigger method again, and, while a stop-loss stays, its trailing and guaranteed flags,
+all as the broker last stated them. A trailing or guaranteed stop-loss therefore stays one when
+its level is moved or the take-profit is cancelled (confirmed live for a trailing one). Both levels
+are always sent because a level left out is removed (confirmed live for the take-profit). An amend
+that removes the stop-loss sends no flags: there is no stop-loss left for them to describe. A
+position whose state the broker has not yet stated in any message the adapter received gets none
+of the three.
 
 **A partial close** leaves the position and its legs. The broker reduces the protective order to
 the position's new volume, and the adapter reports it: an `OrderUpdated` with the new quantity on
@@ -129,6 +153,125 @@ or a protective stop with no position to attach to.
 **With a strategy's order manager on**, cancelling one leg makes Nautilus cancel the other
 (the legs are linked as one-cancels-other), and the adapter then removes that level too. Whether
 that is wanted is a setting of the application, not of the adapter.
+
+### Orders the node did not place
+
+The orders of a position opened by a trader or another program, and the pending orders they
+place, reach Nautilus as external orders: through reports only, never through events made from the broker's
+news ([section 6](#6-account-activity)). Nautilus creates each one when it first sees it, under
+the strategy id `EXTERNAL`, or under the strategy that lists its instrument in
+`external_order_claims`. With Nautilus's `filter_unclaimed_external_orders` on, Nautilus drops
+the reports of unclaimed external orders and never creates them, so nothing in this section
+applies to those orders.
+
+**The legs of a foreign position.** The levels of a position the node did not open are legs as
+well. A stop-loss is a reduce-only `STOP_MARKET` at its trigger price, a take-profit a reduce-only
+`LIMIT` at its price, both on the side opposite the position, good till cancelled, and carrying
+the position id.
+
+- **Ids.** Each leg is named after the position's entry order, as the node's legs are:
+  `<entry order id>-SL` and `<entry order id>-TP`. The position id would not do: the broker
+  numbers positions and orders separately, so a name built from a position id could match the
+  name of one of the node's legs. A position raised by hand has several opening orders, and its
+  entry is always the earliest of them, so a start, a reconnect and the live events name its legs
+  alike. Each later opening order is an external order filled with its own deals, and the legs'
+  quantity follows the protective order's raised volume.
+- **A level put back is a new order.** Nautilus cannot reopen an order it holds as closed. A level
+  removed and then put back while the position stays open is therefore a new leg, under the next
+  generation of the name: `-SL-2`, then `-SL-3`, and so on. The earlier leg stays cancelled. At a
+  start or a reconnect, a standing level takes the lowest generation that the Nautilus cache does
+  not hold as a closed order. Without a persistent cache that is `-SL` again, a new order to that
+  cache; with one, it is the generation the cache already holds open. A level removed and put
+  back while the connection was down is not a new generation: at the reconnect the cache still
+  holds the earlier leg open, so the level is reported as a move of that same leg.
+- **Quantity.** A leg covers what the protective order has left, or the position's volume while
+  no protective order has stated one, plus what the leg has already filled. It follows a partial
+  close like the node's legs. When a fill reaches a leg before the protective order's smaller
+  volume does, the leg's quantity is first raised to the fill, so that Nautilus never sees an
+  overfill.
+- **No links.** A foreign leg has no parent, no linked orders and no contingency. The ids
+  Nautilus gives the entry and the other leg are not known in advance, and a claiming strategy
+  with its order manager on would otherwise start sending cancels of its own.
+- **What Nautilus is told.** A level first seen is reported as an accepted order. A moved level is
+  reported with its new price, which Nautilus turns into an `OrderUpdated`; this includes each
+  move of a trailing stop-loss. A removed level is reported cancelled. A triggered level is
+  reported filled with the real deal, and when the position closes the other leg, and any rest of
+  the triggered one, is reported cancelled. A protective order's fill that no leg can take, because
+  no level or no entry is known, is reported as a reduce-only order under the protective order's
+  own id.
+- **An unknown entry.** A position first seen through its protective order has no legs until its
+  entry is known: the adapter reads the position's order list, and the legs appear once the list
+  names the entry. A DEBUG line says so meanwhile. A position whose order list, read during a
+  start or a reconnect, names no entry stays without legs, with a DEBUG line; the list is not read
+  again.
+- **Client order ids.** A report about an external order that Nautilus already holds carries the
+  client order id Nautilus gave it, because Nautilus's check of its open orders looks for a report
+  under that id. The reports inside a mass status carry none, and Nautilus fills the id in itself:
+  it drops a named report whose status and fills it already holds, a changed price along with it.
+
+An application that watches order events sees a trader's move of a level on a position the node
+did not open, each step of a trailing stop-loss included, as an update of an external order.
+
+**Pending orders** that a trader or another program placed are reported as they stand and as they
+change. The adapter keeps the last state the broker stated for each one, which an amend sends back.
+
+**Commands.** A cancel or a modify is carried out for the node's own legs, for foreign legs and
+for pending orders placed elsewhere. Which order to command is the application's decision; the
+adapter does not judge it.
+
+- A foreign leg is cancelled by an amend that removes its level and keeps the other, and moved by
+  an amend that sets its level, the same way as the node's legs, every attribute kept. Cancels of
+  several legs of one position go out as one amend.
+- A pending order is cancelled with the broker's order cancel and modified with its order amend:
+  `price` sets a `LIMIT` order's limit price, `trigger_price` a stop order's stop price, and
+  `quantity` the volume. The amend sends again everything the command does not change: the volume,
+  the other price, the expiration, the slippage, the stop trigger method, the attached stop-loss
+  and take-profit (as a distance if the order holds one so, otherwise as a price) and, with a
+  stop-loss, its trailing and guaranteed flags.
+- **One amend at a time**: per position for levels, per order for pending orders. Each starts from
+  the state the one before it left, so two modifies never undo each other.
+- **For an external order, answers are reports.** The broker's answer is reported, and Nautilus
+  makes the `OrderCanceled` or `OrderUpdated` from it. A modify that would change nothing sends
+  nothing; a report of the order as the broker holds it ends Nautilus's pending update. The
+  node's own legs keep their events, as described above.
+- **Refusals are events**: `OrderCancelRejected` or `OrderModifyRejected` with the broker's
+  reason, or with "the broker kept the level", "the broker kept the order open" or "the broker did
+  not amend the order as asked" when its answer leaves the order as it was. Only an answer that
+  replaces the order is held against the amend; an answer that ends the order, or that is of
+  another kind, is reported as it stands and is no refusal. They carry the order's own strategy
+  id, `EXTERNAL` or the claiming strategy's, not the id of the strategy that sent the command.
+- **A command the adapter fails to carry out**, on input it did not foresee, is refused all the
+  same: `OrderCancelRejected` or `OrderModifyRejected` naming the error's type, with an ERROR
+  log line. The order never stays pending until Nautilus's in-flight check.
+- A cancel or an amend of a pending order that gets no answer is not sent again: a WARNING says
+  so, and Nautilus's in-flight check asks about the order
+  ([section 5](#5-order-queries-and-in-flight-settings)).
+
+What is still refused, unsent:
+
+| Refused | Reason |
+|---|---|
+| A cancel or a modify of a market order | It fills at once |
+| A cancel or a modify of an order the broker does not hold open: a leg whose level is gone, a pending order that has ended | "the leg is already closed", "the order is not open at the venue" |
+| A quantity change of a leg, the node's or a foreign one | A level covers the whole position |
+| A new trigger price on a `LIMIT` order; a new limit price on a `STOP` or `STOP_LIMIT` order | The venue cannot set it: a stop-limit order's limit is a slippage distance there |
+| A pending order's or a leg's price off the instrument's price grid, or a quantity finer than a hundredth of a unit | A rounded value is a different order |
+| A modify of a stop-loss leg by `price`, or of a take-profit leg by `trigger_price` | "a stop-loss leg moves by its trigger price", "a take-profit leg moves by its price" |
+| A modify of a pending order, or a cancel or a modify of a leg, whose instrument is not loaded | "... is not loaded": the adapter can neither express the request's prices nor read the answer |
+| Any command while not connected | "not connected to the venue"; a level amend first waits for the connection to come back, a few times |
+
+**Commanding an external order from a strategy.** Nautilus does not check which strategy owns an
+order when one cancels or modifies it. A strategy can command an external order in two ways:
+
+- list its instrument in `external_order_claims`. Orders Nautilus creates from reports on that
+  instrument are then the strategy's own, and its `cancel_all_orders` covers them. The claim is
+  applied only when Nautilus first creates the order, so it has to be in place before the order
+  is first reported;
+- pass the cached `Order` (from `self.cache.orders_open(...)`, for example) to `cancel_order` or
+  `modify_order`. `cancel_all_orders` covers only the calling strategy's own orders, so it never
+  reaches an unclaimed `EXTERNAL` one.
+
+Either way, a refusal goes to the order's strategy, as said above.
 
 ## 3. Configuration
 
@@ -220,7 +363,7 @@ adapter writes its own record into each order it sends: the `label` holds a mark
 entry's client order id, the `comment` holds the client order ids of the legs. A trader or another
 program can write those fields too, so parsing is strict: a text that is not exactly a record
 written by the adapter is not a record, and the position is then treated as foreign. The mistake
-can only be "not the node's", never the node managing someone else's position.
+can only be "not the node's", never the node taking someone else's position for its own.
 
 What the mass status holds, for a position the node opened:
 
@@ -239,10 +382,22 @@ What the mass status holds, for a position the node opened:
 For a position or an order that is not the node's, on a loaded instrument:
 
 - its entry as a filled order under the broker's id, with no client order id, with its fills;
-- its closing orders with their fills, and a position report. Its levels are never synthesized
-  as legs. When a protective order filled, it is reported as a reduce-only order under its own
-  id, a `STOP_MARKET` or a `LIMIT` according to which level triggered;
+- its closing orders with their fills, and a position report;
+- its levels as legs ([Orders the node did not place](#orders-the-node-did-not-place)): each
+  standing level accepted, at the generation of its name that the Nautilus cache does not hold
+  closed; for a position that closed in the gap, the leg whose level triggered filled with its
+  fill and the other cancelled; and a leg that Nautilus holds open but whose level is gone,
+  cancelled at the price Nautilus holds. A protective order's fill that no leg can take is
+  reported as a reduce-only order under the protective order's own id;
 - pending orders as they stand.
+
+A foreign position whose order list names no entry gets no legs, and a DEBUG line says so.
+
+**A position raised by hand** has several opening orders. Its entry is the earliest of them by
+creation time, never by the broker's list order (which is newest first), and for the node's
+position the earliest carrying the node's record. Every other opening order is reported as a
+filled order under the broker's id, with no client order id and its own fills, the node's
+position included. Nautilus therefore infers no order for the rest of the position.
 
 An open protective order is never reported as an order: it is its position's levels. **Every
 closing order reported to Nautilus from the broker's data is reduce-only and carries its position
@@ -260,7 +415,8 @@ Two consequences after a restart:
   application as a closed order (a DEBUG line says so). With a persistent cache, the leg is
   cancelled. Legs that stand, or that triggered, are reported either way, and an application that
   claims the position sees them as lifecycle events (accepted, then cancelled or filled) for an
-  order it did not submit in this run.
+  order it did not submit in this run. A foreign leg in the same case is cancelled only when a
+  persistent cache holds it open; otherwise Nautilus never knew it, and it is not reported.
 - **The node's own close.** The close request has no field for a client order id. After a restart
   without a persistent cache the closing order comes back as a reduce-only order with the broker's
   id and no client order id, and the application sees the close inferred, not its own order filled.
@@ -276,6 +432,16 @@ pushed during the rebuild are applied once the mass status is sent and the balan
 has been rewritten; the account state is sent again after them. The rebuild is logged at
 WARNING.
 
+Nautilus skips a mass status's order report whose status and filled quantity match the order it
+holds, without comparing its quantity or prices. So once a mass status is reconciled, at start
+and on a reconnect, and before the held events are applied, the adapter compares each open order
+it reported with the order Nautilus holds. One whose quantity, price or trigger price differs is
+sent again as a report of its own, under the client order id Nautilus holds it by, which Nautilus
+turns into the `OrderUpdated`. This covers the node's legs, foreign legs and pending orders, at
+start only with a persistent cache. The same happens when the start's mass status is never
+reconciled and the held events are applied after the wait. Closed orders and fills are never sent
+again this way.
+
 **Closed orders and fills from before the current moment reach Nautilus only inside a mass
 status, never as order events.** An order that filled while the connection was down is seen in
 the reconnect's mass status; no event is replayed for it.
@@ -287,23 +453,40 @@ pass: the pass reports it under the node's client order id if it reached the bro
 
 The three report generators answer from the same read, without rebuilding the model:
 
-- order reports: every open order and every live leg; with `open_only` false, also orders that
-  ended without a fill. A filled order is never returned here, because without its fills Nautilus
-  would infer one with no commission. It arrives through a mass status or a query;
+- order reports: every open order and every live leg, foreign legs included; with `open_only`
+  false, also orders that ended without a fill. A filled order is never returned here, because
+  without its fills Nautilus would infer one with no commission. It arrives through a mass status
+  or a query;
 - fill reports: the fills of the window;
 - position reports: the open positions.
+
+Unlike a mass status's, these order and fill reports name an external order that Nautilus holds
+by the client order id it gave it, as its check of its open orders expects.
 
 ## 5. Order queries and in-flight settings
 
 A `QueryOrder`, and Nautilus's own check of an order left in flight, are answered from the
 broker's lists:
 
-- a leg is answered from the venue model;
+- the node's leg is answered from the venue model;
+- any other leg, such as a level of a position the node did not open, is matched by its venue
+  order id in the position its entry opened. The venue model names that position, or, for one
+  closed before the model was last rebuilt, the entry's own details (`ProtoOAOrderDetailsReq`).
+  A standing level answers `ACCEPTED` at its current price and quantity; a level or position
+  that is gone answers its closing status;
 - a close is answered from its broker order, once the model has matched it. Before that, while
   the close is still in flight, it is answered from its position's lists, where the closing order
   of the same volume is named by the node's close;
-- an entry or a market order is looked up in the broker's pending orders, then in the order list
-  over the fill window. A partly filled entry is answered from its position, with its fills.
+- any other order the broker has numbered, an external one included, is matched by its venue
+  order id among the broker's pending orders, then in its own details (`ProtoOAOrderDetailsReq`).
+  Where the details cannot be read, the order list over the fill window is searched by the same
+  broker order id;
+- an entry or a market order the broker has not numbered yet (its acceptance was lost) is looked
+  up by the node's record in the broker's pending orders, then in the order list over the fill
+  window.
+
+A partly filled order is answered from its position, with its fills. An answer about an
+external order carries the client order id Nautilus gave it.
 
 The answer is built from that one position's own lists. **An order that already filled is
 answered with its real fills**, as a one-order mass status carrying the report and its fills
@@ -315,6 +498,11 @@ recognised and its levels corrected.
 **While disconnected, nothing is answered.** Nothing is answered either while a leg's entry is
 still in flight, for an order on an instrument that is not loaded, or when nothing matches. In
 each case there is no report, no exception, and a DEBUG line saying why.
+
+These answers matter for commands on orders the node did not place. Nautilus asks about a cancel
+or a modify left pending, and when its tries run out it settles the order as cancelled locally. A
+foreign leg or a pending order whose answer was lost is therefore answered as the broker holds it,
+so that a level or an order still standing is not taken for cancelled.
 
 ### Recommended settings
 
@@ -362,19 +550,23 @@ Notes on reading it:
 
 - A trader's close or partial close of the node's position is reported **twice**: as a
   `manual_change` activity and, because Nautilus needs it for its own bookkeeping, as an external
-  closing order. A trader's move, removal or addition of a level is the activity alone, plus the
-  node's leg events (`OrderUpdated` or `OrderCanceled`).
+  closing order. So is a trader's raise of it: a `manual_change` with the action `opened` and the
+  volume added, and an external filled order. A trader's move, removal or addition of a level is
+  the activity alone, plus the node's leg events (`OrderUpdated` or `OrderCanceled`). A trader's
+  change of a position the node did not open is no activity: it reaches Nautilus as reports of
+  that position's orders and legs.
 - **In the broker's order.** What the adapter tells Nautilus follows the order in which the
   broker sent it. The node's own orders (entries, legs, closes) reach Nautilus as events, which it
-  queues. An order the node did not send reaches it through reports only, which it applies at
-  once: an `OrderStatusReport` when it is first seen, a `FillReport` for each fill, and an
-  `OrderStatusReport` with its current status, quantities and prices for each later change,
-  cancel, expiry or rejection, from which Nautilus makes the `OrderUpdated`, `OrderCanceled` and
-  other events itself. A report or an activity therefore waits until Nautilus has applied every
-  event the adapter sent before it, and everything after it waits behind it. That includes the
-  events the adapter makes itself rather than from the broker's news: its answers to commands
-  (`OrderModifyRejected`, `OrderCancelRejected`, a refused order's `OrderRejected` and its legs'
-  `OrderCanceled`), `OrderSubmitted`, and the `OrderUpdated` of a leg moved by a modify. An event
+  queues. An order the node did not send, a foreign position's leg included, reaches it through
+  reports only, which it applies at once: an `OrderStatusReport` when it is first seen, a
+  `FillReport` for each fill, and an `OrderStatusReport` with its current status, quantities and
+  prices for each later change, cancel, expiry or rejection, from which Nautilus makes the
+  `OrderUpdated`, `OrderCanceled` and other events itself. A report or an activity therefore
+  waits until Nautilus has applied every event the adapter sent before it, and everything after
+  it waits behind it. That includes the events the adapter makes itself rather than from the
+  broker's news: its answers to commands (`OrderModifyRejected`, `OrderCancelRejected`, a refused
+  order's `OrderRejected` and its legs' `OrderCanceled`), `OrderSubmitted`, and the
+  `OrderUpdated` of a leg moved by a modify. An event
   holds anything back until it is at least 0.1 s old and two whole passes of the event loop have
   run since it was sent: Nautilus applies a queued event within two passes, but one it refuses
   never appears, and the passes keep a stalled loop from giving up on an event its queue has not
@@ -384,10 +576,11 @@ Notes on reading it:
   events are sent. A dropped connection that the transport restores drops nothing: the reconnect
   pass delivers everything waiting before it reconciles.
 - **One path per order.** Mixing events and reports for one order could apply its news out of
-  order, so an external order never gets an event from the broker's news. Two exceptions: a
-  change of an order Nautilus already holds as closed is logged as a WARNING and not reported,
-  and a cancel or modify command for an external order is still answered with an
-  `OrderCancelRejected` or `OrderModifyRejected` event.
+  order, so an external order never gets an event from the broker's news. A cancel or a modify of
+  one that the broker carries out is reported too. Two exceptions: a change of an order Nautilus
+  already holds as closed is logged as a WARNING and not reported, and a cancel or modify of an
+  external order that is refused, by the adapter or by the broker, is answered with an
+  `OrderCancelRejected` or `OrderModifyRejected` event under the order's own strategy.
 - **A close is in the position before its activity.** When a `closed` or `partially_closed`
   activity (`manual_change` or `stop_out`) is published for an instrument the node has loaded,
   Nautilus's position already holds that fill, and every earlier fill of the node's own orders
@@ -558,10 +751,24 @@ sign flipped to Nautilus's convention (a charge is positive).
   node's close reached the broker, is taken for the node's. This includes a close whose answer
   was lost: until the next successful reconnect pass, such a trader's close of the same volume on
   that position during the outage is taken for the node's.
-- **A level re-added by hand after its leg was cancelled is adopted after a restart.** After a
-  restart a leg lives exactly while its level does, so the level a trader put back makes the leg
-  alive again under its original id. Before the restart, the same re-added level is only a
-  `manual_change` activity.
+- **On the node's own position, a level re-added by hand after its leg was cancelled is adopted
+  after a restart.** After a restart a leg lives exactly while its level does, so the level a
+  trader put back makes the leg alive again under its original id. Before the restart, the same
+  re-added level is only a `manual_change` activity: it does not become a leg, because an external
+  order would then sit among the node's own orders on its own position.
+- **On a position the node did not open, a level put back is a new order**, under the next
+  generation of the leg's name (`-SL-2` and on), and the leg cancelled before it stays cancelled.
+  An application that follows a foreign stop by its client order id sees a different order; see
+  [Orders the node did not place](#orders-the-node-did-not-place).
+- **A foreign position with no known entry has no legs.** Its levels stay at the broker unseen by
+  Nautilus until the position's order list names the entry, as described there.
+- **An external position claimed by a strategy that sets its OMS to `NETTING` can come out
+  doubled.** The account is always a hedging one. A strategy that overrides its OMS type to
+  `NETTING` and claims an instrument with `external_order_claims` holds the external position
+  under its netting position id. At a start or a reconnect, Nautilus then takes the position
+  report, which names the broker's position id, for a missing position and adds one of the same
+  volume, so the strategy can hold twice the broker's volume. The legs and their fills are
+  reported correctly.
 - **A position whose leg record does not parse gets no legs.** If the `comment` of the node's own
   entry cannot be read, the position is still the node's, but its levels stay at the broker with
   no legs in Nautilus, and a WARNING says so.
@@ -581,30 +788,49 @@ sign flipped to Nautilus's convention (a charge is positive).
 
 ## 10. Not yet confirmed against a live endpoint
 
-No order has yet been sent through the adapter on a live account, so everything about sending is
-read from the schema and the broker's own terminal's behaviour, not observed from the adapter.
-Each such point is marked in the source with a `TODO(verify):` comment saying what would settle
-it. The main groups:
+No new order has yet been sent through the adapter on a live account, so everything about
+sending one is read from the schema and the broker's own terminal's behaviour, not observed from
+the adapter. Cancels and amends have been sent through it, of a pending order and of a position's
+levels that were placed by hand: what they confirmed is listed in
+[Protocol notes](protocol.md), section 10. A partial close made by hand was watched as well, and
+confirmed there: it arrives as the closing order's `ORDER_ACCEPTED` then `ORDER_FILLED`, the fill
+carrying the position; after the fill comes an `ORDER_REPLACED` of the protective order under the
+same id, its `tradeData.volume` the reduced total and its `executedVolume` 0. Those events
+carried a `clientMsgId` the listening connection had not sent (observed once, and inferred from a
+recorder's mislabel: whose id it was is not recorded), so only an id the adapter is waiting for
+marks an answer. Each point still open is marked in the source with a `TODO(verify):` comment
+saying what would settle it. The main groups:
 
 - **Scales and defaults on a new order**: that volume in hundredths of a unit agrees with each
   instrument's quantity units; that relative levels are distances in 1/100000 of a price applied
   from the fill, in the direction assumed; that immediate-or-cancel fills a market order the way
   the broker's own terminal's does; which trigger method a stop-loss set by a relative distance
   uses.
-- **Amends**: that leaving a level out of an amend removes it; whether an accepted amend sends an
-  execution event besides its answer.
+- **Amends**: that leaving the stop-loss out of an amend removes it, as leaving the take-profit
+  out does; what the venue does with an optional field an amend leaves out, a position's trailing
+  and guaranteed flags and trigger method, or a pending order's attributes (it may keep the
+  current value or apply the schema's default). The adapter always sends them, so this matters
+  only where it cannot.
+- **Cancels and amends of pending orders**: how the venue refuses an amend, and a cancel for any
+  reason but an unknown order id; whether an amend's volume is the order's whole volume or its
+  unfilled rest once partly filled; whether an amend that sends the expiration again keeps it.
+- **Order details**: which request limit the order details request counts against. A query falls
+  back to the order list where the details cannot be read.
 - **The records in `label` and `comment`**: their limits, whether the venue counts characters or
   bytes, whether it truncates or rejects an over-long field, and whether it returns them verbatim.
 - **Events not yet seen**: a stop-out and how it is flagged; a trader-update and a margin-change
   event; a protective order that triggers partially, and whether a partly filled protective order
-  reports its total volume or its rest.
+  reports its total volume or its rest (one reduced by a partial close reports the total left);
+  the events of a raise by hand, of which only the order and deal lists were recorded.
+  Every fill recorded carried the position; that every fill does is not confirmed.
 - **Matching the node's close**: whether the broker's closing order carries the volume the node's
   close asked for. The match of a close to the node's order rests on it. Also, that a closing
   order's creation time, the execution events' times and a spot's `timestamp` are all on the
   broker's one clock: the bound that keeps a trader's earlier close from being taken for the
   node's compares them.
 - **Rejected orders**: whether a rejected order carries a position id.
-- **History lists**: the order lists come in, which of an order's times the order list filters by,
+- **History lists**: the order lists come in (one position's order and deal lists were recorded
+  newest first; nothing relies on it), which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
   whether the edges of a window are inclusive, and whether the cash-flow list has no pages and
   takes at most a week.
