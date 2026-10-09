@@ -502,7 +502,14 @@ def _ask(n: Node, what: str) -> UUID4:
         ("quote ticks", "QuoteTick"),
         ("trade ticks", "TradeTick"),
         ("funding rates", "FundingRateUpdate"),
-        ("order book deltas", "OrderBookDeltas"),
+        pytest.param(
+            "order book deltas",
+            "OrderBookDeltas",
+            # Raised inside Nautilus's own engine, which floors the start with pandas' "d".
+            marks=pytest.mark.filterwarnings(
+                "ignore:'d' is deprecated:pandas.errors.Pandas4Warning",
+            ),
+        ),
         ("order book depth", "OrderBookDepth10"),
         ("order book snapshot", "OrderBookDeltas"),
         ("custom data", "CustomData"),

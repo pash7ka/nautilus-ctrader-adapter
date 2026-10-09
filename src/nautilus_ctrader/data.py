@@ -453,22 +453,27 @@ class CTraderDataClient(LiveMarketDataClient):
         cancels the client's tasks in the same loop turn the request arrived in. The task's
         done-callback answers such a request instead.
 
-        Whoever takes `request` out of `_unanswered` first answers it: the handler on its first
-        line, or a done-callback of a task cancelled before that. So it is answered once, however
-        many tasks the base class creates: their first steps are queued as they are created,
-        ahead of any done-callback of one of them cancelled afterwards.
+        The handler takes `request` out of `_unanswered` on its first line; a done-callback
+        answers only a request still there. So the cancellation path never adds a second
+        answer: a task's first step is queued when it is created, ahead of the done-callback of
+        any task cancelled afterwards. Nautilus 1.231 creates one task per request; with several
+        whose handlers all ran, each handler would answer.
         """
         self._unanswered[request.id] = request
         before = set(self._tasks)
         submit(request)
         tasks = set(self._tasks) - before
         if len(tasks) != 1 and request.id in self._unanswered and not self._task_count_warned:
-            # Nautilus 1.231 creates exactly one task per request.
             self._task_count_warned = True
-            self._log.warning(
-                f"Request {request.id} was given {len(tasks)} tasks instead of one; a request "
-                "cancelled before it starts may go unanswered",
-            )
+            if tasks:
+                self._log.warning(
+                    f"Request {request.id} was given {len(tasks)} tasks instead of one; each "
+                    "handler that runs answers it",
+                )
+            else:
+                self._log.warning(
+                    f"Request {request.id} was given no task; it may go unanswered",
+                )
         if not tasks:
             # Never scheduled: nothing will claim it.
             self._unanswered.pop(request.id, None)
