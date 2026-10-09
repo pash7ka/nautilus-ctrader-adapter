@@ -16,7 +16,7 @@ import pytest
 
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.fixtures import FAKE_ACCOUNT_ID, load_recorded
+from tests.fixtures import FAKE_ACCOUNT_ID, load_external_commands_recording, load_recorded
 
 _SPEC = importlib.util.spec_from_file_location(
     "record_fixtures",
@@ -236,6 +236,32 @@ def test_the_recorded_market_data_holds_no_number_in_a_venue_text() -> None:
     for messages in load_recorded().values():
         for message in messages:
             record_fixtures.assert_free_text_clean(message, allowed)
+
+
+def _ids(message) -> set[str]:
+    """Every order, position and deal id `message` holds, at any depth."""
+    found: set[str] = set()
+    for field, value in message.ListFields():
+        items = value if field.is_repeated else (value,)
+        if field.message_type is not None:
+            for item in items:
+                found |= _ids(item)
+        elif field.name in ("orderId", "positionId", "dealId"):
+            found.update(str(item) for item in items)
+    return found
+
+
+def test_the_recorded_commands_hold_no_unmapped_number_in_a_venue_text() -> None:
+    recording = load_external_commands_recording()
+    found = [item["message"] for item in recording["timeline"] if item["message"] is not None]
+    found += [message for items in recording["closing"].values() for message in items]
+    # The scrubber maps each id it knows to its fake, which a venue text may then name.
+    ids = set().union(*(_ids(message) for message in found))
+    allowed = {str(record_fixtures.FAKE_ACCOUNT_ID), str(record_fixtures.FAKE_TRADER_LOGIN), *ids}
+
+    for message in found:
+        record_fixtures.assert_free_text_clean(message, allowed)
+    assert any(isinstance(m, oa.ProtoOAErrorRes) and m.description for m in found)
 
 
 def _recorded_under_the_old_rules() -> bytes:

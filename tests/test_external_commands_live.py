@@ -385,3 +385,40 @@ def test_the_model_keeps_a_trailing_move_newer_than_the_answer_applied_after_it(
     book.apply(later, NoOperations())
 
     assert book.view(POSITION).levels == {Level.STOP_LOSS: Decimal("1.11770")}
+
+
+def at(move: oa.ProtoOATrailingSLChangedEvent, *, utc: int, stop: float):
+    """A copy of the recorded `move`, made at `utc` to `stop` (hand-built)."""
+    copy = type(move)()
+    copy.CopyFrom(move)
+    copy.utcLastUpdateTimestamp = utc
+    copy.stopPrice = stop
+    return copy
+
+
+def test_the_model_drops_a_trailing_move_older_than_the_answer_applied_before_it() -> None:
+    book = VenueBook(lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None)
+    book.load(SNAPSHOTS[0], {})
+    answer = LEVEL_AMENDS[0]
+    book.apply(answer, NoOperations())
+    answered_ms = answer.order.utcLastUpdateTimestamp
+
+    assert book.trailing_stop_moved(at(TRAILED[0], utc=answered_ms - 1, stop=1.1179)) == []
+    assert book.view(POSITION).levels[Level.STOP_LOSS] == Decimal("1.11778")
+
+    # One made in the answer's own millisecond, delivered after it, is taken.
+    book.trailing_stop_moved(at(TRAILED[0], utc=answered_ms, stop=1.11779))
+    assert book.view(POSITION).levels[Level.STOP_LOSS] == Decimal("1.11779")
+
+
+def test_an_answer_without_its_time_sets_its_stop_loss_on_a_trailed_position() -> None:
+    book = VenueBook(lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None)
+    book.load(SNAPSHOTS[0], {})
+    book.trailing_stop_moved(TRAILED[0])
+    unstamped = type(LEVEL_AMENDS[1])()
+    unstamped.CopyFrom(LEVEL_AMENDS[1])
+    unstamped.order.ClearField("utcLastUpdateTimestamp")
+
+    book.apply(unstamped, NoOperations())
+
+    assert book.view(POSITION).levels == {Level.STOP_LOSS: Decimal("1.11778")}

@@ -2601,14 +2601,15 @@ async def test_a_leg_modified_by_the_wrong_price_is_refused(level, change, reaso
         assert amends == []
 
 
-def trailed_at(stop: float) -> oa.ProtoOATrailingSLChangedEvent:
-    """The broker's move of the first position's trailing stop-loss, after any amend's answer."""
+def trailed_at(stop: float, *, utc: int = AMEND_FROM + 100) -> oa.ProtoOATrailingSLChangedEvent:
+    """The broker's move of the first position's trailing stop-loss, by default after any amend's
+    answer."""
     return oa.ProtoOATrailingSLChangedEvent(
         ctidTraderAccountId=ACCOUNT_ID,
         positionId=FIRST,
         orderId=FOREIGN_EVENTS[2].order.orderId,
         stopPrice=stop,
-        utcLastUpdateTimestamp=AMEND_FROM + 100,
+        utcLastUpdateTimestamp=utc,
     )
 
 
@@ -2678,6 +2679,36 @@ async def test_a_trailing_move_ahead_of_the_amends_older_answer_is_kept(foreign)
         await h.client._cancel_order(cancel(other))
         await wait_until(lambda: len(amends) == 2)
         assert levels(amends[1]) == (85160.0, None)
+
+
+@pytest.mark.parametrize("foreign", [True, False], ids=["foreign", "own"])
+async def test_a_trailing_move_made_before_the_amend_and_delivered_after_its_answer_is_dropped(
+    foreign,
+) -> None:
+    execution_venue = ExecutionVenue() if foreign else answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        if foreign:
+            stop, target = await foreign_legs(h, trailing=True)
+            leg, other = stop.client_order_id.value, target.client_order_id.value
+        else:
+            await opened_bracket(h)
+            leg, other = STOP, TARGET
+        await h.client._modify_order(modify(leg, trigger_price="85150.00"))
+        # The answer is stamped `AMEND_FROM + 1`; the move was made a millisecond earlier.
+        await push(h, trailed_at(85160.0, utc=AMEND_FROM))
+
+        order = h.cache.order(ClientOrderId(leg))
+        assert order.trigger_price == Price.from_str("85150.00")
+        moves = [e.trigger_price for e in order.events if isinstance(e, OrderUpdated)]
+        assert Price.from_str("85160.00") not in moves
+        assert h.client._book.view(FIRST).levels[Level.STOP_LOSS] == Decimal("85150.00")
+        assert h.logger.errors() == []
+
+        # The next level amend starts from the amended stop-loss.
+        await h.client._cancel_order(cancel(other))
+        await wait_until(lambda: len(amends) == 2)
+        assert levels(amends[1]) == (85150.0, None)
 
 
 def unload_us100(h) -> None:

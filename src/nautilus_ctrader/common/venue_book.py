@@ -118,6 +118,8 @@ class _Position:
     updated_ms: int = -1
     # The broker's time of the last trailing move applied, -1 for none.
     trailed_ms: int = -1
+    # The broker's time of the newest protective order state applied, -1 for none.
+    protective_ms: int = -1
 
     @property
     def ours(self) -> bool:
@@ -425,6 +427,8 @@ class VenueBook:
                     position.protective_order_id = order.orderId
                     position.protective_volume = remaining_of(order)
                     position.protective_opened_ms = opened_of(order)
+                    if order.HasField("utcLastUpdateTimestamp"):
+                        position.protective_ms = order.utcLastUpdateTimestamp
                     for leg in position.legs.values():
                         if leg.accepted:
                             leg.quantity = position.protective_volume
@@ -478,9 +482,13 @@ class VenueBook:
         # A retired id is never current.
         if event.orderId != position.protective_order_id:
             return []
+        ts = event.utcLastUpdateTimestamp
+        # Made before a protective order state already applied, which states a newer stop-loss.
+        if ts < position.protective_ms:
+            self._seen.add(key)
+            return []
         old_levels = dict(position.levels)
         position.levels[Level.STOP_LOSS] = price_of(event.stopPrice, precision)
-        ts = event.utcLastUpdateTimestamp
         position.trailed_ms = max(position.trailed_ms, ts)
         if position.ours:
             # The broker's own move: no trader's change.
@@ -1077,15 +1085,19 @@ class VenueBook:
             position.protective_opened_ms = opened_of(order)
             levels = levels_of(order, precision)
             trailed = position.levels.get(Level.STOP_LOSS)
+            stamped = order.HasField("utcLastUpdateTimestamp")
             # A trailing move can overtake the answer to an amend made before it, whose older
             # stop-loss must not undo the move.
             if (
                 order.orderId == current
+                and stamped
                 and order.utcLastUpdateTimestamp < position.trailed_ms
                 and trailed is not None
                 and Level.STOP_LOSS in levels
             ):
                 levels[Level.STOP_LOSS] = trailed
+            if stamped:
+                position.protective_ms = max(position.protective_ms, order.utcLastUpdateTimestamp)
             position.levels = levels
             position.awaiting_protection = False
         elif kind == om.ORDER_CANCELLED:

@@ -124,7 +124,8 @@ set to what the leg already holds, which follows the position (the protective or
 anything else is refused. Whether the level moved is read from the broker's answer to the amend,
 so a trailing stop-loss that moves on right after it is not taken for a refusal. A trailing move
 that reaches the adapter before that answer, but was made after it, is kept: the answer's older
-stop-loss does not set the leg back.
+stop-loss does not set the leg back. A trailing move made before the amend that arrives after its
+answer is dropped, for the same reason.
 
 **Every level amend keeps what it does not change.** Besides both levels, it sends the position's
 stop-loss trigger method again, and, while a stop-loss stays, its trailing and guaranteed flags,

@@ -505,11 +505,14 @@ confirmed:
 - **The order details request answers an order that has ended**: `ProtoOAOrderDetailsRes` with a
   cancelled order in `ORDER_STATUS_CANCELLED` and no deals.
 - **A trailing stop-loss's moves arrive only as `ProtoOATrailingSLChangedEvent`**, never as
-  execution events; one run saw 15 of them in 60 seconds. The event's `utcLastUpdateTimestamp`
-  is in milliseconds on the same clock as the execution events and the spots: it agrees within a
-  few tens of milliseconds with the spots received around it. A move changes neither the
-  protective order's nor the position's `utcLastUpdateTimestamp`: a snapshot taken after several
-  moves showed the trailed stop-loss under the time of the last amend.
+  execution events; one run saw 15 of them in 60 seconds. A move changes neither the protective
+  order's nor the position's `utcLastUpdateTimestamp`: a snapshot taken after several moves
+  showed the trailed stop-loss under the time of the last amend.
+
+In the recording, the trailing event's `utcLastUpdateTimestamp` was in milliseconds and agreed
+within a few tens of milliseconds with the times of the execution events and spots around it.
+That the spots share the execution events' clock is still **unconfirmed** (see
+[Execution](execution.md), section 10).
 
 **Unconfirmed**: whether an amend's `volume` is the order's whole volume or its unfilled rest once
 it has partly filled; whether an amend keeps an expiration it sends again (the order had none);
