@@ -189,6 +189,7 @@ def _ms(moment) -> int:
 
 
 def _with_id(orders: Iterable[om.ProtoOAOrder], order_id: int) -> om.ProtoOAOrder | None:
+    """The order among `orders` with broker order id `order_id`, if any."""
     return next((order for order in orders if order.orderId == order_id), None)
 
 
@@ -1655,7 +1656,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._expire_unapplied()
         self._count_passes()
 
-    def _bookkeep(self, record: Record) -> None:
+    def _bookkeep(self, record: Record | _Resent) -> None:
         """What the client itself learns from a record, done as soon as the model makes it."""
         if not isinstance(record, OrderEvent) or record.client_order_id is None:
             return
