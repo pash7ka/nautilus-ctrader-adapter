@@ -1600,7 +1600,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._saw_broker_time(event.utcLastUpdateTimestamp)
 
     def _saw_broker_time(self, *times_ms: int) -> None:
-        # Unset fields read as 0, which never moves the newest time.
+        # Unset fields read as 0: they move the newest time only from its initial -1, to 0.
         self._broker_ms = max(self._broker_ms, *times_ms)
 
     def _on_order_error_event(self, event: oa.ProtoOAOrderErrorEvent) -> None:

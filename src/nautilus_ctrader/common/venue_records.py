@@ -352,11 +352,17 @@ class Operations(Protocol):
         ...
 
     def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
-        """The client order id of the node's close of `volume` on that position, if in flight.
+        """The client order id of the node's close in flight that broker order `order_id` is.
 
-        `order_id` is the broker's closing order and `created_ms` its creation time, on the
-        broker's clock. A close whose own answer named `order_id` is returned; otherwise only a
-        close sent after the broker's last time the node had seen before `created_ms`. The id
-        identifies one close; the execution client consumes it once matched.
+        `order_id` is a closing order of `volume` on that position, and `created_ms` its creation
+        time on the broker's clock. Returns, checked in this order:
+
+        - the close whose own answer named `order_id`;
+        - else the earliest sent close of `volume` on that position whose answer named no other
+          order, and that was sent while the newest broker time the node had seen was earlier
+          than `created_ms`, or while it had seen none;
+        - else `None`.
+
+        The id identifies one close; the execution client consumes it once matched.
         """
         ...
