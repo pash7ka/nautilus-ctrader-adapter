@@ -164,9 +164,8 @@ def created_of(order: om.ProtoOAOrder) -> int:
     """When the broker created `order`, in ms; its last change if it carries no creation time."""
     # TODO(verify): that a closing order's `openTimestamp` is on the same clock as the broker's
     # other timestamps; every recorded closing order carries it.
-    if order.tradeData.HasField("openTimestamp"):
-        return order.tradeData.openTimestamp
-    return order.utcLastUpdateTimestamp
+    opened = opened_of(order)
+    return order.utcLastUpdateTimestamp if opened is None else opened
 
 
 def opened_of(order: om.ProtoOAOrder) -> int | None:
