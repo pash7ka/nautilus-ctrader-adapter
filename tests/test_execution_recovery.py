@@ -8,6 +8,7 @@ later ones run the client's own reconciliation pass against the fake venue's lis
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import re
 import time
@@ -1534,10 +1535,26 @@ async def test_a_position_missing_from_the_snapshot_is_read_again() -> None:
 
 # -- The levels of a position the node did not open, through the engine ----------------------
 
-# The recorded session as if it had ended an hour ago, so its deals are in the fill window.
-LATER_MS = int(time.time() * 1000) - 1_600_000_406_510 - 3_600_000
-FOREIGN = shifted(FOREIGN_EVENTS, LATER_MS)
-PROTECTED, TP_REMOVED = 3, 5  # how many of FOREIGN have come by then
+# The last time stamped in the recorded session.
+RECORDING_END_MS = 1_600_000_406_510
+PROTECTED, TP_REMOVED = 3, 5  # how many of the session's events have come by then
+
+
+@functools.cache
+def later_ms() -> int:
+    """How much later than recorded the session is replayed: read once, at the first call.
+
+    The session then ends an hour before that call, so its deals are in the fill window.
+    """
+    return int(time.time() * 1000) - RECORDING_END_MS - 3_600_000
+
+
+@functools.cache
+def foreign() -> list[Message]:
+    """The recorded session as traded by hand, `later_ms()` later than recorded."""
+    return shifted(FOREIGN_EVENTS, later_ms())
+
+
 NETTING_STRATEGY = StrategyId("S-NET-000")
 
 
@@ -1569,7 +1586,7 @@ OMS = [pytest.param(False, id="HEDGING"), pytest.param(True, id="NETTING")]
 
 def foreign_venue(at: float) -> ExecutionVenue:
     venue = ExecutionVenue()
-    serve(venue, at, mine=False, later_ms=LATER_MS)
+    serve(venue, at, mine=False, later_ms=later_ms())
     return venue
 
 
@@ -1583,10 +1600,10 @@ def leg_in(cache: Cache, venue_order_id: str):
 
 
 async def foreign_cache(oms: Oms, seen: int) -> Cache:
-    """The cache of a node that saw the first `seen` of FOREIGN live, then stopped."""
+    """The cache of a node that saw the first `seen` of `foreign()` live, then stopped."""
     async with harness() as h:
         oms.claim(h)
-        await push(h, *FOREIGN[:seen])
+        await push(h, *foreign()[:seen])
         await wait_until(lambda: leg(h, "6000001-TP") is not None, description="legs reported")
         await wait_until(lambda: not h.client._outbox, description="records delivered")
         return h.cache
@@ -1603,7 +1620,7 @@ def foreign_orders(h: Harness) -> dict[str, OrderStatus]:
 async def stop_loss_triggered(h: Harness, oms: Oms) -> None:
     """Push the stop-loss's last move and its trigger; the fill reduces the position by itself."""
     before = h.cache.position(oms.position_id).quantity.as_decimal()
-    await push(h, *FOREIGN[-2:])
+    await push(h, *foreign()[-2:])
     await wait_until(lambda: leg(h, "6000001-SL").status == OrderStatus.FILLED)
     assert leg(h, "6000001-SL").trade_ids == [TradeId("7000003")]
     after = h.cache.position(oms.position_id)
@@ -1666,7 +1683,7 @@ async def test_foreign_levels_found_at_a_reconnect_take_their_trigger(netting: b
         await started(h)
 
         # The position opened while the connection was down.
-        serve(venue, OPEN_AT, mine=False, later_ms=LATER_MS)
+        serve(venue, OPEN_AT, mine=False, later_ms=later_ms())
         await h.server.drop_connections()
         await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
         assert leg(h, "6000001-SL").status == OrderStatus.ACCEPTED
@@ -1757,7 +1774,7 @@ async def test_a_reconnect_after_a_foreign_legs_fill_reports_the_deal_once(netti
         await stop_loss_triggered(h, oms)
         before = foreign_orders(h)
 
-        serve(venue, CLOSED_AT, mine=False, later_ms=LATER_MS)
+        serve(venue, CLOSED_AT, mine=False, later_ms=later_ms())
         await h.server.drop_connections()
         await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
 
@@ -1849,7 +1866,7 @@ def order_reports(h: Harness) -> list[OrderStatusReport]:
 
 def changed_at(at: float, venue: ExecutionVenue, *, mine: bool = True) -> None:
     """Make the venue what it holds at `at`, as a reconnect pass will find it."""
-    serve(venue, at, mine=mine, later_ms=0 if mine else LATER_MS)
+    serve(venue, at, mine=mine, later_ms=0 if mine else later_ms())
 
 
 async def reconnected(h: Harness) -> None:
@@ -1926,7 +1943,7 @@ async def test_a_partial_close_in_the_gap_reduces_the_take_profit_leg() -> None:
 async def test_a_foreign_level_moved_during_a_reconnect_gap_updates_its_leg() -> None:
     venue = ExecutionVenue()
     async with harness(execution_venue=venue) as h:
-        await push(h, *FOREIGN[:PROTECTED])
+        await push(h, *foreign()[:PROTECTED])
         await wait_until(lambda: leg(h, TP) is not None, description="legs reported")
         assert leg(h, SL).trigger_price == Price.from_str("85197.20")
 
@@ -1963,7 +1980,7 @@ async def test_a_reconnect_with_nothing_changed_reports_nothing_again(mine: bool
 async def test_a_closed_order_is_never_reported_again() -> None:
     cache = await position_closed()
     venue = ExecutionVenue()
-    serve(venue, CLOSED_AT, later_ms=LATER_MS)
+    serve(venue, CLOSED_AT, later_ms=later_ms())
     # Hand-built: the take-profit's last level is not the one Nautilus holds.
     for order in venue.position_orders[FIRST]:
         if order.orderType == om.STOP_LOSS_TAKE_PROFIT:
@@ -1981,6 +1998,37 @@ async def test_a_closed_order_is_never_reported_again() -> None:
         assert order_reports(h) == []
         assert h.cache.order(ClientOrderId(TARGET)).price == held
         assert h.logger.errors() == []
+
+
+async def test_an_order_held_closed_is_not_reported_again_while_the_venue_holds_it_open() -> None:
+    async with harness() as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS[:TP_REMOVED])
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        cache = h.cache
+    held = cache.order(ClientOrderId(TARGET)).price
+
+    # The take-profit put back by hand stands at the venue under the leg Nautilus holds closed.
+    async with harness(execution_venue=serving(OPEN_AT), cache=cache) as h:
+        # Left unreconciled: reconciling the mass status would give the closed leg the report's
+        # price itself.
+        h.client._reconciled_wait_secs = 0.2
+        built = await h.client.generate_mass_status()
+        target = built.order_reports[VenueOrderId(TP)]
+        assert target.order_status == OrderStatus.ACCEPTED
+        assert target.price != held
+
+        # The stop-loss moved meanwhile and is sent again; the take-profit's leg is not.
+        await wait_until(
+            lambda: (
+                any("did not reconcile" in text for _, text in h.logger.lines)
+                and not h.client._outbox
+            ),
+        )
+        assert [r.client_order_id for r in order_reports(h)] == [ClientOrderId(STOP)]
+        assert not any(TARGET in text for _, text in h.logger.lines if "reported again" in text)
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert h.cache.order(ClientOrderId(TARGET)).price == held
 
 
 async def test_a_level_moved_is_updated_when_reconciliation_never_comes() -> None:
