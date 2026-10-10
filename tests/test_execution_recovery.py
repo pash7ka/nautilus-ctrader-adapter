@@ -1535,23 +1535,23 @@ async def test_a_position_missing_from_the_snapshot_is_read_again() -> None:
 
 # -- The levels of a position the node did not open, through the engine ----------------------
 
-# The last time stamped in the recorded session.
-RECORDING_END_MS = 1_600_000_406_510
-PROTECTED, TP_REMOVED = 3, 5  # how many of the session's events have come by then
+# The last time stamped in the first position's events: its close by the stop-loss.
+FIRST_CLOSED_MS = 1_600_000_406_510
+PROTECTED, TP_REMOVED = 3, 5  # how many of those events have come by then
 
 
 @functools.cache
 def later_ms() -> int:
-    """How much later than recorded the session is replayed: read once, at the first call.
+    """How much later than recorded those events are replayed: read once, at the first call.
 
-    The session then ends an hour before that call, so its deals are in the fill window.
+    They then end an hour before that call, so their deals are in the fill window.
     """
-    return int(time.time() * 1000) - RECORDING_END_MS - 3_600_000
+    return int(time.time() * 1000) - FIRST_CLOSED_MS - 3_600_000
 
 
 @functools.cache
 def foreign() -> list[Message]:
-    """The recorded session as traded by hand, `later_ms()` later than recorded."""
+    """The first position's events as traded by hand, `later_ms()` later than recorded."""
     return shifted(FOREIGN_EVENTS, later_ms())
 
 

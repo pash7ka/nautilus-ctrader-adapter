@@ -3178,6 +3178,42 @@ async def test_missing_levels_whose_amend_got_no_answer_leave_the_legs_with_an_e
         assert len(h.client._brackets) == 1
 
 
+async def test_a_correction_that_got_no_answer_is_not_resent_and_waits_for_the_late_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    # Taken as refusing an amend that changes nothing, since the lost one may have applied.
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+    async with harness(execution_venue=execution_venue) as h:
+        sending = await in_flight(h, held)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+        lose_amends(h, monkeypatch, ["lost"])
+        await held.release()
+        await sending
+        await push(h, *FIRST_EVENTS[1:3])
+        await wait_until(lambda: h.received(oa.ProtoOAAmendPositionSLTPReq))
+        await sync(h)
+
+        stop = h.cache.order(ClientOrderId(STOP))
+        assert refusals(h, stop) == []
+        assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderAccepted"]
+        assert len(h.received(oa.ProtoOAAmendPositionSLTPReq)) == 1
+        assert len(h.client._brackets) == 1
+        (error,) = h.logger.errors()
+        assert "whether its levels were set is unknown" in error
+
+        # The lost amend's answer, late.
+        await push(h, protective(85150.0, 85387.22, utc=AMEND_FROM))
+        await wait_until(lambda: last_kind(h, STOP) == "OrderUpdated")
+
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+        assert refusals(h, stop) == []
+        assert len(h.client._brackets) == 0
+
+
 async def test_an_amend_answered_after_a_lost_attempt_is_reported() -> None:
     execution_venue = answered(FIRST_EVENTS[:3])
     amends = echo_amends(execution_venue)

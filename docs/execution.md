@@ -85,6 +85,9 @@ exists, the adapter amends the position's levels to the exact prices requested.
 - If the broker keeps other levels than asked after three rounds, or refuses the amend, the levels
   stay where the broker set them, a WARNING is logged, and each leg reports its actual price in an
   `OrderUpdated`. Anything still showing the requested price shows the request, not the position.
+- If the amend ends as unknown ([section 1](#1-what-it-trades)), no further round is sent: the broker may
+  hold the levels already. An ERROR says that whether they were set is unknown; the legs, and any
+  cancel or modify the amend carries, wait for the broker's late answer or the next rebuild.
 - If no protective order follows the fill within `protective_order_timeout_secs`, the levels are
   set by an amend instead. If that is refused too, the legs are rejected and an ERROR is logged:
   the position stands without its levels. If it gets no answer, an ERROR says that whether the
@@ -255,7 +258,8 @@ adapter does not judge it.
   id, `EXTERNAL` or the claiming strategy's, not the id of the strategy that sent the command.
 - **A command the adapter fails to carry out**, on input it did not foresee, is refused all the
   same when it fails before its request is sent: `OrderCancelRejected` or `OrderModifyRejected`
-  naming the error's type, with an ERROR log line. Once the request is sent, the broker may have
+  naming the error's type, with an ERROR log line. The exception is a request that fails to
+  encode: it ends as unknown, with a WARNING, as an unanswered one does. Once the request is sent, the broker may have
   acted on it, so a failure while its answer is handled is never a refusal: an ERROR line names
   the command and the error's type, the order stays pending, and Nautilus's in-flight check asks
   about it ([section 5](#5-order-queries-and-in-flight-settings)).
@@ -829,7 +833,7 @@ saying what would settle it. The main groups:
   out does; what the venue does with an optional field an amend leaves out, a position's trailing
   and guaranteed flags and trigger method, or a pending order's attributes (it may keep the
   current value or apply the schema's default). The adapter always sends them, so this matters
-  only where it cannot.
+  only where it cannot. How the venue answers an amend that changes nothing.
 - **Cancels and amends of pending orders**: how the venue refuses an amend, and a cancel for any
   reason but an unknown order id; whether an amend's volume is the order's whole volume or its
   unfilled rest once partly filled; whether an amend that sends the expiration again keeps it.

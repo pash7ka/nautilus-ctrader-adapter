@@ -1241,6 +1241,9 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self._on_trailing_stop(event)
                 else:
                     self._on_execution_event(event)
+            # The rebuilt model shows what the broker holds, so an unanswered amend may be resent.
+            for bracket in self._brackets:
+                bracket.unanswered = False
             # A protective order that came during an outage arrives with the rebuild, no event.
             self._settle_brackets()
         finally:
@@ -2917,6 +2920,12 @@ class CTraderExecutionClient(LiveExecutionClient):
                 continue
             if self._wanted_levels(bracket, view) == view.levels:
                 self._bracket_done(bracket, view)
+            elif bracket.unanswered:
+                # The broker may already hold levels the model does not show: a resend changing
+                # nothing could be refused, and so refuse the commands the bracket carries. The
+                # late answer or a rebuild settles it.
+                # TODO(verify): how the venue answers an amend that changes nothing.
+                continue
             elif bracket.rounds >= _CORRECTION_ROUNDS:
                 self._bracket_refused(
                     bracket, view.position_id, "the broker kept other levels than asked"
@@ -2963,8 +2972,15 @@ class CTraderExecutionClient(LiveExecutionClient):
         if isinstance(outcome, _Refused):
             self._bracket_refused(bracket, position_id, outcome.reason)
             return
+        if outcome is None:
+            bracket.unanswered = True
         # Checked again: a cancel or modify may have come while the amend was out.
         self._settle_brackets()
+        if bracket.unanswered and self._brackets.by_entry(bracket.entry_id) is bracket:
+            self._log.error(
+                f"Bracket {bracket.entry_id}: whether its levels were set is unknown; its legs "
+                "wait for the broker's late answer or the next rebuild",
+            )
 
     def _bracket_done(self, bracket: PendingBracket, view: PositionView) -> None:
         """The broker holds the levels asked for: what waited on that is answered."""

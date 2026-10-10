@@ -16,7 +16,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
-from nautilus_ctrader.common import foreign_legs, order_record
+from nautilus_ctrader.common import foreign_legs as foreign_leg_rules
+from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.foreign_legs import ForeignLeg
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.venue_records import (
@@ -413,7 +414,7 @@ class VenueBook:
                     self._open_orders[order.orderId] = _copied(order)
         for position in self._positions.values():
             if not position.ours and position.levels:
-                notices += foreign_legs.open_legs(position, self._held_closed)
+                notices += foreign_leg_rules.open_legs(position, self._held_closed)
         return notices
 
     def apply(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
@@ -460,7 +461,7 @@ class VenueBook:
             # The broker's own move: no trader's change.
             records = self._level_changes(position, old_levels, False, ts)
         else:
-            records = foreign_legs.level_changes(position, old_levels, ts, self._held_closed)
+            records = foreign_leg_rules.level_changes(position, old_levels, ts, self._held_closed)
         self._seen.add(key)
         return records
 
@@ -478,7 +479,7 @@ class VenueBook:
             return []
         records = self._adopt(position, entry, restored=False)
         if not position.ours:
-            records += foreign_legs.level_changes(
+            records += foreign_leg_rules.level_changes(
                 position, {}, entry.utcLastUpdateTimestamp, self._held_closed
             )
         return records
@@ -774,7 +775,7 @@ class VenueBook:
         position.levels = {}
         # The deal is what ended the legs, so their cancels take its time, as reconciliation's do.
         ts = deal.executionTimestamp
-        return self._cancel_legs(position, ts) + foreign_legs.cancel_all(position, ts)
+        return self._cancel_legs(position, ts) + foreign_leg_rules.cancel_all(position, ts)
 
     @staticmethod
     def _activity(
@@ -958,7 +959,7 @@ class VenueBook:
                 )
             if learnt and position.levels:
                 # Levels seen before their entry get their legs now, after the entry's report.
-                records += foreign_legs.level_changes(
+                records += foreign_leg_rules.level_changes(
                     position, {}, order.utcLastUpdateTimestamp, self._held_closed
                 )
         if filled and order.isStopOut:
@@ -1109,7 +1110,7 @@ class VenueBook:
             return []
         self._sync(position, event)
         if not position.ours:
-            return foreign_legs.level_changes(
+            return foreign_leg_rules.level_changes(
                 position, old_levels, order.utcLastUpdateTimestamp, self._held_closed
             )
         manual = not event.isServerEvent and not operations.amending(position.position_id)
@@ -1224,7 +1225,7 @@ class VenueBook:
             if leg.filled >= leg.quantity:
                 leg.alive = False
         elif not position.ours and foreign is not None and foreign.alive:
-            records += foreign_legs.filled(foreign, deal.filledVolume, fill)
+            records += foreign_leg_rules.filled(foreign, deal.filledVolume, fill)
         elif order.orderId in self._reported:
             records.append(
                 OrderEvent(OrderEventKind.FILLED, str(order.orderId), None, fill.ts_ms, fill=fill)

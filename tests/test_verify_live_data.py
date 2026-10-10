@@ -880,8 +880,10 @@ async def test_item_9_asks_both_lists_over_the_three_windows_read_only(monkeypat
     deals = oa.ProtoOADealListRes(deal=[om.ProtoOADeal(dealId=5)], hasMore=False)
     orders = oa.ProtoOAOrderListRes(order=[om.ProtoOAOrder(orderId=6)], hasMore=False)
     refused = CTraderRequestError("INVALID_REQUEST", description="secret description")
+    # Refused early, so the requests behind it show the probe goes on.
     verifier, connection = _edge_verifier(
-        [deals, deals, oa.ProtoOADealListRes(), orders, orders, refused], monkeypatch
+        [deals, refused, oa.ProtoOADealListRes(), orders, orders, oa.ProtoOAOrderListRes()],
+        monkeypatch,
     )
 
     status, detail = await verifier._probe_future_windows()
@@ -899,7 +901,7 @@ async def test_item_9_asks_both_lists_over_the_three_windows_read_only(monkeypat
     ]
     assert _windows(connection) == windows * 2
     assert status == DIFFERS
-    assert "order list, an hour past now to a day past now: refused with INVALID_REQUEST" in detail
+    assert f"deal list, {v._WINDOW_PAST_NOW}: refused with INVALID_REQUEST" in detail
     assert not any("secret description" in line for line in detail)
 
 

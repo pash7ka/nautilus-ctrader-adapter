@@ -91,6 +91,7 @@ class PendingBracket:
     - `requested`: the exact price asked for each leg's level, a later modify included.
     - `cancels`, `modified`: levels whose leg was cancelled or modified meanwhile.
     - `correcting`: the amend is under way; `rounds` counts the amends sent.
+    - `unanswered`: the last amend got no answer; no other goes out until a rebuild.
     """
 
     entry_id: str
@@ -100,6 +101,7 @@ class PendingBracket:
     modified: set[Level] = field(default_factory=set)
     correcting: bool = False
     rounds: int = 0
+    unanswered: bool = False
 
 
 class PendingBrackets:

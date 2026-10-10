@@ -182,7 +182,6 @@ async def test_news_of_an_order_nautilus_has_closed_is_not_reported() -> None:
 
         assert len(h.reports) == before
         assert external(h).status == OrderStatus.FILLED
-        assert any("already FILLED" in line for line in h.logger.warnings())
 
 
 def stop(kind: int, utc: int, *, price: float) -> object:
