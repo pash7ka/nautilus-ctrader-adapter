@@ -360,11 +360,12 @@ class Operations(Protocol):
         ...
 
     def late_amend(self, position_id: int, levels: dict[Level, Decimal]) -> bool:
-        """Whether `levels`, just set on that position, are those of the node's amend whose
-        answer was lost.
+        """Whether `levels`, just set on that position, are those of the oldest of the node's
+        amends whose answers were lost.
 
-        Asked at each event of the position's protective order that is not the broker's own; the
-        lost amend is forgotten once asked, so a trader's later change is never taken for it.
+        Asked at each protective event of the position that the broker did not originate. A match
+        forgets that amend; a mismatch forgets them all, so a trader's later change is never taken
+        for one.
         """
         ...
 

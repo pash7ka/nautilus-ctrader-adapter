@@ -777,10 +777,10 @@ sign flipped to Nautilus's convention (a charge is positive).
   node's close reached the broker, is taken for the node's. This includes a close whose answer
   was lost: until the next successful reconnect pass, such a trader's close of the same volume on
   that position during the outage is taken for the node's. Likewise for a level amend whose answer
-  was lost: the next event of that position's protective order that is not the broker's own is
+  was lost: the next protective event of that position that the broker did not originate is
   taken for its late answer when it sets exactly the levels the amend asked for, so a trader's
-  change to those very levels is not reported. Any other such event, or the next rebuild, ends
-  this.
+  change to those very levels is not reported. Several lost amends are matched in the order they
+  were sent. Any other such event, or the next rebuild, ends this.
 - **On the node's own position, a level re-added by hand after its leg was cancelled is adopted
   after a restart.** After a restart a leg lives exactly while its level does, so the level a
   trader put back makes the leg alive again under its original id. Before the restart, the same

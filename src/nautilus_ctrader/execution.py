@@ -2937,9 +2937,12 @@ class CTraderExecutionClient(LiveExecutionClient):
                 # TODO(verify): how the venue answers an amend that changes nothing.
                 continue
             elif bracket.rounds >= _CORRECTION_ROUNDS:
-                self._bracket_refused(
-                    bracket, view.position_id, "the broker kept other levels than asked"
+                reason = (
+                    "the broker did not answer the correction"
+                    if bracket.answer_lost
+                    else "the broker kept other levels than asked"
                 )
+                self._bracket_refused(bracket, view.position_id, reason)
             else:
                 bracket.correcting = True
                 bracket.rounds += 1
@@ -2986,6 +2989,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         if isinstance(outcome, _Refused):
             self._bracket_refused(bracket, position_id, outcome.reason)
             return
+        bracket.answer_lost = outcome is None
         bracket.unanswered = sent if outcome is None else None
         # Checked again: a cancel or modify may have come while the amend was out.
         self._settle_brackets()
@@ -3002,6 +3006,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         The limit keeps a lost amend that never applied (refused, or never sent) from holding the
         commands the bracket carries until a rebuild.
         """
+        # A detach while the amend was out stopped the client: nothing may be armed now.
+        if self._session is None:
+            return
         wait_secs = self._config.protective_order_timeout_secs
         self._log.error(
             f"Bracket {bracket.entry_id}: whether its levels were set is unknown; its legs wait "
@@ -3010,6 +3017,8 @@ class CTraderExecutionClient(LiveExecutionClient):
 
         def released() -> None:
             self._protection_timers.discard(timer)
+            if self._session is None:
+                return
             # A later lost amend holds by its own timer.
             if bracket.unanswered is sent and self._brackets.by_entry(bracket.entry_id) is bracket:
                 bracket.unanswered = None

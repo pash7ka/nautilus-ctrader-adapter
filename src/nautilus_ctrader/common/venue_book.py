@@ -1109,7 +1109,7 @@ class VenueBook:
         else:
             return []
         self._sync(position, event)
-        # Asked for a foreign position too: a lost amend's wait ends at any such event.
+        # Asked for a foreign position too, so its lost amends are matched or forgotten.
         late = not event.isServerEvent and operations.late_amend(
             position.position_id, position.levels
         )
