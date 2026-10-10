@@ -97,6 +97,21 @@ def foreign_leg(
     )
 
 
+def open_legs(position: ForeignPosition, held_closed: Callable[[str], bool]) -> list[Record]:
+    """Open a leg for each standing level of a position just loaded, telling Nautilus nothing.
+
+    Reconciliation reports these legs, at the generation chosen here from the same
+    `held_closed`. Returns an `EntryUnknown` instead when the position's entry is not known.
+    """
+    if position.entry_order_id is None:
+        return _entry_unknown(position)
+    for level in _LEVELS:
+        leg = position.foreign_legs.get(level)
+        if level in position.levels and (leg is None or not leg.alive):
+            _open(position, level, held_closed)
+    return []
+
+
 def level_changes(
     position: ForeignPosition,
     old_levels: dict[Level, Decimal],
@@ -110,10 +125,7 @@ def level_changes(
     says whether Nautilus holds a venue order id as a closed order.
     """
     if position.entry_order_id is None:
-        if not position.levels or position.entry_unknown_told:
-            return []
-        position.entry_unknown_told = True
-        return [EntryUnknown(position.position_id)]
+        return _entry_unknown(position)
     records: list[Record] = []
     for level in _LEVELS:
         old, new = old_levels.get(level), position.levels.get(level)
@@ -190,13 +202,18 @@ def _rest(position: ForeignPosition) -> int:
     return position.protective_volume
 
 
-def _new_leg(
-    position: ForeignPosition,
-    level: Level,
-    price: Decimal,
-    ts: int,
-    held_closed: Callable[[str], bool],
-) -> ExternalOrder:
+def _entry_unknown(position: ForeignPosition) -> list[Record]:
+    """An `EntryUnknown` the first time a position with levels has no known entry."""
+    if not position.levels or position.entry_unknown_told:
+        return []
+    position.entry_unknown_told = True
+    return [EntryUnknown(position.position_id)]
+
+
+def _open(
+    position: ForeignPosition, level: Level, held_closed: Callable[[str], bool]
+) -> ForeignLeg:
+    """A new leg for `level`, at the first generation Nautilus does not hold closed."""
     assert position.entry_order_id is not None
     last = position.foreign_legs.get(level)
     # A generation this model ended may not have reached Nautilus's cache yet.
@@ -207,9 +224,20 @@ def _new_leg(
         venue_order_id = leg_venue_order_id(position.entry_order_id, level, generation)
     leg = ForeignLeg(venue_order_id, generation, _rest(position))
     position.foreign_legs[level] = leg
+    return leg
+
+
+def _new_leg(
+    position: ForeignPosition,
+    level: Level,
+    price: Decimal,
+    ts: int,
+    held_closed: Callable[[str], bool],
+) -> ExternalOrder:
+    leg = _open(position, level, held_closed)
     accepted = _accepted_ms(position, ts)
     return foreign_leg(
-        venue_order_id,
+        leg.venue_order_id,
         level,
         symbol_id=position.symbol_id,
         position_id=position.position_id,

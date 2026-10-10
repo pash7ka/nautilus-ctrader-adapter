@@ -24,7 +24,6 @@ from nautilus_ctrader.common.venue_records import (
     Activity,
     ActivityKind,
     AwaitProtection,
-    EntryUnknown,
     Exposure,
     ExternalOrder,
     ExternalType,
@@ -414,12 +413,7 @@ class VenueBook:
                     self._open_orders[order.orderId] = _copied(order)
         for position in self._positions.values():
             if not position.ours and position.levels:
-                # Reconciliation reports the standing levels' legs, at the generation chosen here
-                # from the same cache, so this says nothing of them.
-                changes = foreign_legs.level_changes(
-                    position, {}, position.updated_ms, self._held_closed
-                )
-                notices += [record for record in changes if isinstance(record, EntryUnknown)]
+                notices += foreign_legs.open_legs(position, self._held_closed)
         return notices
 
     def apply(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
