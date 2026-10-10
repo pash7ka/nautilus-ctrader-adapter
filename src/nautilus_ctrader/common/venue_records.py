@@ -359,6 +359,15 @@ class Operations(Protocol):
         """Whether the node's own level amend of that position is in flight."""
         ...
 
+    def late_amend(self, position_id: int, levels: dict[Level, Decimal]) -> bool:
+        """Whether `levels`, just set on that position, are those of the node's amend whose
+        answer was lost.
+
+        Asked at each event of the position's protective order that is not the broker's own; the
+        lost amend is forgotten once asked, so a trader's later change is never taken for it.
+        """
+        ...
+
     def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
         """The client order id of the node's in-flight close that broker order `order_id` carries
         out, if any.

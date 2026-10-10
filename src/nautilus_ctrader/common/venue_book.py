@@ -1109,11 +1109,17 @@ class VenueBook:
         else:
             return []
         self._sync(position, event)
+        # Asked for a foreign position too: a lost amend's wait ends at any such event.
+        late = not event.isServerEvent and operations.late_amend(
+            position.position_id, position.levels
+        )
         if not position.ours:
             return foreign_leg_rules.level_changes(
                 position, old_levels, order.utcLastUpdateTimestamp, self._held_closed
             )
-        manual = not event.isServerEvent and not operations.amending(position.position_id)
+        manual = (
+            not event.isServerEvent and not late and not operations.amending(position.position_id)
+        )
         return self._level_changes(position, old_levels, manual, order.utcLastUpdateTimestamp)
 
     def _level_changes(

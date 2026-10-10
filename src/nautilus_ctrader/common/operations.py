@@ -17,11 +17,14 @@ class OperationsInFlight:
     """The node's level amends and closes the broker has not answered yet.
 
     An entry lives until its answer, its refusal or its timeout, so a lost answer never leaves one
-    behind to take a trader's later change for the node's own.
+    behind to take a trader's later change for the node's own. The one exception is the levels
+    of an amend whose answer was lost: they are kept for that answer, coming late, only until the
+    next event of the position's protective order or the next rebuild.
     """
 
     def __init__(self) -> None:
         self._amends: dict[int, int] = {}
+        self._lost_amends: dict[int, dict[Level, Decimal]] = {}
         # Client order id of each close -> (position id, venue volume, anchor in broker ms).
         self._closes: dict[str, tuple[int, int, int]] = {}
         # Client order id of each close -> the broker order its own answer named.
@@ -39,6 +42,16 @@ class OperationsInFlight:
 
     def amending(self, position_id: int) -> bool:
         return position_id in self._amends
+
+    def lost_amend(self, position_id: int, levels: dict[Level, Decimal]) -> None:
+        """The amend setting `levels` got no answer; the broker may still send it."""
+        self._lost_amends[position_id] = dict(levels)
+
+    def late_amend(self, position_id: int, levels: dict[Level, Decimal]) -> bool:
+        return self._lost_amends.pop(position_id, None) == levels
+
+    def forget_lost_amends(self) -> None:
+        self._lost_amends.clear()
 
     def begin_close(
         self, client_order_id: str, position_id: int, volume: int, anchor_ms: int
@@ -91,7 +104,7 @@ class PendingBracket:
     - `requested`: the exact price asked for each leg's level, a later modify included.
     - `cancels`, `modified`: levels whose leg was cancelled or modified meanwhile.
     - `correcting`: the amend is under way; `rounds` counts the amends sent.
-    - `unanswered`: the last amend got no answer; no other goes out until a rebuild.
+    - `unanswered`: the levels of the last amend, whose answer was lost; they are not sent again.
     """
 
     entry_id: str
@@ -101,7 +114,7 @@ class PendingBracket:
     modified: set[Level] = field(default_factory=set)
     correcting: bool = False
     rounds: int = 0
-    unanswered: bool = False
+    unanswered: dict[Level, Decimal] | None = None
 
 
 class PendingBrackets:

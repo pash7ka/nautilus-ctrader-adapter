@@ -85,9 +85,11 @@ exists, the adapter amends the position's levels to the exact prices requested.
 - If the broker keeps other levels than asked after three rounds, or refuses the amend, the levels
   stay where the broker set them, a WARNING is logged, and each leg reports its actual price in an
   `OrderUpdated`. Anything still showing the requested price shows the request, not the position.
-- If the amend ends as unknown ([section 1](#1-what-it-trades)), no further round is sent: the broker may
-  hold the levels already. An ERROR says that whether they were set is unknown; the legs, and any
-  cancel or modify the amend carries, wait for the broker's late answer or the next rebuild.
+- If the amend ends as unknown ([section 1](#1-what-it-trades)), that amend is not repeated: the
+  broker may hold its levels already. An ERROR says that whether they were set is unknown. The
+  legs, and any cancel or modify the amend carries, wait for the broker's late answer or the next
+  rebuild, for at most `protective_order_timeout_secs`; then a new round is sent. A cancel or a
+  modify of a leg that arrives meanwhile is sent at once, in a new round.
 - If no protective order follows the fill within `protective_order_timeout_secs`, the levels are
   set by an amend instead. If that is refused too, the legs are rejected and an ERROR is logged:
   the position stands without its levels. If it gets no answer, an ERROR says that whether the
@@ -259,8 +261,9 @@ adapter does not judge it.
 - **A command the adapter fails to carry out**, on input it did not foresee, is refused all the
   same when it fails before its request is sent: `OrderCancelRejected` or `OrderModifyRejected`
   naming the error's type, with an ERROR log line. The exception is a request that fails to
-  encode: it ends as unknown, with a WARNING, as an unanswered one does. Once the request is sent, the broker may have
-  acted on it, so a failure while its answer is handled is never a refusal: an ERROR line names
+  encode: it ends as unknown, with a WARNING, as an unanswered one does. Once the request is
+  sent, the broker may have acted on it, so a failure while its answer is handled is never a
+  refusal: an ERROR line names
   the command and the error's type, the order stays pending, and Nautilus's in-flight check asks
   about it ([section 5](#5-order-queries-and-in-flight-settings)).
 - A cancel or an amend of a pending order that gets no answer is not sent again: a WARNING says
@@ -773,7 +776,11 @@ sign flipped to Nautilus's convention (a charge is positive).
   clock. So a trader's close created after the last broker stamp the node saw, but before the
   node's close reached the broker, is taken for the node's. This includes a close whose answer
   was lost: until the next successful reconnect pass, such a trader's close of the same volume on
-  that position during the outage is taken for the node's.
+  that position during the outage is taken for the node's. Likewise for a level amend whose answer
+  was lost: the next event of that position's protective order that is not the broker's own is
+  taken for its late answer when it sets exactly the levels the amend asked for, so a trader's
+  change to those very levels is not reported. Any other such event, or the next rebuild, ends
+  this.
 - **On the node's own position, a level re-added by hand after its leg was cancelled is adopted
   after a restart.** After a restart a leg lives exactly while its level does, so the level a
   trader put back makes the leg alive again under its original id. Before the restart, the same

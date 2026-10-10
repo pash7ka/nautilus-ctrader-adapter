@@ -1243,7 +1243,8 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self._on_execution_event(event)
             # The rebuilt model shows what the broker holds, so an unanswered amend may be resent.
             for bracket in self._brackets:
-                bracket.unanswered = False
+                bracket.unanswered = None
+            self._operations.forget_lost_amends()
             # A protective order that came during an outage arrives with the rebuild, no event.
             self._settle_brackets()
         finally:
@@ -2216,6 +2217,8 @@ class CTraderExecutionClient(LiveExecutionClient):
                 self._sort_cancel(client_order_id, by_position, foreign, orders)
             except Exception as e:
                 self._cancel_rejected(client_order_id, self._failed("Cancel", [client_order_id], e))
+        # A bracket holding a lost amend sends the cancels recorded on it, in one round.
+        self._settle_brackets()
         await asyncio.gather(
             *(
                 self._cancel_guarded(self._remove_levels(position_id, legs), legs.values())
@@ -2479,6 +2482,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             bracket = pending[0]
             bracket.requested[level] = price.as_decimal()
             bracket.modified.add(level)
+            # A bracket holding a lost amend sends the modify now.
+            self._settle_brackets()
             return
         wanted = price.as_decimal()
         what = _command("Modify", [client_order_id])
@@ -2804,7 +2809,11 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._operations.begin_amend(position_id)
             try:
                 outcome = await self._send_amend(request, what=what)
-                if outcome is None or isinstance(outcome, _Refused):
+                if outcome is None:
+                    # Its answer may still come; the model then takes it for the node's.
+                    self._operations.lost_amend(position_id, levels)
+                    return None
+                if isinstance(outcome, _Refused):
                     return outcome
                 with self._after_send(what):
                     if not isinstance(outcome, oa.ProtoOAExecutionEvent):
@@ -2918,12 +2927,13 @@ class CTraderExecutionClient(LiveExecutionClient):
                 continue
             if view is None or view.protective_order_id is None:
                 continue
-            if self._wanted_levels(bracket, view) == view.levels:
+            wanted = self._wanted_levels(bracket, view)
+            if wanted == view.levels:
                 self._bracket_done(bracket, view)
-            elif bracket.unanswered:
-                # The broker may already hold levels the model does not show: a resend changing
-                # nothing could be refused, and so refuse the commands the bracket carries. The
-                # late answer or a rebuild settles it.
+            elif wanted == bracket.unanswered:
+                # The broker may already hold them while the model does not show it: a resend
+                # changing nothing could be refused, and so refuse the commands the bracket
+                # carries. Its late answer, a rebuild or the release timer settles it.
                 # TODO(verify): how the venue answers an amend that changes nothing.
                 continue
             elif bracket.rounds >= _CORRECTION_ROUNDS:
@@ -2961,26 +2971,52 @@ class CTraderExecutionClient(LiveExecutionClient):
         return levels
 
     async def _correct(self, bracket: PendingBracket, position_id: int) -> None:
+        sent: dict[Level, Decimal] = {}
+
+        def levels_of(view: PositionView) -> dict[Level, Decimal]:
+            sent.update(self._wanted_levels(bracket, view))
+            return dict(sent)
+
         try:
             outcome = await self._amend(
-                position_id,
-                lambda view: self._wanted_levels(bracket, view),
-                what=f"Levels of bracket {bracket.entry_id}",
+                position_id, levels_of, what=f"Levels of bracket {bracket.entry_id}"
             )
         finally:
             bracket.correcting = False
         if isinstance(outcome, _Refused):
             self._bracket_refused(bracket, position_id, outcome.reason)
             return
-        if outcome is None:
-            bracket.unanswered = True
+        bracket.unanswered = sent if outcome is None else None
         # Checked again: a cancel or modify may have come while the amend was out.
         self._settle_brackets()
-        if bracket.unanswered and self._brackets.by_entry(bracket.entry_id) is bracket:
-            self._log.error(
-                f"Bracket {bracket.entry_id}: whether its levels were set is unknown; its legs "
-                "wait for the broker's late answer or the next rebuild",
-            )
+        if (
+            bracket.unanswered is sent
+            and not bracket.correcting
+            and self._brackets.by_entry(bracket.entry_id) is bracket
+        ):
+            self._hold_unanswered(bracket, sent)
+
+    def _hold_unanswered(self, bracket: PendingBracket, sent: dict[Level, Decimal]) -> None:
+        """Hold the bracket's lost amend unsent for at most `protective_order_timeout_secs`.
+
+        The limit keeps a lost amend that never applied (refused, or never sent) from holding the
+        commands the bracket carries until a rebuild.
+        """
+        wait_secs = self._config.protective_order_timeout_secs
+        self._log.error(
+            f"Bracket {bracket.entry_id}: whether its levels were set is unknown; its legs wait "
+            f"up to {wait_secs:g}s for the broker's late answer, a new command or a rebuild",
+        )
+
+        def released() -> None:
+            self._protection_timers.discard(timer)
+            # A later lost amend holds by its own timer.
+            if bracket.unanswered is sent and self._brackets.by_entry(bracket.entry_id) is bracket:
+                bracket.unanswered = None
+                self._settle_brackets()
+
+        timer = self._loop.call_later(wait_secs, released)
+        self._protection_timers.add(timer)
 
     def _bracket_done(self, bracket: PendingBracket, view: PositionView) -> None:
         """The broker holds the levels asked for: what waited on that is answered."""

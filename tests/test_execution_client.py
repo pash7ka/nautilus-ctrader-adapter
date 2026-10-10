@@ -3178,24 +3178,51 @@ async def test_missing_levels_whose_amend_got_no_answer_leave_the_legs_with_an_e
         assert len(h.client._brackets) == 1
 
 
-async def test_a_correction_that_got_no_answer_is_not_resent_and_waits_for_the_late_answer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def refusing_amends(*, first_only: bool) -> tuple[ExecutionVenue, HeldReplies, list]:
+    """A venue whose entry answer is held and that refuses amends; returns the amends it got.
+
+    Refused amends are taken as ones that change nothing, since the lost one may have applied.
+    With `first_only`, later amends set whatever they ask for.
+    """
     execution_venue = ExecutionVenue()
     held = HeldReplies(
         execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
     )
-    # Taken as refusing an amend that changes nothing, since the lost one may have applied.
-    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
-    async with harness(execution_venue=execution_venue) as h:
-        sending = await in_flight(h, held)
-        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
-        lose_amends(h, monkeypatch, ["lost"])
-        await held.release()
-        await sending
-        await push(h, *FIRST_EVENTS[1:3])
-        await wait_until(lambda: h.received(oa.ProtoOAAmendPositionSLTPReq))
-        await sync(h)
+    received: list = []
+    echo = amend_echo([])
+
+    def answer(request):
+        received.append(request)
+        return echo(request) if first_only and len(received) > 1 else REFUSED_STOPS
+
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, answer)
+    return execution_venue, held, received
+
+
+async def lost_correction(h, held: HeldReplies, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bracket's correction, carrying a stop-loss modify, loses its first answer.
+
+    Its repeat is refused, so it ends unknown and the bracket holds it.
+    """
+    sending = await in_flight(h, held)
+    await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+    lose_amends(h, monkeypatch, ["lost"])
+    await held.release()
+    await sending
+    await push(h, *FIRST_EVENTS[1:3])
+    await wait_until(lambda: h.received(oa.ProtoOAAmendPositionSLTPReq))
+    await sync(h)
+
+
+HOLDING = exec_config(protective_order_timeout_secs=30.0)
+
+
+async def test_a_correction_that_got_no_answer_is_not_resent_and_waits_for_the_late_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held, _ = refusing_amends(first_only=False)
+    async with harness(execution_venue=execution_venue, config=HOLDING) as h:
+        await lost_correction(h, held, monkeypatch)
 
         stop = h.cache.order(ClientOrderId(STOP))
         assert refusals(h, stop) == []
@@ -3212,6 +3239,98 @@ async def test_a_correction_that_got_no_answer_is_not_resent_and_waits_for_the_l
         await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
         assert refusals(h, stop) == []
         assert len(h.client._brackets) == 0
+        # The node's own amend is no trader's change.
+        assert h.activity == []
+
+
+async def test_a_cancel_after_a_lost_correction_goes_out_in_a_new_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held, received = refusing_amends(first_only=True)
+    async with harness(execution_venue=execution_venue, config=HOLDING) as h:
+        await lost_correction(h, held, monkeypatch)
+        await h.client._cancel_order(cancel(TARGET))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderCanceled")
+
+        (_, amend) = received
+        assert amend.stopLoss == 85150.0
+        assert not amend.HasField("takeProfit")
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85150.00"),
+        )
+        assert refusals(h, h.cache.order(ClientOrderId(STOP))) == []
+        assert len(h.client._brackets) == 0
+
+
+async def test_a_modify_after_a_lost_correction_goes_out_in_a_new_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held, received = refusing_amends(first_only=True)
+    async with harness(execution_venue=execution_venue, config=HOLDING) as h:
+        await lost_correction(h, held, monkeypatch)
+        await h.client._modify_order(modify(STOP, trigger_price="85100.00"))
+        stop = h.cache.order(ClientOrderId(STOP))
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85100.00"))
+
+        (_, amend) = received
+        assert amend.stopLoss == 85100.0
+        assert refusals(h, stop) == []
+        assert len(h.client._brackets) == 0
+
+
+async def test_a_held_correction_is_released_after_the_protective_order_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held, received = refusing_amends(first_only=True)
+    config = exec_config(protective_order_timeout_secs=0.3)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await lost_correction(h, held, monkeypatch)
+        assert len(received) == 1
+
+        stop = h.cache.order(ClientOrderId(STOP))
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+        (_, amend) = received
+        assert amend.stopLoss == 85150.0
+        assert refusals(h, stop) == []
+        assert len(h.client._brackets) == 0
+
+
+async def test_a_rebuild_releases_a_held_correction(monkeypatch: pytest.MonkeyPatch) -> None:
+    execution_venue, held, received = refusing_amends(first_only=True)
+    async with harness(execution_venue=execution_venue, config=HOLDING) as h:
+        await lost_correction(h, held, monkeypatch)
+        assert len(received) == 1
+
+        our_open_position(execution_venue)
+        await h.client._load()
+        stop = h.cache.order(ClientOrderId(STOP))
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+
+        (_, amend) = received
+        assert amend.stopLoss == 85150.0
+        assert refusals(h, stop) == []
+        assert len(h.client._brackets) == 0
+
+
+@pytest.mark.parametrize("trader_moved", [False, True], ids=["late-answer", "trader-change"])
+async def test_a_lost_amend_answered_late_is_no_trader_change_but_a_later_change_is(
+    monkeypatch: pytest.MonkeyPatch, trader_moved: bool
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        lose_amends(h, monkeypatch, ["lost", "lost", "lost"])
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await sync(h)
+
+        target = 85450.0 if trader_moved else 85400.0
+        await push(h, protective(85197.2, target, utc=AMEND_FROM))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated")
+        await sync(h)
+
+        kinds = [(a.kind, a.action) for a in h.activity]
+        assert kinds == ([("manual_change", "level_moved")] if trader_moved else [])
 
 
 async def test_an_amend_answered_after_a_lost_attempt_is_reported() -> None:

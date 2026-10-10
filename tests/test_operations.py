@@ -31,6 +31,30 @@ def test_ending_an_amend_never_begun_changes_nothing() -> None:
     assert not table.amending(1)
 
 
+LOST = {Level.STOP_LOSS: Decimal("85150.00"), Level.TAKE_PROFIT: Decimal("85400.00")}
+
+
+def test_a_lost_amend_is_matched_once_by_its_levels_on_its_position() -> None:
+    table = OperationsInFlight()
+    table.lost_amend(1, LOST)
+
+    assert not table.late_amend(2, LOST)
+    same = {Level.STOP_LOSS: Decimal("85150"), Level.TAKE_PROFIT: Decimal("85400.0")}
+    assert table.late_amend(1, same)
+    assert not table.late_amend(1, LOST)
+
+
+def test_a_lost_amend_ends_at_another_change_or_when_forgotten() -> None:
+    table = OperationsInFlight()
+    table.lost_amend(1, LOST)
+    table.lost_amend(2, LOST)
+
+    assert not table.late_amend(1, {Level.STOP_LOSS: Decimal("85150.00")})
+    assert not table.late_amend(1, LOST)
+    table.forget_lost_amends()
+    assert not table.late_amend(2, LOST)
+
+
 # The newest broker time the node had seen when it sent the close.
 ANCHOR = 1_000
 LATER = ANCHOR + 1
