@@ -862,8 +862,9 @@ saying what would settle it. The main groups:
 - **History lists**: the order lists come in (one position's order and deal lists were recorded
   newest first; nothing relies on it), which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
-  whether the edges of a window are inclusive, whether a window may end in the future, and
-  whether the cash-flow list has no pages and takes at most a week.
+  whether the edges of a window are inclusive, and whether the cash-flow list has no pages and
+  takes at most a week. That the deal and order lists answer a window ending in the future is
+  confirmed.
 - **The balance checkpoint**: that an account's first funding is a balance deposit, and the sign
   of a withdrawal's amount.
 

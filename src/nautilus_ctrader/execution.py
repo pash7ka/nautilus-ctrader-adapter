@@ -1145,10 +1145,9 @@ class CTraderExecutionClient(LiveExecutionClient):
 
         The node's clock may run behind the broker's, and a window ending at the node's now would
         miss what the broker stamped since. The broker lists only what exists, so a window that
-        ends later reads nothing extra.
+        ends later reads nothing extra. The deal and order lists answer such a window (confirmed
+        live).
         """
-        # TODO(verify): that the deal and order lists answer a window that ends in the future;
-        # item 9 of scripts/verify_live_data.py asks it.
         return max(self._clock.timestamp_ms(), self._broker_ms) + _WINDOW_MARGIN_MS
 
     def _hold_buffer(self) -> None:
