@@ -32,6 +32,7 @@ from nautilus_ctrader.common.venue_records import (
     ReportedOrder,
     ReportedPosition,
     ReportStatus,
+    leg_prices,
     leg_venue_order_id,
     money_of,
     parse_leg_venue_order_id,
@@ -702,14 +703,13 @@ class _Position:
         if source is not None and source.tradeData.HasField("openTimestamp"):
             # A leg is accepted once its level is set, never before the entry filled.
             accepted = max(source.tradeData.openTimestamp, first_fill)
-        level_price = levels.get(level)
-        stop = level == Level.STOP_LOSS
+        limit, trigger = leg_prices(level, levels.get(level))
         return ReportedOrder(
             venue_order_id=venue_order_id or leg_venue_order_id(self.entry.orderId, level),
             client_order_id=leg_id,
             symbol_id=self.entry.tradeData.symbolId,
             side=_OPPOSITE[self.side],
-            order_type=ExternalType.STOP_MARKET if stop else ExternalType.LIMIT,
+            order_type=ExternalType.STOP_MARKET if level == Level.STOP_LOSS else ExternalType.LIMIT,
             status=status,
             units=units,
             filled_units=filled,
@@ -718,8 +718,8 @@ class _Position:
             ts_accepted_ms=accepted,
             ts_ms=max(ts_ms, accepted),
             avg_price=_average(fills, self.precision),
-            price=None if stop else level_price,
-            trigger_price=level_price if stop else None,
+            price=limit,
+            trigger_price=trigger,
             time_in_force=_GOOD_TILL_CANCEL,
             parent_order_id=entry_id,
             linked_order_ids=linked,

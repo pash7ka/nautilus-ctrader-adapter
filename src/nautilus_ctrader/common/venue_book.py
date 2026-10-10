@@ -36,6 +36,7 @@ from nautilus_ctrader.common.venue_records import (
     OrderEventKind,
     ProtectionMissing,
     Record,
+    leg_prices,
     leg_venue_order_id,
     money_of,
     parse_leg_venue_order_id,
@@ -746,7 +747,7 @@ class VenueBook:
         price: Decimal | None = None,
         fill: Fill | None = None,
     ) -> OrderEvent:
-        stop = level == Level.STOP_LOSS
+        limit, trigger = leg_prices(level, price)
         return OrderEvent(
             kind,
             self._leg_id(position, level),
@@ -754,8 +755,8 @@ class VenueBook:
             ts_ms,
             fill=fill,
             quantity=quantity,
-            price=None if stop else price,
-            trigger_price=price if stop else None,
+            price=limit,
+            trigger_price=trigger,
         )
 
     def _cancel_legs(self, position: _Position, ts_ms: int) -> list[Record]:

@@ -71,6 +71,14 @@ def parse_leg_venue_order_id(text: str) -> tuple[int, Level, int] | None:
     return int(entry), Level(level), 1 if generation is None else int(generation)
 
 
+def leg_prices(level: Level, price: Decimal | None) -> tuple[Decimal | None, Decimal | None]:
+    """A leg's `price` and `trigger_price` at the level `price`.
+
+    A stop-loss triggers at its level; a take-profit is a limit at it.
+    """
+    return (None, price) if level == Level.STOP_LOSS else (price, None)
+
+
 def price_of(value: float, precision: int) -> Decimal:
     """A price the venue sent as a double, at `precision` decimals.
 

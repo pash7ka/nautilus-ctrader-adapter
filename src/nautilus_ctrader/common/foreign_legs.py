@@ -23,6 +23,7 @@ from nautilus_ctrader.common.venue_records import (
     OrderEvent,
     OrderEventKind,
     Record,
+    leg_prices,
     leg_venue_order_id,
     units_of,
 )
@@ -80,18 +81,18 @@ def foreign_leg(
     `LIMIT` at its `price`, both against the position, good till cancelled. `volume` is a venue
     volume; `accepted_ms` is when the level was set, never before the entry filled.
     """
-    stop = level == Level.STOP_LOSS
+    limit, trigger = leg_prices(level, price)
     return ExternalOrder(
         venue_order_id=venue_order_id,
         symbol_id=symbol_id,
         side="SELL" if position_side == "BUY" else "BUY",
-        order_type=ExternalType.STOP_MARKET if stop else ExternalType.LIMIT,
+        order_type=ExternalType.STOP_MARKET if level == Level.STOP_LOSS else ExternalType.LIMIT,
         units=units_of(volume),
         reduce_only=True,
         venue_position_id=str(position_id),
         ts_ms=ts_ms,
-        price=None if stop else price,
-        trigger_price=price if stop else None,
+        price=limit,
+        trigger_price=trigger,
         time_in_force="GOOD_TILL_CANCEL",
         ts_accepted_ms=accepted_ms,
     )
@@ -138,22 +139,12 @@ def level_changes(
             records.append(OrderEvent(OrderEventKind.CANCELED, leg.venue_order_id, None, ts))
         elif live and new != old:
             leg.quantity = leg.filled + _rest(position)
-            records.append(
-                _event(OrderEventKind.UPDATED, leg, level, ts, units_of(leg.quantity), new)
-            )
+            records.append(_moved(leg, level, new, ts))
     for leg in position.foreign_legs.values():
         quantity = leg.filled + _rest(position)
         if leg.alive and leg.quantity != quantity:
             leg.quantity = quantity
-            records.append(
-                OrderEvent(
-                    OrderEventKind.UPDATED,
-                    leg.venue_order_id,
-                    None,
-                    ts,
-                    quantity=units_of(quantity),
-                )
-            )
+            records.append(_resized(leg, ts))
     return records
 
 
@@ -166,15 +157,7 @@ def filled(leg: ForeignLeg, volume: int, fill: Fill) -> list[Record]:
     records: list[Record] = []
     if leg.filled + volume > leg.quantity:
         leg.quantity = leg.filled + volume
-        records.append(
-            OrderEvent(
-                OrderEventKind.UPDATED,
-                leg.venue_order_id,
-                None,
-                fill.ts_ms,
-                quantity=units_of(leg.quantity),
-            )
-        )
+        records.append(_resized(leg, fill.ts_ms))
     records.append(
         OrderEvent(OrderEventKind.FILLED, leg.venue_order_id, None, fill.ts_ms, fill=fill)
     )
@@ -262,21 +245,22 @@ def _accepted_ms(position: ForeignPosition, ts: int) -> int:
     return opened if entry_filled is None else max(opened, entry_filled)
 
 
-def _event(
-    kind: OrderEventKind,
-    leg: ForeignLeg,
-    level: Level,
-    ts: int,
-    quantity: Decimal,
-    price: Decimal,
-) -> OrderEvent:
-    stop = level == Level.STOP_LOSS
+def _resized(leg: ForeignLeg, ts: int) -> OrderEvent:
+    """The leg updated to its quantity, its price unchanged."""
     return OrderEvent(
-        kind,
+        OrderEventKind.UPDATED, leg.venue_order_id, None, ts, quantity=units_of(leg.quantity)
+    )
+
+
+def _moved(leg: ForeignLeg, level: Level, price: Decimal, ts: int) -> OrderEvent:
+    """The leg updated to its quantity, its level at `price`."""
+    limit, trigger = leg_prices(level, price)
+    return OrderEvent(
+        OrderEventKind.UPDATED,
         leg.venue_order_id,
         None,
         ts,
-        quantity=quantity,
-        price=None if stop else price,
-        trigger_price=price if stop else None,
+        quantity=units_of(leg.quantity),
+        price=limit,
+        trigger_price=trigger,
     )
