@@ -71,6 +71,14 @@ def parse_leg_venue_order_id(text: str) -> tuple[int, Level, int] | None:
     return int(entry), Level(level), 1 if generation is None else int(generation)
 
 
+def leg_prices(level: Level, price: Decimal | None) -> tuple[Decimal | None, Decimal | None]:
+    """A leg's `price` and `trigger_price` at the level `price`.
+
+    A stop-loss triggers at its level; a take-profit is a limit at it.
+    """
+    return (None, price) if level == Level.STOP_LOSS else (price, None)
+
+
 def price_of(value: float, precision: int) -> Decimal:
     """A price the venue sent as a double, at `precision` decimals.
 
@@ -351,12 +359,29 @@ class Operations(Protocol):
         """Whether the node's own level amend of that position is in flight."""
         ...
 
-    def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
-        """The client order id of the node's close of `volume` on that position, if in flight.
+    def late_amend(self, position_id: int, levels: dict[Level, Decimal]) -> bool:
+        """Whether `levels`, just set on that position, are those of the oldest of the node's
+        amends whose answers were lost.
 
-        `order_id` is the broker's closing order and `created_ms` its creation time, on the
-        broker's clock. A close whose own answer named `order_id` is returned; otherwise only a
-        close sent after the broker's last time the node had seen before `created_ms`. The id
-        identifies one close; the execution client consumes it once matched.
+        Asked at each protective event of the position that the broker did not originate. A match
+        forgets that amend; a mismatch forgets them all, so a trader's later change is never taken
+        for one.
+        """
+        ...
+
+    def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
+        """The client order id of the node's in-flight close that broker order `order_id` carries
+        out, if any.
+
+        `order_id` is a closing order of `volume` on that position, and `created_ms` its creation
+        time on the broker's clock. Returns, checked in this order:
+
+        - the close whose own answer named `order_id`;
+        - else the earliest sent close of `volume` on that position whose answer named no other
+          order, and that was sent while the newest broker time the node had seen was earlier
+          than `created_ms`, or while it had seen none;
+        - else `None`.
+
+        The id identifies one close; the execution client consumes it once matched.
         """
         ...

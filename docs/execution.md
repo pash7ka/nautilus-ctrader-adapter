@@ -56,7 +56,12 @@ An order or a close that was sent and got **no answer** within `order_request_ti
 never sent again: the lost answer may hide a fill. It stays in flight, with a WARNING, until
 Nautilus's own in-flight check or a reconnect settles it ([section 5](#5-order-queries-and-in-flight-settings)).
 A level amend, which sets the whole state of a position's levels, is the one request that is
-repeated, up to three times. A cancel or an amend of a pending order is not repeated either.
+repeated, up to three times. Once one of its attempts got no answer, the broker may have applied
+it, so the amend ends as unknown unless a later attempt is answered: a later refusal or failure
+is not reported as a refusal. A WARNING says so, and the order the command was about stays
+pending for Nautilus's in-flight check. A cancel or an amend of a pending order is not repeated
+either. A frame from the venue that the adapter cannot read drops the connection; a request
+waiting on it counts as unanswered.
 
 A refusal by the broker is an `OrderRejected` (or `OrderCancelRejected`, `OrderModifyRejected`)
 whose reason is the broker's error code and description, as the broker gave them.
@@ -80,9 +85,15 @@ exists, the adapter amends the position's levels to the exact prices requested.
 - If the broker keeps other levels than asked after three rounds, or refuses the amend, the levels
   stay where the broker set them, a WARNING is logged, and each leg reports its actual price in an
   `OrderUpdated`. Anything still showing the requested price shows the request, not the position.
+- If the amend ends as unknown ([section 1](#1-what-it-trades)), that amend is not repeated: the
+  broker may hold its levels already. An ERROR says that whether they were set is unknown. The
+  legs, and any cancel or modify the amend carries, wait for the broker's late answer or the next
+  rebuild, for at most `protective_order_timeout_secs`; then a new round is sent. A cancel or a
+  modify of a leg that arrives meanwhile is sent at once, in a new round.
 - If no protective order follows the fill within `protective_order_timeout_secs`, the levels are
   set by an amend instead. If that is refused too, the legs are rejected and an ERROR is logged:
-  the position stands without its levels.
+  the position stands without its levels. If it gets no answer, an ERROR says that whether the
+  levels were set is unknown; the legs wait for the broker's late answer or the next rebuild.
 - A cancel or a modify of a leg that arrives while its entry is still in flight is recorded and
   carried by this amend. A rejected entry rejects the pending modify.
 
@@ -248,8 +259,13 @@ adapter does not judge it.
   another kind, is reported as it stands and is no refusal. They carry the order's own strategy
   id, `EXTERNAL` or the claiming strategy's, not the id of the strategy that sent the command.
 - **A command the adapter fails to carry out**, on input it did not foresee, is refused all the
-  same: `OrderCancelRejected` or `OrderModifyRejected` naming the error's type, with an ERROR
-  log line. The order never stays pending until Nautilus's in-flight check.
+  same when it fails before its request is sent: `OrderCancelRejected` or `OrderModifyRejected`
+  naming the error's type, with an ERROR log line. The exception is a request that fails to
+  encode: it ends as unknown, with a WARNING, as an unanswered one does. Once the request is
+  sent, the broker may have acted on it, so a failure while its answer is handled is never a
+  refusal: an ERROR line names
+  the command and the error's type, the order stays pending, and Nautilus's in-flight check asks
+  about it ([section 5](#5-order-queries-and-in-flight-settings)).
 - A cancel or an amend of a pending order that gets no answer is not sent again: a WARNING says
   so, and Nautilus's in-flight check asks about the order
   ([section 5](#5-order-queries-and-in-flight-settings)).
@@ -318,7 +334,10 @@ The in-flight check belongs to Nautilus's `LiveExecEngineConfig`, not to this co
 One pass reads the broker, in this order:
 
 1. The deals of the fill window, which covers `lookback_mins` when Nautilus passes one and
-   `reconciliation_default_lookback_mins` otherwise.
+   `reconciliation_default_lookback_mins` otherwise. The window ends a day past now, taking the
+   later of the node's clock and the newest broker time the client has seen, so a deal the broker
+   stamped after a lagging node clock's now is still read. The order list a query searches
+   ([section 5](#5-order-queries-and-in-flight-settings)) ends the same way.
 2. The snapshot: every open position and pending order, with the protective orders.
 3. For each position that is open, has a deal in the window, or is open in Nautilus's cache on
    this account, its own order list and deal list. A position on an instrument that is not loaded
@@ -757,7 +776,11 @@ sign flipped to Nautilus's convention (a charge is positive).
   clock. So a trader's close created after the last broker stamp the node saw, but before the
   node's close reached the broker, is taken for the node's. This includes a close whose answer
   was lost: until the next successful reconnect pass, such a trader's close of the same volume on
-  that position during the outage is taken for the node's.
+  that position during the outage is taken for the node's. Likewise for a level amend whose answer
+  was lost: the next protective event of that position that the broker did not originate is
+  taken for its late answer when it sets exactly the levels the amend asked for, so a trader's
+  change to those very levels is not reported. Several lost amends are matched in the order they
+  were sent. Any other such event, or the next rebuild, ends this.
 - **On the node's own position, a level re-added by hand after its leg was cancelled is adopted
   after a restart.** After a restart a leg lives exactly while its level does, so the level a
   trader put back makes the leg alive again under its original id. Before the restart, the same
@@ -817,7 +840,7 @@ saying what would settle it. The main groups:
   out does; what the venue does with an optional field an amend leaves out, a position's trailing
   and guaranteed flags and trigger method, or a pending order's attributes (it may keep the
   current value or apply the schema's default). The adapter always sends them, so this matters
-  only where it cannot.
+  only where it cannot. How the venue answers an amend that changes nothing.
 - **Cancels and amends of pending orders**: how the venue refuses an amend, and a cancel for any
   reason but an unknown order id; whether an amend's volume is the order's whole volume or its
   unfilled rest once partly filled; whether an amend that sends the expiration again keeps it.
@@ -840,7 +863,8 @@ saying what would settle it. The main groups:
   newest first; nothing relies on it), which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
   whether the edges of a window are inclusive, and whether the cash-flow list has no pages and
-  takes at most a week.
+  takes at most a week. That the deal and order lists answer a window ending in the future is
+  confirmed.
 - **The balance checkpoint**: that an account's first funding is a balance deposit, and the sign
   of a withdrawal's amount.
 

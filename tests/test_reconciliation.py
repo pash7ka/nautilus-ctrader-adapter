@@ -218,6 +218,9 @@ class OneClose:
     def amending(self, position_id: int) -> bool:
         return False
 
+    def late_amend(self, position_id: int, levels: dict) -> bool:
+        return False
+
     def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
         return self._close_id if (position_id, volume) == self._close else None
 

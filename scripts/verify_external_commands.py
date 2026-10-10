@@ -1072,9 +1072,9 @@ SETTLES_DEAL = (
 )
 SETTLES_CARRIES = "venue_book.py `_sync` TODO(verify): whether a fill always carries the position"
 SETTLES_ARRIVAL = (
-    "venue_book.py `_foreign_fill`: whether, and when, the protective order's smaller volume "
-    "arrives after a partial close; `_protective` TODO(verify): whether the broker replaces the "
-    "protective order's id"
+    "foreign_legs.py `filled`: whether, and when, the protective order's smaller volume "
+    "arrives after a partial close; venue_book.py `_protective` TODO(verify): whether the broker "
+    "replaces the protective order's id"
 )
 SETTLES_REMAINING = (
     "venue_book.py `remaining_of` TODO(verify), and its twin in reconciliation.py: whether a "

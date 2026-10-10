@@ -48,8 +48,8 @@ what to trade or when.
 
 **Explicitly out of scope**
 
-Trading strategies, signals and indicators; backtesting; risk or prop-firm rule engines;
-notification channels; deployment tooling; portfolio management. Those belong in the
+Trading strategies, signals and indicators; backtesting; account-level risk rules and trading
+limits; notification channels; deployment tooling; portfolio management. Those belong in the
 application that *uses* this adapter. Any of them appearing in this repository is a bug in
 its boundaries, not a feature.
 

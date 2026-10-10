@@ -501,7 +501,9 @@ and closed, one pending order cancelled before it ever opened).
   page (`hasMore` false), so paging is **unconfirmed**, as are the order the lists come in, the
   order of items inside one millisecond, which of an order's times the order list filters by,
   and whether either end of a window is inclusive. The adapter asks in windows of a week and
-  de-duplicates by id.
+  de-duplicates by id. Both lists also answer a window that ends a day in the future, and one that
+  lies wholly in the future, and a window running past now served everything the same window
+  ending at now served (confirmed); the adapter ends its windows a day past now for that reason.
 - **The cash-flow list** answered for a window of a week. **Unconfirmed**: whether it has pages
   at all, and whether a week is its maximum.
 

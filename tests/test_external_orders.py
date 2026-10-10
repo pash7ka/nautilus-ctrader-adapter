@@ -17,13 +17,7 @@ from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import PositionId, StrategyId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Price, Quantity
 
-from nautilus_ctrader.common.venue_records import (
-    EntryUnknown,
-    ExternalOrder,
-    ExternalType,
-    OrderEvent,
-    OrderEventKind,
-)
+from nautilus_ctrader.common.venue_records import ExternalOrder, ExternalType
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.account_venue import ACCOUNT_ID
@@ -182,11 +176,12 @@ async def test_news_of_an_order_nautilus_has_closed_is_not_reported() -> None:
         await wait_until(lambda: external(h) is not None and external(h).is_closed)
         before = len(h.reports)
 
-        h.client._handle_records([OrderEvent(OrderEventKind.CANCELED, str(ORDER), None, 20)])
+        cancelled = limit(om.ORDER_CANCELLED, 20, position=make_position(POSITION, volume=200))
+        await push(h, *on_us100([cancelled]))
+        await wait_until(lambda: any("already FILLED" in line for line in h.logger.warnings()))
 
         assert len(h.reports) == before
         assert external(h).status == OrderStatus.FILLED
-        assert any("already FILLED" in line for line in h.logger.warnings())
 
 
 def stop(kind: int, utc: int, *, price: float) -> object:
@@ -375,7 +370,8 @@ async def test_an_external_order_nautilus_holds_is_reported_under_its_client_ord
 
 async def test_a_foreign_position_with_no_known_entry_is_a_debug_line() -> None:
     async with harness() as h:
-        h.client._handle_records([EntryUnknown(FIRST)])
+        # The protective order alone, and the broker lists no entry for its position.
+        await push(h, FOREIGN_FIRST[2])
 
         assert (
             "debug",
@@ -383,6 +379,7 @@ async def test_a_foreign_position_with_no_known_entry_is_a_debug_line() -> None:
             "the entry is known",
         ) in h.logger.lines
         await wait_until(lambda: h.received(oa.ProtoOAOrderListByPositionIdReq))
+        assert by_venue_id(h, FOREIGN_SL) is None
         assert h.logger.warnings() == []
 
 
