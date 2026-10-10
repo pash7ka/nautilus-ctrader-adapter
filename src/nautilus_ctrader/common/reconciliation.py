@@ -565,16 +565,20 @@ class _Position:
         """A foreign position's levels as its legs, as `reconcile` describes."""
         held_open = held.open_legs(self.entry.orderId)
         reports: list[ReportedOrder] = []
+        # An open position's levels are its own, whatever filled.
+        standing = (
+            None
+            if venue_position is None
+            else self._levels_source([], venue_position, live_protective)
+        )
         for level in _LEVELS:
             fills = leg_fills.get(level, [])
-            if venue_position is not None:
-                levels = _position_levels(venue_position, self.precision)
-            else:
-                source = self._closing_source(fills)
-                levels = {} if source is None else levels_of(source, self.precision)
+            found = standing or self._levels_source(fills, venue_position, live_protective)
+            levels = found[1]
             if level not in levels and not fills:
                 continue
             stands = venue_position is not None and level in levels
+            # A level that does not stand keeps all its fills, so `found` still holds for them.
             venue_order_id, generation, fills = self._generation(level, fills, held, stands=stands)
             report = self._leg(
                 level,
@@ -585,6 +589,7 @@ class _Position:
                 venue_position,
                 live_protective,
                 venue_order_id=venue_order_id,
+                found=found,
             )
             ended_unfilled = report.status == ReportStatus.CANCELED and not fills
             if ended_unfilled and generation > 1 and venue_order_id not in held_open:
@@ -642,6 +647,22 @@ class _Position:
             taken |= held_trades
             generation += 1
 
+    def _levels_source(
+        self,
+        fills: list[Fill],
+        venue_position: om.ProtoOAPosition | None,
+        live_protective: om.ProtoOAOrder | None,
+    ) -> tuple[om.ProtoOAOrder | None, dict[Level, Decimal]]:
+        """The protective order a leg's level comes from, and the levels a leg reads.
+
+        An open position's levels are its own, beside its live protective order; a closed one's
+        are those of `_closing_source`.
+        """
+        if venue_position is not None:
+            return live_protective, _position_levels(venue_position, self.precision)
+        source = self._closing_source(fills)
+        return source, {} if source is None else levels_of(source, self.precision)
+
     def _closing_source(self, fills: list[Fill]) -> om.ProtoOAOrder | None:
         """The protective order that filled for a level, else the last one listed."""
         return next(
@@ -660,16 +681,19 @@ class _Position:
         live_protective: om.ProtoOAOrder | None,
         *,
         venue_order_id: str | None = None,
+        found: tuple[om.ProtoOAOrder | None, dict[Level, Decimal]] | None = None,
     ) -> ReportedOrder:
         """A leg as the broker's lists leave it; `leg_id` is the node's, `None` for a foreign one.
 
-        `venue_order_id` defaults to the leg's first generation.
+        `venue_order_id` defaults to the leg's first generation. `found` is `_levels_source`'s
+        answer for `fills`, if the caller has it.
         """
         filled = sum((fill.units for fill in fills), Decimal(0))
         first_fill = self.entry_fills[0].ts_ms
+        if found is None:
+            found = self._levels_source(fills, venue_position, live_protective)
+        source, levels = found
         if venue_position is not None:
-            source = live_protective
-            levels = _position_levels(venue_position, self.precision)
             if live_protective is not None:
                 rest = units_of(remaining_of(live_protective))
                 ts_ms = live_protective.utcLastUpdateTimestamp
@@ -682,8 +706,6 @@ class _Position:
                 status, ts_ms = ReportStatus.CANCELED, venue_position.utcLastUpdateTimestamp
             units = filled + rest
         else:
-            source = self._closing_source(fills)
-            levels = {} if source is None else levels_of(source, self.precision)
             opened = [*self.entry_fills, *(f for o in self.raises for f in self.fills[o.orderId])]
             leg_units = (
                 units_of(source.tradeData.volume)
