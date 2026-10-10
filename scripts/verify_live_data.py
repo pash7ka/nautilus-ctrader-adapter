@@ -14,6 +14,11 @@ from `toTimestamp` by open time, a bar opening exactly on it included, and `from
 bounding the answer. It asks for the exact one-minute window of two consecutive closed M1 bars
 of the first symbol, plus the same window narrowed and widened by 1 ms at each end.
 
+Item 9 checks that the account's deal list and order list answer a window that ends in the
+future, which the adapter's reconciliation asks for: one over the last day to a day past now, and
+one wholly in the future. A window over the last day that ends at now is asked first, so the
+window that runs past now can be checked to serve every id it served. Only counts are reported.
+
 Run from the repository root, while the symbols' market is open:
 
     uv run python scripts/verify_live_data.py --trader-login <login> --minutes 5
@@ -83,6 +88,9 @@ READ_ONLY_REQUESTS: frozenset[type[Message]] = frozenset(
         oa.ProtoOASymbolsListReq,
         oa.ProtoOASymbolByIdReq,
         oa.ProtoOAGetTrendbarsReq,
+        # The account's history lists: they only list deals and orders, never touch them.
+        oa.ProtoOADealListReq,
+        oa.ProtoOAOrderListReq,
         oa.ProtoOASubscribeSpotsReq,
         oa.ProtoOAUnsubscribeSpotsReq,
         oa.ProtoOASubscribeLiveTrendbarReq,
@@ -141,6 +149,17 @@ _EDGE_SEARCH_WINDOWS = ((1800, "the last 30 minutes"), (3 * 86_400, "the last 3 
 # Item 8: more than a one-minute window holds, so an answer that reaches back past the window's
 # start shows that `fromTimestamp` does not bound it.
 _EDGE_PROBE_COUNT = 10
+
+# Item 9: the windows each history list is asked over, in the order asked. The one ending a day
+# past now is the adapter's own; the one ending at now is the control it is compared with.
+_WINDOW_TO_NOW = "last day to now"
+_WINDOW_PAST_NOW = "last day to a day past now"
+_WINDOW_FUTURE = "an hour past now to a day past now"
+# Item 9: each list, the answer type that means it was served, and how its items are read.
+_HISTORY_LISTS = (
+    ("deal list", oa.ProtoOADealListReq, oa.ProtoOADealListRes, "deal", "dealId"),
+    ("order list", oa.ProtoOAOrderListReq, oa.ProtoOAOrderListRes, "order", "orderId"),
+)
 
 _MAX_LISTED_DETAILS = 8
 
@@ -240,6 +259,22 @@ class WindowEdgeObservation:
     control_error: str | None = None
     positive_open_secs: tuple[int, ...] = ()
     positive_error: str | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class ListWindowProbe:
+    """What one history list served for one window.
+
+    `answer` is the response's type name, `None` when the venue refused with `error_code`;
+    `ids` are the deal or order ids of the first page, and `has_more` whether pages followed.
+    """
+
+    kind: str
+    window: str
+    answer: str | None = None
+    ids: tuple[int, ...] = ()
+    has_more: bool = False
     error_code: str | None = None
 
 
@@ -615,6 +650,52 @@ def decide_window_edges(observation: WindowEdgeObservation) -> Decision:
     return OK, tuple(detail)
 
 
+def decide_future_windows(probes: Sequence[ListWindowProbe]) -> Decision:
+    """Whether the deal and order lists answer a window that ends in the future.
+
+    Each list must answer the window that ends a day past now and the one wholly in the future
+    with its own response type; a refusal of either is `DIFFERS`. The window ending at now is a
+    control: the one that ends past now must serve every id it served, unless a page was cut
+    short, and a refused control only withdraws that comparison. A window not asked is `UNKNOWN`.
+    """
+    answers = {kind: response.__name__ for kind, _, response, _, _ in _HISTORY_LISTS}
+    detail: list[str] = []
+    differs = False
+    served: dict[tuple[str, str], ListWindowProbe] = {}
+    for probe in probes:
+        prefix = f"{probe.kind}, {probe.window}"
+        if probe.error_code is not None:
+            detail.append(f"{prefix}: refused with {probe.error_code}")
+            differs = differs or probe.window != _WINDOW_TO_NOW
+        elif probe.answer != answers[probe.kind]:
+            detail.append(f"{prefix}: answered with {probe.answer}")
+            differs = differs or probe.window != _WINDOW_TO_NOW
+        else:
+            more = ", more pages" if probe.has_more else ""
+            detail.append(f"{prefix}: answered, {len(probe.ids)} served{more}")
+            served[(probe.kind, probe.window)] = probe
+    for kind in answers:
+        control = served.get((kind, _WINDOW_TO_NOW))
+        past_now = served.get((kind, _WINDOW_PAST_NOW))
+        if control is None or past_now is None or control.has_more or past_now.has_more:
+            continue
+        missing = len(set(control.ids) - set(past_now.ids))
+        if missing:
+            differs = True
+            detail.append(
+                f"{kind}: {missing} served up to now are missing from the window past now",
+            )
+        else:
+            detail.append(f"{kind}: the window past now served everything served up to now")
+    if differs:
+        return DIFFERS, tuple(detail)
+    asked = {(probe.kind, probe.window) for probe in probes}
+    needed = {(kind, window) for kind in answers for window in (_WINDOW_PAST_NOW, _WINDOW_FUTURE)}
+    if not needed <= asked:
+        return UNKNOWN, (*detail, "not every window ending in the future was asked")
+    return OK, tuple(detail)
+
+
 def _opens_text(open_secs: Sequence[int]) -> str:
     if not open_secs:
         return "no bars"
@@ -682,6 +763,11 @@ class Verifier:
             "8",
             "trendbar window: count bars back from toTimestamp, fromTimestamp not bounding",
             self._probe_window_edges,
+        )
+        await self._item(
+            "9",
+            "deal and order lists answer a window that ends in the future",
+            self._probe_future_windows,
         )
         await self._run_spot_window()
 
@@ -941,6 +1027,45 @@ class Verifier:
                 positive_error=positive_error,
             ),
         )
+
+    async def _probe_future_windows(self) -> Decision:
+        """Item 9."""
+        now_ms = int(time.time() * 1000)
+        day_ms = _SECS_PER_DAY * 1000
+        windows = (
+            (_WINDOW_TO_NOW, now_ms - day_ms, now_ms),
+            (_WINDOW_PAST_NOW, now_ms - day_ms, now_ms + day_ms),
+            (_WINDOW_FUTURE, now_ms + _SECS_PER_HOUR * 1000, now_ms + day_ms),
+        )
+        probes: list[ListWindowProbe] = []
+        for kind, request_class, response_class, items, id_field in _HISTORY_LISTS:
+            for window, from_ms, to_ms in windows:
+                try:
+                    response = await self._request(
+                        request_class(
+                            ctidTraderAccountId=self._account_id,
+                            fromTimestamp=from_ms,
+                            toTimestamp=to_ms,
+                        ),
+                        bucket=BUCKET_HISTORICAL,
+                        timeout_secs=_HISTORY_REQUEST_TIMEOUT_SECS,
+                    )
+                except CTraderRequestError as e:
+                    probes.append(ListWindowProbe(kind, window, error_code=e.error_code))
+                    continue
+                if not isinstance(response, response_class):
+                    probes.append(ListWindowProbe(kind, window, answer=type(response).__name__))
+                    continue
+                probes.append(
+                    ListWindowProbe(
+                        kind,
+                        window,
+                        answer=type(response).__name__,
+                        ids=tuple(getattr(item, id_field) for item in getattr(response, items)),
+                        has_more=response.hasMore,
+                    ),
+                )
+        return decide_future_windows(probes)
 
     async def _control_window(
         self,

@@ -78,6 +78,7 @@ from nautilus_ctrader.common.errors import (
     CTraderAccountError,
     CTraderConnectionError,
     CTraderError,
+    CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
 )
@@ -1146,7 +1147,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         miss what the broker stamped since. The broker lists only what exists, so a window that
         ends later reads nothing extra.
         """
-        # TODO(verify): that the deal and order lists answer a window that ends in the future.
+        # TODO(verify): that the deal and order lists answer a window that ends in the future;
+        # item 9 of scripts/verify_live_data.py asks it.
         return max(self._clock.timestamp_ms(), self._broker_ms) + _WINDOW_MARGIN_MS
 
     def _hold_buffer(self) -> None:
@@ -2147,7 +2149,9 @@ class CTraderExecutionClient(LiveExecutionClient):
                 _reason(e.error_code, e.description),
                 retryable=e.retry_after_secs is not None,
             )
-        except (CTraderTimeoutError, CTraderConnectionError):
+        except (CTraderTimeoutError, CTraderConnectionError, CTraderProtocolError):
+            # A protocol error is also how a request learns that an unreadable frame from the
+            # venue dropped the connection, possibly its own answer.
             return None
         if isinstance(response, oa.ProtoOAOrderErrorEvent):
             # Not an error response to the transport: it arrives as the request's answer.
@@ -2774,8 +2778,8 @@ class CTraderExecutionClient(LiveExecutionClient):
 
         `levels_of` runs once the amends of the position before it are answered, so it sees
         the levels they left and never undoes them. `what` names the command in log lines.
-        Returns `None` when handling the answer failed in the adapter, so the outcome is
-        unknown; that is logged here.
+        Returns `None` when the outcome is unknown: the answer was lost, or handling it failed
+        in the adapter. That is logged here.
         """
         async with self._amend_locks.setdefault(position_id, asyncio.Lock()):
             view = self._book.view(position_id)
@@ -2796,8 +2800,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             )
             self._operations.begin_amend(position_id)
             try:
-                outcome = await self._send_amend(request)
-                if isinstance(outcome, _Refused):
+                outcome = await self._send_amend(request, what=what)
+                if outcome is None or isinstance(outcome, _Refused):
                     return outcome
                 with self._after_send(what):
                     if not isinstance(outcome, oa.ProtoOAExecutionEvent):
@@ -2843,15 +2847,43 @@ class CTraderExecutionClient(LiveExecutionClient):
         value = levels.get(level)
         return None if value is None else reports.price(value, instrument)
 
-    async def _send_amend(self, request: oa.ProtoOAAmendPositionSLTPReq) -> Message | _Refused:
+    async def _send_amend(
+        self, request: oa.ProtoOAAmendPositionSLTPReq, *, what: str
+    ) -> Message | _Refused | None:
+        """Send a level amend, again while it got no answer, never left, or was asked to wait.
+
+        Returns the broker's answer, its refusal, or `None` once an attempt got no answer and no
+        later one was answered: the broker may have applied the lost one, so a later refusal or
+        failure says nothing about it. `None` is logged here.
+        """
         # Confirmed live: an accepted amend sends no execution event besides its answer.
+        lost = False
         outcome: Message | _Refused | None = None
-        for _ in range(_AMEND_ATTEMPTS):
-            outcome = await self._send(request)
-            if outcome is not None and not (isinstance(outcome, _Refused) and outcome.retryable):
-                return outcome
-            await self._wait_ready()
-        return outcome if isinstance(outcome, _Refused) else _Refused("the amend got no answer")
+        try:
+            for _ in range(_AMEND_ATTEMPTS):
+                outcome = await self._send(request)
+                if outcome is None:
+                    lost = True
+                elif not isinstance(outcome, _Refused):
+                    return outcome
+                elif not outcome.retryable:
+                    break
+                await self._wait_ready()
+        except Exception as e:
+            if not lost:
+                raise
+            self._log.exception(
+                f"{what}: repeating an amend that got no answer failed in the adapter "
+                f"({type(e).__name__}); its outcome is unknown, so it is not refused",
+                e,
+            )
+            return None
+        if lost:
+            self._log.warning(
+                f"{what}: the amend got no answer, so its outcome is unknown; it is not refused",
+            )
+            return None
+        return outcome
 
     async def _wait_ready(self) -> None:
         session = self._account.session
@@ -3005,6 +3037,12 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._end_bracket(bracket.entry_id, outcome.reason)
             self._levels_refused(position_id, outcome.reason)
             return
+        if outcome is None:
+            # The broker's answer, if it comes late, or the next rebuild settles the bracket.
+            self._log.error(
+                f"Position {position_id}: whether its levels were set is unknown; it may stand "
+                "without them",
+            )
         self._settle_brackets()
 
     def _levels_refused(self, position_id: int, reason: str) -> None:

@@ -56,7 +56,12 @@ An order or a close that was sent and got **no answer** within `order_request_ti
 never sent again: the lost answer may hide a fill. It stays in flight, with a WARNING, until
 Nautilus's own in-flight check or a reconnect settles it ([section 5](#5-order-queries-and-in-flight-settings)).
 A level amend, which sets the whole state of a position's levels, is the one request that is
-repeated, up to three times. A cancel or an amend of a pending order is not repeated either.
+repeated, up to three times. Once one of its attempts got no answer, the broker may have applied
+it, so the amend ends as unknown unless a later attempt is answered: a later refusal or failure
+is not reported as a refusal. A WARNING says so, and the order the command was about stays
+pending for Nautilus's in-flight check. A cancel or an amend of a pending order is not repeated
+either. A frame from the venue that the adapter cannot read drops the connection; a request
+waiting on it counts as unanswered.
 
 A refusal by the broker is an `OrderRejected` (or `OrderCancelRejected`, `OrderModifyRejected`)
 whose reason is the broker's error code and description, as the broker gave them.
@@ -82,7 +87,8 @@ exists, the adapter amends the position's levels to the exact prices requested.
   `OrderUpdated`. Anything still showing the requested price shows the request, not the position.
 - If no protective order follows the fill within `protective_order_timeout_secs`, the levels are
   set by an amend instead. If that is refused too, the legs are rejected and an ERROR is logged:
-  the position stands without its levels.
+  the position stands without its levels. If it gets no answer, an ERROR says that whether the
+  levels were set is unknown; the legs wait for the broker's late answer or the next rebuild.
 - A cancel or a modify of a leg that arrives while its entry is still in flight is recorded and
   carried by this amend. A rejected entry rejects the pending modify.
 

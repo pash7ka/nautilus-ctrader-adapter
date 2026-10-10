@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 import time
+from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
@@ -50,6 +52,7 @@ from nautilus_ctrader.common.errors import CTraderAccountError
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.venue_book import terms_of
 from nautilus_ctrader.common.venue_records import Level, LevelTerms
+from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.execution import CTraderExecutionClient
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -2993,3 +2996,266 @@ async def test_a_pending_order_amend_failing_once_its_answer_is_applied_is_not_r
         (error,) = h.logger.errors()
         assert "RuntimeError" in error
         assert order.client_order_id.value in error
+
+
+async def test_a_leg_modify_failing_when_nothing_was_sent_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        monkeypatch.setattr(h.client, "_leg_updated", broken)
+        # The price the leg already holds: the levels stand, so no amend goes out.
+        await h.client._modify_order(modify(TARGET, price="85387.22"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderModifyRejected")
+
+        (rejected,) = [e for e in h.events_of(TARGET) if isinstance(e, OrderModifyRejected)]
+        assert "RuntimeError" in rejected.reason
+        assert amends == []
+
+
+@pytest.mark.parametrize("cancelling", [True, False], ids=["cancel", "modify"])
+@pytest.mark.parametrize("pending_order", [False, True], ids=["leg", "pending-order"])
+async def test_a_command_failing_as_its_request_is_built_is_refused_unsent(
+    monkeypatch: pytest.MonkeyPatch, cancelling: bool, pending_order: bool
+) -> None:
+    execution_venue = resting_venue() if pending_order else answered(FIRST_EVENTS[:3])
+    echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        if pending_order:
+            order = await held_resting(h)
+            build = "cancel_order" if cancelling else "amend_order"
+            change = {"price": "84100.00"}
+        else:
+            await opened_bracket(h)
+            order = h.cache.order(ClientOrderId(STOP if cancelling else TARGET))
+            build = "amend_levels"
+            change = {"price": "85400.00"}
+        before = len(h.server.received)
+        monkeypatch.setattr(order_translation, build, broken)
+        if cancelling:
+            await h.client._cancel_order(cancel(order.client_order_id.value))
+        else:
+            await h.client._modify_order(modify(order.client_order_id.value, **change))
+        await wait_until(lambda: refusals(h, order))
+
+        (rejected,) = refusals(h, order)
+        assert isinstance(rejected, OrderCancelRejected if cancelling else OrderModifyRejected)
+        assert "RuntimeError" in rejected.reason
+        assert len(h.server.received) == before
+
+
+@pytest.mark.parametrize("cancelling", [True, False], ids=["cancel", "modify"])
+async def test_a_foreign_leg_command_that_fails_after_its_send_is_not_refused(
+    monkeypatch: pytest.MonkeyPatch, cancelling: bool
+) -> None:
+    execution_venue = ExecutionVenue()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        stop, _ = await foreign_legs(h)
+        await made_pending(h, stop, cancelling=cancelling)
+        monkeypatch.setattr(h.client, "_bookkeep", broken)
+        if cancelling:
+            await h.client._cancel_order(cancel(stop.client_order_id.value))
+        else:
+            await h.client._modify_order(
+                modify(stop.client_order_id.value, trigger_price="85150.00")
+            )
+        await sync(h)
+
+        assert len(amends) == 1
+        pending = OrderStatus.PENDING_CANCEL if cancelling else OrderStatus.PENDING_UPDATE
+        assert_unknown(h, stop, pending)
+
+
+async def test_a_correction_failing_after_its_send_still_answers_the_modify_it_carried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        sending = await in_flight(h, held)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+        bookkeep = h.client._bookkeep
+
+        def failing_in_the_amend(record) -> None:
+            if h.client._operations.amending(FIRST):
+                raise RuntimeError("broken for the test")
+            bookkeep(record)
+
+        monkeypatch.setattr(h.client, "_bookkeep", failing_in_the_amend)
+        await held.release()
+        await sending
+        await push(h, *FIRST_EVENTS[1:3])
+        await wait_until(lambda: last_kind(h, STOP) == "OrderUpdated")
+
+        assert len(amends) == 1
+        assert "OrderModifyRejected" not in h.kinds_of(STOP)
+        assert len(h.client._brackets) == 0
+        (error,) = h.logger.errors()
+        assert "RuntimeError" in error
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85150.00"),
+        )
+
+
+# -- An amend whose answer was lost is never refused afterwards ---------------------------------
+
+
+def lose_amends(h, monkeypatch: pytest.MonkeyPatch, steps: list) -> None:
+    """The first level amends go as `steps` say: "lost" gets no answer, an exception is raised.
+
+    Amends past the steps reach the venue.
+    """
+    send = h.client._send
+
+    async def scripted(request):
+        if isinstance(request, oa.ProtoOAAmendPositionSLTPReq) and steps:
+            step = steps.pop(0)
+            if step == "lost":
+                return None
+            raise step
+        return await send(request)
+
+    monkeypatch.setattr(h.client, "_send", scripted)
+
+
+@pytest.mark.parametrize(
+    ("steps", "venue_refuses"),
+    [
+        pytest.param(["lost"], True, id="then-refused"),
+        pytest.param(["lost", "lost", "lost"], False, id="every-attempt-lost"),
+        pytest.param(["lost", RuntimeError("broken for the test")], False, id="then-failed"),
+    ],
+)
+async def test_an_amend_that_got_no_answer_ends_unknown_not_refused(
+    monkeypatch: pytest.MonkeyPatch, steps: list, venue_refuses: bool
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        if venue_refuses:
+            execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+        target = h.cache.order(ClientOrderId(TARGET))
+        await made_pending(h, target, cancelling=False)
+        failed = any(isinstance(step, Exception) for step in steps)
+        lose_amends(h, monkeypatch, steps)
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await sync(h)
+
+        assert refusals(h, target) == []
+        assert status(h, TARGET) == OrderStatus.PENDING_UPDATE
+        assert len(h.received(oa.ProtoOAAmendPositionSLTPReq)) == (1 if venue_refuses else 0)
+        assert amends == []
+        if failed:
+            (error,) = h.logger.errors()
+            assert "RuntimeError" in error
+            assert TARGET in error
+        else:
+            assert h.logger.errors() == []
+            assert any(TARGET in line and "got no answer" in line for line in h.logger.warnings())
+
+
+async def test_missing_levels_whose_amend_got_no_answer_leave_the_legs_with_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])  # no protective order follows the fill
+    config = exec_config(protective_order_timeout_secs=0.05)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        lose_amends(h, monkeypatch, ["lost", "lost", "lost"])
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h))
+        await wait_until(
+            lambda: any("whether its levels were set is unknown" in e for e in h.logger.errors()),
+        )
+
+        assert OrderStatus.REJECTED not in (status(h, STOP), status(h, TARGET))
+        assert len(h.client._brackets) == 1
+
+
+async def test_an_amend_answered_after_a_lost_attempt_is_reported() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            lose_amends(h, monkeypatch, ["lost"])
+            await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated")
+
+        assert len(amends) == 1
+        assert "OrderModifyRejected" not in h.kinds_of(TARGET)
+
+
+async def test_an_amend_failing_before_any_attempt_was_lost_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        lose_amends(h, monkeypatch, [RuntimeError("broken for the test")])
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderModifyRejected")
+
+        assert amends == []
+
+
+# -- An answer the adapter cannot read --------------------------------------------------------
+
+UNREADABLE = struct.pack(LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES + 1)
+
+
+def answer_unreadably(server, times: int) -> Callable:
+    """A reply for the first `times` requests: a frame too long to read, which drops the link."""
+    pushes: list[asyncio.Task] = []
+
+    def reply(request):
+        if len(pushes) >= times:
+            return None
+        pushes.append(asyncio.get_running_loop().create_task(server.push_raw(UNREADABLE)))
+        return None
+
+    return reply
+
+
+async def test_a_pending_order_cancel_answered_unreadably_is_not_refused() -> None:
+    execution_venue = resting_venue()
+    async with harness(execution_venue=execution_venue) as h:
+        order = await held_resting(h)
+        execution_venue.server.on(
+            om.PROTO_OA_CANCEL_ORDER_REQ, answer_unreadably(execution_venue.server, 1)
+        )
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+
+        assert refusals(h, order) == []
+        assert any("no answer, so its outcome is unknown" in line for line in h.logger.warnings())
+
+
+async def test_a_leg_amend_answered_unreadably_is_sent_again_and_never_refused() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends: list = []
+    echo = amend_echo(amends)
+    unreadable = answer_unreadably(execution_venue.server, 1)
+    asked: list = []
+
+    def reply(request):
+        asked.append(request)
+        return unreadable(request) if len(asked) == 1 else echo(request)
+
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, reply)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        # What the broker holds after the reconnect, for the model's rebuild.
+        our_open_position(execution_venue)
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated", timeout_secs=10)
+
+        assert len(asked) == 2
+        assert len(amends) == 1
+        assert "OrderModifyRejected" not in h.kinds_of(TARGET)

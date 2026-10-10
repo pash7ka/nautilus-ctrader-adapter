@@ -29,6 +29,7 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests import account_venue
+from tests.execution_replay import make_deal, make_order
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 
@@ -94,9 +95,14 @@ def test_the_requester_refuses_an_order_request() -> None:
 
 def test_the_read_only_set_holds_nothing_that_changes_account_state() -> None:
     forbidden = ("Order", "Position", "Amend", "Cancel", "Close", "Deal")
+    # The account's history lists name orders and deals, but only list them.
+    listing = {"ProtoOADealListReq", "ProtoOAOrderListReq"}
     named = sorted(cls.__name__ for cls in v.READ_ONLY_REQUESTS)
     assert named
-    assert not [name for name in named if any(word in name for word in forbidden)]
+    assert listing <= set(named)
+    assert not [
+        name for name in named if name not in listing and any(word in name for word in forbidden)
+    ]
 
 
 def test_the_script_never_names_an_order_request() -> None:
@@ -779,6 +785,124 @@ async def test_item_8_without_a_symbol_is_unknown(monkeypatch) -> None:
     assert connection.sent == []
 
 
+# -- Item 9: history windows that end in the future -----------------------------------------
+
+DEAL_LIST, ORDER_LIST = "deal list", "order list"
+_ANSWERS = {DEAL_LIST: "ProtoOADealListRes", ORDER_LIST: "ProtoOAOrderListRes"}
+
+
+def _served(kind: str, window: str, *ids: int, has_more: bool = False) -> v.ListWindowProbe:
+    return v.ListWindowProbe(kind, window, answer=_ANSWERS[kind], ids=ids, has_more=has_more)
+
+
+def _all_served(**overrides) -> list[v.ListWindowProbe]:
+    """Every window answered; `overrides` replaces a probe, keyed `<deal|order>_<to_now|...>`."""
+    probes = []
+    for kind in (DEAL_LIST, ORDER_LIST):
+        for key, window, ids in (
+            ("to_now", v._WINDOW_TO_NOW, (1, 2)),
+            ("past_now", v._WINDOW_PAST_NOW, (1, 2, 3)),
+            ("future", v._WINDOW_FUTURE, ()),
+        ):
+            name = f"{kind.split()[0]}_{key}"
+            probes.append(overrides.get(name, _served(kind, window, *ids)))
+    return probes
+
+
+def test_item_9_is_ok_when_every_window_is_answered_and_covers_the_control() -> None:
+    status, detail = v.decide_future_windows(_all_served())
+
+    assert status == OK
+    assert "deal list, last day to a day past now: answered, 3 served" in detail
+    assert "order list: the window past now served everything served up to now" in detail
+
+
+@pytest.mark.parametrize("window", [v._WINDOW_PAST_NOW, v._WINDOW_FUTURE])
+def test_item_9_differs_when_a_window_ending_in_the_future_is_refused(window) -> None:
+    key = "past_now" if window == v._WINDOW_PAST_NOW else "future"
+    refused = v.ListWindowProbe(DEAL_LIST, window, error_code="INVALID_REQUEST")
+
+    status, detail = v.decide_future_windows(_all_served(**{f"deal_{key}": refused}))
+
+    assert status == DIFFERS
+    assert f"deal list, {window}: refused with INVALID_REQUEST" in detail
+
+
+def test_item_9_differs_when_answered_with_another_type() -> None:
+    other = v.ListWindowProbe(ORDER_LIST, v._WINDOW_FUTURE, answer="ProtoOAErrorRes")
+
+    status, detail = v.decide_future_windows(_all_served(order_future=other))
+
+    assert status == DIFFERS
+    assert "order list, an hour past now to a day past now: answered with ProtoOAErrorRes" in detail
+
+
+def test_item_9_differs_when_the_window_past_now_misses_what_the_control_served() -> None:
+    short = _served(DEAL_LIST, v._WINDOW_PAST_NOW, 1)
+
+    status, detail = v.decide_future_windows(_all_served(deal_past_now=short))
+
+    assert status == DIFFERS
+    assert "deal list: 1 served up to now are missing from the window past now" in detail
+
+
+def test_item_9_compares_nothing_across_a_page_cut_short() -> None:
+    cut = _served(DEAL_LIST, v._WINDOW_PAST_NOW, 1, has_more=True)
+
+    status, detail = v.decide_future_windows(_all_served(deal_past_now=cut))
+
+    assert status == OK
+    assert not any(line.startswith("deal list: ") for line in detail)
+
+
+def test_item_9_keeps_its_verdict_when_the_control_is_refused() -> None:
+    refused = v.ListWindowProbe(ORDER_LIST, v._WINDOW_TO_NOW, error_code="INVALID_REQUEST")
+
+    status, detail = v.decide_future_windows(_all_served(order_to_now=refused))
+
+    assert status == OK
+    assert "order list, last day to now: refused with INVALID_REQUEST" in detail
+    assert not any(line.startswith("order list: ") for line in detail)
+
+
+def test_item_9_is_unknown_when_a_future_window_was_not_asked() -> None:
+    probes = [p for p in _all_served() if p.window != v._WINDOW_FUTURE]
+
+    status, detail = v.decide_future_windows(probes)
+
+    assert status == UNKNOWN
+    assert detail[-1] == "not every window ending in the future was asked"
+
+
+async def test_item_9_asks_both_lists_over_the_three_windows_read_only(monkeypatch) -> None:
+    now_ms = _NOW * 1000
+    day_ms = _DAY * 1000
+    deals = oa.ProtoOADealListRes(deal=[om.ProtoOADeal(dealId=5)], hasMore=False)
+    orders = oa.ProtoOAOrderListRes(order=[om.ProtoOAOrder(orderId=6)], hasMore=False)
+    refused = CTraderRequestError("INVALID_REQUEST", description="secret description")
+    verifier, connection = _edge_verifier(
+        [deals, deals, oa.ProtoOADealListRes(), orders, orders, refused], monkeypatch
+    )
+
+    status, detail = await verifier._probe_future_windows()
+
+    assert [type(p) for p in connection.sent] == [oa.ProtoOADealListReq] * 3 + [
+        oa.ProtoOAOrderListReq
+    ] * 3
+    assert all(type(p) in v.READ_ONLY_REQUESTS for p in connection.sent)
+    assert connection.buckets == [BUCKET_HISTORICAL] * 6
+    assert all(p.ctidTraderAccountId == account_venue.ACCOUNT_ID for p in connection.sent)
+    windows = [
+        (now_ms - day_ms, now_ms),
+        (now_ms - day_ms, now_ms + day_ms),
+        (now_ms + 3_600_000, now_ms + day_ms),
+    ]
+    assert _windows(connection) == windows * 2
+    assert status == DIFFERS
+    assert "order list, an hour past now to a day past now: refused with INVALID_REQUEST" in detail
+    assert not any("secret description" in line for line in detail)
+
+
 # -- The report -----------------------------------------------------------------------------
 
 
@@ -931,6 +1055,33 @@ def verify_venue(
         return _trendbars(request, count_cap=count_cap, max_window_days=max_window_days)
 
     server.on(om.PROTO_OA_GET_TRENDBARS_REQ, on_trendbars)
+
+    # One deal and one order an hour old, listed by any window that holds them.
+    an_hour_ago_ms = int(time.time() * 1000) - 3_600_000
+
+    def within(request) -> bool:
+        return request.fromTimestamp <= an_hour_ago_ms <= request.toTimestamp
+
+    server.on(
+        om.PROTO_OA_DEAL_LIST_REQ,
+        lambda r: oa.ProtoOADealListRes(
+            ctidTraderAccountId=r.ctidTraderAccountId,
+            deal=[
+                make_deal(5, 6, 7, side=om.BUY, volume=100, price=1.1, ts=an_hour_ago_ms),
+            ]
+            if within(r)
+            else [],
+            hasMore=False,
+        ),
+    )
+    server.on(
+        om.PROTO_OA_ORDER_LIST_REQ,
+        lambda r: oa.ProtoOAOrderListRes(
+            ctidTraderAccountId=r.ctidTraderAccountId,
+            order=[make_order(6, 7, utc=an_hour_ago_ms)] if within(r) else [],
+            hasMore=False,
+        ),
+    )
     return server
 
 
@@ -975,7 +1126,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -
         await server.stop()
 
     by_item = {f.item: f for f in findings}
-    assert sorted(by_item) == ["0", "1", "2", "3", "4", "5a", "5b", "6", "7", "8"]
+    assert sorted(by_item) == ["0", "1", "2", "3", "4", "5a", "5b", "6", "7", "8", "9"]
     assert by_item["0"].status == OK
     assert by_item["1"].status == OK
     assert by_item["2"].status == OK
@@ -985,6 +1136,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -
     assert by_item["6"].status == OK
     assert by_item["7"].status == OK
     assert by_item["8"].status == OK
+    assert by_item["9"].status == OK
     # No M1 bar can close inside a window this short, and that is an UNKNOWN, not a failure.
     assert by_item["4"].status == UNKNOWN
 

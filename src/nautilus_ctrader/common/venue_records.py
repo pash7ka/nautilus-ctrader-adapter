@@ -360,7 +360,8 @@ class Operations(Protocol):
         ...
 
     def closing(self, position_id: int, volume: int, created_ms: int, order_id: int) -> str | None:
-        """The client order id of the node's close in flight that broker order `order_id` is.
+        """The client order id of the node's in-flight close that broker order `order_id` carries
+        out, if any.
 
         `order_id` is a closing order of `volume` on that position, and `created_ms` its creation
         time on the broker's clock. Returns, checked in this order:
