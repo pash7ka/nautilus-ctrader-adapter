@@ -136,6 +136,8 @@ _CORRECTION_ROUNDS = 3
 # Nautilus publishes each mass status here once it has reconciled it.
 _RECONCILED_TOPIC = f"reports.execution.{CTRADER_VENUE}"
 _MINUTE_MS = 60_000
+# How far a history window runs past now (`_window_end_ms`).
+_WINDOW_MARGIN_MS = 1440 * _MINUTE_MS
 _OPEN = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _ENDED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
 # Activity after which what stands on unloaded symbols may have changed.
@@ -932,9 +934,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         self, find: Callable[[Iterable[om.ProtoOAOrder]], om.ProtoOAOrder | None]
     ) -> om.ProtoOAOrder | None:
         """The order `find` picks from the account's order list over the fill window."""
-        windows = history.weekly_windows(
-            self._since_ms(self._lookback_mins), self._clock.timestamp_ms()
-        )
+        windows = history.weekly_windows(self._since_ms(self._lookback_mins), self._window_end_ms())
         # TODO(verify): that the order list holds an order the broker rejected; none was recorded.
         for start, end in reversed(windows):
             found = await history.orders_between(
@@ -1138,6 +1138,16 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _command_since_ms(self, start) -> int:
         return self._since_ms(self._lookback_mins) if start is None else _ms(start)
 
+    def _window_end_ms(self) -> int:
+        """Where a history window ends: a margin past the later of the node's and broker's now.
+
+        The node's clock may run behind the broker's, and a window ending at the node's now would
+        miss what the broker stamped since. The broker lists only what exists, so a window that
+        ends later reads nothing extra.
+        """
+        # TODO(verify): that the deal and order lists answer a window that ends in the future.
+        return max(self._clock.timestamp_ms(), self._broker_ms) + _WINDOW_MARGIN_MS
+
     def _hold_buffer(self) -> None:
         # A rebuild that starts while another holds the buffer joins it.
         if self._buffer is None:
@@ -1313,7 +1323,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         window: dict[int, om.ProtoOADeal] = {}
         if since_ms is not None:
             complete = True
-            for start, end in history.weekly_windows(since_ms, self._clock.timestamp_ms()):
+            for start, end in history.weekly_windows(since_ms, self._window_end_ms()):
                 found, done = await history.deals_between(historical, account_id, start, end)
                 complete &= done
                 window.update((deal.dealId, deal) for deal in found)

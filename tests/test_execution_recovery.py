@@ -695,6 +695,31 @@ async def test_window_uses_the_default_lookback() -> None:
         assert abs(asked.fromTimestamp - expected) < 5_000
 
 
+# Past the window's margin beyond the node's clock: only the broker's own time reaches it.
+FAR_AHEAD_MS = 3 * 1440 * MINUTE_MS
+
+
+@pytest.mark.parametrize(
+    ("ahead_ms", "seen"),
+    [
+        pytest.param(MINUTE_MS, False, id="within-the-margin"),
+        pytest.param(FAR_AHEAD_MS, True, id="at-the-broker-time-seen"),
+    ],
+)
+async def test_the_window_reads_deals_stamped_ahead_of_the_nodes_clock(ahead_ms, seen) -> None:
+    # The node's clock runs behind the broker's by `ahead_ms`.
+    broker_now = int(time.time() * 1000) + ahead_ms
+    venue = ExecutionVenue()
+    deals = closed_position(venue, 1, opened=broker_now - 20_000, closed=broker_now - 10_000)
+    async with harness(execution_venue=venue) as h:
+        if seen:
+            await push_spot(h, 1, 2, timestamp=broker_now)
+        built = await h.client.generate_mass_status()
+
+        trade_ids = {f.trade_id.value for fills in built.fill_reports.values() for f in fills}
+        assert {str(deal.dealId) for deal in deals} <= trade_ids
+
+
 async def test_exposure_written_at_connect_and_on_change() -> None:
     async with harness() as h:
         assert h.cache.get(UNLOADED_EXPOSURE_KEY) == b"[]"

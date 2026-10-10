@@ -824,6 +824,36 @@ async def test_a_numbered_order_whose_details_fail_is_found_in_the_order_list() 
         assert any("details could not be read" in line for line in debug_lines(h))
 
 
+# Past the window's margin beyond the node's clock: only the broker's own time reaches it.
+FAR_AHEAD_MS = 3 * 1440 * MINUTE_MS
+
+
+@pytest.mark.parametrize(
+    ("ahead_ms", "seen"),
+    [
+        pytest.param(MINUTE_MS, False, id="within-the-margin"),
+        pytest.param(FAR_AHEAD_MS, True, id="at-the-broker-time-seen"),
+    ],
+)
+async def test_the_order_list_reads_an_order_stamped_ahead_of_the_nodes_clock(
+    ahead_ms, seen
+) -> None:
+    # The node's clock runs behind the broker's by `ahead_ms`.
+    broker_now = now_ms() + ahead_ms
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await market_numbered(h)
+        if seen:
+            await push_spot(h, BID, ASK, timestamp=broker_now)
+        details_fail(venue, "error")
+        venue.orders = [market_entry(order_status=om.ORDER_STATUS_CANCELLED, utc=broker_now)]
+
+        await h.client._query_order(query(h, MARKET_ID))
+
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.CANCELED)
+        assert walked(h)
+
+
 async def test_a_numbered_order_found_nowhere_is_not_answered() -> None:
     venue = ExecutionVenue()
     async with harness(execution_venue=venue) as h:

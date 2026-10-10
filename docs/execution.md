@@ -321,7 +321,10 @@ The in-flight check belongs to Nautilus's `LiveExecEngineConfig`, not to this co
 One pass reads the broker, in this order:
 
 1. The deals of the fill window, which covers `lookback_mins` when Nautilus passes one and
-   `reconciliation_default_lookback_mins` otherwise.
+   `reconciliation_default_lookback_mins` otherwise. The window ends a day past now, taking the
+   later of the node's clock and the newest broker time the client has seen, so a deal the broker
+   stamped after a lagging node clock's now is still read. The order list a query searches
+   ([section 5](#5-order-queries-and-in-flight-settings)) ends the same way.
 2. The snapshot: every open position and pending order, with the protective orders.
 3. For each position that is open, has a deal in the window, or is open in Nautilus's cache on
    this account, its own order list and deal list. A position on an instrument that is not loaded
@@ -842,8 +845,8 @@ saying what would settle it. The main groups:
 - **History lists**: the order lists come in (one position's order and deal lists were recorded
   newest first; nothing relies on it), which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
-  whether the edges of a window are inclusive, and whether the cash-flow list has no pages and
-  takes at most a week.
+  whether the edges of a window are inclusive, whether a window may end in the future, and
+  whether the cash-flow list has no pages and takes at most a week.
 - **The balance checkpoint**: that an account's first funding is a balance deposit, and the sign
   of a withdrawal's amount.
 
