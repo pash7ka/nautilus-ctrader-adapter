@@ -128,6 +128,7 @@ def test_parse_redirect_uri_returns_port_and_path(
         ("https://localhost:8080/callback", "scheme must be http"),
         ("http://example.com:8080/callback", "localhost"),
         ("http://[::1]:8080/callback", "localhost"),
+        ("http://0.0.0.0:8080/callback", "localhost"),
         ("http://evil.com\\@localhost/cb", "'@'"),
         ("http://localhost:99999/callback", "invalid port"),
         ("http://localhost:abc/callback", "invalid port"),
@@ -170,6 +171,42 @@ def test_wait_for_authorization_code_returns_the_code() -> None:
 
     assert code == "the-code"
     started["thread"].join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("bind_host", "expected"),
+    [
+        pytest.param(None, "127.0.0.1", id="default"),
+        # Only recorded, never bound: a wildcard listener in a test would reach the network.
+        pytest.param("0.0.0.0", "0.0.0.0", id="wildcard"),
+    ],
+)
+def test_wait_for_authorization_code_listens_on_the_bind_host(
+    monkeypatch: pytest.MonkeyPatch, bind_host: str | None, expected: str
+) -> None:
+    port = _free_port()
+    bound: list[tuple[str, int]] = []
+
+    class Recording(oauth._CallbackServer):
+        def __init__(self, address: tuple[str, int], handler: type) -> None:
+            bound.append(address)
+            super().__init__(("127.0.0.1", address[1]), handler)
+
+    monkeypatch.setattr(oauth, "_CallbackServer", Recording)
+
+    def on_listening() -> None:
+        threading.Thread(
+            target=_get,
+            args=(f"http://127.0.0.1:{port}/callback?code=the-code&state=s",),
+        ).start()
+
+    extra = {} if bind_host is None else {"bind_host": bind_host}
+    code = oauth.wait_for_authorization_code(
+        f"http://localhost:{port}/callback", "s", 5.0, on_listening=on_listening, **extra
+    )
+
+    assert code == "the-code"
+    assert bound == [(expected, port)]
 
 
 def test_wait_for_authorization_code_prints_nothing(capsys: pytest.CaptureFixture[str]) -> None:

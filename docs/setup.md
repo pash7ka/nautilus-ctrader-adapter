@@ -15,8 +15,14 @@ Every name below is also importable from `nautilus_ctrader`.
 ## First-time setup
 
 The application's registered redirect URI must be plain `http` on `localhost` or `127.0.0.1`,
-for example `http://localhost:8080/callback`. The callback server binds `127.0.0.1` on that
-port and serves only that path.
+for example `http://localhost:8080/callback`. By default the callback server binds `127.0.0.1`
+on that port and serves only that path.
+
+Where the redirect reaches the process through a forwarded port and the process's own loopback
+is not reachable from there, pass `bind_host="0.0.0.0"` to `wait_for_authorization_code`, and
+bind the forward itself to loopback only. The redirect URI stays on `localhost`. `"0.0.0.0"`
+exposes an unauthenticated plain-HTTP listener, guarded only by `state`, to every network the
+process can be reached on, for the whole wait.
 
 ```python
 import asyncio
