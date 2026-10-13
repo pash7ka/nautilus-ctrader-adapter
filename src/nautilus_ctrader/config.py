@@ -160,8 +160,8 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     restore_retry_interval_secs : float, default 30.0
         How often to retry what a reconnect failed to restore.
     reference_price_max_age_secs : float, default 10.0
-        The oldest spot a bracket's levels may be measured from. The venue takes a market
-        order's levels only as distances, which it applies to the fill.
+        The oldest spot a bracket's levels may be measured from, by the time since it arrived.
+        The venue takes a market order's levels only as distances, which it applies to the fill.
     protective_order_timeout_secs : float, default 2.0
         How long after a bracket's fill to wait for the broker's protective order before
         setting the levels by an amend.

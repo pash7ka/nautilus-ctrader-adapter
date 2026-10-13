@@ -61,6 +61,18 @@ def _trendbar_spot_consumer(period: int, consumer: _Consumer) -> _Consumer:
     return owner, f"trendbar:{period}:{name}"
 
 
+@dataclass(frozen=True)
+class LastSpot:
+    """A symbol's latest bid and ask, in the venue's 1/100000 of a price.
+
+    `at` is the event loop's time the latest spot carrying either arrived.
+    """
+
+    bid: int | None
+    ask: int | None
+    at: float
+
+
 @dataclass
 class _Intent:
     """What one consumer's latest (un)subscribe call asked for, while that is still unsettled."""
@@ -94,6 +106,8 @@ class SubscriptionRegistry:
       data until the restore retry succeeds.
     - It outlives sessions: the account client `attach`es each new session before starting it
       and `detach`es it when dropping it.
+    - It keeps each symbol's last spot for `last_spot()`. A consumer joining a live subscription
+      sends the venue nothing, so it would otherwise have no price until the next spot.
     """
 
     def __init__(self, account: CTraderAccountClient, logger: Logger) -> None:
@@ -113,6 +127,8 @@ class SubscriptionRegistry:
         self._spot_listeners: dict[int, list[SpotListener]] = {}
         # `id()` of each listener that has raised, since listeners need not be hashable.
         self._failing_listeners: set[int] = set()
+        # Symbol id -> the session bring-up the spot came in, and the spot.
+        self._last_spots: dict[int, tuple[int, LastSpot]] = {}
 
     def attach(self, session: CTraderSession) -> None:
         """Route `session`'s spot events here and register a restore for every live key."""
@@ -124,6 +140,7 @@ class SubscriptionRegistry:
 
     def detach(self) -> None:
         session, self._session = self._session, None
+        self._last_spots.clear()
         if session is not None:
             session.remove_event_handler(oa.ProtoOASpotEvent, self._on_spot)
 
@@ -220,6 +237,14 @@ class SubscriptionRegistry:
         self._failing_listeners.discard(id(stored))
         if not listeners:
             del self._spot_listeners[symbol_id]
+
+    def last_spot(self, symbol_id: int) -> LastSpot | None:
+        """`symbol_id`'s latest bid and ask since the session last connected, if any came."""
+        kept = self._last_spots.get(symbol_id)
+        session = self._session
+        if kept is None or session is None or kept[0] != session.bring_up_generation:
+            return None
+        return kept[1]
 
     def consumers(self, symbol_id: int) -> frozenset[str]:
         """Names counted on `symbol_id`'s spots, of every owner, trendbar holders included."""
@@ -372,10 +397,11 @@ class SubscriptionRegistry:
         """Drop `consumer`'s reference; the last one also unsubscribes. Caller holds the key lock.
 
         The reference is dropped once the request has run its course, failure included: its
-        consumer is gone either way, and spots the venue keeps sending are dropped for want of
-        a listener. A cancellation is the one outcome that keeps it, mirroring `_acquire`: the
-        venue may still be streaming the key, and only a repeated unsubscribe settles that. It
-        may equally have stopped, so the key is marked for the next `_acquire` to re-subscribe.
+        consumer is gone either way, and spots the venue keeps sending reach no listener (they
+        are still kept for `last_spot()`). A cancellation is the one outcome that keeps it,
+        mirroring `_acquire`: the venue may still be streaming the key, and only a repeated
+        unsubscribe settles that. It may equally have stopped, so the key is marked for the next
+        `_acquire` to re-subscribe.
         """
         consumers = self._consumers.get(key)
         if consumers is None or consumer not in consumers:
@@ -399,9 +425,15 @@ class SubscriptionRegistry:
                 self._log.warning(f"Unsubscribe {key!r} failed: {detail}")
         except asyncio.CancelledError:
             self._maybe_unsubscribed.add(key)
+            if key[0] == "spots":
+                # Spots may stop and later restart, and a one-sided spot must not pair with a
+                # side from before the gap.
+                self._last_spots.pop(key[1], None)
             raise
         del self._consumers[key]
         self._maybe_unsubscribed.discard(key)
+        if key[0] == "spots":
+            self._last_spots.pop(key[1], None)
         if self._session is not None:
             self._session.remove_restore(key)
 
@@ -449,6 +481,7 @@ class SubscriptionRegistry:
         )
 
     def _on_spot(self, event: oa.ProtoOASpotEvent) -> None:
+        self._keep(event)
         listeners = self._spot_listeners.get(event.symbolId)
         if not listeners:
             self._log.debug(f"Dropped spot for symbol {event.symbolId}: no listener")
@@ -464,6 +497,22 @@ class SubscriptionRegistry:
                 else:
                     self._failing_listeners.add(id(listener))
                     self._log.exception(message, e)
+
+    def _keep(self, event: oa.ProtoOASpotEvent) -> None:
+        session = self._session
+        has_bid, has_ask = event.HasField("bid"), event.HasField("ask")
+        if session is None or not (has_bid or has_ask):
+            return
+        generation = session.bring_up_generation
+        kept = self._last_spots.get(event.symbolId)
+        # A spot may carry only the side that changed.
+        last = kept[1] if kept is not None and kept[0] == generation else None
+        spot = LastSpot(
+            bid=event.bid if has_bid else (last.bid if last else None),
+            ask=event.ask if has_ask else (last.ask if last else None),
+            at=asyncio.get_running_loop().time(),
+        )
+        self._last_spots[event.symbolId] = (generation, spot)
 
 
 async def _subscribe(session: CTraderSession, requests: list[Message]) -> None:

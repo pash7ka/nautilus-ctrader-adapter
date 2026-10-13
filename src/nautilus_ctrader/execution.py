@@ -154,15 +154,6 @@ _EVENT_WAIT_SECS = 0.1
 _EVENT_WAIT_PASSES = 2
 
 
-@dataclass
-class _Quote:
-    """The latest spot of one symbol; `at` is the event loop's time it arrived."""
-
-    bid: Decimal | None = None
-    ask: Decimal | None = None
-    at: float = 0.0
-
-
 def check_account(trader: om.ProtoOATrader) -> None:
     """Refuse an account this adapter cannot trade, naming why."""
     if trader.accountType != om.HEDGED:
@@ -468,7 +459,6 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._margins: dict[int, tuple[int, Decimal]] = {}
         # Position id -> the `utcLastUpdateTimestamp` of the state its margin was taken from.
         self._margin_times: dict[int, int] = {}
-        self._quotes: dict[int, _Quote] = {}
         self._spot_symbols: set[int] = set()
         self._operations = OperationsInFlight()
         self._brackets = PendingBrackets()
@@ -2116,19 +2106,22 @@ class CTraderExecutionClient(LiveExecutionClient):
         return position_id, PositionSide.LONG if view.side == "BUY" else PositionSide.SHORT
 
     def _reference(self, instrument: Instrument) -> tuple[Decimal, Decimal]:
-        """The latest bid and ask, when fresh enough to measure a bracket's levels from."""
-        quote = self._quotes.get(instrument.info["symbol_id"])
+        """The latest bid and ask, when fresh enough to measure a bracket's levels from.
+
+        Read from the account's shared spots, so a spot that reached another client counts too.
+        """
+        spot = self._account.subscriptions.last_spot(instrument.info["symbol_id"])
         max_age = self._config.reference_price_max_age_secs
         if (
-            quote is None
-            or quote.bid is None
-            or quote.ask is None
-            or self._loop.time() - quote.at > max_age
+            spot is None
+            or spot.bid is None
+            or spot.ask is None
+            or self._loop.time() - spot.at > max_age
         ):
             raise Unsupported(
                 f"no price of {instrument.id} newer than {max_age:g}s to measure the levels from",
             )
-        return quote.bid, quote.ask
+        return Decimal(spot.bid) / PRICE_SCALE, Decimal(spot.ask) / PRICE_SCALE
 
     def _refuse(self, orders: list[Order], reason: str) -> None:
         """Refuse a command before anything is sent: the order rejected, its legs cancelled."""
@@ -3154,7 +3147,6 @@ class CTraderExecutionClient(LiveExecutionClient):
         for symbol_id in self._spot_symbols:
             subscriptions.remove_spot_listener(symbol_id, self._on_spot)
         self._spot_symbols.clear()
-        self._quotes.clear()
         for symbol_id, consumer in sorted(subscriptions.spot_holds(self._owner)):
             await subscriptions.unsubscribe_spots(symbol_id, consumer, self._owner)
 
@@ -3163,11 +3155,3 @@ class CTraderExecutionClient(LiveExecutionClient):
             # TODO(verify): that a spot's `timestamp` is on the clock of the broker's execution
             # timestamps; every recorded spot carries one, in ms.
             self._saw_broker_time(event.timestamp)
-        if not (event.HasField("bid") or event.HasField("ask")):
-            return
-        quote = self._quotes.setdefault(event.symbolId, _Quote())
-        if event.HasField("bid"):
-            quote.bid = Decimal(event.bid) / PRICE_SCALE
-        if event.HasField("ask"):
-            quote.ask = Decimal(event.ask) / PRICE_SCALE
-        quote.at = self._loop.time()

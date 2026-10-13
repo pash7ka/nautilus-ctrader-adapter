@@ -879,6 +879,37 @@ async def test_a_stale_price_measures_nothing() -> None:
         assert "no price" in rejection(h, ENTRY)
 
 
+async def test_a_bracket_is_measured_from_a_spot_another_client_received() -> None:
+    async with harness(execution_venue=answered(FIRST_EVENTS[:3])) as h:
+        # As if the spot came before the client joined the subscription.
+        h.account.subscriptions.remove_spot_listener(US100_SYMBOL_ID, h.client._on_spot)
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+
+        (request,) = h.received(oa.ProtoOANewOrderReq)
+        assert request.relativeStopLoss == 9_001_000
+
+
+async def test_a_spot_from_before_a_reconnect_measures_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    async with harness() as h:
+        await push_spot(h, BID, ASK)
+        connections = h.server.connection_count
+        await h.server.drop_connections()
+        await wait_until(
+            lambda: h.server.connection_count > connections and h.account.session.is_ready,
+        )
+
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.REJECTED)
+
+        assert "no price" in rejection(h, ENTRY)
+        assert h.received(oa.ProtoOANewOrderReq) == []
+
+
 async def test_a_level_on_the_wrong_side_of_the_market_is_refused() -> None:
     async with harness() as h:
         await push_spot(h, BID, ASK)

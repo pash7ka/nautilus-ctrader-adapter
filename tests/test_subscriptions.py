@@ -9,6 +9,7 @@ from google.protobuf.message import Message
 from nautilus_ctrader.common import account as account_module
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
+from nautilus_ctrader.common.session import SessionState
 from nautilus_ctrader.common.subscriptions import SubscriptionRegistry
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -700,6 +701,137 @@ async def test_a_raising_listener_is_logged_once_and_does_not_stop_the_others(
 
     listener_lines = [level for level, m in logger.lines if "Spot listener" in m]
     assert listener_lines == ["error", "debug"]
+
+
+# -- The last spot ---------------------------------------------------------------------------
+
+
+def _quote(
+    symbol_id: int, *, bid: int | None = None, ask: int | None = None
+) -> oa.ProtoOASpotEvent:
+    event = oa.ProtoOASpotEvent(ctidTraderAccountId=1, symbolId=symbol_id)
+    if bid is not None:
+        event.bid = bid
+    if ask is not None:
+        event.ask = ask
+    return event
+
+
+async def test_a_consumer_joining_a_live_subscription_finds_its_last_spot(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "first", "data")
+    before = asyncio.get_running_loop().time()
+    await server.push(_quote(EURUSD, bid=110_000, ask=110_010))
+    await _pass_barrier(server, client)
+
+    await registry.subscribe_spots(EURUSD, "joining", "execution")
+
+    assert len(received(server, oa.ProtoOASubscribeSpotsReq)) == 1
+    spot = registry.last_spot(EURUSD)
+    assert (spot.bid, spot.ask) == (110_000, 110_010)
+    assert before <= spot.at <= asyncio.get_running_loop().time()
+    assert registry.last_spot(GBPUSD) is None
+
+
+async def test_a_spot_carrying_one_side_keeps_the_other(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await server.push(_quote(EURUSD, bid=110_000, ask=110_010))
+    await server.push(_quote(EURUSD, ask=110_020))
+    await server.push(_quote(EURUSD))
+    await _pass_barrier(server, client)
+
+    spot = registry.last_spot(EURUSD)
+    assert (spot.bid, spot.ask) == (110_000, 110_020)
+
+
+async def test_the_last_spot_is_forgotten_by_a_reconnect_and_by_the_last_release(
+    monkeypatch: pytest.MonkeyPatch,
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await server.push(_quote(EURUSD, bid=110_000, ask=110_010))
+    await _pass_barrier(server, client)
+    connections = server.connection_count
+
+    await server.drop_connections()
+    await wait_until(
+        lambda: server.connection_count > connections and client.session.is_ready,
+        description="session ready again",
+    )
+    assert registry.last_spot(EURUSD) is None
+
+    await server.push(_quote(EURUSD, bid=110_100, ask=110_110))
+    await _pass_barrier(server, client)
+    assert registry.last_spot(EURUSD).bid == 110_100
+
+    await registry.unsubscribe_spots(EURUSD, "a", "data")
+    assert registry.last_spot(EURUSD) is None
+
+
+async def test_a_spot_arriving_while_its_restore_is_answered_counts_once_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    held = HeldReplies(server, oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ, _spot_reply)
+
+    await server.drop_connections()
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    assert client.session.state is SessionState.RESTORING
+    await server.push(_quote(EURUSD, bid=110_200, ask=110_210))
+    await _pass_barrier(server, client)
+    await held.stop_holding()
+    await wait_until(lambda: client.session.is_ready, description="session ready again")
+
+    spot = registry.last_spot(EURUSD)
+    assert (spot.bid, spot.ask) == (110_200, 110_210)
+
+
+async def test_a_cancelled_last_release_forgets_the_last_spot(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await server.push(_quote(EURUSD, bid=110_000, ask=110_010))
+    await _pass_barrier(server, client)
+    held = HeldReplies(server, oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+
+    assert registry.last_spot(EURUSD) is None
+
+
+async def test_the_last_spot_is_forgotten_when_the_session_is_dropped(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await server.push(_quote(EURUSD, bid=110_000, ask=110_010))
+    await _pass_barrier(server, client)
+
+    await client.disconnect()
+    await client.connect()
+
+    assert registry.last_spot(EURUSD) is None
 
 
 # -- Owners, and consumers being subscribed or released ---------------------------------------
