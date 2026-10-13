@@ -819,6 +819,37 @@ async def test_a_cancelled_last_release_forgets_the_last_spot(
     assert registry.last_spot(EURUSD) is None
 
 
+async def test_no_last_spot_is_given_while_the_connection_is_down(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await server.push(_quote(EURUSD, bid=110_000, ask=110_010))
+    await _pass_barrier(server, client)
+
+    # Lost soon after becoming ready, so the next bring-up waits out a back-off.
+    await server.drop_connections()
+    await wait_until(lambda: not client.session.is_ready, description="loss noticed")
+
+    assert registry.last_spot(EURUSD) is None
+
+
+async def test_a_spot_after_the_last_release_is_not_kept(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await registry.unsubscribe_spots(EURUSD, "a", "data")
+    await server.push(_quote(EURUSD, bid=110_000, ask=110_010))
+    await _pass_barrier(server, client)
+
+    await registry.subscribe_spots(EURUSD, "b", "data")
+
+    assert registry.last_spot(EURUSD) is None
+
+
 async def test_the_last_spot_is_forgotten_when_the_session_is_dropped(
     server: FakeCTraderServer,
     client: CTraderAccountClient,
