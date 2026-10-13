@@ -43,9 +43,9 @@ from nautilus_ctrader.common.errors import (
 AUTHORIZATION_URL = "https://id.ctrader.com/my/settings/openapi/grantingaccess/"
 TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 
-# The callback server binds IPv4 127.0.0.1 by default, whatever the redirect host, so only
-# these are accepted as redirect hosts: a wider host could bind and expose the callback port,
-# and "::1" would parse as loopback but never actually receive the redirect.
+# The redirect host is where the browser sends the code, so it must be loopback: the code never
+# goes to another machine. "::1" is left out because the IPv4 callback server would never
+# receive a redirect sent there.
 _LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1"})
 _CALLBACK_BIND_HOST = "127.0.0.1"
 
@@ -176,11 +176,10 @@ def wait_for_authorization_code(
     - `timeout_secs` is an exact deadline from this call. Every connection is served on its own
       thread, so an idle browser preconnect or a slow client never delays the real redirect.
     - `on_listening`, if given, runs once the socket listens: the cue to open the browser.
-    - `bind_host` is the address the callback listens on, 127.0.0.1 by default. Where the
-      redirect arrives through a port forwarded into the process's own network namespace, as in
-      a container, pass "0.0.0.0": that namespace's loopback cannot be reached. Anywhere else
-      that exposes the port, and the one-time code it receives, to the network for the whole
-      wait. The redirect URI must still be on a loopback host.
+    - `bind_host` is the IPv4 address the callback listens on, 127.0.0.1 by default. "0.0.0.0"
+      is for a redirect that arrives through a forwarded port, where the process's loopback is
+      not reachable; it exposes an unauthenticated plain-HTTP listener, guarded only by `state`,
+      for the whole wait. The redirect URI must still be on a loopback host.
 
     Prints nothing. Raises:
 

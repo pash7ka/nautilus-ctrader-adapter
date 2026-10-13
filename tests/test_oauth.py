@@ -128,6 +128,7 @@ def test_parse_redirect_uri_returns_port_and_path(
         ("https://localhost:8080/callback", "scheme must be http"),
         ("http://example.com:8080/callback", "localhost"),
         ("http://[::1]:8080/callback", "localhost"),
+        ("http://0.0.0.0:8080/callback", "localhost"),
         ("http://evil.com\\@localhost/cb", "'@'"),
         ("http://localhost:99999/callback", "invalid port"),
         ("http://localhost:abc/callback", "invalid port"),
