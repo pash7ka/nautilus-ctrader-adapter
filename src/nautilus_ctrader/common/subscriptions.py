@@ -65,12 +65,14 @@ def _trendbar_spot_consumer(period: int, consumer: _Consumer) -> _Consumer:
 class LastSpot:
     """A symbol's latest bid and ask, in the venue's 1/100000 of a price.
 
-    `at` is the event loop's time the latest spot carrying either arrived.
+    `at` is the event loop's time the latest spot carrying either arrived, and `timestamp` that
+    spot's own time at the broker, in ms, if it carried one.
     """
 
     bid: int | None
     ask: int | None
     at: float
+    timestamp: int | None = None
 
 
 @dataclass
@@ -511,6 +513,7 @@ class SubscriptionRegistry:
             bid=event.bid if has_bid else (last.bid if last else None),
             ask=event.ask if has_ask else (last.ask if last else None),
             at=asyncio.get_running_loop().time(),
+            timestamp=event.timestamp if event.HasField("timestamp") else None,
         )
         self._last_spots[event.symbolId] = (generation, spot)
 

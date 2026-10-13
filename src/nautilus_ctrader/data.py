@@ -1267,7 +1267,32 @@ class CTraderDataClient(LiveMarketDataClient):
         finally:
             # Detaches it again if the registry did not count the subscribe.
             self._sync_listener(symbol_id)
+        self._publish_last_spot(symbol_id)
         return True
+
+    def _publish_last_spot(self, symbol_id: int) -> None:
+        """Publish the account's last spot of a symbol this client has no quote of yet.
+
+        Joining a live subscription sends the venue nothing, so without it the first quote
+        would wait for the price to move. The quote carries the spot's own broker time.
+        """
+        if not self._quoting(symbol_id):
+            return
+        book = self._book(symbol_id)
+        spot = self._account.subscriptions.last_spot(symbol_id)
+        if (book.bid is not None and book.ask is not None) or spot is None:
+            return
+        if spot.bid is None or spot.ask is None:
+            return
+        event = oa.ProtoOASpotEvent(
+            ctidTraderAccountId=self._account.account_id,
+            symbolId=symbol_id,
+            bid=spot.bid,
+            ask=spot.ask,
+        )
+        if spot.timestamp is not None:
+            event.timestamp = spot.timestamp
+        self._on_quote_spot(symbol_id, event)
 
     async def _release_spots(self, symbol_id: int, consumer: str) -> None:
         subscriptions = self._account.subscriptions

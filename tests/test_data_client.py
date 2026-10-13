@@ -707,6 +707,35 @@ async def test_the_synthetic_quote_size_is_used_for_both_sides() -> None:
         assert float(quote.ask_size) == 1_000_000.0
 
 
+async def test_quotes_joining_a_live_subscription_start_from_its_last_spot() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        # Another client of the account holds the spots, and the venue's spot came to it.
+        await h.account.subscriptions.subscribe_spots(GER40_SYMBOL_ID, "reference", "execution")
+        await push_spot(h, GER40_SPOT)
+        assert not h.quotes()
+
+        await subscribe_quotes(h, GER40_ID)
+
+        (quote,) = [q for q in h.quotes() if q.instrument_id == GER40_ID]
+        assert quote.ts_event == GER40_SPOT.timestamp * 1_000_000
+        assert quote.ts_init >= quote.ts_event
+        subscribes = received(h.server, oa.ProtoOASubscribeSpotsReq)
+        assert sum(GER40_SYMBOL_ID in r.symbolId for r in subscribes) == 1
+
+
+async def test_quotes_already_published_are_not_published_again_on_a_second_hold() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await subscribe_quotes(h, GER40_ID)
+        await push_spot(h, GER40_SPOT)
+        published = len(h.quotes())
+
+        await h.client._hold_spots(GER40_SYMBOL_ID, "another")
+
+        assert len(h.quotes()) == published
+
+
 async def test_subscribing_quotes_holds_the_spot_subscription_for_that_instrument() -> None:
     async with harness() as h:
         await h.client._connect()
