@@ -7,7 +7,6 @@ import struct
 import time
 from collections.abc import Callable
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 from nautilus_trader.cache.cache import Cache
@@ -839,10 +838,10 @@ async def test_a_bracket_goes_out_as_one_market_order_measured_from_the_ask() ->
 
 
 def test_a_sell_bracket_is_logged_as_measured_from_the_bid() -> None:
-    request = oa.ProtoOANewOrderReq(relativeTakeProfit=2_500)
-    sell = SimpleNamespace(side=OrderSide.SELL)
+    request = oa.ProtoOANewOrderReq(tradeSide=om.SELL, relativeTakeProfit=2_500)
+    built = order_translation.Bracket(request, None, None, None, None, Decimal("1.10990"))
 
-    text = _distances(sell, request, Decimal("1.10990"), Decimal("1.11000"))
+    text = _distances(built)
 
     assert text == "bid 1.10990, take-profit 0.025 away"
 
@@ -2944,6 +2943,46 @@ async def test_a_leg_command_that_fails_after_its_send_waits_for_a_query(
         else:
             await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
             assert h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00")
+        assert refusals(h, leg) == []
+
+
+@pytest.mark.parametrize("cancelling", [True, False], ids=["cancel", "modify"])
+async def test_a_query_while_a_leg_command_awaits_its_answer_takes_the_leg_back(
+    cancelling: bool,
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends: list = []
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_AMEND_POSITION_SLTP_REQ, amend_echo(amends)
+    )
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        leg = h.cache.order(ClientOrderId(STOP if cancelling else TARGET))
+        await made_pending(h, leg, cancelling=cancelling)
+        if cancelling:
+            command = asyncio.create_task(h.client._cancel_order(cancel(STOP)))
+        else:
+            command = asyncio.create_task(h.client._modify_order(modify(TARGET, price="85400.00")))
+        await asyncio.wait_for(held.arrived.wait(), timeout=5)
+
+        # The broker still holds both levels as they were.
+        serve(execution_venue, OPEN_AT)
+        position = execution_venue.snapshot.position[0]
+        await h.client._query_order(query_of(leg))
+        await wait_until(lambda: status(h, leg.client_order_id.value) == OrderStatus.ACCEPTED)
+        if not cancelling:
+            held_price = Price(position.takeProfit, leg.price.precision)
+            assert h.cache.order(ClientOrderId(TARGET)).price == held_price
+
+        await held.release()
+        await command
+        if cancelling:
+            await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
+        else:
+            await wait_until(
+                lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
+            )
+        assert len(amends) == 1
         assert refusals(h, leg) == []
 
 

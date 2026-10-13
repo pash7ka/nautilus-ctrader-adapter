@@ -51,7 +51,6 @@ from nautilus_trader.model.enums import (
     AccountType,
     LiquiditySide,
     OmsType,
-    OrderSide,
     OrderStatus,
     OrderType,
     PositionSide,
@@ -204,13 +203,14 @@ def _command(verb: str, client_order_ids: Iterable[ClientOrderId]) -> str:
     return f"{verb} of {', '.join(client_order_id.value for client_order_id in client_order_ids)}"
 
 
-def _distances(entry: Order, request: oa.ProtoOANewOrderReq, bid: Decimal, ask: Decimal) -> str:
+def _distances(built: order_translation.Bracket) -> str:
     """The spot a bracket's levels were measured from, and each level's distance, in price units.
 
     The broker sets each level at that distance from the fill, until the correcting amend moves it.
     """
-    side = "ask" if entry.side == OrderSide.BUY else "bid"
-    parts = [f"{side} {ask if side == 'ask' else bid}"]
+    request = built.request
+    side = "ask" if request.tradeSide == om.BUY else "bid"
+    parts = [f"{side} {built.reference}"]
     for name, field in (("stop-loss", "relativeStopLoss"), ("take-profit", "relativeTakeProfit")):
         if request.HasField(field):
             parts.append(f"{name} {Decimal(getattr(request, field)) / PRICE_SCALE} away")
@@ -2025,9 +2025,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 order.strategy_id, order.instrument_id, order.client_order_id, ts
             )
         if bracket:
-            self._log.info(
-                f"Order {entry_id} sent as a bracket: {_distances(entry, request, bid, ask)}"
-            )
+            self._log.info(f"Order {entry_id} sent as a bracket: {_distances(built)}")
         else:
             self._log.info(f"Order {entry_id} sent")
         outcome = await self._send(request)

@@ -549,10 +549,11 @@ inflight_check_threshold_ms × inflight_check_retries  ≥  connect_timeout_secs
 For the default `connect_timeout_secs` of 60 seconds, `5000 × 18` (90 seconds) is a sensible
 choice. The engine's default of 5 retries gives 25 seconds, which a reconnect can outlast.
 
-The budget need not cover how long a command takes, only how long the adapter cannot answer. While
-the connection is up, a query about a leg whose modify or cancel is still being sent is answered
-from the broker's lists, and Nautilus takes the leg back as the broker holds it; if the command
-lands later, its event follows. A level amend (section 1) is tried at most three times, and between
+The budget need not cover how long a command takes, only how long the adapter cannot answer: while
+the connection is down, and while a leg's entry is still in flight (above). Otherwise a query about
+a leg whose modify or cancel is still being sent is answered from the broker's lists, and Nautilus
+takes the leg back as the broker holds it; if the command lands later, its event follows. A level
+amend ([section 1](#1-what-it-trades)) is tried at most three times, and between
 tries it waits for the connection, so it gives up after at most
 
 ```

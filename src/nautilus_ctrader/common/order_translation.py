@@ -48,7 +48,8 @@ class Bracket:
     """A bracket as the one request that opens it, and what must follow once it is filled.
 
     `stop_loss` and `take_profit` are the exact prices asked for. The request carries them only
-    as distances from the fill, so the position is amended to the exact prices afterwards.
+    as distances from the fill, measured here from `reference` (the ask for a buy, the bid for a
+    sell), so the position is amended to the exact prices afterwards.
     """
 
     request: oa.ProtoOANewOrderReq
@@ -56,6 +57,7 @@ class Bracket:
     take_profit_id: ClientOrderId | None
     stop_loss: Price | None
     take_profit: Price | None
+    reference: Decimal
 
 
 def volume_from_quantity(quantity: Quantity) -> int:
@@ -270,6 +272,7 @@ def bracket(
         take_profit_id=None if take_profit is None else take_profit.client_order_id,
         stop_loss=None if stop_loss is None else stop_loss.trigger_price,
         take_profit=None if take_profit is None else take_profit.price,
+        reference=reference,
     )
 
 
