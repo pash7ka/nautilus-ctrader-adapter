@@ -7,6 +7,7 @@ import struct
 import time
 from collections.abc import Callable
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from nautilus_trader.cache.cache import Cache
@@ -53,7 +54,7 @@ from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.venue_book import terms_of
 from nautilus_ctrader.common.venue_records import Level, LevelTerms
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
-from nautilus_ctrader.execution import CTraderExecutionClient
+from nautilus_ctrader.execution import _AMEND_ATTEMPTS, CTraderExecutionClient, _distances
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -830,6 +831,20 @@ async def test_a_bracket_goes_out_as_one_market_order_measured_from_the_ask() ->
         assert request.relativeTakeProfit == 10_001_000
         assert status(h, ENTRY) == OrderStatus.FILLED
         assert status(h, STOP) == OrderStatus.ACCEPTED
+        assert (
+            "info",
+            f"Order {ENTRY} sent as a bracket: ask 85287.21, stop-loss 90.01 away, "
+            "take-profit 100.01 away",
+        ) in h.logger.lines
+
+
+def test_a_sell_bracket_is_logged_as_measured_from_the_bid() -> None:
+    request = oa.ProtoOANewOrderReq(relativeTakeProfit=2_500)
+    sell = SimpleNamespace(side=OrderSide.SELL)
+
+    text = _distances(sell, request, Decimal("1.10990"), Decimal("1.11000"))
+
+    assert text == "bid 1.10990, take-profit 0.025 away"
 
 
 async def test_a_market_order_goes_out_without_levels_and_opens_a_position() -> None:
@@ -3159,6 +3174,29 @@ async def test_an_amend_that_got_no_answer_ends_unknown_not_refused(
         else:
             assert h.logger.errors() == []
             assert any(TARGET in line and "got no answer" in line for line in h.logger.warnings())
+
+
+async def test_an_amend_waits_for_the_connection_only_between_its_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(execution_venue=answered(FIRST_EVENTS[:3])) as h:
+        await opened_bracket(h)
+        target = h.cache.order(ClientOrderId(TARGET))
+        await made_pending(h, target, cancelling=False)
+        waits: list[int] = []
+        wait_ready = h.client._wait_ready
+
+        async def counted() -> None:
+            waits.append(1)
+            await wait_ready()
+
+        monkeypatch.setattr(h.client, "_wait_ready", counted)
+        lose_amends(h, monkeypatch, ["lost"] * _AMEND_ATTEMPTS)
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await sync(h)
+
+        assert len(waits) == _AMEND_ATTEMPTS - 1
+        assert status(h, TARGET) == OrderStatus.PENDING_UPDATE
 
 
 async def test_missing_levels_whose_amend_got_no_answer_leave_the_legs_with_an_error(

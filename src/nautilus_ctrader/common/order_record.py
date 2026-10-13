@@ -72,6 +72,11 @@ def check_client_order_id(entry_id: str) -> str:
 
 
 def encode_label(entry_id: str) -> str:
+    """The `label` the adapter writes on an entry with client order id `entry_id`.
+
+    Raises `ValueError` if `entry_id` is empty or not printable ASCII without a space or `|`,
+    and `RecordTooLong` if the label would not fit the venue's field.
+    """
     return _fit(f"{_LABEL_PREFIX}{_require_recordable(entry_id)}", LABEL_MAX, "label")
 
 
@@ -87,6 +92,10 @@ def parse_label(label: str) -> str | None:
 
 
 def encode_comment(legs: LegIds) -> str:
+    """The `comment` the adapter writes on an entry whose protective legs are `legs`.
+
+    Raises as `encode_label()` does, for each leg id and for the comment's length.
+    """
     parts = [MARKER]
     if legs.stop_loss is not None:
         parts.append(f"{_STOP_LOSS_KEY}={_require_recordable(legs.stop_loss)}")

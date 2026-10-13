@@ -391,6 +391,11 @@ program can write those fields too, so parsing is strict: a text that is not exa
 written by the adapter is not a record, and the position is then treated as foreign. The mistake
 can only be "not the node's", never the node taking someone else's position for its own.
 
+The package exports the codec, for an application that checks what the broker stored:
+`encode_label(entry_id)` and `encode_comment(LegIds(stop_loss, take_profit))` give the texts the
+adapter writes; `parse_label(label)` and `parse_comment(comment)` give back the ids, or `None` for
+a text the adapter did not write.
+
 What the mass status holds, for a position the node opened:
 
 - the **entry** as a filled order under its own client order id, with the broker's real venue
@@ -543,6 +548,20 @@ inflight_check_threshold_ms × inflight_check_retries  ≥  connect_timeout_secs
 
 For the default `connect_timeout_secs` of 60 seconds, `5000 × 18` (90 seconds) is a sensible
 choice. The engine's default of 5 retries gives 25 seconds, which a reconnect can outlast.
+
+The budget need not cover how long a command takes, only how long the adapter cannot answer. While
+the connection is up, a query about a leg whose modify or cancel is still being sent is answered
+from the broker's lists, and Nautilus takes the leg back as the broker holds it; if the command
+lands later, its event follows. A level amend (section 1) is tried at most three times, and between
+tries it waits for the connection, so it gives up after at most
+
+```
+3 × order_request_timeout_secs  +  2 × connect_timeout_secs
+```
+
+plus rate-limit waits and any earlier amend of the same position it queues behind. A connection
+down for longer than the budget lets Nautilus settle the leg as cancelled while the broker may
+still hold its level.
 
 If the retries run out after the entry had filled, the entry's position still opens under the
 node's id when the fill arrives, but the order stays `REJECTED` with nothing filled, and its legs

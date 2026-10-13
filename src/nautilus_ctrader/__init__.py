@@ -23,6 +23,14 @@ from nautilus_ctrader.common.errors import (
     CTraderTimeoutError,
     CTraderTokenExchangeError,
 )
+from nautilus_ctrader.common.order_record import (
+    LegIds,
+    RecordTooLong,
+    encode_comment,
+    encode_label,
+    parse_comment,
+    parse_label,
+)
 from nautilus_ctrader.config import CTraderDataClientConfig, CTraderExecClientConfig
 from nautilus_ctrader.constants import CTRADER, CTRADER_VENUE
 from nautilus_ctrader.data import CTraderDataClient
@@ -75,16 +83,22 @@ __all__ = [
     "GrantedAccount",
     "InstrumentLoadError",
     "InstrumentLoadFailure",
+    "LegIds",
+    "RecordTooLong",
     "RedirectUriError",
     "SymbolInfo",
     "TokenPair",
     "__version__",
     "account_client_from_config",
     "build_authorization_url",
+    "encode_comment",
+    "encode_label",
     "exchange_code",
     "get_cached_ctrader_account_client",
     "leg_position_id",
     "list_accounts",
     "list_symbols",
+    "parse_comment",
+    "parse_label",
     "wait_for_authorization_code",
 ]

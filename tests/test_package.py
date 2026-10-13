@@ -36,3 +36,12 @@ def test_the_setup_api_is_importable_from_the_package_root() -> None:
         "RedirectUriError",
     }
     assert setup_names <= set(nautilus_ctrader.__all__)
+
+
+def test_the_order_record_codec_round_trips_from_the_package_root() -> None:
+    legs = nautilus_ctrader.LegIds(stop_loss="O-2", take_profit=None)
+
+    assert nautilus_ctrader.parse_label(nautilus_ctrader.encode_label("O-1")) == "O-1"
+    assert nautilus_ctrader.parse_comment(nautilus_ctrader.encode_comment(legs)) == legs
+    assert nautilus_ctrader.parse_label("O-1") is None
+    assert issubclass(nautilus_ctrader.RecordTooLong, ValueError)
