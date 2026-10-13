@@ -65,8 +65,7 @@ def volume_from_quantity(quantity: Quantity) -> int:
 
     Refused rather than rounded if it is finer than that: a rounded volume is a different order.
     """
-    # TODO(verify): the schema states volume in 0.01 of a unit; a live minimum-size order confirms
-    # that this factor and the instrument's quantity units agree.
+    # Confirmed live on an index, a metal and a crypto CFD: the volume is in 0.01 of a unit.
     scaled = quantity.as_decimal() * VOLUME_SCALE
     if scaled <= 0 or scaled != scaled.to_integral_value():
         raise Unsupported(
@@ -81,8 +80,7 @@ def relative_level(reference: Decimal, level: Decimal, *, below: bool) -> int:
     `below` says which side of the reference the level must be on. The venue applies the
     distance from the fill price, so a level at or beyond the reference has no valid distance.
     """
-    # TODO(verify): the schema states the distance in 1/100000 of a price, applied from the fill;
-    # a live bracket on a minimum-size order confirms the factor and the direction.
+    # Confirmed live: the distance is in 1/100000 of a price, applied from the fill.
     if reference <= 0:
         raise Unsupported(f"reference price {reference} must be positive")
     if reference * PRICE_SCALE != (reference * PRICE_SCALE).to_integral_value():
@@ -159,8 +157,8 @@ def _new_order(
         comment = order_record.encode_comment(legs)
     except ValueError as e:
         raise Unsupported(str(e)) from e
-    # TODO(verify): the broker's own terminal sends market orders immediate-or-cancel; the first
-    # order the adapter sends, read back from the broker, confirms it fills the same way.
+    # Immediate-or-cancel, as the broker's own terminal sends market orders; such orders fill
+    # (confirmed live).
     return oa.ProtoOANewOrderReq(
         ctidTraderAccountId=account_id,
         symbolId=instrument.info["symbol_id"],
@@ -254,9 +252,8 @@ def bracket(
     buying = entry.side == OrderSide.BUY
     reference = ask if buying else bid
     if stop_loss is not None:
-        # TODO(verify): which trigger method the venue applies to a stop-loss level set by a
-        # relative distance (a new order cannot set the position's `stopLossTriggerMethod`,
-        # whose schema default is TRADE); reading the position back after placement shows it.
+        # A new order cannot set the position's `stopLossTriggerMethod`; a stop-loss set by a
+        # relative distance gets TRADE (confirmed live).
         _require_on_price_grid(instrument, stop_loss.trigger_price)
         request.relativeStopLoss = relative_level(
             reference, stop_loss.trigger_price.as_decimal(), below=buying

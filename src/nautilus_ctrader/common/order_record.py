@@ -19,13 +19,13 @@ from dataclasses import dataclass
 # The format's name and version in one token; a change of format changes it.
 MARKER = "ntca1"
 
+# Confirmed live: the venue returns `label` and `comment` verbatim.
 # TODO(verify): these limits come from the schema's comments. Not yet confirmed live:
 # - the limits themselves;
 # - whether the venue counts characters or bytes (moot while ids are ASCII);
-# - whether it rejects or truncates an over-limit field;
-# - whether it returns `label` and `comment` verbatim, with no trimming or case change.
+# - whether it rejects or truncates an over-limit field.
 # Placing an order with a limit-length label and comment and reading both back from the
-# position would confirm all four.
+# position would confirm all three.
 LABEL_MAX = 100
 COMMENT_MAX = 512
 CLIENT_ORDER_ID_MAX = 50

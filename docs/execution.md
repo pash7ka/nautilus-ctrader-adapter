@@ -75,8 +75,13 @@ translates between the two literally and never guesses what an application inten
 **Going out.** The whole bracket is one new-order request carrying both levels. The venue takes
 a market order's levels only as distances, which it applies to the fill price, so the adapter
 measures each level from the latest spot of the instrument (the ask for a buy, the bid for a
-sell). It holds spot subscriptions for every loaded instrument for this purpose; a spot older
-than `reference_price_max_age_secs` refuses the bracket.
+sell). It holds spot subscriptions for every loaded instrument for this purpose. The latest spot
+is the account's, whichever client's subscription brought it, so one that arrived before the
+execution client joined a live subscription counts too. A spot is as old as the time since it
+arrived, and one from before the last reconnect does not count. With no spot newer than
+`reference_price_max_age_secs` the bracket is refused. A quiet instrument can go some time without
+a spot, so a longer age avoids refusals there; the cost is that until the
+correcting amend below, the broker's levels are off by however far the market moved since.
 
 **Correcting amend.** The fill happens at a price other than the reference, so the levels the
 broker sets differ from the prices the application asked for. Once the broker's protective order
@@ -838,9 +843,21 @@ sign flipped to Nautilus's convention (a charge is positive).
 
 ## 10. Not yet confirmed against a live endpoint
 
-No new order has yet been sent through the adapter on a live account, so everything about
-sending one is read from the schema and the broker's own terminal's behaviour, not observed from
-the adapter. Cancels and amends have been sent through it, of a pending order and of a position's
+Brackets have been sent through the adapter on a live account, on an index, a metal and a
+crypto CFD, each at the instrument's minimum volume. They confirmed:
+
+- volume is in hundredths of a unit;
+- relative levels are distances in 1/100000 of a price, applied from the fill;
+- an immediate-or-cancel market order fills;
+- a stop-loss set by a relative distance triggers on TRADE;
+- the correcting amend leaves the levels at the exact prices asked for;
+- `label` and `comment` come back verbatim;
+- the commission on each fill matches the broker's deal.
+
+A stop-loss one tick from the market, on an instrument whose minimum stop distance is 0, was
+accepted and triggered at once.
+
+Cancels and amends have been sent through it too, of a pending order and of a position's
 levels that were placed by hand: what they confirmed is listed in
 [Protocol notes](protocol.md), section 10. A partial close made by hand was watched as well, and
 confirmed there: it arrives as the closing order's `ORDER_ACCEPTED` then `ORDER_FILLED`, the fill
@@ -851,11 +868,6 @@ recorder's mislabel: whose id it was is not recorded), so only an id the adapter
 marks an answer. Each point still open is marked in the source with a `TODO(verify):` comment
 saying what would settle it. The main groups:
 
-- **Scales and defaults on a new order**: that volume in hundredths of a unit agrees with each
-  instrument's quantity units; that relative levels are distances in 1/100000 of a price applied
-  from the fill, in the direction assumed; that immediate-or-cancel fills a market order the way
-  the broker's own terminal's does; which trigger method a stop-loss set by a relative distance
-  uses.
 - **Amends**: that leaving the stop-loss out of an amend removes it, as leaving the take-profit
   out does; what the venue does with an optional field an amend leaves out, a position's trailing
   and guaranteed flags and trigger method, or a pending order's attributes (it may keep the
@@ -867,7 +879,7 @@ saying what would settle it. The main groups:
 - **Order details**: which request limit the order details request counts against. A query falls
   back to the order list where the details cannot be read.
 - **The records in `label` and `comment`**: their limits, whether the venue counts characters or
-  bytes, whether it truncates or rejects an over-long field, and whether it returns them verbatim.
+  bytes, and whether it truncates or rejects an over-long field.
 - **Events not yet seen**: a stop-out and how it is flagged; a trader-update and a margin-change
   event; a protective order that triggers partially, and whether a partly filled protective order
   reports its total volume or its rest (one reduced by a partial close reports the total left);
