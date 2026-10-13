@@ -18,6 +18,12 @@ The application's registered redirect URI must be plain `http` on `localhost` or
 for example `http://localhost:8080/callback`. The callback server binds `127.0.0.1` on that
 port and serves only that path.
 
+Where the redirect reaches the process through a port forwarded into its own network namespace,
+as in a container, a listener on that namespace's `127.0.0.1` cannot be reached. There, pass
+`bind_host="0.0.0.0"` to `wait_for_authorization_code`, and keep the forwarded port on the outer
+machine's loopback only. The redirect URI stays on `localhost`. Anywhere else, `"0.0.0.0"` exposes
+the callback, and the one-time code it receives, to the network for the whole wait.
+
 ```python
 import asyncio
 import secrets
