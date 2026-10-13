@@ -65,12 +65,14 @@ def _trendbar_spot_consumer(period: int, consumer: _Consumer) -> _Consumer:
 class LastSpot:
     """A symbol's latest bid and ask, in the venue's 1/100000 of a price.
 
-    `at` is the event loop's time the latest spot carrying either arrived.
+    `at` is the event loop's time the latest spot carrying either arrived, and `timestamp` that
+    spot's own time at the broker, in ms, if it carried one.
     """
 
     bid: int | None
     ask: int | None
     at: float
+    timestamp: int | None = None
 
 
 @dataclass
@@ -239,10 +241,19 @@ class SubscriptionRegistry:
             del self._spot_listeners[symbol_id]
 
     def last_spot(self, symbol_id: int) -> LastSpot | None:
-        """`symbol_id`'s latest bid and ask since the session last connected, if any came."""
+        """`symbol_id`'s latest bid and ask since the session last connected, if any came.
+
+        `None` while the connection is down: the generation moves only once the next bring-up
+        starts.
+        """
         kept = self._last_spots.get(symbol_id)
         session = self._session
-        if kept is None or session is None or kept[0] != session.bring_up_generation:
+        if (
+            kept is None
+            or session is None
+            or session.state not in _ACCEPTING
+            or kept[0] != session.bring_up_generation
+        ):
             return None
         return kept[1]
 
@@ -397,11 +408,11 @@ class SubscriptionRegistry:
         """Drop `consumer`'s reference; the last one also unsubscribes. Caller holds the key lock.
 
         The reference is dropped once the request has run its course, failure included: its
-        consumer is gone either way, and spots the venue keeps sending reach no listener (they
-        are still kept for `last_spot()`). A cancellation is the one outcome that keeps it,
-        mirroring `_acquire`: the venue may still be streaming the key, and only a repeated
-        unsubscribe settles that. It may equally have stopped, so the key is marked for the next
-        `_acquire` to re-subscribe.
+        consumer is gone either way, and spots the venue keeps sending are dropped for want of
+        a listener and not kept. A cancellation is the one outcome that keeps it, mirroring
+        `_acquire`: the venue may still be streaming the key, and only a repeated unsubscribe
+        settles that. It may equally have stopped, so the key is marked for the next `_acquire`
+        to re-subscribe.
         """
         consumers = self._consumers.get(key)
         if consumers is None or consumer not in consumers:
@@ -501,7 +512,7 @@ class SubscriptionRegistry:
     def _keep(self, event: oa.ProtoOASpotEvent) -> None:
         session = self._session
         has_bid, has_ask = event.HasField("bid"), event.HasField("ask")
-        if session is None or not (has_bid or has_ask):
+        if session is None or not (has_bid or has_ask) or not self._holds_spots(event.symbolId):
             return
         generation = session.bring_up_generation
         kept = self._last_spots.get(event.symbolId)
@@ -511,8 +522,18 @@ class SubscriptionRegistry:
             bid=event.bid if has_bid else (last.bid if last else None),
             ask=event.ask if has_ask else (last.ask if last else None),
             at=asyncio.get_running_loop().time(),
+            timestamp=event.timestamp if event.HasField("timestamp") else None,
         )
         self._last_spots[event.symbolId] = (generation, spot)
+
+    def _holds_spots(self, symbol_id: int) -> bool:
+        """Whether `symbol_id`'s spots are counted, or a subscribe that takes them is in flight.
+
+        A spot that comes after the last release is not kept, so a later subscribe never finds it.
+        """
+        if _spots_key(symbol_id) in self._consumers:
+            return True
+        return any(key[1] == symbol_id for key in self._intents)
 
 
 async def _subscribe(session: CTraderSession, requests: list[Message]) -> None:

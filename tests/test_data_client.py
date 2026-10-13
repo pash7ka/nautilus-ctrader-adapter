@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -705,6 +706,113 @@ async def test_the_synthetic_quote_size_is_used_for_both_sides() -> None:
         quote = h.quotes()[-1]
         assert float(quote.bid_size) == 1_000_000.0
         assert float(quote.ask_size) == 1_000_000.0
+
+
+async def held_elsewhere(h: Harness, spot: oa.ProtoOASpotEvent = GER40_SPOT) -> None:
+    """Another client of the account holds GER40.cash's spots, and `spot` came to it."""
+    await h.account.subscriptions.subscribe_spots(GER40_SYMBOL_ID, "reference", "execution")
+    await push_spot(h, spot)
+
+
+def ger40_quotes(h: Harness) -> list[QuoteTick]:
+    return [q for q in h.quotes() if q.instrument_id == GER40_ID]
+
+
+async def test_quotes_joining_a_live_subscription_start_from_its_last_spot() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await held_elsewhere(h)
+        assert not ger40_quotes(h)
+        before = time.time_ns()
+
+        await subscribe_quotes(h, GER40_ID)
+
+        (quote,) = ger40_quotes(h)
+        assert quote.ts_event == GER40_SPOT.timestamp * 1_000_000
+        assert quote.ts_init >= before
+        subscribes = received(h.server, oa.ProtoOASubscribeSpotsReq)
+        assert sum(GER40_SYMBOL_ID in r.symbolId for r in subscribes) == 1
+
+
+async def test_a_conversion_leg_joining_a_live_subscription_starts_from_its_last_spot() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await held_elsewhere(h)
+
+        await h.client._hold_spots(GER40_SYMBOL_ID, f"conversion:{US100_ID}")
+
+        assert len(ger40_quotes(h)) == 1
+
+
+async def test_a_last_spot_without_a_broker_time_is_stamped_when_published() -> None:
+    spot = oa.ProtoOASpotEvent()
+    spot.CopyFrom(GER40_SPOT)
+    spot.ClearField("timestamp")
+    async with harness() as h:
+        await h.client._connect()
+        await held_elsewhere(h, spot)
+
+        await subscribe_quotes(h, GER40_ID)
+
+        (quote,) = ger40_quotes(h)
+        assert quote.ts_event == quote.ts_init
+
+
+async def test_a_one_sided_last_spot_publishes_nothing() -> None:
+    spot = oa.ProtoOASpotEvent()
+    spot.CopyFrom(GER40_SPOT)
+    spot.ClearField("ask")
+    async with harness() as h:
+        await h.client._connect()
+        await held_elsewhere(h, spot)
+
+        await subscribe_quotes(h, GER40_ID)
+
+        assert ger40_quotes(h) == []
+
+
+async def test_a_last_spot_from_before_a_reconnect_is_not_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    async with harness() as h:
+        await h.client._connect()
+        await held_elsewhere(h)
+        connections = h.server.connection_count
+        await h.server.drop_connections()
+        await wait_until(
+            lambda: h.server.connection_count > connections and h.account.session.is_ready,
+            description="session ready again",
+        )
+
+        await subscribe_quotes(h, GER40_ID)
+
+        assert ger40_quotes(h) == []
+
+
+async def test_no_last_spot_is_published_while_the_connection_is_down() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await held_elsewhere(h)
+        # Lost soon after becoming ready, so the next bring-up waits out a back-off.
+        await h.server.drop_connections()
+        await wait_until(lambda: not h.account.session.is_ready, description="loss noticed")
+
+        await h.client._hold_spots(GER40_SYMBOL_ID, f"quotes:{GER40_ID}")
+
+        assert ger40_quotes(h) == []
+
+
+async def test_quotes_already_published_are_not_published_again_on_a_second_hold() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await subscribe_quotes(h, GER40_ID)
+        await push_spot(h, GER40_SPOT)
+        published = len(h.quotes())
+
+        await h.client._hold_spots(GER40_SYMBOL_ID, "another")
+
+        assert len(h.quotes()) == published
 
 
 async def test_subscribing_quotes_holds_the_spot_subscription_for_that_instrument() -> None:

@@ -191,6 +191,18 @@ events are one-sided — an event carries only the side that moved — so the la
 ask are kept per symbol and a tick is published as soon as a pair exists. After a reconnect both
 sides are forgotten, so a price from before an outage is never paired with one from after it.
 
+A spot subscription is shared by every client of the account, and a client joining one that is
+already live sends the venue nothing, so whatever the venue sent when the subscription opened is
+not repeated for it. A quote subscription, or a conversion leg, that joins a live one therefore
+publishes the account's last spot of the symbol at once, when:
+
+- both sides of it are known;
+- it came since the last reconnect, and the connection is up;
+- the data client is not already publishing quotes of the symbol.
+
+Its `ts_event` is that spot's time at the broker, which may be well before the subscription on a
+quiet instrument; its `ts_init` is when it was published. Judge such a quote's age by `ts_event`.
+
 Beyond the instruments you subscribe to, the client also subscribes the symbols needed to
 convert each instrument's quote currency into the account's deposit currency. This is on by
 default (`subscribe_conversion_quotes`) and it is the difference between a correct account

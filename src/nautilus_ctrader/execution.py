@@ -2110,6 +2110,9 @@ class CTraderExecutionClient(LiveExecutionClient):
 
         Read from the account's shared spots, so a spot that reached another client counts too.
         """
+        if not self._connected():
+            # No spot is given while the connection is down; this is the reason that matters.
+            raise Unsupported(_NOT_CONNECTED)
         spot = self._account.subscriptions.last_spot(instrument.info["symbol_id"])
         max_age = self._config.reference_price_max_age_secs
         if (
