@@ -397,10 +397,11 @@ class SubscriptionRegistry:
         """Drop `consumer`'s reference; the last one also unsubscribes. Caller holds the key lock.
 
         The reference is dropped once the request has run its course, failure included: its
-        consumer is gone either way, and spots the venue keeps sending are dropped for want of
-        a listener. A cancellation is the one outcome that keeps it, mirroring `_acquire`: the
-        venue may still be streaming the key, and only a repeated unsubscribe settles that. It
-        may equally have stopped, so the key is marked for the next `_acquire` to re-subscribe.
+        consumer is gone either way, and spots the venue keeps sending reach no listener (they
+        are still kept for `last_spot()`). A cancellation is the one outcome that keeps it,
+        mirroring `_acquire`: the venue may still be streaming the key, and only a repeated
+        unsubscribe settles that. It may equally have stopped, so the key is marked for the next
+        `_acquire` to re-subscribe.
         """
         consumers = self._consumers.get(key)
         if consumers is None or consumer not in consumers:
@@ -424,6 +425,10 @@ class SubscriptionRegistry:
                 self._log.warning(f"Unsubscribe {key!r} failed: {detail}")
         except asyncio.CancelledError:
             self._maybe_unsubscribed.add(key)
+            if key[0] == "spots":
+                # Spots may stop and later restart, and a one-sided spot must not pair with a
+                # side from before the gap.
+                self._last_spots.pop(key[1], None)
             raise
         del self._consumers[key]
         self._maybe_unsubscribed.discard(key)

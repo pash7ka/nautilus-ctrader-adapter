@@ -7,9 +7,10 @@ model maps onto Nautilus orders, how it recovers after a restart or a lost conne
 places where an application has to design around a difference.
 
 Read [Instruments](instruments.md) first for how a symbol becomes a Nautilus instrument, and
-[Protocol notes](protocol.md) (section 10) for what was observed on the wire. No new order has
-yet been sent through the adapter on a live account; its cancels and amends of orders placed by
-hand have been. See [Not yet confirmed](#10-not-yet-confirmed-against-a-live-endpoint).
+[Protocol notes](protocol.md) (section 10) for what was observed on the wire. Brackets, and cancels
+and amends of orders placed by hand, have been sent through the adapter on a live account; see
+[Not yet confirmed](#10-not-yet-confirmed-against-a-live-endpoint) for what they confirmed and
+what is still open.
 
 ## 1. What it trades
 
@@ -849,7 +850,7 @@ crypto CFD, each at the instrument's minimum volume. They confirmed:
 - volume is in hundredths of a unit;
 - relative levels are distances in 1/100000 of a price, applied from the fill;
 - an immediate-or-cancel market order fills;
-- a stop-loss set by a relative distance triggers on TRADE;
+- a stop-loss set by a relative distance is given the TRADE trigger method;
 - the correcting amend leaves the levels at the exact prices asked for;
 - `label` and `comment` come back verbatim;
 - the commission on each fill matches the broker's deal.

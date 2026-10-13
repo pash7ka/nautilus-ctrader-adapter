@@ -6,8 +6,9 @@ execution against any broker that exposes cTrader Open API.
 
 > **Status: early development (pre-alpha).** The transport layer, the instrument provider, the
 > market data client and the execution client are in place and tested offline against recorded
-> fixtures and a fake server. The execution client has not yet been confirmed with a live order:
-> the scripts that connect to a real account only read from it. The public API is not stable and
+> fixtures and a fake server. The execution client has sent minimum-size brackets, cancels and
+> amends on a live account; what that confirmed, and what is still open, is in
+> [Execution, section 10](docs/execution.md#10-not-yet-confirmed-against-a-live-endpoint). The public API is not stable and
 > there is no PyPI release yet. See [Roadmap](#roadmap).
 
 ## Why this exists

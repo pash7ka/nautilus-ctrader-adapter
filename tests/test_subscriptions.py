@@ -9,6 +9,7 @@ from google.protobuf.message import Message
 from nautilus_ctrader.common import account as account_module
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
+from nautilus_ctrader.common.session import SessionState
 from nautilus_ctrader.common.subscriptions import SubscriptionRegistry
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -774,6 +775,47 @@ async def test_the_last_spot_is_forgotten_by_a_reconnect_and_by_the_last_release
     assert registry.last_spot(EURUSD).bid == 110_100
 
     await registry.unsubscribe_spots(EURUSD, "a", "data")
+    assert registry.last_spot(EURUSD) is None
+
+
+async def test_a_spot_arriving_while_its_restore_is_answered_counts_once_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    held = HeldReplies(server, oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ, _spot_reply)
+
+    await server.drop_connections()
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    assert client.session.state is SessionState.RESTORING
+    await server.push(_quote(EURUSD, bid=110_200, ask=110_210))
+    await _pass_barrier(server, client)
+    await held.stop_holding()
+    await wait_until(lambda: client.session.is_ready, description="session ready again")
+
+    spot = registry.last_spot(EURUSD)
+    assert (spot.bid, spot.ask) == (110_200, 110_210)
+
+
+async def test_a_cancelled_last_release_forgets_the_last_spot(
+    server: FakeCTraderServer,
+    client: CTraderAccountClient,
+) -> None:
+    registry = client.subscriptions
+    await registry.subscribe_spots(EURUSD, "a", "data")
+    await server.push(_quote(EURUSD, bid=110_000, ask=110_010))
+    await _pass_barrier(server, client)
+    held = HeldReplies(server, oa_model.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, _spot_unsubscribe_reply)
+
+    releasing = asyncio.create_task(registry.unsubscribe_spots(EURUSD, "a", "data"))
+    await asyncio.wait_for(held.arrived.wait(), 2.0)
+    releasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await releasing
+
     assert registry.last_spot(EURUSD) is None
 
 
