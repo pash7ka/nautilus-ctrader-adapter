@@ -203,6 +203,20 @@ def _command(verb: str, client_order_ids: Iterable[ClientOrderId]) -> str:
     return f"{verb} of {', '.join(client_order_id.value for client_order_id in client_order_ids)}"
 
 
+def _distances(built: order_translation.Bracket) -> str:
+    """The spot a bracket's levels were measured from, and each level's distance, in price units.
+
+    The broker sets each level at that distance from the fill, until the correcting amend moves it.
+    """
+    request = built.request
+    side = "ask" if request.tradeSide == om.BUY else "bid"
+    parts = [f"{side} {built.reference}"]
+    for name, field in (("stop-loss", "relativeStopLoss"), ("take-profit", "relativeTakeProfit")):
+        if request.HasField(field):
+            parts.append(f"{name} {Decimal(getattr(request, field)) / PRICE_SCALE} away")
+    return ", ".join(parts)
+
+
 def _foreign_live(view: PositionView | None, level: Level, venue_order_id: str) -> bool:
     """Whether `venue_order_id` is the live leg of `level` of the foreign position `view`."""
     return view is not None and view.foreign_legs.get(level) == venue_order_id
@@ -2010,7 +2024,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             self.generate_order_submitted(
                 order.strategy_id, order.instrument_id, order.client_order_id, ts
             )
-        self._log.info(f"Order {entry_id} sent")
+        if bracket:
+            self._log.info(f"Order {entry_id} sent as a bracket: {_distances(built)}")
+        else:
+            self._log.info(f"Order {entry_id} sent")
         outcome = await self._send(request)
         if isinstance(outcome, _Refused):
             self._entry_refused(
@@ -2871,7 +2888,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         lost = False
         outcome: Message | _Refused | None = None
         try:
-            for _ in range(_AMEND_ATTEMPTS):
+            for attempt in range(1, _AMEND_ATTEMPTS + 1):
                 outcome = await self._send(request)
                 if outcome is None:
                     lost = True
@@ -2879,7 +2896,8 @@ class CTraderExecutionClient(LiveExecutionClient):
                     return outcome
                 elif not outcome.retryable:
                     break
-                await self._wait_ready()
+                if attempt < _AMEND_ATTEMPTS:
+                    await self._wait_ready()
         except Exception as e:
             if not lost:
                 raise
