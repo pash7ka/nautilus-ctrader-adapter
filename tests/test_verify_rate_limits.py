@@ -17,7 +17,9 @@ import itertools
 import json
 import math
 import pathlib
+import random
 import shutil
+import signal
 import subprocess
 import sys
 from collections import defaultdict
@@ -43,7 +45,8 @@ r = verify_rate_limits
 
 TRENDBARS_TYPE = oa_model.PROTO_OA_GET_TRENDBARS_REQ
 DEAL_LIST_TYPE = oa_model.PROTO_OA_DEAL_LIST_REQ
-SYMBOLS_LIST_TYPE = oa_model.PROTO_OA_SYMBOLS_LIST_REQ
+TICK_DATA_TYPE = oa_model.PROTO_OA_GET_TICKDATA_REQ
+TRADER_TYPE = oa_model.PROTO_OA_TRADER_REQ
 
 CLIENT_ID = "client-id-7f3a"
 CLIENT_SECRET = "client-secret-91c2"
@@ -96,13 +99,16 @@ class FakeLimiter:
         return None
 
 
-def limiter_groups(*, shared: bool) -> dict[int, tuple[str, int]]:
-    """Trendbars and the deal list limited at 5, the symbols list at 50, the rest not at all."""
-    return {
-        TRENDBARS_TYPE: ("historical", 5),
-        DEAL_LIST_TYPE: ("historical" if shared else "deal list", 5),
-        SYMBOLS_LIST_TYPE: ("symbols list", 50),
-    }
+def limiter_groups(
+    *,
+    shared: bool,
+    siblings: tuple[int, ...] = (DEAL_LIST_TYPE,),
+) -> dict[int, tuple[str, int]]:
+    """Trendbars and `siblings` limited at 5, trader requests at 50, the rest not at all."""
+    groups = {TRENDBARS_TYPE: ("historical", 5), TRADER_TYPE: ("trader", 50)}
+    for payload_type in siblings:
+        groups[payload_type] = ("historical" if shared else str(payload_type), 5)
+    return groups
 
 
 class _Clock:
@@ -213,9 +219,11 @@ def test_the_allow_list_holds_only_authentication_reference_and_history_requests
         "ProtoOAGetAccountListByAccessTokenReq",
         "ProtoOAAccountAuthReq",
         "ProtoOAVersionReq",
+        "ProtoOATraderReq",
         "ProtoOASymbolsListReq",
         "ProtoOASymbolByIdReq",
         "ProtoOAGetTrendbarsReq",
+        "ProtoOAGetTickDataReq",
         "ProtoOADealListReq",
         "ProtoOAOrderListReq",
         "ProtoOACashFlowHistoryListReq",
@@ -223,6 +231,8 @@ def test_the_allow_list_holds_only_authentication_reference_and_history_requests
         "ProtoHeartbeatEvent",
     }
     assert set(r.PROBED_REQUESTS.values()) <= r.ALLOWED_REQUESTS
+    # The symbols list only resolves `--symbol`; it is never probed.
+    assert oa.ProtoOASymbolsListReq not in set(r.PROBED_REQUESTS.values())
 
 
 async def test_the_guard_stops_at_its_cap_and_on_request() -> None:
@@ -295,7 +305,25 @@ def test_a_burst_summary_gives_the_first_refused_position() -> None:
     summary = burst(8, 5)
 
     assert (summary.answered, summary.refused, summary.first_refused) == (5, 3, 6)
-    assert r.describe_burst(summary) == "burst of 8: 5 answered, 3 refused from request 6"
+    assert r.describe_burst(summary) == (
+        "burst of 8: 5 answered, 3 refused (BLOCKED_PAYLOAD_TYPE) from request 6"
+    )
+
+
+def test_request_frequency_exceeded_counts_as_a_refusal_and_keeps_its_code() -> None:
+    attempts = [attempt(0.0, role=r.ROLE_BURST, index=i) for i in range(5)]
+    attempts += [
+        attempt(0.0, "REQUEST_FREQUENCY_EXCEEDED", role=r.ROLE_BURST, index=5),
+        attempt(0.0, r.BLOCKED, role=r.ROLE_BURST, index=6),
+    ]
+
+    summary = r.summarize_burst(7, attempts)
+
+    assert (summary.refused, summary.other) == (2, ())
+    assert r.infer_allowance([summary]) == (5, "")
+    assert "2 refused (BLOCKED_PAYLOAD_TYPE, REQUEST_FREQUENCY_EXCEEDED)" in r.describe_burst(
+        summary
+    )
 
 
 # -- Inference: the window shape ------------------------------------------------------------
@@ -319,6 +347,30 @@ def test_the_planned_streams_tell_the_window_shape(shape, offset) -> None:
     found, detail = r.infer_window_shape(streams, 5)
 
     assert found == shape, detail
+
+
+@pytest.mark.parametrize("shape", [r.SLIDING, r.FIXED])
+@pytest.mark.parametrize("jitter", [0.0, 0.03])
+@pytest.mark.parametrize("retry_after", [1, 2])
+def test_the_window_shape_is_told_at_any_clock_offset(shape, jitter, retry_after) -> None:
+    # Venue seconds offset from ours by 0 to 0.95 s, send times jittered by up to `jitter`.
+    rng = random.Random(1)
+    for offset in [k / 20 for k in range(20)]:
+        streams = [
+            simulate(
+                shape,
+                [
+                    t + rng.uniform(-jitter, jitter)
+                    for t in stream_times(s.rate, start=1000 + 10 * i + s.phase + offset)
+                ],
+                retry_after=retry_after,
+            )
+            for i, s in enumerate(planned_streams())
+        ]
+
+        found, detail = r.infer_window_shape(streams, 5)
+
+        assert found == shape, (offset, detail)
 
 
 def test_a_fixed_window_names_the_phase_its_seconds_start_at() -> None:
@@ -402,40 +454,58 @@ def _block_attempts(follow_outcome: str, *, follow_at: float = 0.05) -> list:
     [(r.ANSWERED, r.PER_TYPE), (r.BLOCKED, r.SHARED), ("timeout", None)],
 )
 def test_the_follow_up_while_blocked_tells_per_type_from_shared(follow_outcome, expected) -> None:
-    found, detail = r.infer_sharing(_block_attempts(follow_outcome), r.TRENDBARS, r.DEAL_LIST)
+    found, detail = r.infer_sharing(_block_attempts(follow_outcome), {r.DEAL_LIST})
 
     assert found == expected, detail
 
 
 def test_sharing_is_inconclusive_without_a_refusal_or_after_the_block() -> None:
     no_refusal = [attempt(0.0, role=r.ROLE_TRIGGER) for _ in range(12)]
-    assert r.infer_sharing(no_refusal, r.TRENDBARS, r.DEAL_LIST)[0] is None
+    assert r.infer_sharing(no_refusal, {r.DEAL_LIST})[0] is None
 
     late = _block_attempts(r.ANSWERED, follow_at=1.5)
-    found, detail = r.infer_sharing(late, r.TRENDBARS, r.DEAL_LIST)
+    found, detail = r.infer_sharing(late, {r.DEAL_LIST})
     assert found is None
     assert "after the trendbars block had ended" in detail
+
+
+def test_an_answer_from_a_type_not_shown_limited_never_means_per_type() -> None:
+    found, detail = r.infer_sharing(_block_attempts(r.ANSWERED), set())
+
+    assert found is None
+    assert detail == "the deal list type was not shown to be limited"
 
 
 def test_retry_after_reports_its_value_and_whether_waiting_it_out_was_enough() -> None:
     refusal = attempt(0.0, r.BLOCKED, retry_after=1)
 
-    assert r.infer_retry_after([], 0.5)[0] is None
-    assert r.infer_retry_after([attempt(0.0, r.BLOCKED)], 0.5)[0] is None
-    assert r.infer_retry_after([refusal], 0.5)[:2] == ("retryAfter = 1 s", None)
+    def infer(attempts):
+        return r.infer_retry_after(attempts, 0.5, 60.0)
+
+    assert infer([])[0] is None
+    assert infer([attempt(0.0, r.BLOCKED)])[0] is None
+    assert infer([refusal])[:2] == ("retryAfter = 1 s", None)
     answered = attempt(1.6, role=r.ROLE_AFTER_WAIT)
-    assert r.infer_retry_after([refusal, answered], 0.5)[:2] == ("retryAfter = 1 s", True)
+    assert infer([refusal, answered])[:2] == ("retryAfter = 1 s", True)
     refused = attempt(1.6, r.BLOCKED, role=r.ROLE_AFTER_WAIT, retry_after=2)
-    value, enough, _ = r.infer_retry_after([refusal, refused], 0.5)
-    assert (value, enough) == ("retryAfter in [1, 2] s", False)
+    assert infer([refusal, refused])[:2] == ("retryAfter in [1, 2] s", False)
+    huge = attempt(0.0, r.BLOCKED, retry_after=1000)
+    assert infer([huge])[0] == "retryAfter = 1000: implausible; unit unconfirmed (seconds expected)"
 
 
 def test_two_directions_that_disagree_leave_sharing_inconclusive() -> None:
     settings = r.Settings()
-    plan = {step.group: step for step in r.build_plan(settings)}
+    plan = r.build_plan(settings)
+    by_group = {step.group: step for step in plan}
+    deal_list = next(s for s in plan if s.request == r.DEAL_LIST and s.group == r.GROUP_TYPES)
+    burst_attempts = [
+        attempt(0.0, r.ANSWERED if i < 5 else r.BLOCKED, role=r.ROLE_BURST, index=i)
+        for i in range(8)
+    ]
     results = [
-        r.StepResult(plan[r.GROUP_SHARING], tuple(_block_attempts(r.ANSWERED)), r.RAN),
-        r.StepResult(plan[r.GROUP_SHARING_REVERSE], tuple(_block_attempts(r.BLOCKED)), r.RAN),
+        r.StepResult(deal_list, tuple(burst_attempts), r.RAN),
+        r.StepResult(by_group[r.GROUP_SHARING], tuple(_block_attempts(r.ANSWERED)), r.RAN),
+        r.StepResult(by_group[r.GROUP_SHARING_REVERSE], tuple(_block_attempts(r.BLOCKED)), r.RAN),
     ]
 
     finding = r.build_findings(results, settings)[2]
@@ -496,8 +566,12 @@ def limiting_venue(
             ctidTraderAccountId=q.ctidTraderAccountId,
             order=order,
         ),
-        SYMBOLS_LIST_TYPE: lambda q: account_venue.for_account(
-            account_venue.RECORDED["symbols"][0],
+        TICK_DATA_TYPE: lambda q: oa.ProtoOAGetTickDataRes(
+            ctidTraderAccountId=q.ctidTraderAccountId,
+            hasMore=False,
+        ),
+        TRADER_TYPE: lambda q: account_venue.for_account(
+            account_venue.RECORDED["trader"][0],
             q.ctidTraderAccountId,
         ),
     }
@@ -529,22 +603,33 @@ async def run_against(
     *,
     shape: str = r.SLIDING,
     shared: bool = False,
+    siblings: tuple[int, ...] = (DEAL_LIST_TYPE,),
+    retry_after: int = 1,
     settings: r.Settings | None = None,
     plan=None,
-    answer: str = "y",
+    confirm: Callable[[str], str] = lambda _prompt: "y",
     stop_after: int | None = None,
+    on_request: Callable[[FakeCTraderServer], None] | None = None,
+    handle_interrupt: bool = False,
 ):
     """Run the probe against a limiting venue; returns the exit code, the venue and the log."""
     vt = VirtualTime()
-    limiter = FakeLimiter(vt.clock, limiter_groups(shared=shared), shape=shape)
+    limiter = FakeLimiter(
+        vt.clock,
+        limiter_groups(shared=shared, siblings=siblings),
+        shape=shape,
+        retry_after=retry_after,
+    )
     settings = settings or r.Settings(trader_login=account_venue.TRADER_LOGIN)
     guard = r.ReadOnlyGuard(settings.max_requests)
 
-    def stop_when_due(server: FakeCTraderServer) -> None:
+    def hook(server: FakeCTraderServer) -> None:
         if stop_after is not None and len(server.received) >= stop_after:
             guard.stop_requested = True
+        if on_request is not None:
+            on_request(server)
 
-    server = limiting_venue(limiter, on_request=stop_when_due)
+    server = limiting_venue(limiter, on_request=hook)
     vt.server, vt.guard = server, guard
     await server.start()
     try:
@@ -555,9 +640,10 @@ async def run_against(
             guard=guard,
             endpoints=r.Endpoints(server.host, server.host, server.port, tls=False),
             log_dir=tmp_path,
-            confirm=lambda _prompt: answer,
+            confirm=confirm,
             clock=vt.clock,
             sleep=vt.sleep,
+            handle_interrupt=handle_interrupt,
         )
     finally:
         await server.stop()
@@ -581,11 +667,36 @@ async def test_a_run_against_a_sliding_per_type_venue_reports_what_it_enforces(
     assert "historical: 5 within any 1 s (sliding)" in summary
     assert (
         "deal list: limited at 8; order list: NOT limited at 8; cash-flow list: NOT limited at 8; "
-        "order details: NOT limited at 8" in summary
+        "order details: NOT limited at 8; tick data: skipped" in summary
     )
     assert "limit is per payload type" in summary
     assert "default: refusals from request 51" in summary
     assert "retryAfter = 1 s, waiting it out enough" in summary
+    assert "one deal list request sent 0.00 s after the first trendbars refusal" in out
+
+
+async def test_with_no_list_type_limited_tick_data_is_the_sibling(tmp_path, capsys) -> None:
+    code, _, _, records = await run_against(tmp_path, siblings=(TICK_DATA_TYPE,))
+
+    out = capsys.readouterr().out
+    summary = out.split("Summary: ", 1)[1]
+    assert code == 0
+    assert "deal list: NOT limited at 8" in summary
+    assert "tick data: limited at 8" in summary
+    assert "limit is per payload type" in summary
+    assert "one tick data request sent 0.00 s after the first trendbars refusal" in out
+    assert any(rec.get("payload") == "ProtoOAGetTickDataReq" for rec in records)
+
+
+async def test_with_no_other_limited_type_sharing_stays_inconclusive(tmp_path, capsys) -> None:
+    code, server, _, _ = await run_against(tmp_path, siblings=())
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "measured:   inconclusive: no other limited type to test with" in out
+    assert "per type or shared: inconclusive" in out.split("Summary: ", 1)[1]
+    # The block steps were skipped: no trendbar burst of 12 went out.
+    assert sum(isinstance(m, oa.ProtoOAGetTrendbarsReq) for m in server.received) == 29 + 54
 
 
 async def test_a_run_against_a_fixed_shared_venue_reports_what_it_enforces(
@@ -640,14 +751,79 @@ async def test_the_log_and_the_output_carry_no_credential_or_account_id(tmp_path
 
 
 async def test_a_declined_run_probes_nothing(tmp_path, capsys) -> None:
-    code, server, _, records = await run_against(tmp_path, answer="n")
+    code, server, _, records = await run_against(tmp_path, confirm=lambda _prompt: "n")
 
+    out = capsys.readouterr().out
     assert code == 2
     assert [type(m).__name__ for m in server.received] == [
         "ProtoOAApplicationAuthReq",
         "ProtoOAGetAccountListByAccessTokenReq",
     ]
     assert records == []
+    assert r.OTHER_SESSIONS in out
+
+
+async def test_ctrl_c_at_the_prompt_declines(tmp_path, capsys) -> None:
+    def interrupted(_prompt: str) -> str:
+        signal.raise_signal(signal.SIGINT)
+        return "y"
+
+    try:
+        code, server, _, records = await run_against(
+            tmp_path,
+            confirm=interrupted,
+            handle_interrupt=True,
+        )
+    except KeyboardInterrupt:
+        pytest.fail("Ctrl+C at the prompt escaped the probe")
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert len(server.received) == 2
+    assert records == []
+    assert "Declined: nothing was probed." in captured.out
+    assert "the log holds" not in captured.out + captured.err
+
+
+async def test_a_real_sigint_stops_the_run_at_the_next_send(tmp_path, capsys) -> None:
+    raised = []
+    before = signal.getsignal(signal.SIGINT)
+
+    def interrupt_once(server: FakeCTraderServer) -> None:
+        if raised or len(server.received) < 20:
+            return
+        handler = signal.getsignal(signal.SIGINT)
+        # Never raise into pytest's own handler: that would end the whole session.
+        raised.append(handler is not signal.default_int_handler)
+        if raised[0]:
+            signal.raise_signal(signal.SIGINT)
+
+    code, server, guard, _ = await run_against(
+        tmp_path,
+        on_request=interrupt_once,
+        handle_interrupt=True,
+    )
+
+    captured = capsys.readouterr()
+    assert raised == [True], "the probe did not install its own SIGINT handler"
+    assert code == 1
+    assert guard.stop_requested
+    assert len(server.received) < 40
+    assert "stopped by Ctrl+C" in captured.out
+    assert "Stopping at the next send" in captured.err
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+async def test_an_implausible_retry_after_is_reported_raw_and_stops_the_run(
+    tmp_path,
+    capsys,
+) -> None:
+    code, _, _, _ = await run_against(tmp_path, retry_after=1000)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "retryAfter = 1000: implausible; unit unconfirmed (seconds expected)" in out
+    assert "The run stopped at" in out
 
 
 async def test_a_stop_ends_the_run_at_the_next_send_and_still_reports(tmp_path, capsys) -> None:
@@ -690,7 +866,9 @@ async def test_a_dry_run_sends_nothing(tmp_path, capsys) -> None:
     assert code == 0
     assert server.connection_count == 0
     assert "Dry run: nothing was sent." in out
-    assert "at most 338 requests (cap 400" in out
+    assert "at most 346 requests (cap 400" in out
+    assert "expected run time: about 75 s with retryAfter = 1 s" in out
+    assert r.OTHER_SESSIONS in out
     assert list(tmp_path.iterdir()) == []
 
 

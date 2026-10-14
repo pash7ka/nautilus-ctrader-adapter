@@ -5,8 +5,9 @@ Measures, against one live account in one run of a minute or two:
 1. how many historical (trendbar) requests the venue answers at once, and whether it counts
    them in a sliding one-second window or per calendar second;
 2. which history lists are limited the same way;
-3. whether a refusal blocks only its own payload type or every limited one;
-4. where the general limit starts refusing;
+3. whether a refusal blocks only its own payload type or every limited one, tested against
+   another type the run showed limited (tick data, if no list is);
+4. where the general limit starts refusing, with the small `ProtoOATraderReq`;
 5. what `retryAfter` says, and whether waiting it out is enough.
 
 **Read-only by construction.** Every request passes through `ReadOnlyGuard`, which refuses any
@@ -49,7 +50,7 @@ import signal
 import sys
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TextIO
 
@@ -84,6 +85,11 @@ _GET_TOKENS_SPEC.loader.exec_module(get_tokens)
 
 _TRADER_LOGIN_KEY = "CTRADER_TRADER_LOGIN"
 
+OTHER_SESSIONS = (
+    "Stop any other session using these credentials or this account (for example a running "
+    "node) for the duration of the run: its requests count against the same limits."
+)
+
 # The only payload classes this script may send. Nothing that creates, amends or closes an
 # order is listed, so a read-only run is a property of this set rather than of each call site.
 ALLOWED_REQUESTS: frozenset[type[Message]] = frozenset(
@@ -92,9 +98,12 @@ ALLOWED_REQUESTS: frozenset[type[Message]] = frozenset(
         oa.ProtoOAGetAccountListByAccessTokenReq,
         oa.ProtoOAAccountAuthReq,
         oa.ProtoOAVersionReq,
+        oa.ProtoOATraderReq,
+        # Only to resolve `--symbol` at setup.
         oa.ProtoOASymbolsListReq,
         oa.ProtoOASymbolByIdReq,
         oa.ProtoOAGetTrendbarsReq,
+        oa.ProtoOAGetTickDataReq,
         oa.ProtoOADealListReq,
         oa.ProtoOAOrderListReq,
         oa.ProtoOACashFlowHistoryListReq,
@@ -105,25 +114,33 @@ ALLOWED_REQUESTS: frozenset[type[Message]] = frozenset(
 
 # What a probed request asks for, by the name the report uses.
 TRENDBARS = "trendbars"
+TICK_DATA = "tick data"
 DEAL_LIST = "deal list"
 ORDER_LIST = "order list"
 CASH_FLOW = "cash-flow list"
 ORDER_DETAILS = "order details"
-SYMBOLS_LIST = "symbols list"
+TRADER = "trader"
+# A plan placeholder, replaced at run time by the first other type shown to be limited.
+SIBLING = "limited sibling"
 
 PROBED_REQUESTS: dict[str, type[Message]] = {
     TRENDBARS: oa.ProtoOAGetTrendbarsReq,
+    TICK_DATA: oa.ProtoOAGetTickDataReq,
     DEAL_LIST: oa.ProtoOADealListReq,
     ORDER_LIST: oa.ProtoOAOrderListReq,
     CASH_FLOW: oa.ProtoOACashFlowHistoryListReq,
     ORDER_DETAILS: oa.ProtoOAOrderDetailsReq,
-    SYMBOLS_LIST: oa.ProtoOASymbolsListReq,
+    TRADER: oa.ProtoOATraderReq,
 }
 
 # An attempt's outcome is `ANSWERED`, `TIMEOUT`, or the venue's error code.
 ANSWERED = "answered"
 TIMEOUT = "timeout"
 BLOCKED = "BLOCKED_PAYLOAD_TYPE"
+REFUSALS = frozenset({BLOCKED, "REQUEST_FREQUENCY_EXCEEDED"})
+
+NO_SIBLING = "no other limited type to test with"
+IMPLAUSIBLE = "implausible; unit unconfirmed (seconds expected)"
 
 # Step kinds.
 BURST = "burst"
@@ -141,6 +158,7 @@ ROLE_AFTER_WAIT = "after-wait"
 GROUP_HISTORICAL_BURSTS = "historical bursts"
 GROUP_HISTORICAL_STREAMS = "historical streams"
 GROUP_TYPES = "types"
+GROUP_TICK_DATA = "tick data"
 GROUP_SHARING = "sharing"
 GROUP_SHARING_REVERSE = "sharing, reversed"
 GROUP_DEFAULT = "default"
@@ -157,11 +175,8 @@ PER_TYPE = "per payload type"
 SHARED = "shared"
 
 _HISTORICAL_BURSTS = (5, 6, 8, 10)
-# (rate per second, fraction of a local second the stream starts at). Under calendar seconds,
-# the 6/s or the 7/s stream then opens with a run of answers that straddles a boundary and
-# shows more than the allowance within 1 s, while the venue's seconds start within about 0.4 s
-# of ours. Under a sliding window, the first refusals of the two land at phases that no single
-# calendar-second boundary explains.
+# (rate, start phase), chosen so the two window shapes separate at any clock offset; see
+# `test_the_window_shape_is_told_at_any_clock_offset`.
 _HISTORICAL_STREAMS = ((5.0, 0.5), (6.0, 0.5), (7.0, 0.85))
 _TYPE_BURST = 8
 _TYPE_KINDS = (DEAL_LIST, ORDER_LIST, CASH_FLOW, ORDER_DETAILS)
@@ -173,7 +188,10 @@ _DEFAULT_BURSTS = (50, 60, 80)
 _SETUP_REQUESTS = 5
 
 _TRENDBAR_WINDOW_MS = 3_600_000
+_TICK_WINDOW_MS = 60_000
 _LIST_WINDOW_MS = 2 * 86_400_000
+# The `retryAfter` the plan's run-time estimate assumes.
+_ESTIMATE_RETRY_AFTER_SECS = 1.0
 
 _WINDOW_SECS = 1.0
 # How far a local send time may sit from the venue's arrival time. Generous to both window
@@ -377,27 +395,48 @@ def build_plan(settings: Settings) -> tuple[Step, ...]:
     ]
     steps += [
         Step(
-            f"trendbars burst of {_BLOCK_TRIGGER}, then one deal list while blocked",
+            f"{TICK_DATA}, burst of {_TYPE_BURST}",
+            BURST,
+            TICK_DATA,
+            _TYPE_BURST,
+            GROUP_TICK_DATA,
+        ),
+        Step(
+            f"trendbars burst of {_BLOCK_TRIGGER}, then one {SIBLING} request while blocked",
             BLOCK,
             TRENDBARS,
             _BLOCK_TRIGGER,
             GROUP_SHARING,
-            follow_up=DEAL_LIST,
+            follow_up=SIBLING,
         ),
         Step(
-            f"deal-list burst of {_BLOCK_TRIGGER}, then one trendbar request while blocked",
+            f"{SIBLING} burst of {_BLOCK_TRIGGER}, then one trendbars request while blocked",
             BLOCK,
-            DEAL_LIST,
+            SIBLING,
             _BLOCK_TRIGGER,
             GROUP_SHARING_REVERSE,
             follow_up=TRENDBARS,
         ),
     ]
     steps += [
-        Step(f"symbols list, burst of {n}", BURST, SYMBOLS_LIST, n, GROUP_DEFAULT)
-        for n in _DEFAULT_BURSTS
+        Step(f"{TRADER}, burst of {n}", BURST, TRADER, n, GROUP_DEFAULT) for n in _DEFAULT_BURSTS
     ]
     return tuple(steps)
+
+
+def estimated_run_secs(plan: Sequence[Step], settings: Settings) -> float:
+    """Every step run, each refusal answered with `_ESTIMATE_RETRY_AFTER_SECS`."""
+    retry_after = _ESTIMATE_RETRY_AFTER_SECS
+    gap = max(settings.min_gap_secs, retry_after + settings.gap_margin_secs)
+    total = 0.0
+    for step in plan:
+        # The gap, then on average half a second until the step's start phase.
+        total += gap + 0.5
+        if step.kind == STREAM and step.rate:
+            total += step.count / step.rate
+        elif step.kind == BLOCK:
+            total += retry_after + settings.retry_margin_secs
+    return total
 
 
 def validate_plan(plan: Sequence[Step], settings: Settings) -> None:
@@ -426,19 +465,24 @@ def format_plan(plan: Sequence[Step], settings: Settings) -> str:
         extra = ""
         if step.kind == BLOCK:
             extra = " (+1 while blocked, +1 after retryAfter)"
-        if step.group == GROUP_SHARING_REVERSE:
-            extra += ", only if the deal list is limited"
+        if SIBLING in (step.request, step.follow_up):
+            extra += f"; the {SIBLING} is the first type above shown limited, if any"
+        if step.group == GROUP_TICK_DATA:
+            extra += ", only if no list type above is limited"
         if step.request == ORDER_DETAILS:
             extra += ", only if the order list served an order id"
         lines.append(f"  {number:2d}. {step.name}: {step.count} requests{extra}")
     total = _SETUP_REQUESTS + sum(step.planned for step in plan)
+    estimate = 5 * math.ceil(estimated_run_secs(plan, settings) / 5)
     lines += [
         f"at most {total} requests (cap {settings.max_requests}, at most "
         f"{settings.max_step_requests} per step)",
         f"between steps: at least {settings.min_gap_secs:g} s, and at least the step's largest "
         f"retryAfter + {settings.gap_margin_secs:g} s; a retryAfter over "
         f"{settings.max_wait_secs:g} s stops the run",
-        f"hard limit: {settings.max_run_secs:g} s",
+        f"expected run time: about {estimate} s with retryAfter = "
+        f"{_ESTIMATE_RETRY_AFTER_SECS:g} s; hard limit {settings.max_run_secs:g} s",
+        OTHER_SESSIONS,
     ]
     return "\n".join(lines)
 
@@ -478,8 +522,16 @@ class RequestFactory:
             if self.order_id is None:
                 raise ValueError("no order id is known")
             return oa.ProtoOAOrderDetailsReq(ctidTraderAccountId=account, orderId=self.order_id)
-        if kind == SYMBOLS_LIST:
-            return oa.ProtoOASymbolsListReq(ctidTraderAccountId=account)
+        if kind == TICK_DATA:
+            return oa.ProtoOAGetTickDataReq(
+                ctidTraderAccountId=account,
+                symbolId=self._symbol_id,
+                type=om.BID,
+                fromTimestamp=now_ms - _TICK_WINDOW_MS,
+                toTimestamp=now_ms,
+            )
+        if kind == TRADER:
+            return oa.ProtoOATraderReq(ctidTraderAccountId=account)
         raise ValueError(f"unknown request kind {kind!r}")
 
     def note(self, response: Message | None) -> None:
@@ -571,6 +623,8 @@ class Prober:
         stopped = False
         previous: tuple[Attempt, ...] = ()
         for step in plan:
+            if SIBLING in (step.request, step.follow_up) and (sibling := choose_sibling(results)):
+                step = _with_sibling(step, sibling)
             if stopped:
                 result = StepResult(step, (), NOT_RUN)
             elif skip := self._skip_reason(step, results):
@@ -595,11 +649,10 @@ class Prober:
     def _skip_reason(self, step: Step, results: Sequence[StepResult]) -> str:
         if step.request == ORDER_DETAILS and self._requests.order_id is None:
             return "the order list served no order, so there is no order id to ask about"
-        if step.group == GROUP_SHARING_REVERSE:
-            deal_list = _type_summary(results, DEAL_LIST)
-            limited, _ = classify_type(deal_list, None)
-            if limited is not True:
-                return "the deal list was not shown to be limited"
+        if step.group == GROUP_TICK_DATA and (sibling := choose_sibling(results)):
+            return f"not needed: the {sibling} is limited"
+        if SIBLING in (step.request, step.follow_up):
+            return NO_SIBLING
         return ""
 
     async def _run_step(self, step: Step) -> None:
@@ -635,34 +688,31 @@ class Prober:
         """Trigger a refusal, ask the other type while blocked, then ask again once unblocked."""
         assert step.follow_up is not None
         await self._burst(step, step.request, step.count, ROLE_TRIGGER)
-        if not any(a.outcome == BLOCKED for a in self._step_attempts()):
+        if not any(a.outcome in REFUSALS for a in self._step_attempts()):
             return
         await self._send(step, step.follow_up, ROLE_FOLLOW_UP, step.count)
-        unblocked = [
-            a.answered_at + a.retry_after
-            for a in self._step_attempts()
-            if a.outcome == BLOCKED and a.retry_after is not None
+        refusals = [
+            a for a in self._step_attempts() if a.outcome in REFUSALS and a.retry_after is not None
         ]
-        if not unblocked:
+        if not refusals:
             return
-        target = max(unblocked) + self._settings.retry_margin_secs
-        if target - self._clock() > self._settings.max_wait_secs:
-            raise WaitTooLong(
-                f"waiting out retryAfter would take over {self._settings.max_wait_secs:g} s",
-            )
-        await self._until(target)
+        self._check_retry_after(max(a.retry_after for a in refusals))
+        target = max(a.answered_at + a.retry_after for a in refusals)
+        await self._until(target + self._settings.retry_margin_secs)
         await self._send(step, step.request, ROLE_AFTER_WAIT, step.count + 1)
 
     async def _gap(self, previous: Sequence[Attempt]) -> None:
         retry_after = max((a.retry_after or 0 for a in previous), default=0)
+        self._check_retry_after(retry_after)
         wait = max(self._settings.min_gap_secs, retry_after + self._settings.gap_margin_secs)
-        if wait > self._settings.max_wait_secs:
-            raise WaitTooLong(
-                f"a retryAfter of {retry_after} s is longer than this run waits "
-                f"({self._settings.max_wait_secs:g} s)",
-            )
         last = max((a.answered_at for a in previous), default=self._clock())
         await self._until(last + wait)
+
+    def _check_retry_after(self, retry_after: int) -> None:
+        if retry_after > self._settings.max_wait_secs:
+            raise WaitTooLong(
+                f"retryAfter = {retry_after}: {IMPLAUSIBLE}; the run stops rather than wait it out",
+            )
 
     async def _until(self, target: float) -> None:
         while (left := target - self._clock()) > 0:
@@ -714,6 +764,18 @@ class Prober:
         self._requests.note(response)
 
 
+def _with_sibling(step: Step, sibling: str) -> Step:
+    def resolved(kind: str | None) -> str | None:
+        return sibling if kind == SIBLING else kind
+
+    return dataclasses.replace(
+        step,
+        name=step.name.replace(SIBLING, sibling),
+        request=resolved(step.request),
+        follow_up=resolved(step.follow_up),
+    )
+
+
 def _raise_first(outcomes: Sequence[object]) -> None:
     for outcome in outcomes:
         if isinstance(outcome, BaseException):
@@ -741,6 +803,7 @@ class BurstSummary:
     other: tuple[str, ...]
     # 1-based send position of the first refusal.
     first_refused: int | None
+    refusal_codes: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -749,19 +812,24 @@ class BurstSummary:
 
 def summarize_burst(size: int, attempts: Sequence[Attempt]) -> BurstSummary:
     ordered = sorted(attempts, key=lambda a: a.index)
+    refused = [a for a in ordered if a.outcome in REFUSALS]
     return BurstSummary(
         size=size,
         answered=sum(1 for a in ordered if a.outcome == ANSWERED),
-        refused=sum(1 for a in ordered if a.outcome == BLOCKED),
-        other=tuple(a.outcome for a in ordered if a.outcome not in (ANSWERED, BLOCKED)),
-        first_refused=next((a.index + 1 for a in ordered if a.outcome == BLOCKED), None),
+        refused=len(refused),
+        other=tuple(
+            a.outcome for a in ordered if a.outcome != ANSWERED and a.outcome not in REFUSALS
+        ),
+        first_refused=refused[0].index + 1 if refused else None,
+        refusal_codes=tuple(sorted({a.outcome for a in refused})),
     )
 
 
 def describe_burst(summary: BurstSummary) -> str:
     text = f"burst of {summary.size}: {summary.answered} answered"
     if summary.refused:
-        text += f", {summary.refused} refused from request {summary.first_refused}"
+        codes = ", ".join(summary.refusal_codes)
+        text += f", {summary.refused} refused ({codes}) from request {summary.first_refused}"
     if summary.other:
         counts = Counter(summary.other)
         text += ", " + ", ".join(f"{n} {code}" for code, n in sorted(counts.items()))
@@ -820,7 +888,7 @@ def fits_sliding(attempts: Sequence[Attempt], allowance: int) -> bool:
     answered = sorted(a.sent_at for a in attempts if a.outcome == ANSWERED)
     if most_within(answered, _WINDOW_SECS - _TIMING_TOLERANCE_SECS) > allowance:
         return False
-    refusals = [a for a in attempts if a.outcome == BLOCKED]
+    refusals = [a for a in attempts if a.outcome in REFUSALS]
     for r in refusals:
         if _blocked(r, refusals):
             continue
@@ -843,7 +911,7 @@ def fits_fixed(attempts: Sequence[Attempt], allowance: int, phase: float) -> boo
     answered = [a.sent_at for a in attempts if a.outcome == ANSWERED]
     if any(n > allowance for n in Counter(window(t) for t in answered).values()):
         return False
-    refusals = [a for a in attempts if a.outcome == BLOCKED]
+    refusals = [a for a in attempts if a.outcome in REFUSALS]
     for r in refusals:
         if _blocked(r, refusals):
             continue
@@ -863,9 +931,9 @@ def infer_window_shape(
         return None, "the allowance at once is unknown, so the streams cannot be read"
     if not any(streams):
         return None, "no stream ran"
-    if any(a.outcome not in (ANSWERED, BLOCKED) for s in streams for a in s):
+    if any(a.outcome != ANSWERED and a.outcome not in REFUSALS for s in streams for a in s):
         return None, "a stream ended in something other than answers and refusals"
-    if not any(a.outcome == BLOCKED for s in streams for a in s):
+    if not any(a.outcome in REFUSALS for s in streams for a in s):
         return None, "no stream was refused, so neither shape showed"
     sliding = all(fits_sliding(s, allowance) for s in streams)
     phases = [
@@ -903,11 +971,12 @@ def describe_stream(label: str, attempts: Sequence[Attempt]) -> str:
         return f"{label}: nothing sent"
     start = min(a.sent_at for a in attempts)
     answered = [a.sent_at for a in attempts if a.outcome == ANSWERED]
-    refused = sorted(a.sent_at - start for a in attempts if a.outcome == BLOCKED)
+    refused = sorted(a.sent_at - start for a in attempts if a.outcome in REFUSALS)
+    codes = ", ".join(sorted({a.outcome for a in attempts if a.outcome in REFUSALS}))
     other = len(attempts) - len(answered) - len(refused)
     text = (
         f"{label}: {len(attempts)} sent, {len(answered)} answered, {len(refused)} refused"
-        f"{f', {other} other' if other else ''}; at most "
+        f"{f' ({codes})' if codes else ''}{f', {other} other' if other else ''}; at most "
         f"{most_within(answered, _WINDOW_SECS)} answered within any 1 s"
     )
     if refused:
@@ -932,40 +1001,57 @@ def classify_type(summary: BurstSummary | None, allowance: int | None) -> tuple[
     return False, f"NOT limited at {summary.size}"
 
 
+def choose_sibling(results: Sequence[StepResult]) -> str | None:
+    """The first type other than trendbars that a burst showed limited, or `None`."""
+    for kind in (*_TYPE_KINDS, TICK_DATA):
+        if classify_type(_type_summary(results, kind), None)[0] is True:
+            return kind
+    return None
+
+
 def infer_sharing(
     attempts: Sequence[Attempt],
-    trigger: str,
-    follow_up: str,
+    limited: Collection[str],
 ) -> tuple[str | None, str]:
-    """`PER_TYPE` or `SHARED` from one block step; otherwise `None` and why."""
+    """`PER_TYPE` or `SHARED` from one block step; otherwise `None` and why.
+
+    `limited` holds the types a burst showed limited. A follow-up answered while another type
+    is blocked says nothing about sharing unless its own type is limited too.
+    """
     triggers = [a for a in attempts if a.role == ROLE_TRIGGER]
-    refusals = [a for a in triggers if a.outcome == BLOCKED]
+    follow = next((a for a in attempts if a.role == ROLE_FOLLOW_UP), None)
+    trigger = triggers[0].request if triggers else "trigger"
+    refusals = [a for a in triggers if a.outcome in REFUSALS]
     if not refusals:
         return None, f"no {trigger} request was refused in a burst of {len(triggers)}"
-    follow = next((a for a in attempts if a.role == ROLE_FOLLOW_UP), None)
     if follow is None:
-        return None, f"no {follow_up} request was sent"
+        return None, "no follow-up request was sent"
+    unshown = [k for k in (trigger, follow.request) if k != TRENDBARS and k not in limited]
+    if unshown:
+        return None, f"the {unshown[0]} type was not shown to be limited"
     ends = [q.answered_at + q.retry_after for q in refusals if q.retry_after is not None]
     if ends and follow.sent_at >= max(ends):
-        return None, f"the {follow_up} request left after the {trigger} block had ended"
+        return None, f"the {follow.request} request left after the {trigger} block had ended"
     after = follow.sent_at - min(q.answered_at for q in refusals)
-    lead = f"one {follow_up} request sent {after:.2f} s after the first {trigger} refusal"
+    lead = f"one {follow.request} request sent {after:.2f} s after the first {trigger} refusal"
     if follow.outcome == ANSWERED:
         return PER_TYPE, f"{lead} was answered"
-    if follow.outcome == BLOCKED:
-        return SHARED, f"{lead} was refused with {BLOCKED}"
+    if follow.outcome in REFUSALS:
+        return SHARED, f"{lead} was refused with {follow.outcome}"
     return None, f"{lead} ended with {follow.outcome}"
 
 
 def infer_retry_after(
     attempts: Sequence[Attempt],
     margin_secs: float,
+    max_wait_secs: float,
 ) -> tuple[str | None, bool | None, str]:
     """What `retryAfter` said, whether waiting it out was enough, and the evidence.
 
     The value is `None` when no refusal carried one; "enough" is `None` when it was not checked.
+    A value over `max_wait_secs` is reported raw and marked implausible.
     """
-    refusals = [a for a in attempts if a.outcome == BLOCKED]
+    refusals = [a for a in attempts if a.outcome in REFUSALS]
     if not refusals:
         return None, None, "no refusal was seen"
     values = sorted({a.retry_after for a in refusals if a.retry_after is not None})
@@ -973,6 +1059,8 @@ def infer_retry_after(
     if not values:
         return None, None, f"none of the {len(refusals)} refusals carried retryAfter"
     value = f"retryAfter = {values[0]} s" if len(values) == 1 else f"retryAfter in {values} s"
+    if values[-1] > max_wait_secs:
+        value = f"retryAfter = {values[-1]}: {IMPLAUSIBLE}"
     if missing:
         value += f" ({missing} of {len(refusals)} refusals carried none)"
     checks = [a for a in attempts if a.role == ROLE_AFTER_WAIT]
@@ -992,7 +1080,11 @@ def _ran(results: Sequence[StepResult], group: str) -> list[StepResult]:
 
 def _type_summary(results: Sequence[StepResult], kind: str) -> BurstSummary | None:
     result = next(
-        (r for r in _ran(results, GROUP_TYPES) if r.step.request == kind),
+        (
+            r
+            for r in [*_ran(results, GROUP_TYPES), *_ran(results, GROUP_TICK_DATA)]
+            if r.step.request == kind
+        ),
         None,
     )
     return None if result is None else summarize_burst(result.step.count, result.attempts)
@@ -1037,54 +1129,58 @@ def build_findings(results: Sequence[StepResult], settings: Settings) -> list[Fi
         Finding(1, "Historical limit (trendbars)", measured, tuple(evidence), conclusion)
     )
 
-    verdicts = []
-    for kind in _TYPE_KINDS:
+    # (kind, limited or `None`, evidence, conclusion)
+    verdicts: list[tuple[str, bool | None, str, str]] = []
+    for kind in (*_TYPE_KINDS, TICK_DATA):
         result = next(
-            (r for r in results if r.step.group == GROUP_TYPES and r.step.request == kind), None
+            (
+                r
+                for r in results
+                if r.step.group in (GROUP_TYPES, GROUP_TICK_DATA) and r.step.request == kind
+            ),
+            None,
         )
         if result is not None and result.status == SKIPPED:
-            verdicts.append((kind, None, f"skipped: {result.note}"))
+            verdicts.append((kind, None, f"skipped: {result.note}", "skipped"))
             continue
         if result is not None and result.status != RAN:
-            verdicts.append((kind, None, result.status))
+            verdicts.append((kind, None, result.status, "inconclusive"))
             continue
         limited, text = classify_type(_type_summary(results, kind), allowance)
-        verdicts.append((kind, limited, text))
-    evidence = [f"{kind}: {text}" for kind, _, text in verdicts]
+        short = {
+            True: f"limited at {_TYPE_BURST}",
+            False: f"NOT limited at {_TYPE_BURST}",
+            None: "inconclusive",
+        }[limited]
+        verdicts.append((kind, limited, text, short))
+    evidence = [f"{kind}: {text}" for kind, _, text, _ in verdicts]
     measured = "; ".join(
         f"{kind}: {'limited' if limited else 'NOT limited' if limited is False else 'unknown'}"
-        for kind, limited, _ in verdicts
+        for kind, limited, _, short in verdicts
+        if short != "skipped"
     )
-    conclusion = "; ".join(
-        f"{kind}: "
-        + (
-            f"limited at {_TYPE_BURST}"
-            if limited
-            else f"NOT limited at {_TYPE_BURST}"
-            if limited is False
-            else "inconclusive"
-        )
-        for kind, limited, _ in verdicts
-    )
+    conclusion = "; ".join(f"{kind}: {short}" for kind, _, _, short in verdicts)
     findings.append(
         Finding(2, "Which payload types are historical", measured, tuple(evidence), conclusion)
     )
 
-    forward = _ran(results, GROUP_SHARING)
-    reverse = _ran(results, GROUP_SHARING_REVERSE)
+    limited_kinds = {kind for kind, limited, _, _ in verdicts if limited}
     readings = []
     evidence = []
-    for found, trigger, follow_up in (
-        (forward, TRENDBARS, DEAL_LIST),
-        (reverse, DEAL_LIST, TRENDBARS),
-    ):
-        if found:
-            value, detail = infer_sharing(found[0].attempts, trigger, follow_up)
+    for group in (GROUP_SHARING, GROUP_SHARING_REVERSE):
+        for found in _ran(results, group):
+            value, detail = infer_sharing(found.attempts, limited_kinds)
             readings.append(value)
             evidence.append(detail)
     evidence += _not_ran(results, GROUP_SHARING) + _not_ran(results, GROUP_SHARING_REVERSE)
     settled = {r for r in readings if r is not None}
-    if not readings:
+    skipped = [r for r in results if r.step.group == GROUP_SHARING and r.status == SKIPPED]
+    if not readings and skipped:
+        measured, conclusion = (
+            f"inconclusive: {skipped[0].note}",
+            "per type or shared: inconclusive",
+        )
+    elif not readings:
         measured, conclusion = "inconclusive: no block step ran", "per type or shared: inconclusive"
     elif None in readings:
         unsettled = evidence[readings.index(None)]
@@ -1109,11 +1205,13 @@ def build_findings(results: Sequence[StepResult], settings: Settings) -> list[Fi
     else:
         measured, conclusion = f"inconclusive: {why}", f"default: inconclusive ({why})"
     findings.append(
-        Finding(4, f"Default limit ({SYMBOLS_LIST})", measured, tuple(evidence), conclusion)
+        Finding(4, f"Default limit ({TRADER} requests)", measured, tuple(evidence), conclusion)
     )
 
     every = [a for r in results for a in r.attempts]
-    value, enough, detail = infer_retry_after(every, settings.retry_margin_secs)
+    value, enough, detail = infer_retry_after(
+        every, settings.retry_margin_secs, settings.max_wait_secs
+    )
     if value is None:
         measured, conclusion = f"inconclusive: {detail}", "retryAfter: inconclusive"
     else:
@@ -1207,6 +1305,19 @@ def _stop_on_interrupt(guard: ReadOnlyGuard, *, enabled: bool) -> Iterator[None]
         signal.signal(signal.SIGINT, previous)
 
 
+@contextlib.contextmanager
+def _interrupt_raises(*, enabled: bool) -> Iterator[None]:
+    """Ctrl+C raises `KeyboardInterrupt` here, rather than cancelling the whole run."""
+    if not enabled:
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 async def run_probe(
     settings: Settings,
     credentials: AccountCredentials,
@@ -1227,9 +1338,11 @@ async def run_probe(
     assert settings.trader_login is not None
     host, account_id = await resolve_account(settings.trader_login, credentials, guard, endpoints)
     print(f"account: trader login {settings.trader_login}, host {host}")
+    print(OTHER_SESSIONS)
     try:
-        answer = confirm("Type y to start probing: ")
-    except EOFError:
+        with _interrupt_raises(enabled=handle_interrupt):
+            answer = confirm("Type y to start probing: ")
+    except (EOFError, KeyboardInterrupt):
         answer = ""
     if answer.strip().lower() != "y":
         print("Declined: nothing was probed.")
