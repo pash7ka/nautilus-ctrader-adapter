@@ -51,10 +51,38 @@ BUCKET_HISTORICAL: str = "historical"
 DEFAULT_RATE_LIMIT_PER_SEC: float = 50.0
 HISTORICAL_RATE_LIMIT_PER_SEC: float = 5.0
 
-# Payload types that `CTraderSession.request()` defaults to the historical bucket for; an
-# explicit `bucket` argument still overrides this.
+# The venue's limits, measured live (docs/protocol.md §6): 5 historical requests within any
+# 1 s, and 50 of the others at once.
+VENUE_REQUESTS_PER_SEC: int = 50
+VENUE_HISTORICAL_REQUESTS_PER_SEC: int = 5
+
+# The scheduler paces each group to the venue's count per this window. Longer than the venue's
+# 1 s, so that arrival jitter cannot bring more than the count within one of the venue's.
+REQUEST_WINDOW_SECS: float = 1.25
+# Added to the venue's `retryAfter` before a refused group sends again.
+RATE_LIMIT_PAUSE_MARGIN_SECS: float = 0.25
+# Resends of a refused historical request; other requests are never resent.
+RATE_LIMIT_RETRIES: int = 3
+# The longest a request may wait in the queue, retries included, before it fails unsent.
+REQUEST_QUEUE_TIMEOUT_SECS: float = 60.0
+
+GROUP_HISTORICAL: str = "historical"
+GROUP_OTHER: str = "other"
+
+# The payload types sharing the venue's historical limit: the scheduler's historical group, and
+# the types `CTraderSession.request()` defaults to the historical bucket for.
+# TODO(verify): tick data and the two per-position lists were not measured; a burst of each
+# beyond 5 within 1 s, refused like trendbars, would confirm them.
 HISTORICAL_PAYLOAD_TYPES: frozenset[type] = frozenset(
-    {_oa.ProtoOAGetTrendbarsReq, _oa.ProtoOAGetTickDataReq},
+    {
+        _oa.ProtoOAGetTrendbarsReq,
+        _oa.ProtoOAGetTickDataReq,
+        _oa.ProtoOADealListReq,
+        _oa.ProtoOADealListByPositionIdReq,
+        _oa.ProtoOAOrderListReq,
+        _oa.ProtoOAOrderListByPositionIdReq,
+        _oa.ProtoOACashFlowHistoryListReq,
+    },
 )
 
 # Confirmed live: 100 ids in one request are accepted and all 100 symbols come back.
