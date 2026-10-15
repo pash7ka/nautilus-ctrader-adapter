@@ -579,6 +579,53 @@ async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
         await server.stop()
 
 
+class _HeldScheduler:
+    """Grants every request once `release` is set, and ignores `fail_all()` and `reset()`."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.waiting = 0
+
+    async def submit(self, group, priority, send):
+        self.waiting += 1
+        await self.release.wait()
+        return await send()
+
+    def fail_all(self, error: Exception) -> None:
+        pass
+
+    def reset(self) -> None:
+        pass
+
+
+async def test_a_request_granted_after_a_reconnect_is_never_sent() -> None:
+    # Only the connection itself can stop it: this scheduler neither fails nor forgets it.
+    server = FakeCTraderServer()
+    await server.start()
+    scheduler = _HeldScheduler()
+    connection = await _connected(server, scheduler=scheduler)
+    try:
+        await server.wait_for_connections()
+        pending = asyncio.create_task(
+            connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1)),
+        )
+        await wait_until(lambda: scheduler.waiting == 1, description="request queued")
+
+        await connection.close()
+        await connection.connect()
+        await server.wait_for_connections()
+        scheduler.release.set()
+
+        with pytest.raises(CTraderConnectionError):
+            await asyncio.wait_for(pending, timeout=2.0)
+        # A fixed wait is right here: this checks that the request never arrives.
+        await asyncio.sleep(0.5)
+        assert not any(isinstance(m, oa.ProtoOATraderReq) for m in server.received)
+    finally:
+        await connection.close()
+        await server.stop()
+
+
 async def test_credentials_never_reach_the_log() -> None:
     # DEBUG carries payload type, correlation id and byte length, never payload bytes.
     # Authentication payloads are where the secrets are.
