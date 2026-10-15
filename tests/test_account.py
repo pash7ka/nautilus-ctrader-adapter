@@ -12,6 +12,7 @@ from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_ctrader.common import account as account_module
 from nautilus_ctrader.common.account import (
     CTraderAccountClient,
+    account_client_from_config,
     get_cached_ctrader_account_client,
 )
 from nautilus_ctrader.common.errors import (
@@ -20,6 +21,7 @@ from nautilus_ctrader.common.errors import (
     CTraderTimeoutError,
 )
 from nautilus_ctrader.common.session import SessionState
+from nautilus_ctrader.config import CTraderDataClientConfig, CTraderExecClientConfig
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -653,6 +655,60 @@ def test_unknown_environment_is_rejected() -> None:
             environment="paper",
             logger=RecordingLogger(),
         )
+
+
+def _client_config(config_class, **overrides):
+    return config_class(
+        client_id="client-id",
+        client_secret="client-secret",
+        access_token="access-token",
+        trader_login=TRADER_LOGIN,
+        **overrides,
+    )
+
+
+_NON_DEFAULT_PACING = {
+    "request_window_secs": 2.5,
+    "historical_requests_per_window": 2,
+    "requests_per_window": 7,
+    "rate_limit_retries": 1,
+    "request_queue_timeout_secs": 9.0,
+}
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+async def test_the_configured_pacing_reaches_the_session(config_class) -> None:
+    config = _client_config(config_class, **_NON_DEFAULT_PACING)
+    server = venue()
+    await server.start()
+    client = account_client_from_config(config, RecordingLogger())
+    # Pointed at the fake server; the config carries no hosts.
+    client._demo_host = client._live_host = server.host
+    client._port = server.port
+    client._tls = False
+    try:
+        await client.connect()
+
+        assert client.session._connection._scheduler._pacing == config.pacing()
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"requests_per_window": 0},
+        {"historical_requests_per_window": 0},
+        {"request_window_secs": 0.0},
+        {"request_queue_timeout_secs": 0.0},
+        {"rate_limit_retries": -1},
+    ],
+)
+def test_an_impossible_pacing_is_refused_at_config_time(config_class, bad) -> None:
+    with pytest.raises(ValueError):
+        _client_config(config_class, **bad)
 
 
 async def test_the_last_disconnect_closes_the_session() -> None:

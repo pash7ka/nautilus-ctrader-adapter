@@ -31,6 +31,7 @@ from nautilus_ctrader.common.errors import (
     CTraderRequestError,
     CTraderTimeoutError,
 )
+from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.common.subscriptions import SubscriptionRegistry
 from nautilus_ctrader.constants import (
@@ -194,6 +195,7 @@ class CTraderAccountClient:
         logger: Logger,
         connect_timeout_secs: float = 60.0,
         restore_retry_interval_secs: float = 30.0,
+        pacing: Pacing | None = None,
         demo_host: str = DEMO_HOST,
         live_host: str = LIVE_HOST,
         port: int = PROTOBUF_PORT,
@@ -208,6 +210,7 @@ class CTraderAccountClient:
         self._log = logger
         self._connect_timeout_secs = connect_timeout_secs
         self._restore_retry_interval_secs = restore_retry_interval_secs
+        self._pacing = pacing
         self._demo_host = demo_host
         self._live_host = live_host
         self._port = port
@@ -630,6 +633,7 @@ class CTraderAccountClient:
             on_tokens_refreshed=self._on_tokens_refreshed,
             logger=self._log,
             tls=self._tls,
+            pacing=self._pacing,
         )
 
     async def _wait_ready(self, session: CTraderSession) -> None:
@@ -825,6 +829,8 @@ class AccountClientConfig(Protocol):
 
     def credentials(self) -> AccountCredentials: ...
 
+    def pacing(self) -> Pacing: ...
+
 
 def account_client_from_config(
     config: AccountClientConfig,
@@ -842,6 +848,7 @@ def account_client_from_config(
         logger=logger,
         connect_timeout_secs=config.connect_timeout_secs,
         restore_retry_interval_secs=config.restore_retry_interval_secs,
+        pacing=config.pacing(),
     )
 
 

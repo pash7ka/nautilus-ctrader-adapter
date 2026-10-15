@@ -18,6 +18,14 @@ from nautilus_trader.config import (
 from nautilus_trader.model.enums import AssetClass
 
 from nautilus_ctrader.common.account import ENVIRONMENTS, AccountCredentials, Environment
+from nautilus_ctrader.common.rate_limit import Pacing
+from nautilus_ctrader.constants import (
+    RATE_LIMIT_RETRIES,
+    REQUEST_QUEUE_TIMEOUT_SECS,
+    REQUEST_WINDOW_SECS,
+    VENUE_HISTORICAL_REQUESTS_PER_SEC,
+    VENUE_REQUESTS_PER_SEC,
+)
 
 
 def parse_asset_class_overrides(overrides: Mapping[str, str]) -> dict[str, AssetClass]:
@@ -83,12 +91,28 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
         Bound on the whole account bring-up.
     restore_retry_interval_secs : float, default 30.0
         How often to retry subscriptions whose restore failed.
+    request_window_secs : float, default 1.25
+        The sliding window the request limits count within.
+    historical_requests_per_window : int, default 5
+        The most historical requests sent within one window.
+    requests_per_window : int, default 50
+        The most other requests sent within one window.
+    rate_limit_retries : int, default 3
+        Resends of a historical request the venue refused for its rate limit.
+    request_queue_timeout_secs : float, default 60.0
+        The longest a request waits in the queue, retries included, before it fails unsent.
 
     Raises
     ------
     ValueError
-        If `history_page_size` is below 1, or `environment` is not one of "auto", "demo",
-        "live".
+        If `history_page_size` is below 1, `environment` is not one of "auto", "demo",
+        "live", or the request pacing is impossible (a window or a count below 1, a
+        non-positive duration, negative retries).
+
+    Notes
+    -----
+    Every client of one account shares one connection: the connection settings of the first
+    config built for the account win, the request pacing included.
 
     """
 
@@ -110,8 +134,14 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     history_request_timeout_secs: float = 30.0
     connect_timeout_secs: float = 60.0
     restore_retry_interval_secs: float = 30.0
+    request_window_secs: float = REQUEST_WINDOW_SECS
+    historical_requests_per_window: int = VENUE_HISTORICAL_REQUESTS_PER_SEC
+    requests_per_window: int = VENUE_REQUESTS_PER_SEC
+    rate_limit_retries: int = RATE_LIMIT_RETRIES
+    request_queue_timeout_secs: float = REQUEST_QUEUE_TIMEOUT_SECS
 
     def __post_init__(self) -> None:
+        self.pacing()
         if self.history_page_size < 1:
             raise ValueError(
                 f"history_page_size must be at least 1, got {self.history_page_size}",
@@ -130,6 +160,16 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
             access_token=self.access_token,
             refresh_token=self.refresh_token,
             token_expires_at=self.token_expires_at,
+        )
+
+    def pacing(self) -> Pacing:
+        """The request pacing settings; raises `ValueError` if they are impossible."""
+        return Pacing(
+            requests_per_window=self.requests_per_window,
+            historical_requests_per_window=self.historical_requests_per_window,
+            window_secs=self.request_window_secs,
+            retries=self.rate_limit_retries,
+            queue_timeout_secs=self.request_queue_timeout_secs,
         )
 
 
@@ -159,6 +199,16 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
         Bound on the whole account bring-up.
     restore_retry_interval_secs : float, default 30.0
         How often to retry what a reconnect failed to restore.
+    request_window_secs : float, default 1.25
+        The sliding window the request limits count within.
+    historical_requests_per_window : int, default 5
+        The most historical requests sent within one window.
+    requests_per_window : int, default 50
+        The most other requests sent within one window.
+    rate_limit_retries : int, default 3
+        Resends of a historical request the venue refused for its rate limit.
+    request_queue_timeout_secs : float, default 60.0
+        The longest a request waits in the queue, retries included, before it fails unsent.
     reference_price_max_age_secs : float, default 10.0
         The oldest spot a bracket's levels may be measured from, by the time since it arrived.
         The venue takes a market order's levels only as distances, which it applies to the fill.
@@ -183,13 +233,14 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     ValueError
         If `instrument_provider` is set, `environment` is not one of "auto", "demo", "live", a
         duration or `reconciliation_default_lookback_mins` is not positive,
-        `balance_checkpoint_hour` is outside 0-23, or `balance_checkpoint_timezone` is not a
-        known time zone.
+        `balance_checkpoint_hour` is outside 0-23, `balance_checkpoint_timezone` is not a
+        known time zone, or the request pacing is impossible (a window or a count below 1, a
+        non-positive duration, negative retries).
 
     Notes
     -----
     Every client of one account shares one connection: the connection settings of the first
-    config built for the account win.
+    config built for the account win, the request pacing included.
 
     """
 
@@ -202,6 +253,11 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     environment: Environment = "auto"
     connect_timeout_secs: float = 60.0
     restore_retry_interval_secs: float = 30.0
+    request_window_secs: float = REQUEST_WINDOW_SECS
+    historical_requests_per_window: int = VENUE_HISTORICAL_REQUESTS_PER_SEC
+    requests_per_window: int = VENUE_REQUESTS_PER_SEC
+    rate_limit_retries: int = RATE_LIMIT_RETRIES
+    request_queue_timeout_secs: float = REQUEST_QUEUE_TIMEOUT_SECS
     reference_price_max_age_secs: float = 10.0
     protective_order_timeout_secs: float = 2.0
     order_request_timeout_secs: float = 30.0
@@ -210,6 +266,7 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     balance_checkpoint_timezone: str = "UTC"
 
     def __post_init__(self) -> None:
+        self.pacing()
         if self.instrument_provider != InstrumentProviderConfig():
             raise ValueError(
                 "instrument_provider is set on the execution config; the execution client "
@@ -250,4 +307,14 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
             access_token=self.access_token,
             refresh_token=self.refresh_token,
             token_expires_at=self.token_expires_at,
+        )
+
+    def pacing(self) -> Pacing:
+        """The request pacing settings; raises `ValueError` if they are impossible."""
+        return Pacing(
+            requests_per_window=self.requests_per_window,
+            historical_requests_per_window=self.historical_requests_per_window,
+            window_secs=self.request_window_secs,
+            retries=self.rate_limit_retries,
+            queue_timeout_secs=self.request_queue_timeout_secs,
         )

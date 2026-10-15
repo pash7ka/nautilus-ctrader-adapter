@@ -318,6 +318,11 @@ connection, and the connection settings of the first config built for the accoun
 | `environment` | `"auto"` | `"auto"` reads the account's own live flag and picks the host; `"demo"` or `"live"` force it |
 | `connect_timeout_secs` | `60.0` | Bound on the whole account bring-up. It also bounds how long events are held while the start's reconciliation is applied, and how long a request waits for a rebuilt model: past it, a waiting amend or close goes ahead on the old model, with a WARNING |
 | `restore_retry_interval_secs` | `30.0` | How often to retry what a reconnect failed to restore |
+| `request_window_secs` | `1.25` | The sliding window the two request limits below count within; a little longer than the venue's 1 s |
+| `historical_requests_per_window` | `5` | The most historical requests sent within one window |
+| `requests_per_window` | `50` | The most other requests sent within one window |
+| `rate_limit_retries` | `3` | Resends of a historical request the venue refused for its rate limit; other requests are never resent |
+| `request_queue_timeout_secs` | `60.0` | The longest a request waits in the queue, retries included, before it fails unsent |
 | `reference_price_max_age_secs` | `10.0` | The oldest spot a bracket's levels may be measured from |
 | `protective_order_timeout_secs` | `2.0` | How long after a bracket's fill to wait for the broker's protective order before setting the levels by an amend |
 | `order_request_timeout_secs` | `30.0` | Response timeout for an order, a close or a level amend. An order or close with no answer by then is never resent, so a slow answer must not be taken for a lost one |
@@ -328,7 +333,14 @@ connection, and the connection settings of the first config built for the accoun
 The config refuses, with a `ValueError`: an `instrument_provider`, an `environment` other than
 the three above, a value that is not positive in `reference_price_max_age_secs`,
 `protective_order_timeout_secs`, `order_request_timeout_secs` or
-`reconciliation_default_lookback_mins`, an hour outside 0 to 23, and an unknown time zone.
+`reconciliation_default_lookback_mins`, an hour outside 0 to 23, an unknown time zone, and an
+impossible request pacing (a count below 1, a window or queue timeout that is not positive,
+negative retries).
+
+The five request pacing fields are on `CTraderDataClientConfig` too, with the same names and
+defaults. The defaults come from the limits measured live and recorded in
+[`protocol.md` section 6](protocol.md#6-rate-limiting); the first config built for an account
+sets the pacing every client of that account uses.
 
 The in-flight check belongs to Nautilus's `LiveExecEngineConfig`, not to this config; see
 [section 5](#5-order-queries-and-in-flight-settings) for the values to set there.
