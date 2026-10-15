@@ -1,0 +1,350 @@
+{"step": "trendbars, burst of 5", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 0, "sent_at": 3.425, "answered_at": 3.4797, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 5", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 2, "sent_at": 3.4258, "answered_at": 3.5279, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 5", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 1, "sent_at": 3.4255, "answered_at": 3.5282, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 5", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 4, "sent_at": 3.4262, "answered_at": 3.5294, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 5", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 3, "sent_at": 3.426, "answered_at": 3.5298, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 5", "status": "ran", "note": ""}
+{"step": "trendbars, burst of 6", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 0, "sent_at": 7.4299, "answered_at": 7.4776, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 6", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 5, "sent_at": 7.4313, "answered_at": 7.5137, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 6", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 3, "sent_at": 7.4309, "answered_at": 7.5258, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 6", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 2, "sent_at": 7.4307, "answered_at": 7.526, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 6", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 1, "sent_at": 7.4304, "answered_at": 7.5266, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 6", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 4, "sent_at": 7.4311, "answered_at": 7.532, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 6", "status": "ran", "note": ""}
+{"step": "trendbars, burst of 8", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 0, "sent_at": 11.4209, "answered_at": 11.4788, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 8", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 5, "sent_at": 11.4223, "answered_at": 11.5152, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 8", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 6, "sent_at": 11.4225, "answered_at": 11.5155, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 8", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 7, "sent_at": 11.4227, "answered_at": 11.5156, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 8", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 4, "sent_at": 11.4221, "answered_at": 11.5276, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 8", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 1, "sent_at": 11.4215, "answered_at": 11.5278, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 8", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 2, "sent_at": 11.4218, "answered_at": 11.5281, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 8", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 3, "sent_at": 11.422, "answered_at": 11.5286, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 8", "status": "ran", "note": ""}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 0, "sent_at": 15.4304, "answered_at": 15.4794, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 5, "sent_at": 15.4318, "answered_at": 15.518, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 6, "sent_at": 15.432, "answered_at": 15.5185, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 7, "sent_at": 15.4322, "answered_at": 15.5187, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 8, "sent_at": 15.4324, "answered_at": 15.5188, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 9, "sent_at": 15.4326, "answered_at": 15.519, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 1, "sent_at": 15.431, "answered_at": 15.5355, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 2, "sent_at": 15.4312, "answered_at": 15.5357, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 4, "sent_at": 15.4317, "answered_at": 15.5461, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 10", "payload": "ProtoOAGetTrendbarsReq", "role": "burst", "index": 3, "sent_at": 15.4315, "answered_at": 15.5483, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, burst of 10", "status": "ran", "note": ""}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 0, "sent_at": 19.4214, "answered_at": 19.4715, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 1, "sent_at": 19.6227, "answered_at": 19.6732, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 2, "sent_at": 19.8341, "answered_at": 19.8938, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 3, "sent_at": 20.0253, "answered_at": 20.0737, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 4, "sent_at": 20.2266, "answered_at": 20.2762, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 5, "sent_at": 20.4275, "answered_at": 20.4956, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 6, "sent_at": 20.6288, "answered_at": 20.6769, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 7, "sent_at": 20.8365, "answered_at": 20.8933, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 8, "sent_at": 21.0291, "answered_at": 21.0849, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 9, "sent_at": 21.2292, "answered_at": 21.2777, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 10, "sent_at": 21.4292, "answered_at": 21.4666, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 11, "sent_at": 21.6293, "answered_at": 21.6649, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 12, "sent_at": 21.8225, "answered_at": 21.8597, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 13, "sent_at": 22.0308, "answered_at": 22.0686, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 5/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 14, "sent_at": 22.2309, "answered_at": 22.2691, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 5/s for 3 s", "status": "ran", "note": ""}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 0, "sent_at": 25.4281, "answered_at": 25.4744, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 1, "sent_at": 25.5981, "answered_at": 25.6494, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 2, "sent_at": 25.779, "answered_at": 25.829, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 3, "sent_at": 25.9365, "answered_at": 25.986, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 4, "sent_at": 26.1066, "answered_at": 26.1553, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 5, "sent_at": 26.2628, "answered_at": 26.2985, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 6, "sent_at": 26.4327, "answered_at": 26.4711, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 7, "sent_at": 26.5957, "answered_at": 26.6301, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 8, "sent_at": 26.7799, "answered_at": 26.8223, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 9, "sent_at": 26.9424, "answered_at": 26.9777, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 10, "sent_at": 27.0986, "answered_at": 27.1393, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 11, "sent_at": 27.2687, "answered_at": 27.3158, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 12, "sent_at": 27.4387, "answered_at": 27.485, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 13, "sent_at": 27.6087, "answered_at": 27.6598, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 14, "sent_at": 27.7627, "answered_at": 27.8175, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 15, "sent_at": 27.9324, "answered_at": 27.9811, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 16, "sent_at": 28.1042, "answered_at": 28.1394, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 6/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 17, "sent_at": 28.2744, "answered_at": 28.3123, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 6/s for 3 s", "status": "ran", "note": ""}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 0, "sent_at": 31.7812, "answered_at": 31.8359, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 1, "sent_at": 31.9466, "answered_at": 31.9974, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 2, "sent_at": 32.0716, "answered_at": 32.1233, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 3, "sent_at": 32.2105, "answered_at": 32.2624, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 4, "sent_at": 32.3648, "answered_at": 32.4124, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 5, "sent_at": 32.5056, "answered_at": 32.5447, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 6, "sent_at": 32.6443, "answered_at": 32.6804, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 7, "sent_at": 32.783, "answered_at": 32.818, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 8, "sent_at": 32.936, "answered_at": 32.9724, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 9, "sent_at": 33.0778, "answered_at": 33.1193, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 10, "sent_at": 33.2165, "answered_at": 33.2525, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 11, "sent_at": 33.3553, "answered_at": 33.3997, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 12, "sent_at": 33.4959, "answered_at": 33.53, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 13, "sent_at": 33.6504, "answered_at": 33.6981, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 14, "sent_at": 33.7882, "answered_at": 33.8374, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 15, "sent_at": 33.9388, "answered_at": 33.9898, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 16, "sent_at": 34.0675, "answered_at": 34.1198, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 17, "sent_at": 34.2219, "answered_at": 34.2792, "outcome": "answered", "retry_after": null}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 18, "sent_at": 34.3607, "answered_at": 34.3977, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 19, "sent_at": 34.5013, "answered_at": 34.5358, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "payload": "ProtoOAGetTrendbarsReq", "role": "stream", "index": 20, "sent_at": 34.6443, "answered_at": 34.6823, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars, 7/s for 3 s", "status": "ran", "note": ""}
+{"step": "deal list, burst of 8", "payload": "ProtoOADealListReq", "role": "burst", "index": 0, "sent_at": 38.4276, "answered_at": 38.4746, "outcome": "answered", "retry_after": null}
+{"step": "deal list, burst of 8", "payload": "ProtoOADealListReq", "role": "burst", "index": 5, "sent_at": 38.429, "answered_at": 38.5102, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list, burst of 8", "payload": "ProtoOADealListReq", "role": "burst", "index": 6, "sent_at": 38.4292, "answered_at": 38.5105, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list, burst of 8", "payload": "ProtoOADealListReq", "role": "burst", "index": 7, "sent_at": 38.4294, "answered_at": 38.5107, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list, burst of 8", "payload": "ProtoOADealListReq", "role": "burst", "index": 2, "sent_at": 38.4285, "answered_at": 38.5141, "outcome": "answered", "retry_after": null}
+{"step": "deal list, burst of 8", "payload": "ProtoOADealListReq", "role": "burst", "index": 1, "sent_at": 38.4283, "answered_at": 38.5144, "outcome": "answered", "retry_after": null}
+{"step": "deal list, burst of 8", "payload": "ProtoOADealListReq", "role": "burst", "index": 3, "sent_at": 38.4287, "answered_at": 38.5145, "outcome": "answered", "retry_after": null}
+{"step": "deal list, burst of 8", "payload": "ProtoOADealListReq", "role": "burst", "index": 4, "sent_at": 38.4289, "answered_at": 38.5146, "outcome": "answered", "retry_after": null}
+{"step": "deal list, burst of 8", "status": "ran", "note": ""}
+{"step": "order list, burst of 8", "payload": "ProtoOAOrderListReq", "role": "burst", "index": 0, "sent_at": 42.4216, "answered_at": 42.4645, "outcome": "answered", "retry_after": null}
+{"step": "order list, burst of 8", "payload": "ProtoOAOrderListReq", "role": "burst", "index": 5, "sent_at": 42.423, "answered_at": 42.4999, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "order list, burst of 8", "payload": "ProtoOAOrderListReq", "role": "burst", "index": 6, "sent_at": 42.4232, "answered_at": 42.5002, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "order list, burst of 8", "payload": "ProtoOAOrderListReq", "role": "burst", "index": 7, "sent_at": 42.4233, "answered_at": 42.5003, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "order list, burst of 8", "payload": "ProtoOAOrderListReq", "role": "burst", "index": 3, "sent_at": 42.4226, "answered_at": 42.5079, "outcome": "answered", "retry_after": null}
+{"step": "order list, burst of 8", "payload": "ProtoOAOrderListReq", "role": "burst", "index": 4, "sent_at": 42.4228, "answered_at": 42.5081, "outcome": "answered", "retry_after": null}
+{"step": "order list, burst of 8", "payload": "ProtoOAOrderListReq", "role": "burst", "index": 2, "sent_at": 42.4224, "answered_at": 42.5083, "outcome": "answered", "retry_after": null}
+{"step": "order list, burst of 8", "payload": "ProtoOAOrderListReq", "role": "burst", "index": 1, "sent_at": 42.4222, "answered_at": 42.5088, "outcome": "answered", "retry_after": null}
+{"step": "order list, burst of 8", "status": "ran", "note": ""}
+{"step": "cash-flow list, burst of 8", "payload": "ProtoOACashFlowHistoryListReq", "role": "burst", "index": 0, "sent_at": 46.4249, "answered_at": 46.466, "outcome": "answered", "retry_after": null}
+{"step": "cash-flow list, burst of 8", "payload": "ProtoOACashFlowHistoryListReq", "role": "burst", "index": 5, "sent_at": 46.4263, "answered_at": 46.5037, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "cash-flow list, burst of 8", "payload": "ProtoOACashFlowHistoryListReq", "role": "burst", "index": 6, "sent_at": 46.4264, "answered_at": 46.5039, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "cash-flow list, burst of 8", "payload": "ProtoOACashFlowHistoryListReq", "role": "burst", "index": 7, "sent_at": 46.4266, "answered_at": 46.5041, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "cash-flow list, burst of 8", "payload": "ProtoOACashFlowHistoryListReq", "role": "burst", "index": 4, "sent_at": 46.4261, "answered_at": 46.5051, "outcome": "answered", "retry_after": null}
+{"step": "cash-flow list, burst of 8", "payload": "ProtoOACashFlowHistoryListReq", "role": "burst", "index": 2, "sent_at": 46.4257, "answered_at": 46.5053, "outcome": "answered", "retry_after": null}
+{"step": "cash-flow list, burst of 8", "payload": "ProtoOACashFlowHistoryListReq", "role": "burst", "index": 1, "sent_at": 46.4255, "answered_at": 46.5054, "outcome": "answered", "retry_after": null}
+{"step": "cash-flow list, burst of 8", "payload": "ProtoOACashFlowHistoryListReq", "role": "burst", "index": 3, "sent_at": 46.4259, "answered_at": 46.5055, "outcome": "answered", "retry_after": null}
+{"step": "cash-flow list, burst of 8", "status": "ran", "note": ""}
+{"step": "order details, burst of 8", "payload": "ProtoOAOrderDetailsReq", "role": "burst", "index": 0, "sent_at": 50.4403, "answered_at": 50.4891, "outcome": "answered", "retry_after": null}
+{"step": "order details, burst of 8", "payload": "ProtoOAOrderDetailsReq", "role": "burst", "index": 2, "sent_at": 50.4411, "answered_at": 50.5389, "outcome": "answered", "retry_after": null}
+{"step": "order details, burst of 8", "payload": "ProtoOAOrderDetailsReq", "role": "burst", "index": 3, "sent_at": 50.4412, "answered_at": 50.5392, "outcome": "answered", "retry_after": null}
+{"step": "order details, burst of 8", "payload": "ProtoOAOrderDetailsReq", "role": "burst", "index": 5, "sent_at": 50.4415, "answered_at": 50.541, "outcome": "answered", "retry_after": null}
+{"step": "order details, burst of 8", "payload": "ProtoOAOrderDetailsReq", "role": "burst", "index": 1, "sent_at": 50.4408, "answered_at": 50.5412, "outcome": "answered", "retry_after": null}
+{"step": "order details, burst of 8", "payload": "ProtoOAOrderDetailsReq", "role": "burst", "index": 7, "sent_at": 50.4419, "answered_at": 50.5422, "outcome": "answered", "retry_after": null}
+{"step": "order details, burst of 8", "payload": "ProtoOAOrderDetailsReq", "role": "burst", "index": 4, "sent_at": 50.4414, "answered_at": 50.5626, "outcome": "answered", "retry_after": null}
+{"step": "order details, burst of 8", "payload": "ProtoOAOrderDetailsReq", "role": "burst", "index": 6, "sent_at": 50.4417, "answered_at": 50.5627, "outcome": "answered", "retry_after": null}
+{"step": "order details, burst of 8", "status": "ran", "note": ""}
+{"step": "tick data, burst of 8", "status": "skipped", "note": "not needed: the deal list is limited"}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 0, "sent_at": 54.4342, "answered_at": 54.4971, "outcome": "answered", "retry_after": null}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 5, "sent_at": 54.4351, "answered_at": 54.533, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 6, "sent_at": 54.4352, "answered_at": 54.5332, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 7, "sent_at": 54.4353, "answered_at": 54.5333, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 8, "sent_at": 54.4354, "answered_at": 54.5333, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 9, "sent_at": 54.4355, "answered_at": 54.5334, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 10, "sent_at": 54.4356, "answered_at": 54.5335, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 11, "sent_at": 54.4357, "answered_at": 54.5336, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 2, "sent_at": 54.4348, "answered_at": 54.55, "outcome": "answered", "retry_after": null}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 3, "sent_at": 54.4349, "answered_at": 54.5504, "outcome": "answered", "retry_after": null}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 1, "sent_at": 54.4345, "answered_at": 54.5514, "outcome": "answered", "retry_after": null}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "trigger", "index": 4, "sent_at": 54.435, "answered_at": 54.5525, "outcome": "answered", "retry_after": null}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOADealListReq", "role": "follow-up", "index": 12, "sent_at": 54.5527, "answered_at": 54.5947, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "after-wait", "index": 13, "sent_at": 56.0972, "answered_at": 56.1548, "outcome": "answered", "retry_after": null}
+{"step": "trendbars burst of 12, then one deal list request while blocked", "status": "ran", "note": ""}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 0, "sent_at": 59.4305, "answered_at": 59.4748, "outcome": "answered", "retry_after": null}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 5, "sent_at": 59.4317, "answered_at": 59.5171, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 6, "sent_at": 59.4318, "answered_at": 59.5172, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 7, "sent_at": 59.4318, "answered_at": 59.5172, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 8, "sent_at": 59.4318, "answered_at": 59.5173, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 9, "sent_at": 59.4319, "answered_at": 59.5173, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 10, "sent_at": 59.4319, "answered_at": 59.5173, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 11, "sent_at": 59.4319, "answered_at": 59.5174, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 3, "sent_at": 59.431, "answered_at": 59.5223, "outcome": "answered", "retry_after": null}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 2, "sent_at": 59.4309, "answered_at": 59.5224, "outcome": "answered", "retry_after": null}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 1, "sent_at": 59.4307, "answered_at": 59.5224, "outcome": "answered", "retry_after": null}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "trigger", "index": 4, "sent_at": 59.4317, "answered_at": 59.5236, "outcome": "answered", "retry_after": null}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOAGetTrendbarsReq", "role": "follow-up", "index": 12, "sent_at": 59.5237, "answered_at": 59.5652, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "payload": "ProtoOADealListReq", "role": "after-wait", "index": 13, "sent_at": 61.0801, "answered_at": 61.1214, "outcome": "answered", "retry_after": null}
+{"step": "deal list burst of 12, then one trendbars request while blocked", "status": "ran", "note": ""}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 0, "sent_at": 64.4316, "answered_at": 64.4694, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 1, "sent_at": 64.4319, "answered_at": 64.4769, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 2, "sent_at": 64.432, "answered_at": 64.4775, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 3, "sent_at": 64.4321, "answered_at": 64.4776, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 4, "sent_at": 64.4322, "answered_at": 64.4776, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 5, "sent_at": 64.4323, "answered_at": 64.4777, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 6, "sent_at": 64.4323, "answered_at": 64.4778, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 7, "sent_at": 64.4324, "answered_at": 64.4778, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 8, "sent_at": 64.4325, "answered_at": 64.4782, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 9, "sent_at": 64.4326, "answered_at": 64.4783, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 10, "sent_at": 64.4327, "answered_at": 64.4783, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 11, "sent_at": 64.4327, "answered_at": 64.4784, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 12, "sent_at": 64.4328, "answered_at": 64.4784, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 13, "sent_at": 64.4329, "answered_at": 64.4785, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 14, "sent_at": 64.433, "answered_at": 64.4785, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 15, "sent_at": 64.4331, "answered_at": 64.4787, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 16, "sent_at": 64.4332, "answered_at": 64.4789, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 17, "sent_at": 64.4332, "answered_at": 64.479, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 18, "sent_at": 64.4333, "answered_at": 64.479, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 19, "sent_at": 64.4334, "answered_at": 64.4791, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 20, "sent_at": 64.4335, "answered_at": 64.4792, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 21, "sent_at": 64.4335, "answered_at": 64.5123, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 22, "sent_at": 64.4336, "answered_at": 64.5124, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 23, "sent_at": 64.4337, "answered_at": 64.5125, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 24, "sent_at": 64.4338, "answered_at": 64.5125, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 25, "sent_at": 64.4338, "answered_at": 64.5126, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 26, "sent_at": 64.4339, "answered_at": 64.5126, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 27, "sent_at": 64.434, "answered_at": 64.5127, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 28, "sent_at": 64.4341, "answered_at": 64.5127, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 29, "sent_at": 64.4341, "answered_at": 64.5128, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 30, "sent_at": 64.4342, "answered_at": 64.5128, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 31, "sent_at": 64.4343, "answered_at": 64.5129, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 32, "sent_at": 64.4344, "answered_at": 64.5129, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 33, "sent_at": 64.4344, "answered_at": 64.513, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 34, "sent_at": 64.4345, "answered_at": 64.513, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 35, "sent_at": 64.4346, "answered_at": 64.5131, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 36, "sent_at": 64.4347, "answered_at": 64.5132, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 37, "sent_at": 64.4348, "answered_at": 64.5132, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 38, "sent_at": 64.4349, "answered_at": 64.5133, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 39, "sent_at": 64.4349, "answered_at": 64.5133, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 40, "sent_at": 64.435, "answered_at": 64.5134, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 41, "sent_at": 64.4351, "answered_at": 64.5134, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 43, "sent_at": 64.4352, "answered_at": 64.5135, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 42, "sent_at": 64.4352, "answered_at": 64.5135, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 45, "sent_at": 64.4354, "answered_at": 64.5136, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 44, "sent_at": 64.4353, "answered_at": 64.5136, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 46, "sent_at": 64.4355, "answered_at": 64.5137, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 47, "sent_at": 64.4356, "answered_at": 64.5137, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 48, "sent_at": 64.4357, "answered_at": 64.5138, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "payload": "ProtoOATraderReq", "role": "burst", "index": 49, "sent_at": 64.4357, "answered_at": 64.5138, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 50", "status": "ran", "note": ""}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 0, "sent_at": 68.4351, "answered_at": 68.4741, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 1, "sent_at": 68.4353, "answered_at": 68.4832, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 50, "sent_at": 68.4381, "answered_at": 68.4868, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 51, "sent_at": 68.4381, "answered_at": 68.4869, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 52, "sent_at": 68.4382, "answered_at": 68.487, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 53, "sent_at": 68.4382, "answered_at": 68.487, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 54, "sent_at": 68.4383, "answered_at": 68.4871, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 55, "sent_at": 68.4383, "answered_at": 68.4871, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 56, "sent_at": 68.4384, "answered_at": 68.4872, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 57, "sent_at": 68.4384, "answered_at": 68.4872, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 58, "sent_at": 68.4385, "answered_at": 68.4872, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 59, "sent_at": 68.4386, "answered_at": 68.4873, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 2, "sent_at": 68.4354, "answered_at": 68.4873, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 3, "sent_at": 68.4355, "answered_at": 68.4874, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 4, "sent_at": 68.4355, "answered_at": 68.4874, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 5, "sent_at": 68.4356, "answered_at": 68.4875, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 6, "sent_at": 68.4356, "answered_at": 68.4875, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 7, "sent_at": 68.4357, "answered_at": 68.4875, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 8, "sent_at": 68.4357, "answered_at": 68.4876, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 9, "sent_at": 68.4358, "answered_at": 68.4876, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 10, "sent_at": 68.4358, "answered_at": 68.4876, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 11, "sent_at": 68.4359, "answered_at": 68.4877, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 12, "sent_at": 68.436, "answered_at": 68.4877, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 13, "sent_at": 68.436, "answered_at": 68.4877, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 14, "sent_at": 68.4361, "answered_at": 68.4878, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 15, "sent_at": 68.4362, "answered_at": 68.4878, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 16, "sent_at": 68.4362, "answered_at": 68.4879, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 17, "sent_at": 68.4363, "answered_at": 68.4879, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 18, "sent_at": 68.4363, "answered_at": 68.4879, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 19, "sent_at": 68.4364, "answered_at": 68.488, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 20, "sent_at": 68.4364, "answered_at": 68.488, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 21, "sent_at": 68.4365, "answered_at": 68.488, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 22, "sent_at": 68.4365, "answered_at": 68.4881, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 23, "sent_at": 68.4366, "answered_at": 68.4881, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 24, "sent_at": 68.4367, "answered_at": 68.4882, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 25, "sent_at": 68.4367, "answered_at": 68.4882, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 26, "sent_at": 68.4368, "answered_at": 68.4882, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 27, "sent_at": 68.4368, "answered_at": 68.4883, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 28, "sent_at": 68.4369, "answered_at": 68.4883, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 29, "sent_at": 68.4369, "answered_at": 68.4883, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 30, "sent_at": 68.437, "answered_at": 68.4884, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 31, "sent_at": 68.437, "answered_at": 68.4884, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 32, "sent_at": 68.4371, "answered_at": 68.4885, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 33, "sent_at": 68.4371, "answered_at": 68.4885, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 34, "sent_at": 68.4372, "answered_at": 68.4885, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 35, "sent_at": 68.4373, "answered_at": 68.4886, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 36, "sent_at": 68.4373, "answered_at": 68.4886, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 37, "sent_at": 68.4374, "answered_at": 68.4886, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 38, "sent_at": 68.4374, "answered_at": 68.4887, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 39, "sent_at": 68.4375, "answered_at": 68.4887, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 40, "sent_at": 68.4375, "answered_at": 68.4887, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 41, "sent_at": 68.4376, "answered_at": 68.4888, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 42, "sent_at": 68.4376, "answered_at": 68.4888, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 43, "sent_at": 68.4377, "answered_at": 68.4888, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 44, "sent_at": 68.4377, "answered_at": 68.4889, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 45, "sent_at": 68.4378, "answered_at": 68.4889, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 46, "sent_at": 68.4379, "answered_at": 68.489, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 47, "sent_at": 68.4379, "answered_at": 68.489, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 48, "sent_at": 68.438, "answered_at": 68.489, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "payload": "ProtoOATraderReq", "role": "burst", "index": 49, "sent_at": 68.438, "answered_at": 68.4891, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 60", "status": "ran", "note": ""}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 0, "sent_at": 72.432, "answered_at": 72.4693, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 1, "sent_at": 72.4323, "answered_at": 72.4773, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 2, "sent_at": 72.4324, "answered_at": 72.4774, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 3, "sent_at": 72.4325, "answered_at": 72.4774, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 4, "sent_at": 72.4326, "answered_at": 72.4775, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 5, "sent_at": 72.4327, "answered_at": 72.4775, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 6, "sent_at": 72.4328, "answered_at": 72.4779, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 7, "sent_at": 72.4329, "answered_at": 72.478, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 8, "sent_at": 72.433, "answered_at": 72.478, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 9, "sent_at": 72.4331, "answered_at": 72.478, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 10, "sent_at": 72.4332, "answered_at": 72.4781, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 11, "sent_at": 72.4333, "answered_at": 72.4781, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 12, "sent_at": 72.4334, "answered_at": 72.4781, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 13, "sent_at": 72.4335, "answered_at": 72.4782, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 14, "sent_at": 72.4336, "answered_at": 72.4782, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 15, "sent_at": 72.4337, "answered_at": 72.4782, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 16, "sent_at": 72.4338, "answered_at": 72.4783, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 17, "sent_at": 72.4339, "answered_at": 72.4783, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 18, "sent_at": 72.434, "answered_at": 72.4783, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 19, "sent_at": 72.4341, "answered_at": 72.4784, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 50, "sent_at": 72.4366, "answered_at": 72.4787, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 51, "sent_at": 72.4366, "answered_at": 72.4787, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 52, "sent_at": 72.4367, "answered_at": 72.4788, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 53, "sent_at": 72.4368, "answered_at": 72.4788, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 54, "sent_at": 72.4368, "answered_at": 72.4788, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 55, "sent_at": 72.4369, "answered_at": 72.4789, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 56, "sent_at": 72.4369, "answered_at": 72.4789, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 57, "sent_at": 72.437, "answered_at": 72.5209, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 20, "sent_at": 72.4342, "answered_at": 72.521, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 21, "sent_at": 72.4343, "answered_at": 72.521, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 22, "sent_at": 72.4344, "answered_at": 72.521, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 23, "sent_at": 72.4344, "answered_at": 72.5211, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 24, "sent_at": 72.4345, "answered_at": 72.5211, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 25, "sent_at": 72.4346, "answered_at": 72.5211, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 26, "sent_at": 72.4348, "answered_at": 72.5212, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 27, "sent_at": 72.4349, "answered_at": 72.5212, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 28, "sent_at": 72.435, "answered_at": 72.5212, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 58, "sent_at": 72.4371, "answered_at": 72.5213, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 59, "sent_at": 72.4371, "answered_at": 72.5213, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 60, "sent_at": 72.4372, "answered_at": 72.5213, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 61, "sent_at": 72.4372, "answered_at": 72.5214, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 62, "sent_at": 72.4373, "answered_at": 72.5214, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 63, "sent_at": 72.4373, "answered_at": 72.5215, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 64, "sent_at": 72.4374, "answered_at": 72.5215, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 65, "sent_at": 72.4375, "answered_at": 72.5215, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 66, "sent_at": 72.4376, "answered_at": 72.5216, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 67, "sent_at": 72.4376, "answered_at": 72.5216, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 68, "sent_at": 72.4377, "answered_at": 72.5216, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 69, "sent_at": 72.4377, "answered_at": 72.5217, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 70, "sent_at": 72.4378, "answered_at": 72.5217, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 71, "sent_at": 72.4379, "answered_at": 72.5217, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 72, "sent_at": 72.4379, "answered_at": 72.5218, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 73, "sent_at": 72.438, "answered_at": 72.5218, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 74, "sent_at": 72.438, "answered_at": 72.5218, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 75, "sent_at": 72.4381, "answered_at": 72.5219, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 76, "sent_at": 72.4381, "answered_at": 72.5219, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 77, "sent_at": 72.4382, "answered_at": 72.5219, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 78, "sent_at": 72.4382, "answered_at": 72.522, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 79, "sent_at": 72.4383, "answered_at": 72.522, "outcome": "BLOCKED_PAYLOAD_TYPE", "retry_after": 1}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 29, "sent_at": 72.4351, "answered_at": 72.522, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 30, "sent_at": 72.4352, "answered_at": 72.5221, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 31, "sent_at": 72.4353, "answered_at": 72.5221, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 32, "sent_at": 72.4354, "answered_at": 72.5221, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 33, "sent_at": 72.4355, "answered_at": 72.5222, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 34, "sent_at": 72.4356, "answered_at": 72.5222, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 35, "sent_at": 72.4356, "answered_at": 72.5222, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 36, "sent_at": 72.4357, "answered_at": 72.5222, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 37, "sent_at": 72.4358, "answered_at": 72.5223, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 38, "sent_at": 72.4358, "answered_at": 72.5223, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 39, "sent_at": 72.4359, "answered_at": 72.5223, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 40, "sent_at": 72.4359, "answered_at": 72.5224, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 41, "sent_at": 72.436, "answered_at": 72.5224, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 42, "sent_at": 72.4361, "answered_at": 72.5224, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 43, "sent_at": 72.4361, "answered_at": 72.5225, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 44, "sent_at": 72.4362, "answered_at": 72.5225, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 45, "sent_at": 72.4363, "answered_at": 72.5225, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 46, "sent_at": 72.4363, "answered_at": 72.5225, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 47, "sent_at": 72.4364, "answered_at": 72.5226, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 48, "sent_at": 72.4365, "answered_at": 72.5226, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "payload": "ProtoOATraderReq", "role": "burst", "index": 49, "sent_at": 72.4365, "answered_at": 72.5226, "outcome": "answered", "retry_after": null}
+{"step": "trader, burst of 80", "status": "ran", "note": ""}

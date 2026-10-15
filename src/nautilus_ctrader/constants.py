@@ -46,9 +46,8 @@ PENDING_ORDER_TYPES: tuple[int, ...] = (_om.LIMIT, _om.STOP, _om.STOP_LIMIT)
 BUCKET_DEFAULT: str = "default"
 BUCKET_HISTORICAL: str = "historical"
 
-# Documented figures (50/s general, 5/s historical per connection); M1 used 5/1 as
-# placeholders. TODO(verify): a live BLOCKED_PAYLOAD_TYPE with retryAfter under load settles
-# the real figures.
+# The venue allows 50 at once and 5 historical within any 1 s, measured live (docs/protocol.md
+# §6). A token bucket at these rates can still exceed them within its first second.
 DEFAULT_RATE_LIMIT_PER_SEC: float = 50.0
 HISTORICAL_RATE_LIMIT_PER_SEC: float = 5.0
 

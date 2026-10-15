@@ -182,16 +182,45 @@ re-authentication as an expired token) breaks that cycle.
 ## 6. Rate limiting
 
 A rate-limit breach is reported as `ProtoOAErrorRes` with `errorCode = BLOCKED_PAYLOAD_TYPE`
-(confirmed) and a `retryAfter` value in seconds, scoped to the specific payload type that was
-throttled.
+and `retryAfter = 1`, in seconds.
 
-This adapter treats `retryAfter` as authoritative: on a breach, the affected bucket is paused
-for exactly the duration the venue reports, rather than guessing a backoff. Requests are
-throttled locally before they are ever sent, using separate budgets for ordinary requests and
-for historical requests, so that a burst of historical requests cannot starve everything
-else. **Unconfirmed**: the real budgets. Published figures for this API are inconsistent, so
-the defaults this adapter ships with are deliberately conservative until a live connection's
-own `BLOCKED_PAYLOAD_TYPE` responses settle the real numbers.
+Published figures for this API are inconsistent. The figures below were measured on one
+connection to a live account with `scripts/verify_rate_limits.py`, which sends read-only
+requests with no local pacing. The run's log is kept as `tests/fixtures/rate_limits_live.jsonl`;
+`--from-log` on that script prints the report again from it.
+
+There are two limits:
+
+- **Historical: 5 requests within any 1 s.** The window slides: it does not reset on calendar
+  seconds. The limit is one budget shared by trendbars, the deal list, the order list and the
+  cash-flow list. While trendbars are refused, a deal list request is refused too, and the
+  other way round. Order details are not in it: 8 at once are all answered.
+- **Everything else: 50 at once.** From a burst of 60 or 80, exactly 50 are answered. The
+  window shape of this limit was not measured.
+
+What a breach does:
+
+- The first refusal blocks the whole historical budget for 1 s, the `retryAfter` it carries.
+- Requests refused during that second do not extend the block.
+- A request sent once `retryAfter` has passed is answered.
+
+**Pace with a margin.** The venue counts arrival times, and network jitter moves them. A
+stream sent exactly 5 per second, 0.2 s apart, was refused at its 11th request: the 6th and
+the 11th were sent 1.002 s apart. A sender that keeps to the limit must leave room in the
+window.
+
+A token bucket whose capacity equals its rate does not keep to these limits. It sends a full
+bucket at once and then refills during the same second, so up to twice the allowance can
+leave within one second. A live start-up was refused this way after 12 trendbar requests in
+about 2 s. This adapter still paces that way, with buckets of 50/s and 5/s; on a breach it
+pauses the refused bucket for `retryAfter` and fails the request.
+
+**Not measured:**
+
+- tick data and the per-position lists (`ProtoOADealListByPositionIdReq`,
+  `ProtoOAOrderListByPositionIdReq`); this adapter treats them as historical;
+- whether the limits count per connection or per account. The run used one connection with
+  nothing else connected.
 
 ## 7. Scaling — read this before trusting any number
 

@@ -927,7 +927,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Broker order `order_id` as it stands now, pending or ended."""
         # Confirmed live: an ended order is answered, and an unknown id is refused with
         # ORDER_NOT_FOUND. Where it fails, the order list over the fill window is searched.
-        # TODO(verify): which request limit it counts against (taken as the historical one here).
+        # Measured live: not the historical limit. Sent on the historical bucket anyway, which
+        # only paces it more tightly than needed.
         response = await self._request(
             oa.ProtoOAOrderDetailsReq(
                 ctidTraderAccountId=self._account.account_id, orderId=order_id

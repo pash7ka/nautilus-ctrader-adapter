@@ -29,7 +29,8 @@ Run from the repository root; credentials and, by default, the trader login come
 The plan is printed first. The account's host is then looked up from the account list, and
 nothing is probed until `y` is typed. Each request's payload type, timing, outcome and
 `retryAfter` are appended to `logs/verify_rate_limits-<stamp>.raw.jsonl`; no credential and no
-account identifier is written there.
+account identifier is written there. `--from-log <path>` prints that run's report again,
+offline.
 
 Exit code: 0 when every step ran or was skipped for a stated reason, 1 otherwise, 2 when the
 plan is invalid or the run was declined.
@@ -586,6 +587,45 @@ class AttemptLog:
         if self._file is not None:
             self._file.write(json.dumps(record) + "\n")
             self._file.flush()
+
+
+def read_log(path: pathlib.Path, plan: Sequence[Step]) -> list[StepResult]:
+    """The step results a run's log records, as the run itself returned them.
+
+    The sibling is chosen as the run chose it. A plan step the log never reached is `NOT_RUN`.
+    """
+    kinds = {cls.__name__: kind for kind, cls in PROBED_REQUESTS.items()}
+    attempts: dict[str, list[Attempt]] = {}
+    ends: dict[str, dict] = {}
+    with path.open(encoding="utf-8") as file:
+        for line in file:
+            record = json.loads(line)
+            if "status" in record:
+                ends[record["step"]] = record
+                continue
+            attempts.setdefault(record["step"], []).append(
+                Attempt(
+                    record["step"],
+                    kinds[record["payload"]],
+                    record["role"],
+                    record["index"],
+                    record["sent_at"],
+                    record["answered_at"],
+                    record["outcome"],
+                    record["retry_after"],
+                ),
+            )
+    results: list[StepResult] = []
+    for step in plan:
+        if SIBLING in (step.request, step.follow_up) and (sibling := choose_sibling(results)):
+            step = _with_sibling(step, sibling)
+        end = ends.get(step.name)
+        if end is None:
+            results.append(StepResult(step, (), NOT_RUN))
+        else:
+            step_attempts = tuple(attempts.get(step.name, ()))
+            results.append(StepResult(step, step_attempts, end["status"], end["note"]))
+    return results
 
 
 class Prober:
@@ -1424,6 +1464,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the plan and send nothing",
     )
+    parser.add_argument(
+        "--from-log",
+        type=pathlib.Path,
+        metavar="PATH",
+        help="print the report of an earlier run from its log, and send nothing",
+    )
     return parser
 
 
@@ -1449,6 +1495,13 @@ def main(
     if args.dry_run:
         print(format_plan(plan, settings))
         print("Dry run: nothing was sent.")
+        return 0
+    if args.from_log is not None:
+        results = read_log(args.from_log, plan)
+        sent = sum(len(r.attempts) for r in results)
+        print(
+            format_report(build_findings(results, settings), results, sent=sent, settings=settings)
+        )
         return 0
 
     try:

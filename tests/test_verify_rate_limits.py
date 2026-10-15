@@ -872,6 +872,33 @@ async def test_a_dry_run_sends_nothing(tmp_path, capsys) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+async def test_a_run_s_log_gives_back_the_report_it_printed(tmp_path, capsys) -> None:
+    settings = r.Settings(trader_login=account_venue.TRADER_LOGIN)
+    await run_against(tmp_path, shared=True, settings=settings)
+    printed = capsys.readouterr().out
+
+    (log,) = tmp_path.glob("verify_rate_limits-*.raw.jsonl")
+    results = r.read_log(log, r.build_plan(settings))
+    findings = r.build_findings(results, settings)
+    report = r.format_report(findings, results, sent=0, settings=settings)
+
+    assert findings
+    # The first two lines count the setup requests too, which the log does not hold.
+    assert "\n".join(report.splitlines()[2:]) in printed
+
+
+def test_a_plan_step_missing_from_the_log_is_not_run(tmp_path) -> None:
+    log = tmp_path / "partial.raw.jsonl"
+    log.write_text(
+        json.dumps({"step": "trendbars, burst of 5", "status": r.RAN, "note": ""}) + "\n"
+    )
+
+    results = r.read_log(log, r.build_plan(r.Settings()))
+
+    assert results[0].status == r.RAN
+    assert {res.status for res in results[1:]} == {r.NOT_RUN}
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
 def test_the_log_file_name_is_ignored_by_git() -> None:
     result = subprocess.run(
