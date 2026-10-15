@@ -5,11 +5,10 @@ Spotware's SDK drains a send queue on a one-second timer (`TcpProtocol._sendStri
 behind a timer, and a message is either sent or its caller sees an error.
 
 `RequestScheduler` paces each group of payload types to a sliding window and serves the waiting
-requests by priority. `TokenBucket` and `RateLimiter` are the previous limiter, still used by
-the transport.
+requests by priority.
 
-The venue reports a breach as `BLOCKED_PAYLOAD_TYPE` carrying `retryAfter`, so neither has to
-guess the real limits after a refusal: both pause for what the venue asked.
+The venue reports a breach as `BLOCKED_PAYLOAD_TYPE` carrying `retryAfter`, so the scheduler
+does not have to guess the real limits after a refusal: it pauses for what the venue asked.
 """
 
 from __future__ import annotations
@@ -122,6 +121,7 @@ class RequestScheduler:
         self._clock = clock or (lambda: asyncio.get_running_loop().time())
         self._sleep = sleep or asyncio.sleep
         self._sequence = itertools.count()
+        self._failed: Exception | None = None
         self._groups = {
             GROUP_HISTORICAL: _Group(GROUP_HISTORICAL, pacing.historical_requests_per_window),
             GROUP_OTHER: _Group(GROUP_OTHER, pacing.requests_per_window),
@@ -144,6 +144,9 @@ class RequestScheduler:
         CTraderTimeoutError
             The request waited `Pacing.queue_timeout_secs` in the queue, retries included, and
             was dropped unsent. Time inside `send()` does not count.
+        Exception
+            The error given to `fail_all()`, for a request waiting then, or queued (a retry
+            included) after it and before `reset()`.
         """
         state = self._groups[group]
         sequence = next(self._sequence)
@@ -175,7 +178,8 @@ class RequestScheduler:
                     raise
 
     def fail_all(self, error: Exception) -> None:
-        """Fail every waiting request with `error` and stop the dispatchers."""
+        """Fail every waiting request with `error`, and every later one until `reset()`."""
+        self._failed = error
         for state in self._groups.values():
             self._stop_dispatcher(state)
             for _, _, entry in state.heap:
@@ -184,7 +188,8 @@ class RequestScheduler:
             state.heap.clear()
 
     def reset(self) -> None:
-        """Forget the send times and pauses, for a new connection; waiting requests stay."""
+        """Forget send times, pauses and failure, for a new connection; waiting requests stay."""
+        self._failed = None
         for state in self._groups.values():
             self._stop_dispatcher(state)
             state.granted.clear()
@@ -200,6 +205,8 @@ class RequestScheduler:
         waited: float,
     ) -> float:
         """Queue one attempt and wait for its grant; returns the time it waited."""
+        if self._failed is not None:
+            raise self._failed
         budget = self._pacing.queue_timeout_secs - waited
         if budget <= 0:
             self._raise_queue_timeout()
@@ -264,75 +271,3 @@ class RequestScheduler:
                 f"Granted a {state.name} request at {RequestPriority(priority).name} after "
                 f"{now - entry.queued_at:.3f} s in the queue, {len(state.heap)} still queued",
             )
-
-
-class TokenBucket:
-    """A single rate-limited bucket.
-
-    The lock is held across the wait, which serialises waiters and so preserves the order in
-    which they arrived.
-    """
-
-    def __init__(self, rate_per_sec: float, capacity: float | None = None) -> None:
-        if not (rate_per_sec > 0):
-            raise ValueError("rate_per_sec must be positive")
-        if capacity is not None and not (capacity >= 1):
-            raise ValueError("capacity must be at least 1, or a token could never be held")
-        self._rate = rate_per_sec
-        # A capacity below 1 could never hold a whole token, so acquire() would hang forever
-        # below 1/s; the floor keeps a burst of exactly one available immediately.
-        self._capacity = max(1.0, rate_per_sec) if capacity is None else capacity
-        self._tokens = self._capacity
-        self._updated: float | None = None
-        self._paused_until = 0.0
-        self._lock = asyncio.Lock()
-
-    async def acquire(self) -> None:
-        """Wait until one token is available, then consume it."""
-        loop = asyncio.get_running_loop()
-        async with self._lock:
-            if self._updated is None:
-                self._updated = loop.time()
-            while True:
-                now = loop.time()
-                if now < self._paused_until:
-                    await asyncio.sleep(self._paused_until - now)
-                    continue
-                self._tokens = min(
-                    self._capacity,
-                    self._tokens + (now - self._updated) * self._rate,
-                )
-                self._updated = now
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-                await asyncio.sleep((1.0 - self._tokens) / self._rate)
-
-    def pause_for(self, seconds: float) -> None:
-        """Block the bucket for `seconds`, as instructed by the venue.
-
-        Never shortens a pause already in effect. Nothing accrues while paused: the bucket
-        resumes with one token and refills at the normal rate from there.
-        """
-        if not (seconds >= 0):
-            raise ValueError("seconds must not be negative")
-        self._paused_until = max(
-            self._paused_until,
-            asyncio.get_running_loop().time() + seconds,
-        )
-        # A full burst on resume could re-trigger the block.
-        self._tokens = min(self._capacity, 1.0)
-        self._updated = self._paused_until
-
-
-class RateLimiter:
-    """Named token buckets, so historical requests get their own much tighter budget."""
-
-    def __init__(self, rates: dict[str, float]) -> None:
-        self._buckets = {name: TokenBucket(rate) for name, rate in rates.items()}
-
-    async def acquire(self, bucket: str = "default") -> None:
-        await self._buckets[bucket].acquire()
-
-    def pause(self, bucket: str, seconds: float) -> None:
-        self._buckets[bucket].pause_for(seconds)

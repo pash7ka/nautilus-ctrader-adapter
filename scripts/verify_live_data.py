@@ -51,11 +51,10 @@ from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderProtocolError, CTraderRequestError
 from nautilus_ctrader.common.parsing import bar_boundary_secs, price_from_raw
-from nautilus_ctrader.common.rate_limit import RateLimiter
+from nautilus_ctrader.common.rate_limit import Pacing, RequestScheduler, group_of
 from nautilus_ctrader.constants import (
-    BUCKET_DEFAULT,
-    BUCKET_HISTORICAL,
     DEMO_HOST,
+    GROUP_HISTORICAL,
     LIVE_HOST,
     PROTOBUF_PORT,
     SYMBOL_BY_ID_BATCH,
@@ -105,8 +104,14 @@ UNKNOWN = "UNKNOWN"
 Decision = tuple[str, tuple[str, ...]]
 
 # The poll cadence item 4 asks for is 4/s, just under the documented historical budget of 5/s;
-# a burst with no limiter at all is what once earned a live BLOCKED_PAYLOAD_TYPE.
-_RATE_LIMITS = {BUCKET_DEFAULT: 5.0, BUCKET_HISTORICAL: 4.0}
+# a burst with no pacing at all is what once earned a live BLOCKED_PAYLOAD_TYPE. The scheduler
+# never retries: `ReadOnlyRequester` does.
+_PACING = Pacing(
+    requests_per_window=5,
+    historical_requests_per_window=4,
+    window_secs=1.0,
+    retries=0,
+)
 _MAX_RATE_LIMIT_RETRIES = 3
 _RATE_LIMIT_FALLBACK_WAIT_SECS = 2.0
 
@@ -339,14 +344,13 @@ class ReadOnlyRequester:
         self,
         payload: Message,
         *,
-        bucket: str = BUCKET_DEFAULT,
         timeout_secs: float | None = None,
     ) -> Message:
         if type(payload) not in READ_ONLY_REQUESTS:
             raise ReadOnlyViolation(
                 f"{type(payload).__name__} is not one of this script's read-only requests",
             )
-        if bucket == BUCKET_HISTORICAL:
+        if group_of(payload) == GROUP_HISTORICAL:
             if self.history_remaining == 0:
                 raise RequestBudgetExhausted(
                     f"the run's budget of {self._history_budget} historical requests is spent",
@@ -356,11 +360,7 @@ class ReadOnlyRequester:
 
         for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
             try:
-                return await self._connection.request(
-                    payload,
-                    bucket=bucket,
-                    timeout_secs=timeout_secs,
-                )
+                return await self._connection.request(payload, timeout_secs=timeout_secs)
             except CTraderRequestError as e:
                 if e.error_code != "BLOCKED_PAYLOAD_TYPE":
                     raise
@@ -788,14 +788,8 @@ class Verifier:
             # Deliberately broad: one failed probe must never stop the items after it.
             return UNKNOWN, (f"the probe failed with {type(e).__name__}",)
 
-    async def _request(
-        self,
-        payload: Message,
-        *,
-        bucket: str = BUCKET_DEFAULT,
-        timeout_secs: float | None = None,
-    ) -> Message:
-        return await self._requester.request(payload, bucket=bucket, timeout_secs=timeout_secs)
+    async def _request(self, payload: Message, *, timeout_secs: float | None = None) -> Message:
+        return await self._requester.request(payload, timeout_secs=timeout_secs)
 
     # -- Symbols ----------------------------------------------------------------------------
 
@@ -1047,7 +1041,6 @@ class Verifier:
                             fromTimestamp=from_ms,
                             toTimestamp=to_ms,
                         ),
-                        bucket=BUCKET_HISTORICAL,
                         timeout_secs=_HISTORY_REQUEST_TIMEOUT_SECS,
                     )
                 except CTraderRequestError as e:
@@ -1341,7 +1334,6 @@ class Verifier:
                 toTimestamp=to_ms,
                 count=count,
             ),
-            bucket=BUCKET_HISTORICAL,
             timeout_secs=_HISTORY_REQUEST_TIMEOUT_SECS,
         )
 
@@ -1395,7 +1387,7 @@ async def verify(
     credentials: Credentials,
     settings: Settings,
     account_id: int,
-    rate_limiter: RateLimiter | None = None,
+    pacing: Pacing | None = None,
 ) -> tuple[list[Finding], str]:
     """Authenticate, run every item, and return the findings with the formatted report.
 
@@ -1403,15 +1395,16 @@ async def verify(
     list; `settings.trader_login` is what the caller asked for and is never sent.
 
     The connection is closed whatever happens, and the report is built from whatever was
-    decided before an error or the hard time bound cut the run short. `rate_limiter` defaults
-    to the venue-shaped budget; a test against a local server has no reason to wait on it.
+    decided before an error or the hard time bound cut the run short. `pacing` defaults to the
+    venue-shaped budget; a test against a local server has no reason to wait on it.
     """
+    logger = QuietLogger()
     connection = CTraderConnection(
         host,
         port,
-        logger=QuietLogger(),
+        logger=logger,
         tls=tls,
-        rate_limiter=RateLimiter(_RATE_LIMITS) if rate_limiter is None else rate_limiter,
+        scheduler=RequestScheduler(_PACING if pacing is None else pacing, logger=logger),
     )
     requester = ReadOnlyRequester(connection, history_budget=settings.history_budget)
     verifier = Verifier(requester, settings, account_id)

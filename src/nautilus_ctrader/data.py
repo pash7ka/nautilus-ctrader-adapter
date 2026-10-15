@@ -54,6 +54,7 @@ from nautilus_ctrader.common.parsing import (
     is_unaligned_boundary,
     quote_from_prices,
 )
+from nautilus_ctrader.common.rate_limit import RequestPriority
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
@@ -1075,6 +1076,7 @@ class CTraderDataClient(LiveMarketDataClient):
             end_secs=now_secs if request.end is None else int(request.end.timestamp()),
             limit=request.limit or None,
             closed_secs=now_secs,
+            priority=RequestPriority.DATA,
         )
         # History serves the forming bar too, which is not a bar yet.
         closed = [raw for raw in served if raw.boundary_secs + period_secs <= now_secs]
@@ -1112,6 +1114,7 @@ class CTraderDataClient(LiveMarketDataClient):
         end_secs: int,
         limit: int | None,
         closed_secs: int,
+        priority: RequestPriority,
     ) -> list[RawBar]:
         """Bars opening in `[start_secs, end_secs)`, ascending, paging backwards from the end.
 
@@ -1146,6 +1149,7 @@ class CTraderDataClient(LiveMarketDataClient):
                 # the forming bar, and one for an answer a bar short of `count`, which the venue
                 # gives at times.
                 count=self._page_size() + 2,
+                priority=priority,
             )
             for raw in page:
                 # The venue includes a bar opening on `toTimestamp`, and serves bars before
@@ -1198,6 +1202,7 @@ class CTraderDataClient(LiveMarketDataClient):
             # Two for a one-bar window: the venue counts `count` back from `toTimestamp` and
             # includes a bar opening on it, so asking for one would hand back the next bar.
             count=2,
+            priority=RequestPriority.DATA,
         )
         return next((raw for raw in bars if raw.boundary_secs == boundary_secs), None)
 
@@ -1213,6 +1218,7 @@ class CTraderDataClient(LiveMarketDataClient):
             end_secs=end_secs + period_secs,
             limit=None,
             closed_secs=end_secs + period_secs,
+            priority=RequestPriority.BACKFILL,
         )
 
     async def _get_trendbars(
@@ -1223,6 +1229,7 @@ class CTraderDataClient(LiveMarketDataClient):
         from_secs: int,
         to_secs: int,
         count: int,
+        priority: RequestPriority,
     ) -> tuple[list[RawBar], bool]:
         """The window's bars, and whether the venue served fewer than the window holds."""
         session = self._session
@@ -1248,6 +1255,7 @@ class CTraderDataClient(LiveMarketDataClient):
                 count=count,
             ),
             timeout_secs=self._config.history_request_timeout_secs,
+            priority=priority,
         )
         bars = [_raw_bar(trendbar) for trendbar in response.trendbar]
         return bars, response.hasMore or len(bars) >= count

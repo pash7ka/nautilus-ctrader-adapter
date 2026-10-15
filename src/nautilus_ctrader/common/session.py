@@ -24,19 +24,14 @@ from nautilus_ctrader.common.errors import (
     CTraderRequestError,
     CTraderTimeoutError,
 )
-from nautilus_ctrader.common.rate_limit import RateLimiter
+from nautilus_ctrader.common.rate_limit import Pacing, RequestPriority, RequestScheduler
 from nautilus_ctrader.constants import (
     BACKOFF_BASE_SECS,
     BACKOFF_JITTER,
     BACKOFF_MAX_SECS,
-    BUCKET_DEFAULT,
-    BUCKET_HISTORICAL,
     CONNECT_TIMEOUT_SECS,
-    DEFAULT_RATE_LIMIT_PER_SEC,
     DEFAULT_REQUEST_TIMEOUT_SECS,
     HEARTBEAT_IDLE_SECS,
-    HISTORICAL_PAYLOAD_TYPES,
-    HISTORICAL_RATE_LIMIT_PER_SEC,
     INBOUND_SILENCE_SECS,
     LATE_REFRESH_WAIT_SECS,
     MIN_TOKEN_REFRESH_INTERVAL_SECS,
@@ -75,7 +70,7 @@ class CTraderSession:
         # `True` (verified TLS) is the only safe choice against a real venue; `False` is for
         # tests against the local fake server.
         tls: ssl.SSLContext | bool = True,
-        rate_limiter: RateLimiter | None = None,
+        pacing: Pacing | None = None,
         heartbeat_idle_secs: float = HEARTBEAT_IDLE_SECS,
         inbound_silence_secs: float = INBOUND_SILENCE_SECS,
         request_timeout_secs: float = DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -97,21 +92,13 @@ class CTraderSession:
         self._backoff_max_secs = backoff_max_secs
         self._failure_threshold = failure_threshold
 
-        # Rate limiting is part of the transport, not an opt-in: a session built without a
-        # limiter would send unthrottled. Callers override the rates, not their existence.
-        if rate_limiter is None:
-            rate_limiter = RateLimiter(
-                {
-                    BUCKET_DEFAULT: DEFAULT_RATE_LIMIT_PER_SEC,
-                    BUCKET_HISTORICAL: HISTORICAL_RATE_LIMIT_PER_SEC,
-                },
-            )
-
+        # Pacing is part of the transport, not an opt-in: a session without a scheduler would
+        # send unthrottled. Callers override the pacing, not its existence.
         self._connection = CTraderConnection(
             host=host,
             port=port,
             logger=logger,
-            rate_limiter=rate_limiter,
+            scheduler=RequestScheduler(pacing or Pacing(), logger=logger),
             heartbeat_idle_secs=heartbeat_idle_secs,
             inbound_silence_secs=inbound_silence_secs,
             request_timeout_secs=request_timeout_secs,
@@ -257,7 +244,7 @@ class CTraderSession:
         payload: Message,
         *,
         timeout_secs: float | None = None,
-        bucket: str | None = None,
+        priority: RequestPriority = RequestPriority.EXECUTION,
     ) -> Message:
         """Issue a request, failing fast when the session is not ready.
 
@@ -265,18 +252,14 @@ class CTraderSession:
         here. Subscriptions survive a reconnect through the restore registry, so anything else
         is better refused than silently delayed.
 
-        `bucket` defaults to `BUCKET_HISTORICAL` for the payload types that carry historical
-        data, `BUCKET_DEFAULT` otherwise; an explicit value overrides that choice.
+        `priority` orders the request among those waiting in its pacing group.
         """
         if self._state not in (SessionState.READY, SessionState.RESTORING):
             raise CTraderConnectionError(f"session not ready (state={self._state.name})")
-        if bucket is None:
-            is_historical = type(payload) in HISTORICAL_PAYLOAD_TYPES
-            bucket = BUCKET_HISTORICAL if is_historical else BUCKET_DEFAULT
         return await self._connection.request(
             payload,
             timeout_secs=timeout_secs,
-            bucket=bucket,
+            priority=priority,
         )
 
     async def _supervise(self) -> None:

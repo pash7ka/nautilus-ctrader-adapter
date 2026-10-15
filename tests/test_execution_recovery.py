@@ -48,6 +48,7 @@ from nautilus_trader.trading.strategy import Strategy
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.execution_reports import mass_status
 from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.reconciliation import PositionHistory, Reconciliation, reconcile
 from nautilus_ctrader.common.venue_records import Fill, Level, ReportedOrder, money_of
 from nautilus_ctrader.constants import CTRADER_VENUE, UNLOADED_EXPOSURE_KEY
@@ -102,6 +103,8 @@ CLOSED_AT = 408.8  # FIRST closed by its stop-loss, nothing open
 OPEN_AT = 358.0  # FIRST open with 0.99 after a manual partial close, both levels set
 REMOVED_AT = 228.8  # FIRST open, its take-profit removed by hand
 UUID_SHAPED = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# Stands in for the session's default pacing.
+_FAST_HISTORY = functools.partial(Pacing, historical_requests_per_window=1000)
 
 
 def precision(symbol_id: int) -> int | None:
@@ -617,7 +620,7 @@ async def test_a_failed_list_releases_the_buffer() -> None:
 
 async def test_the_pass_asks_each_position_once(monkeypatch: pytest.MonkeyPatch) -> None:
     # The suite need not wait out the venue's historical rate for 50 lists.
-    monkeypatch.setattr("nautilus_ctrader.common.session.HISTORICAL_RATE_LIMIT_PER_SEC", 1000.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.Pacing", _FAST_HISTORY)
     venue = ExecutionVenue()
     for n in range(25):
         foreign_position(venue, n, ts=1_600_000_000_000 + n)
@@ -636,7 +639,7 @@ async def test_the_pass_asks_each_position_once(monkeypatch: pytest.MonkeyPatch)
 
 async def test_a_deal_list_cut_short_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
     # The suite need not wait out the venue's historical rate for 20 pages.
-    monkeypatch.setattr("nautilus_ctrader.common.session.HISTORICAL_RATE_LIMIT_PER_SEC", 1000.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.Pacing", _FAST_HISTORY)
     venue = ExecutionVenue()
     venue.page_size = 2
     foreign_position(venue, 1, ts=1_600_000_000_000)

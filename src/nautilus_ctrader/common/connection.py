@@ -24,12 +24,10 @@ from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderProtocolError,
-    CTraderRequestError,
     CTraderTimeoutError,
 )
-from nautilus_ctrader.common.rate_limit import RateLimiter
+from nautilus_ctrader.common.rate_limit import RequestPriority, RequestScheduler, group_of
 from nautilus_ctrader.constants import (
-    BUCKET_DEFAULT,
     CONNECT_TIMEOUT_SECS,
     DEFAULT_REQUEST_TIMEOUT_SECS,
     HEARTBEAT_IDLE_SECS,
@@ -66,7 +64,7 @@ class CTraderConnection:
         port: int,
         *,
         logger: Logger,
-        rate_limiter: RateLimiter | None = None,
+        scheduler: RequestScheduler | None = None,
         heartbeat_idle_secs: float = HEARTBEAT_IDLE_SECS,
         inbound_silence_secs: float = INBOUND_SILENCE_SECS,
         request_timeout_secs: float = DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -78,6 +76,10 @@ class CTraderConnection:
         context) is the only safe choice against a real venue; `False` (plaintext) is for tests
         against the local fake server.
 
+        `scheduler` paces every request and send; without one nothing is paced. It serves this
+        connection across reconnects: `connect()` resets it, and a loss or `close()` fails what
+        it holds.
+
         `inbound_silence_secs` only has to outlast the venue's own send rhythm - we never get a
         reply to our heartbeats, so `heartbeat_idle_secs` does not bound it.
         """
@@ -88,7 +90,7 @@ class CTraderConnection:
         self._host = host
         self._port = port
         self._log = logger
-        self._rate_limiter = rate_limiter
+        self._scheduler = scheduler
         self._heartbeat_idle_secs = heartbeat_idle_secs
         self._inbound_silence_secs = inbound_silence_secs
         self._request_timeout_secs = request_timeout_secs
@@ -139,6 +141,8 @@ class CTraderConnection:
 
         self._generation += 1
         self._connected = True
+        if self._scheduler is not None:
+            self._scheduler.reset()
         now = asyncio.get_running_loop().time()
         self._last_send = now
         self._last_receive = now
@@ -163,6 +167,7 @@ class CTraderConnection:
         if writer is not None:
             writer.close()
         self._reject_pending(CTraderConnectionError("connection closed"))
+        self._fail_queued(CTraderConnectionError("connection closed while waiting to send"))
         self._heartbeat_task = None
         self._read_task = None
         self._writer = None
@@ -187,69 +192,73 @@ class CTraderConnection:
         payload: Message,
         *,
         timeout_secs: float | None = None,
-        bucket: str = BUCKET_DEFAULT,
+        priority: RequestPriority = RequestPriority.EXECUTION,
     ) -> Message:
         """Send a request and await its correlated response.
 
-        `timeout_secs` bounds only the wait for the response. Time spent waiting on the rate
-        limiter, including a venue-ordered pause, comes on top of it.
+        `timeout_secs` bounds only the wait for the response. Time spent in the scheduler's
+        queue, including a venue-ordered pause and any retry, comes on top of it.
         """
         if not self._connected:
             raise CTraderConnectionError("not connected")
+        generation = self._generation
+        deadline = self._request_timeout_secs if timeout_secs is None else timeout_secs
 
+        async def exchange() -> Message:
+            return await self._exchange(payload, deadline, generation)
+
+        if self._scheduler is None:
+            return await exchange()
+        return await self._scheduler.submit(group_of(payload), priority, exchange)
+
+    async def _exchange(self, payload: Message, deadline: float, generation: int) -> Message:
+        """Write `payload` under a fresh `clientMsgId` and await its response."""
         client_msg_id = str(uuid.uuid4())
         future: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
         self._pending[client_msg_id] = future
-        deadline = self._request_timeout_secs if timeout_secs is None else timeout_secs
         try:
             frame = codec.encode_frame(payload, client_msg_id)
-            self._log_send(payload, client_msg_id, frame)
-            await self._write(frame, bucket=bucket)
+            await self._write(payload, client_msg_id, frame, generation)
             return await asyncio.wait_for(future, deadline)
         except TimeoutError as e:
             raise CTraderTimeoutError(
                 f"no response to payloadType={payload.payloadType} within {deadline}s",
             ) from e
-        except CTraderRequestError as e:
-            if e.retry_after_secs is not None and self._rate_limiter is not None:
-                self._log.warning(
-                    f"Rate limited on bucket '{bucket}', pausing {e.retry_after_secs}s",
-                )
-                self._rate_limiter.pause(bucket, e.retry_after_secs)
-            raise
         finally:
             self._pending.pop(client_msg_id, None)
             if future.done() and not future.cancelled():
                 future.exception()
 
-    async def send(
-        self,
-        payload: Message,
-        *,
-        client_msg_id: str | None = None,
-        bucket: str = BUCKET_DEFAULT,
-    ) -> None:
-        """Send a message without awaiting a response."""
+    async def send(self, payload: Message, *, client_msg_id: str | None = None) -> None:
+        """Send a message without awaiting a response, paced like a request at `EXECUTION`."""
         if not self._connected:
             raise CTraderConnectionError("not connected")
-        frame = codec.encode_frame(payload, client_msg_id)
-        self._log_send(payload, client_msg_id, frame)
-        await self._write(frame, bucket=bucket)
+        generation = self._generation
 
-    def _log_send(self, payload: Message, client_msg_id: str | None, frame: bytes) -> None:
+        async def write() -> None:
+            frame = codec.encode_frame(payload, client_msg_id)
+            await self._write(payload, client_msg_id, frame, generation)
+
+        if self._scheduler is None:
+            await write()
+        else:
+            await self._scheduler.submit(group_of(payload), RequestPriority.EXECUTION, write)
+
+    async def _write(
+        self,
+        payload: Message,
+        client_msg_id: str | None,
+        frame: bytes,
+        generation: int,
+    ) -> None:
+        # A wait in the queue, or between retries, can outlast the connection it began on
+        # (`generation`). A frame meant for a closed socket must fail, never go out on the next.
+        if not self._connected or self._writer is None or self._generation != generation:
+            raise CTraderConnectionError("connection lost while waiting to send")
         self._log.debug(
             f"send payloadType={payload.payloadType} "
             f"clientMsgId={client_msg_id or '-'} bytes={len(frame)}",
         )
-
-    async def _write(self, frame: bytes, *, bucket: str | None) -> None:
-        generation = self._generation
-        if bucket is not None and self._rate_limiter is not None:
-            await self._rate_limiter.acquire(bucket)
-        # The wait can outlast the connection it began on. A frame queued for a closed socket
-        # must fail, never go out on the next one.
-        if not self._connected or self._writer is None or self._generation != generation:
-            raise CTraderConnectionError("connection lost while waiting to send")
         self._writer.write(frame)
         self._last_send = asyncio.get_running_loop().time()
         try:
@@ -258,9 +267,9 @@ class CTraderConnection:
             raise CTraderConnectionError(f"write failed: {e!r}") from e
 
     def _write_now(self, frame: bytes) -> None:
-        """Write without awaiting the rate limiter or the drain.
+        """Write without awaiting the scheduler or the drain.
 
-        Used only for idle heartbeats: a paused bucket must never suppress a keep-alive, or a
+        Used only for idle heartbeats: a paused group must never suppress a keep-alive, or a
         rate-limit breach would escalate into a dropped connection. The frame is a handful of
         bytes, so skipping `drain()` costs nothing.
         """
@@ -367,6 +376,7 @@ class CTraderConnection:
         was_connected = self._connected
         self._connected = False
         self._reject_pending(error)
+        self._fail_queued(CTraderConnectionError(f"connection lost while waiting to send: {error}"))
         if was_connected:
             self._call_handler("Disconnect", self._disconnect_handler, error)
 
@@ -375,3 +385,7 @@ class CTraderConnection:
         for future in pending.values():
             if not future.done():
                 future.set_exception(error)
+
+    def _fail_queued(self, error: CTraderConnectionError) -> None:
+        if self._scheduler is not None:
+            self._scheduler.fail_all(error)

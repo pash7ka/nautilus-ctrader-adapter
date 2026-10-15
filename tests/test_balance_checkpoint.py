@@ -21,7 +21,8 @@ from nautilus_ctrader.common import balance_checkpoint
 from nautilus_ctrader.common.balance_checkpoint import BalanceCheckpoint
 from nautilus_ctrader.common.balance_history import OFF, checkpoint_at, next_checkpoint, value_json
 from nautilus_ctrader.common.errors import CTraderConnectionError
-from nautilus_ctrader.constants import BALANCE_CHECKPOINT_KEY, BUCKET_HISTORICAL
+from nautilus_ctrader.common.rate_limit import Pacing, RequestPriority
+from nautilus_ctrader.constants import BALANCE_CHECKPOINT_KEY
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.account_venue import ACCOUNT_ID, HeldReplies
@@ -35,6 +36,8 @@ LAST_CHANGE_MS = 1_600_000_658_056  # version 6, the trader's
 DEPOSIT_MS = 1_599_143_632_165  # version 2
 BALANCE = 5_122_378_460
 AVAILABLE = {"balance": "51223784.60", "currency": "USD", "first_deposit": "51224029.64"}
+# Stands in for the session's default pacing.
+_FAST_HISTORY = partial(Pacing, historical_requests_per_window=1000)
 
 
 def now_ms() -> int:
@@ -239,7 +242,7 @@ async def test_the_reconnect_walk_is_bounded_then_completes_in_background() -> N
 def direct(h, clock: dict, written: list, request=None) -> BalanceCheckpoint:
     """A checkpoint on the harness's connection, with a clock the test sets."""
     return BalanceCheckpoint(
-        request=request or partial(h.client._request, bucket=BUCKET_HISTORICAL),
+        request=request or partial(h.client._request, priority=RequestPriority.CHECKPOINT),
         account_id=ACCOUNT_ID,
         hour=HOUR,
         zone=UTC_ZONE,
@@ -322,7 +325,7 @@ async def test_a_refresh_overtaken_by_the_next_checkpoint_writes_nothing() -> No
     venue = history_venue(last_at=last_t() - DAY_MS)
     async with harness(execution_venue=venue) as h:
         held, opened = asyncio.Event(), asyncio.Event()
-        plain = partial(h.client._request, bucket=BUCKET_HISTORICAL)
+        plain = partial(h.client._request, priority=RequestPriority.CHECKPOINT)
 
         async def request(payload):
             # The slow refresh's first deal list waits; every later request goes through.
@@ -503,7 +506,7 @@ async def test_an_item_without_a_scale_is_mixed_scales() -> None:
 
 def gated(h, gates: dict) -> object:
     """The harness's request, held while the asking task is a key of `gates` and its gate shut."""
-    plain = partial(h.client._request, bucket=BUCKET_HISTORICAL)
+    plain = partial(h.client._request, priority=RequestPriority.CHECKPOINT)
 
     async def request(payload):
         gate = gates.get(asyncio.current_task())
@@ -514,7 +517,9 @@ def gated(h, gates: dict) -> object:
     return request
 
 
-async def test_a_task_replaced_by_a_continuation_is_cancelled() -> None:
+async def test_a_task_replaced_by_a_continuation_is_cancelled(monkeypatch) -> None:
+    # The suite need not wait out the venue's historical rate for the whole walk.
+    monkeypatch.setattr("nautilus_ctrader.common.session.Pacing", _FAST_HISTORY)
     t_ms = last_t()
     last_at = t_ms - 12 * WEEK_MS
     venue = history_venue(last_at=last_at, registration=deposit_at(last_at) - 20 * WEEK_MS)
@@ -547,7 +552,9 @@ async def test_a_task_replaced_by_a_continuation_is_cancelled() -> None:
             checkpoint.stop()
 
 
-async def test_a_stopped_checkpoint_starts_no_background_walk() -> None:
+async def test_a_stopped_checkpoint_starts_no_background_walk(monkeypatch) -> None:
+    # The suite need not wait out the venue's historical rate for the whole walk.
+    monkeypatch.setattr("nautilus_ctrader.common.session.Pacing", _FAST_HISTORY)
     t_ms = last_t()
     last_at = t_ms - 12 * WEEK_MS
     venue = history_venue(last_at=last_at, registration=deposit_at(last_at) - 20 * WEEK_MS)
@@ -606,7 +613,7 @@ async def test_a_stopped_checkpoint_writes_no_off_value() -> None:
     async with harness() as h:
         written: list[bytes] = []
         checkpoint = BalanceCheckpoint(
-            request=partial(h.client._request, bucket=BUCKET_HISTORICAL),
+            request=partial(h.client._request, priority=RequestPriority.CHECKPOINT),
             account_id=ACCOUNT_ID,
             hour=None,
             zone=UTC_ZONE,

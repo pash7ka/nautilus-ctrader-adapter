@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import itertools
 import struct
 
 import pytest
@@ -15,7 +16,7 @@ from nautilus_ctrader.common.errors import (
     CTraderRequestError,
     CTraderTimeoutError,
 )
-from nautilus_ctrader.common.rate_limit import RateLimiter
+from nautilus_ctrader.common.rate_limit import Pacing, RequestScheduler
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -35,6 +36,36 @@ async def _connected(server: FakeCTraderServer, **kwargs) -> CTraderConnection:
     )
     await connection.connect()
     return connection
+
+
+def _scheduler(logger: Logger | RecordingLogger | None = None) -> RequestScheduler:
+    return RequestScheduler(Pacing(), logger=logger or Logger("test"))
+
+
+def _rate_limited() -> oa.ProtoOAErrorRes:
+    return oa.ProtoOAErrorRes(errorCode="BLOCKED_PAYLOAD_TYPE", retryAfter=1)
+
+
+def _refuse_first(answer):
+    """A handler that refuses its first request for the rate limit, then calls `answer`."""
+    calls = itertools.count()
+    return lambda request: _rate_limited() if next(calls) == 0 else answer(request)
+
+
+def _trendbars_req(symbol_id: int = 1) -> oa.ProtoOAGetTrendbarsReq:
+    return oa.ProtoOAGetTrendbarsReq(ctidTraderAccountId=1, period=oa_model.M1, symbolId=symbol_id)
+
+
+def _trendbars_res(_request: object) -> oa.ProtoOAGetTrendbarsRes:
+    return oa.ProtoOAGetTrendbarsRes(ctidTraderAccountId=1, period=oa_model.M1)
+
+
+def _spots_res(request: oa.ProtoOASubscribeSpotsReq) -> oa.ProtoOASubscribeSpotsRes:
+    return oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=request.ctidTraderAccountId)
+
+
+def _received(server: FakeCTraderServer, payload_class: type) -> list:
+    return [m for m in server.received if isinstance(m, payload_class)]
 
 
 async def test_request_returns_the_correlated_response() -> None:
@@ -98,22 +129,126 @@ async def test_an_error_response_rejects_its_caller() -> None:
         await server.stop()
 
 
-async def test_a_rate_limit_rejection_pauses_that_bucket() -> None:
+async def test_a_rate_limit_rejection_pauses_its_group() -> None:
     server = FakeCTraderServer()
-    server.on(
-        oa_model.PROTO_OA_TRADER_REQ,
-        lambda _r: oa.ProtoOAErrorRes(errorCode="BLOCKED_PAYLOAD_TYPE", retryAfter=1),
-    )
+    server.on(oa_model.PROTO_OA_TRADER_REQ, lambda _r: _rate_limited())
     await server.start()
-    limiter = RateLimiter({"default": 1000.0, "historical": 1000.0})
-    connection = await _connected(server, rate_limiter=limiter)
+    connection = await _connected(server, scheduler=_scheduler())
     try:
         with pytest.raises(CTraderRequestError):
             await connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1))
 
-        # The bucket is now paused, so the next acquire must not return immediately.
+        # The group is now paused, so the next request must not leave at once.
         with pytest.raises(TimeoutError):
-            await asyncio.wait_for(limiter.acquire("default"), timeout=0.2)
+            await asyncio.wait_for(
+                connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1)),
+                timeout=0.2,
+            )
+        assert len(server.received) == 1
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_a_request_is_paced_and_retried_through_the_scheduler() -> None:
+    server = FakeCTraderServer()
+    server.on(oa_model.PROTO_OA_GET_TRENDBARS_REQ, _refuse_first(_trendbars_res))
+    await server.start()
+    connection = await _connected(server, scheduler=_scheduler())
+    try:
+        response = await connection.request(_trendbars_req(), timeout_secs=5.0)
+
+        assert isinstance(response, oa.ProtoOAGetTrendbarsRes)
+        assert len(server.received) == 2
+        first, second = server.received_client_msg_ids
+        assert first != second
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_an_order_refused_by_the_rate_limit_is_never_resent() -> None:
+    server = FakeCTraderServer()
+    server.on(oa_model.PROTO_OA_NEW_ORDER_REQ, lambda _r: _rate_limited())
+    await server.start()
+    connection = await _connected(server, scheduler=_scheduler())
+    order = oa.ProtoOANewOrderReq(
+        ctidTraderAccountId=1,
+        symbolId=1,
+        orderType=oa_model.MARKET,
+        tradeSide=oa_model.BUY,
+        volume=100,
+    )
+    try:
+        with pytest.raises(CTraderRequestError) as raised:
+            await connection.request(order)
+
+        assert raised.value.retry_after_secs == 1
+        assert len(_received(server, oa.ProtoOANewOrderReq)) == 1
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_queued_requests_fail_on_loss_and_never_reach_the_next_socket() -> None:
+    # A request queued before a loss must not reach the next connection: for an order that
+    # would be a duplicate the caller never knows about.
+    server = FakeCTraderServer()
+    server.on(oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ, _refuse_first(_spots_res))
+    server.on(oa_model.PROTO_OA_GET_TRENDBARS_REQ, _refuse_first(_trendbars_res))
+    await server.start()
+    logger = RecordingLogger()
+    connection = await _connected(server, scheduler=_scheduler(logger))
+    try:
+        # Pauses the other group.
+        with pytest.raises(CTraderRequestError):
+            await connection.request(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=1))
+        queued = asyncio.create_task(
+            connection.request(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=2)),
+        )
+        # Refused once, so its retry waits out the historical group's pause.
+        retrying = asyncio.create_task(connection.request(_trendbars_req()))
+        await wait_until(lambda: len(logger.warnings()) == 2, description="trendbars refused")
+        assert not queued.done()
+        assert not retrying.done()
+
+        await server.drop_connections()
+        for task in (queued, retrying):
+            with pytest.raises(CTraderConnectionError):
+                await asyncio.wait_for(task, timeout=2.0)
+
+        await connection.close()
+        await connection.connect()
+        await server.wait_for_connections()
+        loop = asyncio.get_running_loop()
+        sent_at = loop.time()
+        await connection.request(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=3))
+        # Far inside the old pause: the new connection starts with an empty window.
+        assert loop.time() - sent_at < 0.5
+
+        # A fixed wait is right here: this checks that neither request ever arrives.
+        await asyncio.sleep(1.5)
+        spots = _received(server, oa.ProtoOASubscribeSpotsReq)
+        assert [m.ctidTraderAccountId for m in spots] == [1, 3]
+        assert len(_received(server, oa.ProtoOAGetTrendbarsReq)) == 1
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_a_connection_without_a_scheduler_sends_unpaced() -> None:
+    server = FakeCTraderServer()
+    server.on(oa_model.PROTO_OA_GET_TRENDBARS_REQ, _trendbars_res)
+    await server.start()
+    connection = await _connected(server)
+    try:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await asyncio.gather(*(connection.request(_trendbars_req(n)) for n in range(10)))
+
+        # Paced, the sixth would wait a full window.
+        assert loop.time() - started < 1.0
+        assert len(server.received) == 10
     finally:
         await connection.close()
         await server.stop()
@@ -416,17 +551,19 @@ async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
     # A request that failed must not reach the next connection: for an order that would be
     # a duplicate the caller never knows about.
     server = FakeCTraderServer()
+    server.on(oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ, lambda _r: _rate_limited())
     await server.start()
-    limiter = RateLimiter({"default": 1000.0, "historical": 1000.0})
-    connection = await _connected(server, rate_limiter=limiter)
+    connection = await _connected(server, scheduler=_scheduler())
     try:
         await server.wait_for_connections()
-        limiter.pause("default", 0.3)
+        # Pauses the other group.
+        with pytest.raises(CTraderRequestError):
+            await connection.request(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=1))
         pending = asyncio.create_task(
             connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1)),
         )
         await asyncio.sleep(0.05)
-        assert not pending.done(), "request should be waiting on the paused bucket"
+        assert not pending.done(), "request should be waiting on the paused group"
 
         await connection.close()
         await connection.connect()

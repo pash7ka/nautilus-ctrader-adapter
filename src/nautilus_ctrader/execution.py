@@ -86,6 +86,7 @@ from nautilus_ctrader.common.operations import OperationsInFlight, PendingBracke
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.order_translation import Unsupported
 from nautilus_ctrader.common.parsing import PRICE_SCALE
+from nautilus_ctrader.common.rate_limit import RequestPriority
 from nautilus_ctrader.common.reconciliation import (
     PositionHistory,
     Reconciliation,
@@ -116,7 +117,6 @@ from nautilus_ctrader.common.venue_records import (
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
     BALANCE_CHECKPOINT_KEY,
-    BUCKET_HISTORICAL,
     CTRADER,
     CTRADER_VENUE,
     UNLOADED_EXPOSURE_KEY,
@@ -536,7 +536,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._hold_reference_spots()
             self._check_attached()
             checkpoint = self._checkpoint = BalanceCheckpoint(
-                request=partial(self._request, bucket=BUCKET_HISTORICAL),
+                request=partial(self._request, priority=RequestPriority.CHECKPOINT),
                 account_id=self._account.account_id,
                 hour=self._config.balance_checkpoint_hour,
                 zone=self._config.checkpoint_zone(),
@@ -927,13 +927,11 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Broker order `order_id` as it stands now, pending or ended."""
         # Confirmed live: an ended order is answered, and an unknown id is refused with
         # ORDER_NOT_FOUND. Where it fails, the order list over the fill window is searched.
-        # Measured live: not the historical limit. Sent on the historical bucket anyway, which
-        # only paces it more tightly than needed.
+        # Measured live: not the historical limit, so it is paced in the other group.
         response = await self._request(
             oa.ProtoOAOrderDetailsReq(
                 ctidTraderAccountId=self._account.account_id, orderId=order_id
             ),
-            bucket=BUCKET_HISTORICAL,
         )
         return response.order
 
@@ -945,7 +943,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         # TODO(verify): that the order list holds an order the broker rejected; none was recorded.
         for start, end in reversed(windows):
             found = await history.orders_between(
-                partial(self._request, bucket=BUCKET_HISTORICAL),
+                self._request,
                 self._account.account_id,
                 start,
                 end,
@@ -1266,11 +1264,16 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     # -- Venue data ---------------------------------------------------------------------------
 
-    async def _request(self, payload: Message, *, bucket: str | None = None) -> Message:
+    async def _request(
+        self,
+        payload: Message,
+        *,
+        priority: RequestPriority = RequestPriority.EXECUTION,
+    ) -> Message:
         session = self._account.session
         if session is None:
             raise CTraderConnectionError("account client not connected")
-        return await session.request(payload, bucket=bucket)
+        return await session.request(payload, priority=priority)
 
     async def _trader(self) -> om.ProtoOATrader:
         response = await self._request(
@@ -1319,7 +1322,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         async def historical(payload: Message) -> Message:
             nonlocal requests
             requests += 1
-            return await self._request(payload, bucket=BUCKET_HISTORICAL)
+            return await self._request(payload)
 
         async def read_snapshot() -> oa.ProtoOAReconcileRes:
             nonlocal requests
@@ -1790,9 +1793,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         """
         await self._model_standing.wait()
         try:
-            orders = await self._position_orders(
-                position_id, partial(self._request, bucket=BUCKET_HISTORICAL)
-            )
+            orders = await self._position_orders(position_id, self._request)
         except CTraderError as e:
             self._log.warning(
                 f"Position {position_id}: its order list could not be read, so its levels stay "

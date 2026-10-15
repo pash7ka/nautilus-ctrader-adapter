@@ -68,14 +68,8 @@ from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderError, CTraderRequestError
-from nautilus_ctrader.common.rate_limit import RateLimiter
-from nautilus_ctrader.constants import (
-    BUCKET_DEFAULT,
-    BUCKET_HISTORICAL,
-    DEMO_HOST,
-    LIVE_HOST,
-    PROTOBUF_PORT,
-)
+from nautilus_ctrader.common.rate_limit import Pacing, RequestScheduler
+from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
@@ -129,7 +123,12 @@ _MIN_NAME_CHARS = 3
 FAKE_EPOCH_MS = 1_600_000_000_000
 FORMAT = 1
 
-_RATE_LIMITS = {BUCKET_DEFAULT: 5.0, BUCKET_HISTORICAL: 1.0}
+_PACING = Pacing(
+    requests_per_window=5,
+    historical_requests_per_window=1,
+    window_secs=1.0,
+    retries=0,
+)
 _REQUEST_TIMEOUT_SECS = 30.0
 _TICK_SECS = 0.2
 # A snapshot is taken this long after the last event of a burst, so one manual action yields
@@ -284,18 +283,29 @@ class ReadOnlyViolation(RuntimeError):
     """A request outside `READ_ONLY_REQUESTS` was about to be sent."""
 
 
-async def send(
-    connection: CTraderConnection,
-    payload: Message,
-    *,
-    bucket: str = BUCKET_DEFAULT,
-) -> Message:
+def _paced_connection(
+    host: str,
+    port: int,
+    tls: bool,
+    pacing: Pacing | None,
+) -> CTraderConnection:
+    logger = record_fixtures._QuietLogger()
+    return CTraderConnection(
+        host,
+        port,
+        logger=logger,
+        tls=tls,
+        scheduler=RequestScheduler(_PACING if pacing is None else pacing, logger=logger),
+    )
+
+
+async def send(connection: CTraderConnection, payload: Message) -> Message:
     """The one place this script sends anything."""
     if type(payload) not in READ_ONLY_REQUESTS:
         raise ReadOnlyViolation(
             f"{type(payload).__name__} is not one of this script's read-only requests",
         )
-    return await connection.request(payload, bucket=bucket, timeout_secs=_REQUEST_TIMEOUT_SECS)
+    return await connection.request(payload, timeout_secs=_REQUEST_TIMEOUT_SECS)
 
 
 class IdMap:
@@ -1270,7 +1280,7 @@ async def _ask_closing_lists(
             mark(f"closing list skipped: {key}")
             return None
         try:
-            response = await send(connection, request, bucket=BUCKET_HISTORICAL)
+            response = await send(connection, request)
         except CTraderRequestError as e:
             # One list refused says nothing about the next: note it and ask the rest.
             mark(f"closing list refused: {key} {e.error_code}")
@@ -1431,7 +1441,7 @@ async def record(
     minutes: float,
     stop: asyncio.Event,
     markers: asyncio.Queue[str],
-    rate_limiter: RateLimiter | None = None,
+    pacing: Pacing | None = None,
     snapshot_debounce_secs: float = _SNAPSHOT_DEBOUNCE_SECS,
     tick_secs: float = _TICK_SECS,
     reconnect_waits: tuple[float, ...] = _RECONNECT_WAIT_SECS,
@@ -1530,13 +1540,7 @@ async def record(
     first = True
     try:
         while not finished():
-            connection = CTraderConnection(
-                host,
-                port,
-                logger=record_fixtures._QuietLogger(),
-                tls=tls,
-                rate_limiter=RateLimiter(_RATE_LIMITS) if rate_limiter is None else rate_limiter,
-            )
+            connection = _paced_connection(host, port, tls, pacing)
             lost = asyncio.Event()
             last_event = None
             # Execution events are pushed after account authorisation alone; nothing subscribes.
@@ -1772,7 +1776,7 @@ async def finish(
     secrets: Iterable[str],
     raw_dir: pathlib.Path = _RAW_DIR,
     outcome: Outcome | None = None,
-    rate_limiter: RateLimiter | None = None,
+    pacing: Pacing | None = None,
     status: Callable[[str], None] = _silent,
 ) -> None:
     """Finish a recording an abrupt end left in `journal_file`, read as `recording`.
@@ -1787,13 +1791,7 @@ async def finish(
     outcome = Outcome() if outcome is None else outcome
     outcome.journal = journal_file
     last = recording.timeline[-1].t if recording.timeline else 0.0
-    connection = CTraderConnection(
-        host,
-        port,
-        logger=record_fixtures._QuietLogger(),
-        tls=tls,
-        rate_limiter=RateLimiter(_RATE_LIMITS) if rate_limiter is None else rate_limiter,
-    )
+    connection = _paced_connection(host, port, tls, pacing)
     await connection.connect()
     try:
         await send(

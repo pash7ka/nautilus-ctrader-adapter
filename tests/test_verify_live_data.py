@@ -22,8 +22,8 @@ import pytest
 
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderRequestError
-from nautilus_ctrader.common.rate_limit import RateLimiter
-from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL, SYMBOL_BY_ID_BATCH
+from nautilus_ctrader.common.rate_limit import Pacing, group_of
+from nautilus_ctrader.constants import GROUP_HISTORICAL, SYMBOL_BY_ID_BATCH
 from nautilus_ctrader.enums import PERIOD_SECS
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -44,6 +44,7 @@ OK, DIFFERS, UNKNOWN = v.OK, v.DIFFERS, v.UNKNOWN
 
 EURUSD = "EURUSD"
 XAUUSD = "XAUUSD"
+FAST = Pacing(requests_per_window=1000, historical_requests_per_window=1000)
 
 
 def settings(**overrides) -> v.Settings:
@@ -67,15 +68,13 @@ class _StubConnection:
 
     def __init__(self, replies: list[object] | None = None) -> None:
         self.sent: list[object] = []
-        self.buckets: list[str] = []
         self._replies = list(replies or [])
 
     def set_event_handler(self, handler) -> None:
         pass
 
-    async def request(self, payload, *, bucket=BUCKET_DEFAULT, timeout_secs=None):
+    async def request(self, payload, *, timeout_secs=None):
         self.sent.append(payload)
-        self.buckets.append(bucket)
         reply = self._replies.pop(0) if self._replies else oa.ProtoOAApplicationAuthRes()
         if isinstance(reply, Exception):
             raise reply
@@ -119,9 +118,9 @@ def test_the_historical_budget_bounds_the_whole_run() -> None:
 
     async def run() -> None:
         for _ in range(2):
-            await requester.request(oa.ProtoOAGetTrendbarsReq(), bucket=BUCKET_HISTORICAL)
+            await requester.request(oa.ProtoOAGetTrendbarsReq())
         with pytest.raises(v.RequestBudgetExhausted):
-            await requester.request(oa.ProtoOAGetTrendbarsReq(), bucket=BUCKET_HISTORICAL)
+            await requester.request(oa.ProtoOAGetTrendbarsReq())
         # The cap is on historical requests only; the rest of the run carries on.
         await requester.request(oa.ProtoOASymbolsListReq())
 
@@ -136,7 +135,7 @@ def test_a_rate_limit_block_is_waited_out_and_counted() -> None:
     connection = _StubConnection([blocked, oa.ProtoOAGetTrendbarsRes()])
     requester = v.ReadOnlyRequester(connection, history_budget=10)
 
-    asyncio.run(requester.request(oa.ProtoOAGetTrendbarsReq(), bucket=BUCKET_HISTORICAL))
+    asyncio.run(requester.request(oa.ProtoOAGetTrendbarsReq()))
 
     assert len(connection.sent) == 2
     assert requester.rate_limit_blocks == 1
@@ -608,7 +607,7 @@ async def test_item_8_asks_the_exact_millisecond_windows_and_nothing_but_history
     assert status == OK
     assert {type(p) for p in connection.sent} == {oa.ProtoOAGetTrendbarsReq}
     assert oa.ProtoOAGetTrendbarsReq in v.READ_ONLY_REQUESTS
-    assert connection.buckets == [BUCKET_HISTORICAL] * 4
+    assert {group_of(p) for p in connection.sent} == {GROUP_HISTORICAL}
     assert all(p.symbolId == _SYMBOL_ID and p.period == om.M1 for p in connection.sent)
     assert all(p.ctidTraderAccountId == account_venue.ACCOUNT_ID for p in connection.sent)
     assert _windows(connection) == [
@@ -892,7 +891,7 @@ async def test_item_9_asks_both_lists_over_the_three_windows_read_only(monkeypat
         oa.ProtoOAOrderListReq
     ] * 3
     assert all(type(p) in v.READ_ONLY_REQUESTS for p in connection.sent)
-    assert connection.buckets == [BUCKET_HISTORICAL] * 6
+    assert {group_of(p) for p in connection.sent} == {GROUP_HISTORICAL}
     assert all(p.ctidTraderAccountId == account_venue.ACCOUNT_ID for p in connection.sent)
     windows = [
         (now_ms - day_ms, now_ms),
@@ -1120,7 +1119,7 @@ async def test_a_whole_run_reports_every_item_and_never_prints_an_identifier() -
             settings=settings(),
             account_id=account_venue.ACCOUNT_ID,
             # The fake venue is local; the live budget would only slow the test down.
-            rate_limiter=RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0}),
+            pacing=FAST,
         )
         await pusher
     finally:
@@ -1171,7 +1170,7 @@ async def test_a_whole_run_reports_how_the_venue_answered_a_window(
             credentials=v.Credentials("client-id", "client-secret", "access-token"),
             settings=settings(symbols=(EURUSD,), minutes=0.005),
             account_id=account_venue.ACCOUNT_ID,
-            rate_limiter=RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0}),
+            pacing=FAST,
         )
     finally:
         await server.stop()

@@ -29,8 +29,7 @@ from google.protobuf.descriptor import FieldDescriptor
 from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderRequestError, CTraderTimeoutError
-from nautilus_ctrader.common.rate_limit import RateLimiter
-from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL
+from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.messages import OpenApiCommonMessages_pb2 as common
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -50,7 +49,7 @@ ORDER_ID = 550_022_334
 DEAL_ID = 660_033_445
 BROKER_NAME = "Example Broker Ltd"
 BROKER_TITLE = "ExampleFX"
-FAST = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
+FAST = Pacing(requests_per_window=1000, historical_requests_per_window=1000)
 
 
 def trade_data(*, label: str = "", comment: str = "") -> om.ProtoOATradeData:
@@ -1792,7 +1791,7 @@ def settings(
         "minutes": 1.0,
         "stop": stop,
         "markers": markers,
-        "rate_limiter": FAST,
+        "pacing": FAST,
         "snapshot_debounce_secs": 0.05,
         "tick_secs": 0.01,
         "reconnect_waits": (0.05,),
@@ -2652,7 +2651,7 @@ async def test_a_recording_is_written_even_when_the_run_fails(tmp_path) -> None:
             minutes=1.0,
             stop=stop,
             markers=markers,
-            rate_limiter=FAST,
+            pacing=FAST,
             snapshot_debounce_secs=0.05,
             tick_secs=0.01,
             reconnect_waits=(0.05,),
@@ -3144,7 +3143,7 @@ def finishing_settings(server: FakeCTraderServer, output: pathlib.Path) -> dict:
         "access_token": "access-token",
         "secrets": ("client-secret", "access-token"),
         "raw_dir": output.parent / "raw",
-        "rate_limiter": FAST,
+        "pacing": FAST,
     }
 
 

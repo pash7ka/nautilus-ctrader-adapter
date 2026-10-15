@@ -45,21 +45,21 @@ from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderRequestError
-from nautilus_ctrader.common.rate_limit import RateLimiter
-from nautilus_ctrader.constants import (
-    BUCKET_DEFAULT,
-    BUCKET_HISTORICAL,
-    DEMO_HOST,
-    LIVE_HOST,
-    PROTOBUF_PORT,
-)
+from nautilus_ctrader.common.rate_limit import Pacing, RequestScheduler
+from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
-# Conservative outbound rates for the recorder's connection: the historical bucket in
-# particular is much tighter than the default one, and a burst of trendbar requests (one per
-# symbol, M15 and H1) is exactly what triggered a live BLOCKED_PAYLOAD_TYPE rejection.
-_RATE_LIMITS = {BUCKET_DEFAULT: 5.0, BUCKET_HISTORICAL: 1.0}
+# Conservative outbound pace for the recorder's connection: the historical group in
+# particular is much tighter than the other one, and a burst of trendbar requests (one per
+# symbol, M15 and H1) is exactly what triggered a live BLOCKED_PAYLOAD_TYPE rejection. The
+# scheduler never retries: `_request_with_retry()` does.
+_PACING = Pacing(
+    requests_per_window=5,
+    historical_requests_per_window=1,
+    window_secs=1.0,
+    retries=0,
+)
 _MAX_RATE_LIMIT_RETRIES = 3
 _RATE_LIMIT_FALLBACK_WAIT_SECS = 2.0
 
@@ -433,7 +433,6 @@ async def _request_with_retry(
     connection: CTraderConnection,
     payload: Message,
     *,
-    bucket: str,
     rate_limit_retries: list[float | None],
 ) -> Message:
     """Send `payload`, retrying up to `_MAX_RATE_LIMIT_RETRIES` times on `BLOCKED_PAYLOAD_TYPE`.
@@ -445,7 +444,7 @@ async def _request_with_retry(
     """
     for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
         try:
-            return await connection.request(payload, bucket=bucket)
+            return await connection.request(payload)
         except CTraderRequestError as e:
             if e.error_code != "BLOCKED_PAYLOAD_TYPE":
                 raise
@@ -528,12 +527,13 @@ async def record(trader_login: int, env: dict[str, str]) -> RecordResult:
     }
 
     rate_limit_retries: list[float | None] = []
+    logger = _QuietLogger()
     connection = CTraderConnection(
         host,
         PROTOBUF_PORT,
-        logger=_QuietLogger(),
+        logger=logger,
         tls=True,
-        rate_limiter=RateLimiter(_RATE_LIMITS),
+        scheduler=RequestScheduler(_PACING, logger=logger),
     )
     await connection.connect()
     try:
@@ -607,7 +607,6 @@ async def record(trader_login: int, env: dict[str, str]) -> RecordResult:
                     fromTimestamp=now_ms - 7 * day_ms,
                     toTimestamp=now_ms,
                 ),
-                bucket=BUCKET_HISTORICAL,
                 rate_limit_retries=rate_limit_retries,
             )
             _verify_scrubs_cleanly(m15_res, account_id, real_login)
@@ -623,7 +622,6 @@ async def record(trader_login: int, env: dict[str, str]) -> RecordResult:
                     fromTimestamp=now_ms - 21 * day_ms,
                     toTimestamp=now_ms,
                 ),
-                bucket=BUCKET_HISTORICAL,
                 rate_limit_retries=rate_limit_retries,
             )
             _verify_scrubs_cleanly(h1_res, account_id, real_login)

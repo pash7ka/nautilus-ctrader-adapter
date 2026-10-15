@@ -212,8 +212,29 @@ window.
 A token bucket whose capacity equals its rate does not keep to these limits. It sends a full
 bucket at once and then refills during the same second, so up to twice the allowance can
 leave within one second. A live start-up was refused this way after 12 trendbar requests in
-about 2 s. This adapter still paces that way, with buckets of 50/s and 5/s; on a breach it
-pauses the refused bucket for `retryAfter` and fails the request.
+about 2 s.
+
+**How this adapter paces.** Each connection has one request scheduler. It sorts requests into
+two groups: historical (the request types listed above, plus tick data and the per-position
+lists) and everything else. Each group keeps a sliding window of `request_window_secs`, 1.25 s
+by default, and lets at most 5 historical requests or 50 others leave within any such window.
+The window is longer than the venue's 1 s so that jitter cannot push more than the limit into
+one of the venue's seconds.
+
+- **Priorities.** Waiting requests leave in priority order, then in arrival order: execution
+  (orders, cancels, reconciliation, queries, subscriptions), then the balance checkpoint, then
+  bar requests, then bar backfills after a reconnect.
+- **Refusals.** A rate-limit refusal pauses the refused group for `retryAfter` plus 0.25 s, so
+  nothing of that group leaves before the venue's block has passed. The other group is not
+  affected.
+- **Retries.** A refused historical request is sent again after the pause, ahead of the other
+  requests at its priority, at most 3 times; the next refusal fails it. A refused request of
+  the other group fails at once and is never resent: whether to resend an order is the
+  strategy's decision.
+- **Queue limit.** A request that has waited 60 s in the queue, the waits before its retries
+  included, fails without being sent.
+- **Connection loss.** Every waiting request fails at once. A new connection starts with empty
+  windows and no pause.
 
 **Not measured:**
 

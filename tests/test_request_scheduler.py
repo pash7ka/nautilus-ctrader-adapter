@@ -498,6 +498,68 @@ async def test_fail_all_fails_every_waiter() -> None:
     assert sends.times("historical") == sends.times("other") == []
 
 
+async def test_after_fail_all_a_submit_fails_at_once_until_reset() -> None:
+    clock = VirtualClock()
+    s = scheduler(clock)
+    sends = Sends(clock)
+    lost = CTraderConnectionError("lost")
+    failed_at: list[float] = []
+
+    async def scenario() -> None:
+        await clock.at(1.0)
+        s.fail_all(lost)
+        for group in (GROUP_HISTORICAL, GROUP_OTHER):
+            with pytest.raises(CTraderConnectionError) as raised:
+                await s.submit(group, EXECUTION, sends.ok("refused"))
+            assert raised.value is lost
+        failed_at.append(clock.now)
+        s.reset()
+        await s.submit(GROUP_OTHER, EXECUTION, sends.ok("after reset"))
+
+    await clock.run(scenario())
+
+    assert failed_at == [1.0]
+    assert sends.names() == ["after reset"]
+
+
+async def test_a_refusal_after_fail_all_is_not_requeued() -> None:
+    # The request was already inside `send()` when the connection was lost.
+    clock = VirtualClock()
+    s = scheduler(clock)
+    sends = Sends(clock)
+    lost = CTraderConnectionError("lost")
+
+    async def scenario() -> None:
+        refused = spawn(
+            s, GROUP_HISTORICAL, DATA, sends.failing("refused", [refusal(1)], takes=0.5)
+        )
+        await clock.at(0.1)
+        s.fail_all(lost)
+        with pytest.raises(CTraderConnectionError) as raised:
+            await refused
+        assert raised.value is lost
+
+    await clock.run(scenario())
+
+    assert sends.times("refused") == [0.0]
+
+
+async def test_a_historical_pause_does_not_delay_the_other_group() -> None:
+    clock = VirtualClock()
+    s = scheduler(clock, Pacing(retries=0))
+    sends = Sends(clock)
+
+    async def scenario() -> None:
+        with pytest.raises(CTraderRequestError):
+            await s.submit(GROUP_HISTORICAL, DATA, sends.failing("refused", [refusal(1)]))
+        await clock.at(0.1)
+        await s.submit(GROUP_OTHER, BACKFILL, sends.ok("other"))
+
+    await clock.run(scenario())
+
+    assert sends.times("other") == [pytest.approx(0.1)]
+
+
 async def test_reset_forgets_the_window_and_the_pause() -> None:
     clock = VirtualClock()
     s = scheduler(clock)

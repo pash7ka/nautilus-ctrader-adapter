@@ -1,7 +1,7 @@
 """Paged reads of the account's history: deal lists, order lists, and the windows to ask them in.
 
-Each helper takes a request function the caller has already bound to the historical bucket, so
-the rate limit stays the caller's concern.
+Each helper takes a request function the caller has already bound to its priority, so pacing
+stays the caller's concern.
 """
 
 from __future__ import annotations

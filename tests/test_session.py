@@ -13,14 +13,9 @@ from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderProtocolError,
 )
-from nautilus_ctrader.common.rate_limit import RateLimiter
+from nautilus_ctrader.common.rate_limit import Pacing, RequestPriority
 from nautilus_ctrader.common.session import CTraderSession, SessionState
-from nautilus_ctrader.constants import (
-    BUCKET_DEFAULT,
-    BUCKET_HISTORICAL,
-    LENGTH_PREFIX_FORMAT,
-    MAX_FRAME_BYTES,
-)
+from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
@@ -28,6 +23,8 @@ from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
 ACCOUNT_ID = 1234567
+
+FAST = Pacing(requests_per_window=1000, historical_requests_per_window=1000)
 
 
 class _SlowRestore:
@@ -927,9 +924,8 @@ async def test_start_during_stop_ends_healthy() -> None:
         lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
     )
     await server.start()
-    # A fast limiter, so the new bring-up finishes well inside the restore's cancellation delay.
-    limiter = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
-    session = _session(server, backoff_base_secs=0.01, rate_limiter=limiter)
+    # Fast pacing, so the new bring-up finishes well inside the restore's cancellation delay.
+    session = _session(server, backoff_base_secs=0.01, pacing=FAST)
     slow_restore = _SlowRestore()
 
     def subscribe_request() -> oa.ProtoOASubscribeSpotsReq:
@@ -994,8 +990,7 @@ async def test_a_stop_after_a_waiting_start_wins() -> None:
     # and wakes S, C - not S - must be the call the session ends up reflecting.
     server = _authenticating_server()
     await server.start()
-    limiter = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
-    session = _session(server, backoff_base_secs=0.01, rate_limiter=limiter)
+    session = _session(server, backoff_base_secs=0.01, pacing=FAST)
     slow_restore = _SlowRestore()
     try:
         session.add_restore("slow", slow_restore)
@@ -1021,8 +1016,7 @@ async def test_a_stop_after_a_waiting_start_wins_as_separate_tasks() -> None:
     # than awaited together in one coroutine.
     server = _authenticating_server()
     await server.start()
-    limiter = RateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
-    session = _session(server, backoff_base_secs=0.01, rate_limiter=limiter)
+    session = _session(server, backoff_base_secs=0.01, pacing=FAST)
     slow_restore = _SlowRestore()
     try:
         session.add_restore("slow", slow_restore)
@@ -1087,6 +1081,44 @@ async def test_stop_returns_promptly_after_the_server_drops_the_connection(
         started = loop.time()
         await session.stop()
         assert loop.time() - started < 1.0
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_session_request_passes_its_priority() -> None:
+    server = _authenticating_server()
+    server.on(
+        oa_model.PROTO_OA_GET_TRENDBARS_REQ,
+        lambda _r: oa.ProtoOAGetTrendbarsRes(ctidTraderAccountId=ACCOUNT_ID, period=oa_model.M1),
+    )
+    await server.start()
+    session = _session(server)
+
+    def trendbars(symbol_id: int) -> oa.ProtoOAGetTrendbarsReq:
+        return oa.ProtoOAGetTrendbarsReq(
+            ctidTraderAccountId=ACCOUNT_ID,
+            period=oa_model.M1,
+            symbolId=symbol_id,
+        )
+
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        # Fills the historical window.
+        await asyncio.gather(*(session.request(trendbars(0)) for _ in range(5)))
+
+        data = asyncio.create_task(
+            session.request(trendbars(1), priority=RequestPriority.DATA),
+        )
+        await asyncio.sleep(0.05)
+        execution = asyncio.create_task(
+            session.request(trendbars(2), priority=RequestPriority.EXECUTION),
+        )
+        await asyncio.wait_for(asyncio.gather(data, execution), timeout=5.0)
+
+        sent = [m.symbolId for m in server.received if isinstance(m, oa.ProtoOAGetTrendbarsReq)]
+        assert sent[5:] == [2, 1]
     finally:
         await session.stop()
         await server.stop()

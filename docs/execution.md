@@ -379,7 +379,7 @@ order keeps them consistent:
   execution events bring it.
 
 The venue model is rebuilt from that same snapshot. The request count is logged at INFO. The
-history lists use the historical rate-limit bucket, so they never queue ahead of orders.
+history lists are paced in the historical group, so they never queue ahead of orders.
 
 ### At start
 

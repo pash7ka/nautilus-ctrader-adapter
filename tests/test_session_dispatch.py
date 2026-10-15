@@ -1,4 +1,4 @@
-"""Multi-handler event dispatch, historical-bucket routing, and restore retry."""
+"""Multi-handler event dispatch, historical-group routing, and restore retry."""
 
 from __future__ import annotations
 
@@ -7,9 +7,8 @@ import asyncio
 from nautilus_trader.common.component import Logger
 
 from nautilus_ctrader.common.errors import CTraderConnectionError
-from nautilus_ctrader.common.rate_limit import RateLimiter
 from nautilus_ctrader.common.session import CTraderSession, SessionState
-from nautilus_ctrader.constants import BUCKET_DEFAULT, BUCKET_HISTORICAL
+from nautilus_ctrader.constants import GROUP_HISTORICAL, GROUP_OTHER
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
@@ -200,16 +199,18 @@ async def test_an_event_with_no_handler_logs_a_debug_line_naming_the_type() -> N
         await server.stop()
 
 
-class _RecordingRateLimiter(RateLimiter):
-    """A `RateLimiter` that records the buckets it is asked for, then delegates."""
+def _record_groups(session: CTraderSession) -> list[str]:
+    """Make the session's scheduler record the group of every request it is given."""
+    scheduler = session._connection._scheduler
+    submit = scheduler.submit
+    groups: list[str] = []
 
-    def __init__(self, rates: dict[str, float]) -> None:
-        super().__init__(rates)
-        self.acquired: list[str] = []
+    async def recording(group, priority, send):
+        groups.append(group)
+        return await submit(group, priority, send)
 
-    async def acquire(self, bucket: str = BUCKET_DEFAULT) -> None:
-        self.acquired.append(bucket)
-        await super().acquire(bucket)
+    scheduler.submit = recording
+    return groups
 
 
 def _trendbars_req() -> oa.ProtoOAGetTrendbarsReq:
@@ -220,46 +221,24 @@ def _trendbars_req() -> oa.ProtoOAGetTrendbarsReq:
     )
 
 
-async def test_a_historical_request_uses_the_historical_bucket_and_auth_uses_default() -> None:
+async def test_a_historical_request_uses_the_historical_group_and_auth_the_other() -> None:
     server = _authenticating_server()
     server.on(
         oa_model.PROTO_OA_GET_TRENDBARS_REQ,
         lambda _r: oa.ProtoOAGetTrendbarsRes(ctidTraderAccountId=ACCOUNT_ID, period=oa_model.M1),
     )
     await server.start()
-    limiter = _RecordingRateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
-    session = _session(server, rate_limiter=limiter)
+    session = _session(server)
+    groups = _record_groups(session)
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
-        # The two auth requests during bring-up went through the default bucket.
-        assert limiter.acquired == [BUCKET_DEFAULT, BUCKET_DEFAULT]
+        # The two auth requests during bring-up.
+        assert groups == [GROUP_OTHER, GROUP_OTHER]
 
         await session.request(_trendbars_req())
 
-        assert limiter.acquired == [BUCKET_DEFAULT, BUCKET_DEFAULT, BUCKET_HISTORICAL]
-    finally:
-        await session.stop()
-        await server.stop()
-
-
-async def test_an_explicit_bucket_overrides_the_historical_default() -> None:
-    server = _authenticating_server()
-    server.on(
-        oa_model.PROTO_OA_GET_TRENDBARS_REQ,
-        lambda _r: oa.ProtoOAGetTrendbarsRes(ctidTraderAccountId=ACCOUNT_ID, period=oa_model.M1),
-    )
-    await server.start()
-    limiter = _RecordingRateLimiter({BUCKET_DEFAULT: 1000.0, BUCKET_HISTORICAL: 1000.0})
-    session = _session(server, rate_limiter=limiter)
-    try:
-        await session.start()
-        await session.wait_ready(timeout_secs=2.0)
-        limiter.acquired.clear()
-
-        await session.request(_trendbars_req(), bucket=BUCKET_DEFAULT)
-
-        assert limiter.acquired == [BUCKET_DEFAULT]
+        assert groups == [GROUP_OTHER, GROUP_OTHER, GROUP_HISTORICAL]
     finally:
         await session.stop()
         await server.stop()

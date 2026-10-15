@@ -14,7 +14,7 @@ Measures, against one live account in one run of a minute or two:
 payload class outside `ALLOWED_REQUESTS` before it is written. Nothing that creates, amends or
 closes an order is in that set.
 
-**No local pacing.** The connection is built without a `RateLimiter`, so each request leaves
+**No local pacing.** The connection is built without a `RequestScheduler`, so each request leaves
 exactly when the probe schedules it, and every refusal is the venue's own.
 
 **Bounded.** A cap on requests per run and per step; between steps at least 3 s, and at least
