@@ -26,7 +26,7 @@ from typing import NoReturn
 from google.protobuf.message import Message
 from nautilus_trader.common.component import Logger
 
-from nautilus_ctrader.common.errors import CTraderRequestError, CTraderTimeoutError
+from nautilus_ctrader.common.errors import CTraderQueueTimeoutError, CTraderRequestError
 from nautilus_ctrader.constants import (
     GROUP_HISTORICAL,
     GROUP_OTHER,
@@ -141,7 +141,7 @@ class RequestScheduler:
 
         Raises
         ------
-        CTraderTimeoutError
+        CTraderQueueTimeoutError
             The request waited `Pacing.queue_timeout_secs` in the queue, retries included, and
             was dropped unsent. Time inside `send()` does not count.
         Exception
@@ -230,7 +230,7 @@ class RequestScheduler:
         return self._clock() - queued_at
 
     def _raise_queue_timeout(self) -> NoReturn:
-        raise CTraderTimeoutError(
+        raise CTraderQueueTimeoutError(
             f"waited {self._pacing.queue_timeout_secs:g} s in the request queue",
         )
 

@@ -23,6 +23,7 @@ from nautilus_trader.common.component import Logger
 from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
+    CTraderNotSentConnectionError,
     CTraderProtocolError,
     CTraderTimeoutError,
 )
@@ -167,7 +168,7 @@ class CTraderConnection:
         if writer is not None:
             writer.close()
         self._reject_pending(CTraderConnectionError("connection closed"))
-        self._fail_queued(CTraderConnectionError("connection closed while waiting to send"))
+        self._fail_queued(CTraderNotSentConnectionError("connection closed while waiting to send"))
         self._heartbeat_task = None
         self._read_task = None
         self._writer = None
@@ -198,9 +199,12 @@ class CTraderConnection:
 
         `timeout_secs` bounds only the wait for the response. Time spent in the scheduler's
         queue, including a venue-ordered pause and any retry, comes on top of it.
+
+        A failure before the frame is written raises a `CTraderNotSentError`; any other
+        connection error or timeout leaves unknown whether the venue received the request.
         """
         if not self._connected:
-            raise CTraderConnectionError("not connected")
+            raise CTraderNotSentConnectionError("not connected")
         generation = self._generation
         deadline = self._request_timeout_secs if timeout_secs is None else timeout_secs
 
@@ -232,7 +236,7 @@ class CTraderConnection:
     async def send(self, payload: Message, *, client_msg_id: str | None = None) -> None:
         """Send a message without awaiting a response, paced like a request at `EXECUTION`."""
         if not self._connected:
-            raise CTraderConnectionError("not connected")
+            raise CTraderNotSentConnectionError("not connected")
         generation = self._generation
 
         async def write() -> None:
@@ -254,7 +258,7 @@ class CTraderConnection:
         # A wait in the queue, or between retries, can outlast the connection it began on
         # (`generation`). A frame meant for a closed socket must fail, never go out on the next.
         if not self._connected or self._writer is None or self._generation != generation:
-            raise CTraderConnectionError("connection lost while waiting to send")
+            raise CTraderNotSentConnectionError("connection lost while waiting to send")
         self._log.debug(
             f"send payloadType={payload.payloadType} "
             f"clientMsgId={client_msg_id or '-'} bytes={len(frame)}",
@@ -376,7 +380,9 @@ class CTraderConnection:
         was_connected = self._connected
         self._connected = False
         self._reject_pending(error)
-        self._fail_queued(CTraderConnectionError(f"connection lost while waiting to send: {error}"))
+        self._fail_queued(
+            CTraderNotSentConnectionError(f"connection lost while waiting to send: {error}"),
+        )
         if was_connected:
             self._call_handler("Disconnect", self._disconnect_handler, error)
 
@@ -386,6 +392,6 @@ class CTraderConnection:
             if not future.done():
                 future.set_exception(error)
 
-    def _fail_queued(self, error: CTraderConnectionError) -> None:
+    def _fail_queued(self, error: CTraderNotSentConnectionError) -> None:
         if self._scheduler is not None:
             self._scheduler.fail_all(error)

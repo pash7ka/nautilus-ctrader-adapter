@@ -64,6 +64,13 @@ pending for Nautilus's in-flight check. A cancel or an amend of a pending order 
 either. A frame from the venue that the adapter cannot read drops the connection; a request
 waiting on it counts as unanswered.
 
+Only a request that was sent can end as unknown. A command whose request never left is refused,
+and may be sent again: one that waited `request_queue_timeout_secs` in the request queue, or that
+was still waiting there when the connection dropped. It ends as an `OrderRejected` (or
+`OrderCancelRejected`, `OrderModifyRejected`) whose reason starts with "not sent:" and says why,
+the same as a command sent while the connection is down. A level amend refused this way is tried
+again, as for any refusal that allows it.
+
 A refusal by the broker is an `OrderRejected` (or `OrderCancelRejected`, `OrderModifyRejected`)
 whose reason is the broker's error code and description, as the broker gave them.
 

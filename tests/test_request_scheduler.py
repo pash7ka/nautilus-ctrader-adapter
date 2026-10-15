@@ -18,6 +18,7 @@ import pytest
 
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
+    CTraderQueueTimeoutError,
     CTraderRequestError,
     CTraderTimeoutError,
 )
@@ -415,18 +416,22 @@ async def test_the_ceiling_drops_a_request_unsent() -> None:
     s = scheduler(clock, Pacing(queue_timeout_secs=60.0))
     sends = Sends(clock)
     failed_at: list[float] = []
+    errors: list[Exception] = []
 
     async def scenario() -> None:
         with pytest.raises(CTraderRequestError):
             await s.submit(GROUP_OTHER, EXECUTION, sends.failing("refused", [refusal(1000)]))
-        with pytest.raises(CTraderTimeoutError, match="waited 60 s in the request queue"):
+        with pytest.raises(CTraderQueueTimeoutError, match="waited 60 s in the request queue") as e:
             await s.submit(GROUP_OTHER, EXECUTION, sends.ok("dropped"))
         failed_at.append(clock.now)
+        errors.append(e.value)
 
     await clock.run(scenario())
 
     assert failed_at == [pytest.approx(60.0)]
     assert sends.times("dropped") == []
+    # Existing handlers of a timeout still catch it.
+    assert isinstance(errors[0], CTraderTimeoutError)
 
 
 async def test_the_ceiling_counts_retry_waits() -> None:

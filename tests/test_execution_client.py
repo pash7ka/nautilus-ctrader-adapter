@@ -9,6 +9,7 @@ from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
+from google.protobuf.message import Message
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import InstrumentProviderConfig, StrategyConfig
@@ -48,8 +49,9 @@ from nautilus_trader.trading.strategy import Strategy
 from nautilus_ctrader.activity import CTraderAccountActivity
 from nautilus_ctrader.common import order_record, order_translation
 from nautilus_ctrader.common.account import account_client_from_config
-from nautilus_ctrader.common.errors import CTraderAccountError
+from nautilus_ctrader.common.errors import CTraderAccountError, CTraderRequestError
 from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.venue_book import terms_of
 from nautilus_ctrader.common.venue_records import Level, LevelTerms
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
@@ -1006,6 +1008,51 @@ async def test_an_order_waits_for_its_answer_as_long_as_configured() -> None:
         assert 0.3 <= waited < 2.0
         assert status(h, MARKET_ID) == OrderStatus.SUBMITTED
         assert any("not resent" in line for line in h.logger.warnings())
+
+
+async def pause_order_requests(h) -> None:
+    """Have the venue refuse one request of the orders' pacing group, pausing it for long."""
+    serve_trader = h.venue.replies[om.PROTO_OA_TRADER_REQ]
+    refused: list[Message] = []
+
+    def refuse_once(request: Message) -> Message:
+        if refused:
+            return serve_trader(request)
+        refused.append(request)
+        return oa.ProtoOAErrorRes(
+            ctidTraderAccountId=ACCOUNT_ID, errorCode="BLOCKED_PAYLOAD_TYPE", retryAfter=1000
+        )
+
+    h.server.on(om.PROTO_OA_TRADER_REQ, refuse_once)
+    with pytest.raises(CTraderRequestError):
+        await sync(h)
+
+
+async def test_an_order_that_waits_out_the_queue_ceiling_is_rejected() -> None:
+    async with harness(pacing=Pacing(queue_timeout_secs=0.5)) as h:
+        await pause_order_requests(h)
+        await submit(h, market(h))
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.REJECTED)
+
+        assert rejection(h, MARKET_ID) == "not sent: waited 0.5 s in the request queue"
+        assert h.kinds_of(MARKET_ID) == ["OrderSubmitted", "OrderRejected"]
+        assert h.received(oa.ProtoOANewOrderReq) == []
+
+
+async def test_an_order_queued_when_the_connection_drops_is_rejected() -> None:
+    async with harness() as h:
+        await pause_order_requests(h)
+        sending = asyncio.create_task(submit(h, market(h)))
+        # Submitted is reported just before the request joins the queue, with no wait between.
+        await wait_until(lambda: h.kinds_of(MARKET_ID) == ["OrderSubmitted"])
+        await h.server.drop_connections()
+        await asyncio.wait_for(sending, timeout=2.0)
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.REJECTED)
+
+        assert rejection(h, MARKET_ID).startswith("not sent: connection lost")
+        await wait_until(lambda: h.account.session.is_ready, timeout_secs=10)
+        await sync(h)
+        assert h.received(oa.ProtoOANewOrderReq) == []
 
 
 def closing_venue() -> ExecutionVenue:

@@ -12,6 +12,8 @@ from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
+    CTraderNotSentConnectionError,
+    CTraderNotSentError,
     CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
@@ -214,7 +216,7 @@ async def test_queued_requests_fail_on_loss_and_never_reach_the_next_socket() ->
 
         await server.drop_connections()
         for task in (queued, retrying):
-            with pytest.raises(CTraderConnectionError):
+            with pytest.raises(CTraderNotSentConnectionError):
                 await asyncio.wait_for(task, timeout=2.0)
 
         await connection.close()
@@ -457,8 +459,10 @@ async def test_a_lost_connection_rejects_pending_requests_and_notifies() -> None
         assert server.received, "request never reached the server"
         await server.drop_connections()
 
-        with pytest.raises(CTraderConnectionError):
+        with pytest.raises(CTraderConnectionError) as raised:
             await asyncio.wait_for(pending, timeout=2.0)
+        # It was written, so the venue may have acted on it.
+        assert not isinstance(raised.value, CTraderNotSentError)
         assert len(losses) == 1
         assert connection.is_connected is False
     finally:
@@ -569,7 +573,7 @@ async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
         await connection.connect()
         await server.wait_for_connections()
 
-        with pytest.raises(CTraderConnectionError):
+        with pytest.raises(CTraderNotSentConnectionError):
             await asyncio.wait_for(pending, timeout=2.0)
         # A fixed wait is right here: this checks that the request never arrives.
         await asyncio.sleep(0.5)
@@ -616,7 +620,7 @@ async def test_a_request_granted_after_a_reconnect_is_never_sent() -> None:
         await server.wait_for_connections()
         scheduler.release.set()
 
-        with pytest.raises(CTraderConnectionError):
+        with pytest.raises(CTraderNotSentConnectionError):
             await asyncio.wait_for(pending, timeout=2.0)
         # A fixed wait is right here: this checks that the request never arrives.
         await asyncio.sleep(0.5)
@@ -673,7 +677,7 @@ async def test_a_request_before_connecting_fails_fast() -> None:
         logger=Logger("test"),
         tls=False,
     )
-    with pytest.raises(CTraderConnectionError, match="not connected"):
+    with pytest.raises(CTraderNotSentConnectionError, match="not connected"):
         await connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1))
 
 
@@ -907,5 +911,5 @@ async def test_send_before_connecting_fails_fast() -> None:
         logger=Logger("test"),
         tls=False,
     )
-    with pytest.raises(CTraderConnectionError, match="not connected"):
+    with pytest.raises(CTraderNotSentConnectionError, match="not connected"):
         await connection.send(oa.ProtoOATraderReq(ctidTraderAccountId=1))

@@ -78,6 +78,7 @@ from nautilus_ctrader.common.errors import (
     CTraderAccountError,
     CTraderConnectionError,
     CTraderError,
+    CTraderNotSentError,
     CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
@@ -2167,6 +2168,9 @@ class CTraderExecutionClient(LiveExecutionClient):
                 _reason(e.error_code, e.description),
                 retryable=e.retry_after_secs is not None,
             )
+        except CTraderNotSentError as e:
+            # Before the generic handler: these are also timeouts or connection errors.
+            return _Refused(f"not sent: {e}", retryable=True)
         except (CTraderTimeoutError, CTraderConnectionError, CTraderProtocolError):
             # A protocol error is also how a request learns that an unreadable frame from the
             # venue dropped the connection, possibly its own answer.

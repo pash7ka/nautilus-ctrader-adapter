@@ -41,6 +41,7 @@ from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.reconciliation import PositionHistory
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import CTRADER_VENUE, PENDING_ORDER_TYPES
@@ -413,11 +414,12 @@ async def harness(
     connect: bool = True,
     cache: Cache | None = None,
     instruments: Iterable[InstrumentId] = (US100_ID,),
+    pacing: Pacing | None = None,
 ) -> AsyncIterator[Harness]:
     """The client against the fake venue, inside a live execution engine and a portfolio.
 
     A given `cache` stands for one a restarted node reloads from a persistent backend.
-    `instruments` are the ones the node loads.
+    `instruments` are the ones the node loads. `pacing` defaults to the session's own.
 
     What the client sends Nautilus is recorded on the way in: order events, execution reports,
     mass statuses, account states, and the account activity published on the message bus.
@@ -427,7 +429,7 @@ async def harness(
     await server.start()
     config = config or exec_config()
     logger = RecordingLogger()
-    account = account_client(server, logger=logger, credentials=config.credentials())
+    account = account_client(server, logger=logger, credentials=config.credentials(), pacing=pacing)
     provider = account.get_instrument_provider(
         config=InstrumentProviderConfig(load_ids=frozenset(instruments)),
         asset_class_overrides={},

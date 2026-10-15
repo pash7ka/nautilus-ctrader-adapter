@@ -23,6 +23,18 @@ class CTraderTimeoutError(CTraderError):
     """No response arrived for a request within its timeout."""
 
 
+class CTraderNotSentError(CTraderError):
+    """The request was never written to the socket."""
+
+
+class CTraderQueueTimeoutError(CTraderTimeoutError, CTraderNotSentError):
+    """The request waited out the queue's time limit and was dropped unsent."""
+
+
+class CTraderNotSentConnectionError(CTraderConnectionError, CTraderNotSentError):
+    """The connection was down or lost before the request was written."""
+
+
 class CTraderAuthError(CTraderError):
     """Application or account authentication was rejected, or a token was invalidated."""
 
