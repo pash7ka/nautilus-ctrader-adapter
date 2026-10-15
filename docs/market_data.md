@@ -63,7 +63,13 @@ once, in ascending order, whichever of them got there first:
   rather than flooding the log. A request that finds no connection is not one of those
   attempts: the bar keeps waiting, and the backfill below closes it.
 - **A backfill after a reconnect.** Bars that closed while the connection was down are fetched
-  from history and emitted before the stream resumes.
+  from history and emitted before the stream resumes. The backfill runs in the background once
+  the session is ready again, at the lowest request priority, so commands and other requests are
+  not held back by it; live bars arriving meanwhile are held and replayed after it. Another
+  reconnect restarts a running backfill, and an unsubscribe cancels it. A backfill that fails for
+  any reason but the lost connection is logged at ERROR and retried every
+  `restore_retry_interval_secs`, like any other failed restore: a failed retry is a WARNING, and
+  the third failed retry in a row an ERROR again.
 
 Two rules follow from this, and applications depend on both:
 

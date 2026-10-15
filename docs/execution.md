@@ -481,6 +481,10 @@ pushed during the rebuild are applied once the mass status is sent and the balan
 has been rewritten; the account state is sent again after them. The rebuild is logged at
 WARNING.
 
+Commands are refused from the moment the connection drops until this reload (reconciliation,
+balance checkpoint, held events) is done. They do not wait for the bar backfills of a data client
+on the same account, which run afterwards at a lower request priority.
+
 Nautilus skips a mass status's order report whose status and filled quantity match the order it
 holds, without comparing its quantity or prices. So once a mass status is reconciled, at start
 and on a reconnect, and before the held events are applied, the adapter compares each open order

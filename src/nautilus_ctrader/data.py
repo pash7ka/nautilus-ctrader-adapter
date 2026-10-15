@@ -39,7 +39,7 @@ from nautilus_trader.model.data import Bar, BarType, DataType
 from nautilus_trader.model.identifiers import ClientId, InstrumentId
 from nautilus_trader.model.instruments import Instrument
 
-from nautilus_ctrader.common.account import CTraderAccountClient
+from nautilus_ctrader.common.account import RESTORE_RETRY_ERROR_ATTEMPTS, CTraderAccountClient
 from nautilus_ctrader.common.bars import BarCloser, Clock, RawBar
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
@@ -170,13 +170,20 @@ class _LoopClock:
         return self.loop.call_later(delay_secs, callback)
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class _BarSub:
     """One live bar subscription: where its trendbars come from, and what closes them."""
 
     symbol_id: int
     period: int
     closer: BarCloser
+    # The backfill started by the latest restore, and its failures in a row since a reconnect.
+    backfill: asyncio.Task | None = None
+    backfill_failures: int = 0
+
+    def cancel_backfill(self) -> None:
+        if self.backfill is not None:
+            self.backfill.cancel()
 
 
 class CTraderDataClient(LiveMarketDataClient):
@@ -371,6 +378,7 @@ class CTraderDataClient(LiveMarketDataClient):
         session = self._account.session
         for bar_type, sub in self._bars.items():
             sub.closer.close()
+            sub.cancel_backfill()
             if session is not None:
                 session.remove_restore(_bar_restore_key(bar_type))
         self._bars.clear()
@@ -895,7 +903,7 @@ class CTraderDataClient(LiveMarketDataClient):
                         # it: the backfill's history needs the reconnected subscription in place.
                         self._session.add_restore(
                             _bar_restore_key(bar_type),
-                            functools.partial(self._restore_bars, sub),
+                            functools.partial(self._restore_bars, bar_type, sub),
                         )
                 else:
                     self._forget_bars(bar_type, sub)
@@ -928,6 +936,7 @@ class CTraderDataClient(LiveMarketDataClient):
         del self._bars[bar_type]
         self._bar_routes.pop((sub.symbol_id, sub.period), None)
         sub.closer.close()
+        sub.cancel_backfill()
         self._sync_listener(sub.symbol_id)
 
     def _make_closer(self, bar_type: BarType, symbol_id: int, period: int) -> BarCloser:
@@ -942,9 +951,63 @@ class CTraderDataClient(LiveMarketDataClient):
             label=str(bar_type),
         )
 
-    async def _restore_bars(self, sub: _BarSub) -> None:
+    async def _restore_bars(self, bar_type: BarType, sub: _BarSub) -> None:
+        """Start backfilling what `bar_type` missed, and return without waiting for it.
+
+        The session becomes ready only once every restore has returned, and every command waits
+        for that. A backfill still running from an earlier restore is replaced: the closer would
+        ignore a second one, leaving the new gap unfilled.
+        """
+        session = self._session
+        if session is not None and not session.is_ready:
+            # Run by a bring-up, not by a retry: a failure is the first since the reconnect.
+            sub.backfill_failures = 0
         sub.closer.on_disconnect()
-        await sub.closer.backfill(functools.partial(self._fetch_bar_range, sub))
+        previous = sub.backfill
+        sub.cancel_backfill()
+        sub.backfill = asyncio.create_task(self._backfill(bar_type, sub, previous))
+
+    async def _backfill(
+        self,
+        bar_type: BarType,
+        sub: _BarSub,
+        previous: asyncio.Task | None,
+    ) -> None:
+        """Run one backfill; a failure goes to the session's failed restores, to be retried."""
+        if previous is not None and not previous.done():
+            # Until it has unwound, the closer still counts it as running.
+            await asyncio.wait({previous})
+        try:
+            await sub.closer.backfill(functools.partial(self._fetch_bar_range, sub))
+        except CTraderConnectionError as e:
+            # The next reconnect starts another.
+            self._log.debug(f"Backfill of {bar_type} ended with the connection: {e}")
+            return
+        except CTraderError as e:
+            sub.backfill_failures += 1
+            detail = e.error_code if isinstance(e, CTraderRequestError) else repr(e)
+            message = f"Backfill of {bar_type} failed: {detail}"
+            # The levels of a failed restore: ERROR for the first failure after a reconnect,
+            # WARNING for a failed retry, ERROR again once the retries keep failing.
+            if sub.backfill_failures == 1:
+                self._log.error(message)
+            elif sub.backfill_failures == 1 + RESTORE_RETRY_ERROR_ATTEMPTS:
+                self._log.error(
+                    f"{message}; still failing after {RESTORE_RETRY_ERROR_ATTEMPTS} retries",
+                )
+            else:
+                self._log.warning(message)
+            self._mark_backfill_failed(bar_type)
+            return
+        except Exception as e:
+            self._log.exception(f"Backfill of {bar_type} raised", e)
+            self._mark_backfill_failed(bar_type)
+            return
+        sub.backfill_failures = 0
+
+    def _mark_backfill_failed(self, bar_type: BarType) -> None:
+        if self._session is not None:
+            self._session.mark_restore_failed(_bar_restore_key(bar_type))
 
     def _on_bar_spot(self, symbol_id: int, event: oa.ProtoOASpotEvent) -> None:
         for trendbar in event.trendbar:

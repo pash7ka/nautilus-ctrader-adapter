@@ -34,10 +34,13 @@ from nautilus_trader.data.messages import (
     UnsubscribeBars,
     UnsubscribeQuoteTicks,
 )
+from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.model.currencies import EUR, USD
 from nautilus_trader.model.data import Bar, BarType, QuoteTick
+from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.model.objects import Quantity
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 
 from nautilus_ctrader.common.account import CTraderAccountClient
@@ -64,6 +67,8 @@ from tests.account_venue import (
     received,
     venue,
 )
+from tests.execution_venue import STRATEGY_ID, TRADER_ID, ExecutionVenue
+from tests.execution_venue import harness as execution_harness
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
@@ -148,12 +153,26 @@ class Harness:
         return [i for r in received(self.server, oa.ProtoOAUnsubscribeSpotsReq) for i in r.symbolId]
 
 
+class LoggedDataClient(CTraderDataClient):
+    """The client with its log lines kept: the Nautilus logger writes from Rust, out of reach."""
+
+    def __init__(self, *args, logger: RecordingLogger, **kwargs) -> None:
+        self.__dict__["_recording"] = logger
+        super().__init__(*args, **kwargs)
+
+    @property
+    def _log(self):
+        return self.__dict__["_recording"]
+
+
 @asynccontextmanager
 async def harness(
     *,
     client_config: CTraderDataClientConfig | None = None,
     server: FakeCTraderServer | None = None,
+    logged: bool = False,
 ) -> AsyncIterator[Harness]:
+    """The client against `server`; with `logged`, its own log lines go to `Harness.logger` too."""
     client_config = client_config or config()
     server = server or data_venue()
     await server.start()
@@ -184,14 +203,17 @@ async def harness(
     msgbus.deregister(endpoint="DataEngine.response", handler=engine.response)
     msgbus.register(endpoint="DataEngine.process", handler=process)
     msgbus.register(endpoint="DataEngine.response", handler=responses.append)
-    client = CTraderDataClient(
-        loop=asyncio.get_running_loop(),
-        account=account,
-        msgbus=msgbus,
-        cache=cache,
-        clock=clock,
-        instrument_provider=provider,
-        config=client_config,
+    arguments = {
+        "loop": asyncio.get_running_loop(),
+        "account": account,
+        "msgbus": msgbus,
+        "cache": cache,
+        "clock": clock,
+        "instrument_provider": provider,
+        "config": client_config,
+    }
+    client = (
+        LoggedDataClient(**arguments, logger=logger) if logged else CTraderDataClient(**arguments)
     )
     try:
         yield Harness(server, account, provider, client, cache, published, responses, logger)
@@ -338,7 +360,22 @@ def trendbar_venue(
     announce_more: bool = True,
 ) -> FakeCTraderServer:
     """The data venue, also accepting live trendbar subscriptions and serving recorded history."""
-    server = data_venue()
+    return with_trendbars(
+        data_venue(),
+        chunk=chunk,
+        short_by=short_by,
+        announce_more=announce_more,
+    )
+
+
+def with_trendbars(
+    server: FakeCTraderServer,
+    *,
+    chunk: int | None = None,
+    short_by: int = 0,
+    announce_more: bool = True,
+) -> FakeCTraderServer:
+    """`server`, also accepting live trendbar subscriptions and serving recorded history."""
     for payload_type, response_class in (
         (om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ, oa.ProtoOASubscribeLiveTrendbarRes),
         (om.PROTO_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQ, oa.ProtoOAUnsubscribeLiveTrendbarRes),
@@ -406,7 +443,11 @@ def spots_until(symbol_id: int, minute: int) -> list[oa.ProtoOASpotEvent]:
 
 
 async def subscribe_bars(h: Harness, bar_type: BarType) -> None:
-    await h.client._subscribe_bars(
+    await subscribe_client_bars(h.client, bar_type)
+
+
+async def subscribe_client_bars(client: CTraderDataClient, bar_type: BarType) -> None:
+    await client._subscribe_bars(
         SubscribeBars(
             bar_type=bar_type,
             client_id=None,
@@ -2459,6 +2500,254 @@ async def test_the_backfill_range_holds_no_bar_before_its_start() -> None:
             (FIRST_M1_MINUTE + 1) * 60,
             (FIRST_M1_MINUTE + 2) * 60,
         ]
+
+
+# -- Backfills after READY ------------------------------------------------------------------
+
+M1_GAP = [close_ns(FIRST_M1_MINUTE + i, 60) for i in range(3)]
+
+
+def fast_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.BACKOFF_BASE_SECS", 0.01)
+
+
+async def reconnected(server: FakeCTraderServer, account: CTraderAccountClient) -> None:
+    """Drop the connection and return once the session is ready again."""
+    connections = server.connection_count
+    await server.drop_connections()
+    await wait_until(lambda: server.connection_count > connections, description="a reconnect")
+    await account.session.wait_ready(timeout_secs=5.0)
+
+
+def hold_history(server: FakeCTraderServer) -> HeldReplies:
+    return HeldReplies(
+        server,
+        om.PROTO_OA_GET_TRENDBARS_REQ,
+        server._handlers[om.PROTO_OA_GET_TRENDBARS_REQ],
+    )
+
+
+def closes(published: list, bar_type: BarType) -> list[int]:
+    return [d.ts_event for d in published if isinstance(d, Bar) and d.bar_type == bar_type]
+
+
+async def test_an_order_is_accepted_before_the_backfills_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_reconnect(monkeypatch)
+    execution_venue = ExecutionVenue()
+    server = with_trendbars(execution_venue.server)
+    refusal = oa.ProtoOAOrderErrorEvent(
+        ctidTraderAccountId=ACCOUNT_ID, errorCode="NOT_ENOUGH_MONEY", description="Not enough"
+    )
+    server.on(om.PROTO_OA_NEW_ORDER_REQ, lambda _r: refusal)
+    held = hold_history(server)
+    async with execution_harness(
+        execution_venue=execution_venue,
+        instruments=(US100_ID, EURUSD_ID, GER40_ID),
+    ) as e:
+        published: list = []
+        msgbus = TestComponentStubs.msgbus()
+        msgbus.register(endpoint="DataEngine.process", handler=published.append)
+        data = CTraderDataClient(
+            loop=asyncio.get_running_loop(),
+            account=e.account,
+            msgbus=msgbus,
+            cache=TestComponentStubs.cache(),
+            clock=TestComponentStubs.clock(),
+            instrument_provider=e.account.instrument_provider,
+            config=config(),
+        )
+        await data._connect()
+        try:
+            # H1 subscribed first, so the last recorded hour is still its own to emit.
+            clock = PinnedClock((LAST_H1_MINUTE + 5) * 60 + 5)
+            data._bar_clock = clock
+            await subscribe_client_bars(data, EURUSD_H1)
+            clock.t = FIRST_M1_MINUTE * 60 + 5
+            await subscribe_client_bars(data, EURUSD_M1)
+            await subscribe_client_bars(data, GER40_M1)
+
+            clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+            await reconnected(server, e.account)
+            await wait_until(
+                lambda: len(held.pending) == 3,
+                timeout_secs=10.0,
+                description="every backfill asked for history",
+            )
+            order = e.factory.market(US100_ID, OrderSide.BUY, Quantity.from_str("1.00"))
+            e.cache.add_order(order)
+            await e.client._submit_order(
+                SubmitOrder(
+                    trader_id=TRADER_ID,
+                    strategy_id=STRATEGY_ID,
+                    order=order,
+                    command_id=UUID4(),
+                    ts_init=0,
+                ),
+            )
+
+            (request,) = e.received(oa.ProtoOANewOrderReq)
+            assert request.clientOrderId == order.client_order_id.value
+            assert not [d for d in published if isinstance(d, Bar)]
+            assert not any(sub.backfill.done() for sub in data._bars.values())
+
+            await held.stop_holding()
+            await wait_until(
+                lambda: all(sub.backfill.done() for sub in data._bars.values()),
+                timeout_secs=10.0,
+                description="the backfills finished",
+            )
+            assert closes(published, EURUSD_M1) == M1_GAP
+            assert closes(published, GER40_M1) == M1_GAP
+            assert closes(published, EURUSD_H1) == [close_ns(LAST_H1_MINUTE, 3600)]
+        finally:
+            await data._disconnect()
+
+
+async def test_a_second_reconnect_restarts_a_running_backfill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_reconnect(monkeypatch)
+    server = trendbar_venue()
+    held = hold_history(server)
+    async with harness(server=server) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        sub = h.client._bars[EURUSD_M1]
+        session = h.account.session
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await reconnected(h.server, h.account)
+        await wait_until(lambda: len(held.pending) == 1, description="the first history request")
+        first = sub.backfill
+
+        # The restore run again while its backfill still waits, as a bring-up runs it.
+        await session._restores[("bar_backfill", str(EURUSD_M1))]()
+        await wait_until(lambda: len(held.pending) == 2, description="the second history request")
+        second = sub.backfill
+        assert first.cancelled()
+        # The cancelled run left the closer free to start another.
+        assert sub.closer._holding
+
+        await reconnected(h.server, h.account)
+        await wait_until(lambda: len(held.pending) == 3, description="the third history request")
+        assert second.done() and not second.cancelled()
+        third = sub.backfill
+        assert third is not second
+
+        await held.stop_holding()
+        await asyncio.wait_for(asyncio.shield(third), timeout=10.0)
+        assert [b.ts_event for b in h.bars()] == M1_GAP
+        assert not session.failed_restores
+        assert sub.backfill_failures == 0
+
+
+async def test_unsubscribing_cancels_a_running_backfill(monkeypatch: pytest.MonkeyPatch) -> None:
+    fast_reconnect(monkeypatch)
+    server = trendbar_venue()
+    held = hold_history(server)
+    async with harness(server=server) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        sub = h.client._bars[EURUSD_M1]
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await reconnected(h.server, h.account)
+        await asyncio.wait_for(held.arrived.wait(), timeout=5.0)
+
+        await unsubscribe_bars(h, EURUSD_M1)
+        await asyncio.wait({sub.backfill}, timeout=5.0)
+
+        assert sub.backfill.cancelled()
+        await held.stop_holding()
+        for event in spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 3):
+            await push_spot(h, event)
+        assert not h.bars()
+
+
+def refuse_history(server: FakeCTraderServer) -> dict[str, bool]:
+    """Make `server` refuse every trendbar request while the returned switch's `refuse` is set."""
+    serve = server._handlers[om.PROTO_OA_GET_TRENDBARS_REQ]
+    switch = {"refuse": True}
+    server.on(
+        om.PROTO_OA_GET_TRENDBARS_REQ,
+        lambda r: (
+            oa.ProtoOAErrorRes(
+                ctidTraderAccountId=r.ctidTraderAccountId, errorCode="INVALID_REQUEST"
+            )
+            if switch["refuse"]
+            else serve(r)
+        ),
+    )
+    return switch
+
+
+def backfill_lines(h: Harness) -> list[tuple[str, str]]:
+    return [(level, line) for level, line in h.logger.lines if line.startswith("Backfill of")]
+
+
+async def test_a_failed_backfill_is_retried_by_the_restore_mechanism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_reconnect(monkeypatch)
+    server = trendbar_venue()
+    switch = refuse_history(server)
+    async with harness(server=server, logged=True) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        session = h.account.session
+        key = ("bar_backfill", str(EURUSD_M1))
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await reconnected(h.server, h.account)
+        await wait_until(lambda: key in session.failed_restores, description="a failed backfill")
+
+        assert backfill_lines(h) == [("error", f"Backfill of {EURUSD_M1} failed: INVALID_REQUEST")]
+        assert not h.bars()
+
+        switch["refuse"] = False
+        await session.retry_failed_restores()
+        await asyncio.wait_for(asyncio.shield(h.client._bars[EURUSD_M1].backfill), timeout=10.0)
+
+        assert [b.ts_event for b in h.bars()] == M1_GAP
+        assert key not in session.failed_restores
+        assert h.client._bars[EURUSD_M1].backfill_failures == 0
+
+
+async def test_a_backfill_failing_on_every_retry_is_reported_at_error_on_the_third(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_reconnect(monkeypatch)
+    server = trendbar_venue()
+    refuse_history(server)
+    async with harness(server=server, logged=True) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        session = h.account.session
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await reconnected(h.server, h.account)
+
+        for retries in range(5):
+            await wait_until(
+                lambda n=retries: len(backfill_lines(h)) == n + 1,
+                description="a failed backfill",
+            )
+            if retries < 4:
+                await session.retry_failed_restores()
+
+        assert [level for level, _ in backfill_lines(h)] == [
+            "error",
+            "warning",
+            "warning",
+            "error",
+            "warning",
+        ]
+        assert backfill_lines(h)[3][1] == (
+            f"Backfill of {EURUSD_M1} failed: INVALID_REQUEST; still failing after 3 retries"
+        )
 
 
 # -- Carry-over fixes -----------------------------------------------------------------------

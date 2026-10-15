@@ -54,7 +54,7 @@ Environment = Literal["auto", "demo", "live"]
 ENVIRONMENTS: tuple[Environment, ...] = get_args(Environment)
 _READY_POLL_SECS = 0.5
 # A restore still failing after this many background retries is reported once at ERROR.
-_RESTORE_RETRY_ERROR_ATTEMPTS = 3
+RESTORE_RETRY_ERROR_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -733,7 +733,7 @@ class CTraderAccountClient:
             # flapping can log the ERROR again.
             failures = {key: failures.get(key, 0) + 1 for key in session.failed_restores}
             for key, attempts in failures.items():
-                if attempts == _RESTORE_RETRY_ERROR_ATTEMPTS:
+                if attempts == RESTORE_RETRY_ERROR_ATTEMPTS:
                     self._log.error(f"Restore {key!r} still failing after {attempts} retries")
 
 
