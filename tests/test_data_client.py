@@ -2644,6 +2644,31 @@ async def test_a_second_reconnect_restarts_a_running_backfill(
         assert sub.backfill_failures == 0
 
 
+async def test_a_stream_update_right_after_a_restore_is_held_and_replayed() -> None:
+    server = trendbar_venue()
+    held = hold_history(server)
+    async with harness(server=server) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        sub = h.client._bars[EURUSD_M1]
+        clock.t = (FIRST_M1_MINUTE + 2) * 60 + 5
+        forming = spots_until(EURUSD_SYMBOL_ID, FIRST_M1_MINUTE + 2)[-1]
+
+        await h.client._restore_bars(EURUSD_M1, sub)
+        # No loop iteration has run since the restore returned.
+        assert sub.closer._holding
+        h.client._on_bar_spot(EURUSD_SYMBOL_ID, forming)
+        assert sub.closer._held is not None
+
+        await held.stop_holding()
+        await asyncio.wait_for(asyncio.shield(sub.backfill), timeout=10.0)
+        assert [b.ts_event for b in h.bars()] == M1_GAP[:2]
+        # The update that arrived mid-backfill is the bar now forming.
+        assert sub.closer._current is not None
+        assert sub.closer._current.boundary_secs == (FIRST_M1_MINUTE + 2) * 60
+
+
 async def test_unsubscribing_cancels_a_running_backfill(monkeypatch: pytest.MonkeyPatch) -> None:
     fast_reconnect(monkeypatch)
     server = trendbar_venue()

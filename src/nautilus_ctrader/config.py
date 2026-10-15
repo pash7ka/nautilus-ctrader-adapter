@@ -106,8 +106,8 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     ------
     ValueError
         If `history_page_size` is below 1, `environment` is not one of "auto", "demo",
-        "live", or the request pacing is impossible (a window or a count below 1, a
-        non-positive duration, negative retries).
+        "live", or the request pacing is impossible (a count below 1, a window or queue
+        timeout that is not positive, negative retries).
 
     Notes
     -----
@@ -234,8 +234,8 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
         If `instrument_provider` is set, `environment` is not one of "auto", "demo", "live", a
         duration or `reconciliation_default_lookback_mins` is not positive,
         `balance_checkpoint_hour` is outside 0-23, `balance_checkpoint_timezone` is not a
-        known time zone, or the request pacing is impossible (a window or a count below 1, a
-        non-positive duration, negative retries).
+        known time zone, or the request pacing is impossible (a count below 1, a window or
+        queue timeout that is not positive, negative retries).
 
     Notes
     -----

@@ -965,7 +965,12 @@ class CTraderDataClient(LiveMarketDataClient):
         sub.closer.on_disconnect()
         previous = sub.backfill
         sub.cancel_backfill()
-        sub.backfill = asyncio.create_task(self._backfill(bar_type, sub, previous))
+        # Eager, so the closer holds stream updates before this returns.
+        sub.backfill = asyncio.Task(
+            self._backfill(bar_type, sub, previous),
+            loop=asyncio.get_running_loop(),
+            eager_start=True,
+        )
 
     async def _backfill(
         self,

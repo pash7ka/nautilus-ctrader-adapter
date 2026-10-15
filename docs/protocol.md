@@ -219,7 +219,9 @@ two groups: historical (the request types listed above, plus tick data and the p
 lists) and everything else. Each group keeps a sliding window of `request_window_secs`, 1.25 s
 by default, and lets at most 5 historical requests or 50 others leave within any such window.
 The window is longer than the venue's 1 s so that jitter cannot push more than the limit into
-one of the venue's seconds.
+one of the venue's seconds. All five pacing values are settings of the client configs, not
+fixed numbers; the 5, 50, 3 and 60 s here are the defaults. See the settings table in
+[execution.md](execution.md).
 
 - **Priorities.** Waiting requests leave in priority order, then in arrival order: execution
   (orders, cancels, reconciliation, queries, subscriptions), then the balance checkpoint, then
