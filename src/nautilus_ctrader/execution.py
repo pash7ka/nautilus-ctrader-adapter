@@ -1293,14 +1293,17 @@ class CTraderExecutionClient(LiveExecutionClient):
         )
         return response.trader
 
-    async def _load(self) -> None:
+    async def _load(self, stood: Callable[[], None] | None = None) -> None:
         """Rebuild the venue model from the broker's open positions and their order lists.
 
-        Execution events that arrive meanwhile are applied once it stands, in order.
+        Execution events that arrive meanwhile are applied once it stands, in order; `stood`
+        runs before them.
         """
         self._hold_buffer()
         try:
             self._stand(await self._read_broker(since_ms=None, deals=False))
+            if stood is not None:
+                stood()
         finally:
             self._release_buffer()
         self._write_exposure()
@@ -2966,13 +2969,16 @@ class CTraderExecutionClient(LiveExecutionClient):
                 # carries. Its late answer, a rebuild or the release timer settles it.
                 # TODO(verify): how the venue answers an amend that changes nothing.
                 continue
-            elif bracket.rounds >= _CORRECTION_ROUNDS:
-                reason = (
-                    "the broker did not answer the correction"
-                    if bracket.answer_lost
-                    else "the broker kept other levels than asked"
+            elif bracket.rounds >= _CORRECTION_ROUNDS and bracket.answer_lost:
+                bracket.correcting = True
+                self.create_task(
+                    self._settle_from_broker(bracket),
+                    log_msg=f"settle bracket {bracket.entry_id} from the broker",
                 )
-                self._bracket_refused(bracket, view.position_id, reason)
+            elif bracket.rounds >= _CORRECTION_ROUNDS:
+                self._bracket_refused(
+                    bracket, view.position_id, "the broker kept other levels than asked"
+                )
             else:
                 bracket.correcting = True
                 bracket.rounds += 1
@@ -3086,6 +3092,69 @@ class CTraderExecutionClient(LiveExecutionClient):
                 and level in view.levels
             ):
                 self._leg_updated(client_order_id, level, view.levels[level])
+
+    async def _settle_from_broker(self, bracket: PendingBracket) -> None:
+        """Answer, from a rebuild of the model, a bracket whose rounds ran out on a lost answer.
+
+        The lost amend may have applied, so nothing the bracket carries is refused for the lost
+        answer:
+
+        - a leg the rebuild ended, its level or its position gone, is cancelled; a modify it
+          carried is rejected first;
+        - a standing leg is updated to the broker's level; a cancel, or a modify of another
+          price, is rejected with that level.
+
+        A leg ended by an event held during the rebuild was reported by that event. A failed
+        rebuild, or one held off by a rebuild under way, leaves the bracket to the next settle.
+        """
+        alive_stood: set[Level] = set()
+        try:
+            # As in `_learn_position()`: the rebuild under way settles again once released.
+            if self._buffer is not None:
+                return
+            alive_before = self._alive_legs(bracket)
+            await self._load(lambda: alive_stood.update(self._alive_legs(bracket)))
+        except CTraderError as e:
+            self._log.warning(
+                f"Bracket {bracket.entry_id}: the venue model was not rebuilt to settle it: {e}",
+            )
+            return
+        finally:
+            bracket.correcting = False
+        if self._session is None or self._brackets.by_entry(bracket.entry_id) is not bracket:
+            return
+        self._log.warning(
+            f"Bracket {bracket.entry_id}: its corrections got no answer; its legs are answered "
+            "as the broker holds them",
+        )
+        self._brackets.remove(bracket.entry_id)
+        ended = alive_before - alive_stood
+        view = self._bracket_position(bracket)
+        ts_ms = self._clock.timestamp_ms()
+        for level, leg_id in bracket.legs.items():
+            client_order_id = ClientOrderId(leg_id)
+            modified = level in bracket.modified and level not in bracket.cancels
+            if level in ended:
+                if modified:
+                    self._modify_rejected(client_order_id, _not_moved(None))
+                self._handle_records([OrderEvent(OrderEventKind.CANCELED, None, leg_id, ts_ms)])
+            elif (
+                view is not None
+                and view.legs.get(level, (leg_id, False))[1]
+                and level in view.levels
+            ):
+                held = view.levels[level]
+                if level in bracket.cancels:
+                    self._cancel_rejected(client_order_id, _not_moved(held))
+                elif modified and held != bracket.requested[level]:
+                    self._modify_rejected(client_order_id, _not_moved(held))
+                self._leg_updated(client_order_id, level, held)
+
+    def _alive_legs(self, bracket: PendingBracket) -> set[Level]:
+        view = self._bracket_position(bracket)
+        if view is None:
+            return set()
+        return {level for level, (_, alive) in view.legs.items() if alive}
 
     async def _set_missing_levels(self, record: ProtectionMissing) -> None:
         """No protective order followed the fill: set the levels the legs asked for."""

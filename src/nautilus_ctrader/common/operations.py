@@ -110,7 +110,8 @@ class PendingBracket:
     - `legs`: each leg's client order id, by level.
     - `requested`: the exact price asked for each leg's level, a later modify included.
     - `cancels`, `modified`: levels whose leg was cancelled or modified meanwhile.
-    - `correcting`: the amend is under way; `rounds` counts the amends sent.
+    - `correcting`: the amend, or the rebuild that settles the bracket, is under way; `rounds`
+      counts the amends sent.
     - `unanswered`: the levels of the last amend, whose answer was lost; they are not sent again.
     - `answer_lost`: the last amend's answer was lost, held or not.
     """

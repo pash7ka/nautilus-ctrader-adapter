@@ -103,6 +103,13 @@ exists, the adapter amends the position's levels to the exact prices requested.
   legs, and any cancel or modify the amend carries, wait for the broker's late answer or the next
   rebuild, for at most `protective_order_timeout_secs`; then a new round is sent. A cancel or a
   modify of a leg that arrives meanwhile is sent at once, in a new round.
+- If the third round ends as unknown too, nothing the bracket carries is refused for the lost
+  answer: the venue model is rebuilt from the broker, a WARNING is logged, and each leg is answered
+  as the broker holds it. A leg whose level (or position) is gone is cancelled, after its carried
+  modify is rejected. A standing leg reports its level in an `OrderUpdated`; a carried cancel, or a
+  modify to another price, is rejected with a reason naming the broker's level. If the rebuild
+  fails, a WARNING says so and the bracket is tried again on the account's next execution event,
+  cancel, modify or rebuild.
 - If no protective order follows the fill within `protective_order_timeout_secs`, the levels are
   set by an amend instead. If that is refused too, the legs are rejected and an ERROR is logged:
   the position stands without its levels. If it gets no answer, an ERROR says that whether the
