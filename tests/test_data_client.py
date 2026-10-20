@@ -2775,6 +2775,110 @@ async def test_a_backfill_failing_on_every_retry_is_reported_at_error_on_the_thi
         )
 
 
+async def test_a_backfill_failing_again_after_a_reconnect_is_reported_at_error_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_reconnect(monkeypatch)
+    server = trendbar_venue()
+    refuse_history(server)
+    async with harness(server=server, logged=True) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        session = h.account.session
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await reconnected(h.server, h.account)
+        await wait_until(lambda: len(backfill_lines(h)) == 1, description="a failed backfill")
+        await session.retry_failed_restores()
+        await wait_until(lambda: len(backfill_lines(h)) == 2, description="a failed retry")
+
+        await reconnected(h.server, h.account)
+        await wait_until(lambda: len(backfill_lines(h)) == 3, description="a failed backfill")
+
+        assert [level for level, _ in backfill_lines(h)] == ["error", "warning", "error"]
+
+
+async def test_a_backfill_failing_after_a_newer_bring_up_began_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_reconnect(monkeypatch)
+    server = trendbar_venue()
+    async with harness(server=server, logged=True) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        sub = h.client._bars[EURUSD_M1]
+        session = h.account.session
+        key = ("bar_backfill", str(EURUSD_M1))
+
+        # The first backfill's history fails when the test says so; later ones are served.
+        fetch = h.client._fetch_bar_range
+        fail_now = asyncio.Event()
+
+        async def failing_fetch(*args) -> list:
+            h.client._fetch_bar_range = fetch
+            await fail_now.wait()
+            raise CTraderRequestError("INVALID_REQUEST")
+
+        h.client._fetch_bar_range = failing_fetch
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await reconnected(h.server, h.account)
+        stale = sub.backfill
+
+        # The next bring-up waits at the trendbar resubscribe, before its own backfill starts.
+        resubscribe = HeldReplies(
+            server,
+            om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ,
+            lambda r: oa.ProtoOASubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+        await server.drop_connections()
+        await asyncio.wait_for(resubscribe.arrived.wait(), timeout=5.0)
+        fail_now.set()
+        await asyncio.wait({stale}, timeout=5.0)
+        assert stale.done() and not stale.cancelled()
+
+        await resubscribe.stop_holding()
+        await session.wait_ready(timeout_secs=5.0)
+        assert sub.backfill is not stale
+        await asyncio.wait_for(asyncio.shield(sub.backfill), timeout=10.0)
+
+        assert [b.ts_event for b in h.bars()] == M1_GAP
+        assert [line for level, line in backfill_lines(h) if level != "debug"] == []
+        assert key not in session.failed_restores
+        assert sub.backfill_failures == 0
+
+
+async def test_disconnect_returns_only_once_every_backfill_has_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_reconnect(monkeypatch)
+    server = trendbar_venue()
+    async with harness(server=server) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        await subscribe_bars(h, GER40_M1)
+        subs = list(h.client._bars.values())
+
+        # Each backfill takes a while to unwind once cancelled.
+        async def slow_to_cancel_fetch(*args) -> list:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0.2)
+            return []
+
+        h.client._fetch_bar_range = slow_to_cancel_fetch
+        clock.t = (FIRST_M1_MINUTE + 3) * 60 + 5
+        await reconnected(h.server, h.account)
+        backfills = [sub.backfill for sub in subs]
+        assert not any(task.done() for task in backfills)
+
+        await h.client._disconnect()
+
+        assert all(task.done() for task in backfills)
+
+
 # -- Carry-over fixes -----------------------------------------------------------------------
 
 

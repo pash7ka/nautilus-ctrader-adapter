@@ -177,8 +177,10 @@ class _BarSub:
     symbol_id: int
     period: int
     closer: BarCloser
-    # The backfill started by the latest restore, and its failures in a row since a reconnect.
+    # The backfill started by the latest restore, the session bring-up it was started for, and
+    # the failures in a row within that bring-up.
     backfill: asyncio.Task | None = None
+    backfill_generation: tuple[CTraderSession, int] | None = None
     backfill_failures: int = 0
 
     def cancel_backfill(self) -> None:
@@ -347,13 +349,21 @@ class CTraderDataClient(LiveMarketDataClient):
         self._preparing.clear()
         session, self._session = self._session, None
         self._account.remove_reload_listener(self._on_instrument_reloaded)
+        backfills = {sub.backfill for sub in self._bars.values() if sub.backfill is not None}
         try:
             await self._release_subscriptions(session)
             self._converted.clear()
         finally:
-            if self._holds_account:
-                self._holds_account = False
-                await self._account.disconnect()
+            # Releasing cancels them, unless it failed first. Either way none outlives this.
+            for task in backfills:
+                task.cancel()
+            try:
+                if backfills:
+                    await asyncio.wait(backfills)
+            finally:
+                if self._holds_account:
+                    self._holds_account = False
+                    await self._account.disconnect()
 
     async def _release_subscriptions(self, session: CTraderSession | None) -> None:
         """Release everything the registry still counts for this client.
@@ -958,27 +968,38 @@ class CTraderDataClient(LiveMarketDataClient):
         for that. A backfill still running from an earlier restore is replaced: the closer would
         ignore a second one, leaving the new gap unfilled.
         """
-        session = self._session
-        if session is not None and not session.is_ready:
-            # Run by a bring-up, not by a retry: a failure is the first since the reconnect.
+        generation = self._backfill_generation()
+        if generation != sub.backfill_generation:
+            # The first backfill of this bring-up: a failure is the first since the reconnect.
+            sub.backfill_generation = generation
             sub.backfill_failures = 0
         sub.closer.on_disconnect()
         previous = sub.backfill
         sub.cancel_backfill()
         # Eager, so the closer holds stream updates before this returns.
         sub.backfill = asyncio.Task(
-            self._backfill(bar_type, sub, previous),
+            self._backfill(bar_type, sub, previous, generation),
             loop=asyncio.get_running_loop(),
             eager_start=True,
         )
+
+    def _backfill_generation(self) -> tuple[CTraderSession, int] | None:
+        """The session and its `bring_up_generation`, which a backfill is started for."""
+        session = self._session
+        return None if session is None else (session, session.bring_up_generation)
 
     async def _backfill(
         self,
         bar_type: BarType,
         sub: _BarSub,
         previous: asyncio.Task | None,
+        generation: tuple[CTraderSession, int] | None,
     ) -> None:
-        """Run one backfill; a failure goes to the session's failed restores, to be retried."""
+        """Run one backfill; a failure goes to the session's failed restores, to be retried.
+
+        Once the session has been brought up again, the outcome is stale and ignored: that
+        bring-up runs its own backfill.
+        """
         if previous is not None and not previous.done():
             # Until it has unwound, the closer still counts it as running.
             await asyncio.wait({previous})
@@ -989,6 +1010,9 @@ class CTraderDataClient(LiveMarketDataClient):
             self._log.debug(f"Backfill of {bar_type} ended with the connection: {e}")
             return
         except CTraderError as e:
+            if self._backfill_generation() != generation:
+                self._log.debug(f"Backfill of {bar_type} from an earlier bring-up failed: {e!r}")
+                return
             sub.backfill_failures += 1
             detail = e.error_code if isinstance(e, CTraderRequestError) else repr(e)
             message = f"Backfill of {bar_type} failed: {detail}"
@@ -1006,9 +1030,11 @@ class CTraderDataClient(LiveMarketDataClient):
             return
         except Exception as e:
             self._log.exception(f"Backfill of {bar_type} raised", e)
-            self._mark_backfill_failed(bar_type)
+            if self._backfill_generation() == generation:
+                self._mark_backfill_failed(bar_type)
             return
-        sub.backfill_failures = 0
+        if self._backfill_generation() == generation:
+            sub.backfill_failures = 0
 
     def _mark_backfill_failed(self, bar_type: BarType) -> None:
         if self._session is not None:
