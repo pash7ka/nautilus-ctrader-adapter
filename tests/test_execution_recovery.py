@@ -1168,13 +1168,30 @@ def stepped_by_one_unit(venue: ExecutionVenue) -> ExecutionVenue:
 
 
 def off_step_position(venue: ExecutionVenue, n: int, *, ts: int) -> None:
-    """A foreign position of 1.5 units, its entry and its deal alike: finer than a one-unit step."""
-    foreign_position(venue, n, ts=ts)
-    position_id = 5_100_000 + n
-    venue.snapshot.position[-1].tradeData.volume = 150
-    venue.position_orders[position_id][0].tradeData.volume = 150
-    for deal in venue.position_deals[position_id]:
-        deal.volume = deal.filledVolume = 150
+    """A foreign position of 2 units, 0.5 closed at `ts`: under a one-unit step its entry fits,
+    its close and the 1.5 left do not.
+    """
+    foreign_position(venue, n, ts=ts - 5_000)
+    position_id, close_id = 5_100_000 + n, 6_150_000 + n
+    position = venue.snapshot.position[-1]
+    position.tradeData.volume = 150
+    position.utcLastUpdateTimestamp = ts
+    (entry,) = venue.position_orders[position_id]
+    entry.tradeData.volume = 200
+    (deal,) = venue.position_deals[position_id]
+    deal.volume = deal.filledVolume = 200
+    close = make_order(
+        close_id, position_id, side=om.SELL, volume=50, closing=True, utc=ts, symbol=US100_SYMBOL_ID
+    )
+    close.orderStatus = om.ORDER_STATUS_FILLED
+    venue.position_orders[position_id].append(close)
+    venue.position_deals[position_id] += on_us100(
+        [
+            make_deal(
+                7_150_000 + n, close_id, position_id, side=om.SELL, volume=50, price=85100.0, ts=ts
+            )
+        ]
+    )
 
 
 async def test_an_off_step_record_is_left_out_of_the_mass_status() -> None:
@@ -1188,13 +1205,13 @@ async def test_an_off_step_record_is_left_out_of_the_mass_status() -> None:
         assert built is not None
         (report,) = built.position_reports[US100_ID]
         assert report.venue_position_id == PositionId("5100001")
+        # The entry fits, but alone it would rebuild the position at 2 units.
         assert list(built.order_reports) == [VenueOrderId("6100001")]
         assert list(built.fill_reports) == [VenueOrderId("6100001")]
-        # One per record left out: the entry, with its fill, and the position.
-        order_error, position_error = h.logger.errors()
-        assert "6100002" in order_error
-        assert "5100002" in position_error
-        assert all("does not fit" in line for line in (order_error, position_error))
+        (error,) = h.logger.errors()
+        assert "Position 5100002" in error
+        assert "6150002" in error
+        assert "does not fit" in error
 
 
 async def test_an_off_step_record_does_not_fail_the_reconnect_rebuild() -> None:

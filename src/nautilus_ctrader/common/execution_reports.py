@@ -393,15 +393,16 @@ def mass_status(
       The report itself names no client order id for such an order: Nautilus finds it by its
       venue order id, and drops a report naming a cached order whose status it already holds,
       a changed price or quantity with it.
-    - `misfit`: called with a line naming each order or position whose price or quantity does
-      not fit its instrument, such as a volume finer than the step; the record is then left
-      out. By default such a record raises `ValueError`.
+    - `misfit`: called once per position, and once per order on no position, with a line naming
+      the records whose price or quantity does not fit the instrument, such as a volume finer
+      than the step. Such an order is left out; for a position, all its records are: its
+      orders, their fills and its report. By default a misfit raises `ValueError`.
 
     A leg whose level the broker no longer lists has no price of its own. It is reported at
     the held price: no price change was seen, and Nautilus would otherwise emit an update
     without a price. Failing that, a leg with fills is reported at their average price; one
-    without is left out. What is left out is unlinked from the orders kept, since Nautilus
-    fails on a linked order it cannot find.
+    without is left out. What is left out is unlinked from the orders kept and is no longer
+    their parent, since Nautilus fails on a linked order it cannot find.
 
     Returns the mass status and the records left out for want of a price.
     """
@@ -418,34 +419,55 @@ def mass_status(
         else:
             kept.append((priced, instrument))
     gone = {record.client_order_id for record in left_out}
+    # Why each position's records do not fit, and its instrument.
+    unfit: dict[str, list[str]] = {}
+    unfit_on: dict[str, InstrumentId] = {}
     built: list[tuple[ReportedOrder, Instrument, OrderStatusReport, list[FillReport]]] = []
     for record, instrument in kept:
         try:
             report, fills = reported_order(record, instrument, account_id, currency, ts_init)
         except ValueError as e:
             name = record.client_order_id or record.venue_order_id
-            misfit(f"Order {name} on {instrument.id} is not reported: {e}")
             gone.add(record.client_order_id)
+            if record.venue_position_id is None:
+                misfit(f"Order {name} on {instrument.id} is not reported: {e}")
+            else:
+                unfit.setdefault(record.venue_position_id, []).append(f"order {name}: {e}")
+                unfit_on[record.venue_position_id] = instrument.id
         else:
             built.append((record, instrument, report, fills))
-    order_reports: list[OrderStatusReport] = []
-    fill_reports: list[FillReport] = []
-    for record, instrument, report, fills in built:
-        if gone.intersection(record.linked_order_ids):
-            linked = tuple(i for i in record.linked_order_ids if i not in gone)
-            unlinked = replace(record, linked_order_ids=linked)
-            report, fills = reported_order(unlinked, instrument, account_id, currency, ts_init)
-        order_reports.append(report)
-        fill_reports += fills
-    position_reports: list[PositionStatusReport] = []
+    positions: list[tuple[str, PositionStatusReport]] = []
     for record in reconciliation.positions:
         instrument = instrument_for(record.symbol_id)
         if instrument is None:
             continue
         try:
-            position_reports.append(position_report(record, instrument, account_id, ts_init))
+            report = position_report(record, instrument, account_id, ts_init)
         except ValueError as e:
-            misfit(f"Position {record.venue_position_id} on {instrument.id} is not reported: {e}")
+            unfit.setdefault(record.venue_position_id, []).append(f"position: {e}")
+            unfit_on[record.venue_position_id] = instrument.id
+        else:
+            positions.append((record.venue_position_id, report))
+    for position_id, reasons in unfit.items():
+        misfit(
+            f"Position {position_id} on {unfit_on[position_id]} is not reported, nor any of its "
+            f"orders: {'; '.join(reasons)}",
+        )
+    # A position's records go together: the ones that fit would rebuild it at another size.
+    gone.update(record.client_order_id for record, *_ in built if record.venue_position_id in unfit)
+    order_reports: list[OrderStatusReport] = []
+    fill_reports: list[FillReport] = []
+    for record, instrument, report, fills in built:
+        if record.venue_position_id in unfit:
+            continue
+        linked = tuple(i for i in record.linked_order_ids if i not in gone)
+        parent = None if record.parent_order_id in gone else record.parent_order_id
+        if linked != record.linked_order_ids or parent != record.parent_order_id:
+            unlinked = replace(record, linked_order_ids=linked, parent_order_id=parent)
+            report, fills = reported_order(unlinked, instrument, account_id, currency, ts_init)
+        order_reports.append(report)
+        fill_reports += fills
+    position_reports = [report for position_id, report in positions if position_id not in unfit]
     status.add_order_reports(order_reports)
     status.add_fill_reports(fill_reports)
     status.add_position_reports(position_reports)

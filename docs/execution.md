@@ -461,9 +461,14 @@ closing order reported to Nautilus from the broker's data is reduce-only and car
 id**, whoever placed it; reported with Nautilus's default it would look like an opening order.
 
 Anything on an instrument that is not loaded is left out of the mass status and counted in
-[the unloaded exposure](#6-account-activity). An order or a position whose quantity or price
-does not fit its instrument, such as a volume finer than a step the broker has since raised, is
-left out with an ERROR naming it; the rest of the mass status is still built.
+[the unloaded exposure](#6-account-activity). A record whose quantity or price does not fit its
+instrument, such as a volume finer than a step the broker has since raised, is left out with an
+ERROR naming it, and with it every record of its position: its orders, their fills and its
+report. The kept records alone would rebuild the position at another size. The rest of the mass
+status is still built. The start can still fail this way: for an open position Nautilus holds on
+an instrument the mass status reports no position for, it then asks for that instrument's
+position reports, which [raise](#reports-outside-a-mass-status) on the same record. So a
+persistent cache holding the left-out position fails the start, and a human must look.
 
 Reports are ordered chronologically, with an entry's report before any report whose fill closes
 that position, because Nautilus applies a fill for a position it does not hold yet by opening
@@ -588,9 +593,14 @@ inflight_check_threshold_ms × inflight_check_retries  ≥  connect_timeout_secs
 For the default `connect_timeout_secs` of 60 seconds, `5000 × 18` (90 seconds) is a sensible
 choice. The engine's default of 5 retries gives 25 seconds, which a reconnect can outlast.
 
-Keep Nautilus's `open_check_open_only=True`. With `False`, Nautilus marks every `ACCEPTED` leg
-`REJECTED` after an outage of `open_check_missing_retries` open-check cycles (5 by default),
+Keep Nautilus's `open_check_open_only=True`. With `False`, after an outage longer than
+`open_check_missing_retries` open-check cycles (5 by default), Nautilus rejects every open order
+it holds, `ACCEPTED` or `SUBMITTED`, legs included, and cancels a `PARTIALLY_FILLED` one,
 whatever the adapter answers.
+
+During an outage Nautilus logs `Failed to generate order status reports` at ERROR once per
+open-check cycle, until the reconnect is complete. An application that alerts on ERROR can filter
+or rate-limit that line.
 
 The budget need not cover how long a command takes, only how long the adapter cannot answer: while
 the connection is down, and while a leg's entry is still in flight (above). Otherwise a query about

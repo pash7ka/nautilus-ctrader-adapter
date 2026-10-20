@@ -529,29 +529,56 @@ def test_a_priceless_leg_with_fills_is_priced_at_their_average() -> None:
     ]
 
 
-def test_a_record_that_does_not_fit_is_left_out_unlinked_or_refused() -> None:
+def test_a_misfit_leaves_out_its_whole_position_and_unlinks_the_rest() -> None:
     # Finer than the instrument's hundredths, as after the broker raised the step.
     stop = leg(units=Decimal("0.995"))
+    other = entry(
+        venue_order_id="6000002",
+        client_order_id=None,
+        venue_position_id="5000002",
+        linked_order_ids=(),
+        contingency=None,
+    )
+    # Orders on no position, as a pending order and one naming it.
+    pending = entry(
+        venue_order_id="6000003",
+        client_order_id="O-P",
+        venue_position_id=None,
+        status=ReportStatus.ACCEPTED,
+        units=Decimal("0.995"),
+        filled_units=Decimal(0),
+        avg_price=None,
+        fills=(),
+        linked_order_ids=("O-C",),
+    )
+    child = leg(
+        venue_order_id="6000004",
+        client_order_id="O-C",
+        venue_position_id=None,
+        parent_order_id="O-P",
+        linked_order_ids=("O-P",),
+    )
     positions = (
         ReportedPosition("5000001", 275, "BUY", Decimal("1.00"), Decimal("85287.21"), 5),
-        ReportedPosition("5000002", 275, "BUY", Decimal("0.005"), Decimal("85287.21"), 5),
+        ReportedPosition("5000002", 275, "BUY", Decimal("1.00"), Decimal("85287.21"), 5),
     )
-    records = Reconciliation((entry(), stop, target_leg()), positions, ())
+    records = Reconciliation((entry(), stop, target_leg(), other, pending, child), positions, ())
     misfits: list[str] = []
 
     status, left_out = build(records, misfit=misfits.append)
 
     assert left_out == ()
     kept = status.order_reports
-    assert list(kept) == [VenueOrderId("6000001"), VenueOrderId("6000001-TP")]
-    assert kept[VenueOrderId("6000001")].linked_order_ids == [ClientOrderId(TARGET)]
-    assert kept[VenueOrderId("6000001-TP")].linked_order_ids is None
+    assert list(kept) == [VenueOrderId("6000002"), VenueOrderId("6000004")]
+    assert kept[VenueOrderId("6000004")].parent_order_id is None
+    assert kept[VenueOrderId("6000004")].linked_order_ids is None
     (position,) = status.position_reports[US100.id]
-    assert position.venue_position_id == PositionId("5000001")
-    order_line, position_line = misfits
-    assert STOP in order_line
-    assert "5000002" in position_line
-    assert "does not fit" in order_line
+    assert position.venue_position_id == PositionId("5000002")
+    pending_line, position_line = misfits
+    assert "O-P" in pending_line
+    assert "5000001" in position_line
+    assert STOP in position_line
+    assert "does not fit" in position_line
     with pytest.raises(ValueError, match="does not fit"):
         build(records)
 
