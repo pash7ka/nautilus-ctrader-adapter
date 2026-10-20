@@ -284,11 +284,10 @@ adapter does not judge it.
   id, `EXTERNAL` or the claiming strategy's, not the id of the strategy that sent the command.
 - **A command the adapter fails to carry out**, on input it did not foresee, is refused all the
   same when it fails before its request is sent: `OrderCancelRejected` or `OrderModifyRejected`
-  naming the error's type, with an ERROR log line. The exception is a request that fails to
-  encode: it ends as unknown, with a WARNING, as an unanswered one does. Once the request is
-  sent, the broker may have acted on it, so a failure while its answer is handled is never a
-  refusal: an ERROR line names
-  the command and the error's type, the order stays pending, and Nautilus's in-flight check asks
+  naming the error's type, with an ERROR log line. A request that fails to encode is refused as
+  well, with "not sent" and the reason. Once the request is sent, the broker may have acted on
+  it, so a failure while its answer is handled is never a refusal: an ERROR line names the
+  command and the error's type, the order stays pending, and Nautilus's in-flight check asks
   about it ([section 5](#5-order-queries-and-in-flight-settings)).
 - A cancel or an amend of a pending order that gets no answer is not sent again: a WARNING says
   so, and Nautilus's in-flight check asks about the order

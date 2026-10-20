@@ -14,6 +14,7 @@ from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderNotSentConnectionError,
     CTraderNotSentError,
+    CTraderNotSentProtocolError,
     CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
@@ -578,6 +579,29 @@ async def test_a_request_waiting_across_a_reconnect_is_never_sent() -> None:
         # A fixed wait is right here: this checks that the request never arrives.
         await asyncio.sleep(0.5)
         assert not any(isinstance(m, oa.ProtoOATraderReq) for m in server.received)
+    finally:
+        await connection.close()
+        await server.stop()
+
+
+async def test_an_encode_failure_is_not_sent() -> None:
+    server = FakeCTraderServer()
+    await server.start()
+    connection = await _connected(server)
+    try:
+        await server.wait_for_connections()
+        # Required fields left unset, so the payload cannot be serialised.
+        unencodable = oa.ProtoOANewOrderReq()
+        with pytest.raises(CTraderNotSentProtocolError) as raised:
+            await connection.request(unencodable)
+        assert isinstance(raised.value, CTraderProtocolError)
+        assert isinstance(raised.value, CTraderNotSentError)
+        with pytest.raises(CTraderNotSentProtocolError):
+            await connection.send(unencodable)
+
+        # A fixed wait is right here: this checks that nothing arrives.
+        await asyncio.sleep(0.2)
+        assert not any(isinstance(m, oa.ProtoOANewOrderReq) for m in server.received)
     finally:
         await connection.close()
         await server.stop()

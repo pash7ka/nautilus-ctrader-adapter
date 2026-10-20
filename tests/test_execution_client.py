@@ -47,11 +47,12 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
 from nautilus_ctrader.activity import CTraderAccountActivity
-from nautilus_ctrader.common import order_record, order_translation
+from nautilus_ctrader.common import codec, order_record, order_translation
 from nautilus_ctrader.common.account import account_client_from_config
 from nautilus_ctrader.common.errors import (
     CTraderAccountError,
     CTraderConnectionError,
+    CTraderProtocolError,
     CTraderRequestError,
 )
 from nautilus_ctrader.common.order_record import LegIds
@@ -1074,6 +1075,26 @@ async def test_an_order_queued_when_the_connection_drops_is_rejected() -> None:
         assert rejection(h, MARKET_ID).startswith("not sent: connection lost")
         await wait_until(lambda: h.account.session.is_ready, timeout_secs=10)
         await sync(h)
+        assert h.received(oa.ProtoOANewOrderReq) == []
+
+
+async def test_an_order_that_cannot_be_encoded_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encode_frame = codec.encode_frame
+
+    def refuse_orders(payload, client_msg_id=None):
+        if isinstance(payload, oa.ProtoOANewOrderReq):
+            raise CTraderProtocolError("cannot encode payloadType=2106: missing required field")
+        return encode_frame(payload, client_msg_id)
+
+    async with harness() as h:
+        monkeypatch.setattr(codec, "encode_frame", refuse_orders)
+        await submit(h, market(h))
+        await wait_until(lambda: status(h, MARKET_ID) == OrderStatus.REJECTED)
+
+        assert rejection(h, MARKET_ID).startswith("not sent: cannot encode")
+        assert h.kinds_of(MARKET_ID) == ["OrderSubmitted", "OrderRejected"]
         assert h.received(oa.ProtoOANewOrderReq) == []
 
 

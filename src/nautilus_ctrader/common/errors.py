@@ -35,6 +35,10 @@ class CTraderNotSentConnectionError(CTraderConnectionError, CTraderNotSentError)
     """The connection was down or lost before the request was written."""
 
 
+class CTraderNotSentProtocolError(CTraderProtocolError, CTraderNotSentError):
+    """The request could not be encoded, so nothing was written."""
+
+
 class CTraderAuthError(CTraderError):
     """Application or account authentication was rejected, or a token was invalidated."""
 

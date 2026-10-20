@@ -237,10 +237,10 @@ fixed numbers; the 5, 50, 3 and 60 s here are the defaults. See the settings tab
   included, fails without being sent.
 - **Connection loss.** Every waiting request fails at once. A new connection starts with empty
   windows and no pause.
-- **Unsent failures.** A request that fails in the queue, or finds the connection down before it
-  is written, raises a `CTraderNotSentError`: this attempt was never written to the socket. (A
-  historical request that was refused earlier was sent then.) Any other connection error or
-  timeout leaves that unknown.
+- **Unsent failures.** A request that fails in the queue, finds the connection down before it
+  is written, or cannot be encoded, raises a `CTraderNotSentError`: this attempt was never
+  written to the socket. (A historical request that was refused earlier was sent then.) Any other
+  connection error or timeout leaves that unknown.
 
 **Not measured:**
 

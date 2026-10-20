@@ -24,6 +24,7 @@ from nautilus_ctrader.common import codec
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderNotSentConnectionError,
+    CTraderNotSentProtocolError,
     CTraderProtocolError,
     CTraderTimeoutError,
 )
@@ -51,6 +52,14 @@ def retrieve_exceptions(tasks: Iterable[asyncio.Task]) -> None:
 def _retrieve_exception(task: asyncio.Task) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _encode(payload: Message, client_msg_id: str | None) -> bytes:
+    """`payload` as a frame; an encode failure happens before any write, so nothing was sent."""
+    try:
+        return codec.encode_frame(payload, client_msg_id)
+    except CTraderProtocolError as e:
+        raise CTraderNotSentProtocolError(str(e)) from e
 
 
 class _CloseHandles(NamedTuple):
@@ -221,7 +230,7 @@ class CTraderConnection:
         future: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
         self._pending[client_msg_id] = future
         try:
-            frame = codec.encode_frame(payload, client_msg_id)
+            frame = _encode(payload, client_msg_id)
             await self._write(payload, client_msg_id, frame, generation)
             return await asyncio.wait_for(future, deadline)
         except TimeoutError as e:
@@ -240,7 +249,7 @@ class CTraderConnection:
         generation = self._generation
 
         async def write() -> None:
-            frame = codec.encode_frame(payload, client_msg_id)
+            frame = _encode(payload, client_msg_id)
             await self._write(payload, client_msg_id, frame, generation)
 
         if self._scheduler is None:
