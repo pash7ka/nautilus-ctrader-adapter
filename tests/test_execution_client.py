@@ -3556,13 +3556,13 @@ def broker_holds(
 async def corrections_lost(
     h, held: HeldReplies, monkeypatch: pytest.MonkeyPatch, command: Callable
 ) -> list:
-    """Every correction of the bracket, carrying `command`, gets no answer.
+    """Every attempt of the bracket's three correction rounds, carrying `command`, gets no answer.
 
-    Returns the amend attempts left unused, of four rounds' worth.
+    Returns the attempts not yet used; later amends reach the venue.
     """
     sending = await in_flight(h, held)
     await command()
-    steps = ["lost"] * (_AMEND_ATTEMPTS * 4)
+    steps = ["lost"] * (_AMEND_ATTEMPTS * 3)
     lose_amends(h, monkeypatch, steps)
     await held.release()
     await sending
@@ -3581,8 +3581,23 @@ def entry_held() -> tuple[ExecutionVenue, HeldReplies]:
 LOSING = exec_config(protective_order_timeout_secs=0.05)
 
 
-def refused_for_no_answer(h) -> bool:
-    return any("did not answer the correction" in line for line in h.logger.warnings())
+def failing_reads(h, monkeypatch: pytest.MonkeyPatch, failures: int) -> list:
+    """The first `failures` reads of the broker fail; returns one entry per read."""
+    read_broker = h.client._read_broker
+    reads: list = []
+
+    async def read(**kwargs):
+        reads.append(kwargs)
+        if len(reads) <= failures:
+            raise CTraderConnectionError("dropped for the test")
+        return await read_broker(**kwargs)
+
+    monkeypatch.setattr(h.client, "_read_broker", read)
+    return reads
+
+
+def rebuild_failures(h) -> list[str]:
+    return [line for line in h.logger.warnings() if "dropped for the test" in line]
 
 
 async def test_a_carried_cancel_is_settled_from_the_broker_after_lost_answers(
@@ -3599,10 +3614,12 @@ async def test_a_carried_cancel_is_settled_from_the_broker_after_lost_answers(
         await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
         await sync(h)
 
-        assert len(steps) == _AMEND_ATTEMPTS
+        # Three rounds, and nothing sent after them.
+        assert steps == []
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
         assert refusals(h, h.cache.order(ClientOrderId(TARGET))) == []
         assert status(h, STOP) == OrderStatus.ACCEPTED
-        assert not refused_for_no_answer(h)
 
 
 async def test_a_carried_modify_is_settled_from_the_broker_after_lost_answers(
@@ -3622,16 +3639,19 @@ async def test_a_carried_modify_is_settled_from_the_broker_after_lost_answers(
         await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
         await sync(h)
 
-        assert len(steps) == _AMEND_ATTEMPTS
+        assert steps == []
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
         assert last_kind(h, STOP) == "OrderUpdated"
         assert refusals(h, stop) == []
-        assert not refused_for_no_answer(h)
+        # The take-profit stands where Nautilus holds it: nothing to say.
+        assert h.kinds_of(TARGET) == ["OrderSubmitted", "OrderAccepted"]
 
 
-async def test_a_leg_the_broker_kept_is_reported_as_held_after_lost_answers(
+async def test_a_carried_modify_the_broker_does_not_hold_is_sent_again_after_lost_answers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     execution_venue, held = entry_held()
+    amends = echo_amends(execution_venue)
     async with harness(execution_venue=execution_venue, config=LOSING) as h:
         broker_holds(execution_venue, stop=85197.2, target=85387.22)
         await corrections_lost(
@@ -3642,14 +3662,72 @@ async def test_a_leg_the_broker_kept_is_reported_as_held_after_lost_answers(
         )
         stop = h.cache.order(ClientOrderId(STOP))
         await wait_until(lambda: len(h.client._brackets) == 0)
-        await wait_until(lambda: last_kind(h, STOP) == "OrderUpdated")
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
         await sync(h)
 
-        (refusal,) = refusals(h, stop)
-        assert isinstance(refusal, OrderModifyRejected)
-        assert "85197.2" in refusal.reason
-        assert stop.trigger_price == Price.from_str("85197.20")
-        assert not refused_for_no_answer(h)
+        (amend,) = amends
+        assert amend.stopLoss == 85150.0
+        assert amend.takeProfit == 85387.22
+        assert refusals(h, stop) == []
+
+
+async def test_a_cancel_after_the_last_lost_round_is_sent_once_the_rounds_run_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        broker_holds(execution_venue, stop=85197.2, target=85387.22)
+        steps = ["lost"] * (_AMEND_ATTEMPTS * 3)
+        lose_amends(h, monkeypatch, steps)
+        hold = h.client._hold_unanswered
+        holds: list = []
+
+        def holding(bracket, sent) -> None:
+            hold(bracket, sent)
+            holds.append(sent)
+            if len(holds) == 3:
+                # Inside the hold of the third round.
+                asyncio.get_running_loop().create_task(h.client._cancel_order(cancel(TARGET)))
+
+        monkeypatch.setattr(h.client, "_hold_unanswered", holding)
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h, stop_price="85190.00", target_price="85400.00"))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        await sync(h)
+
+        assert steps == []
+        (amend,) = amends
+        assert amend.stopLoss == 85197.2
+        assert not amend.HasField("takeProfit")
+        assert refusals(h, h.cache.order(ClientOrderId(TARGET))) == []
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
+        assert len(h.client._brackets) == 0
+
+
+async def test_a_level_removed_during_the_settling_rebuild_cancels_its_leg_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        broker_holds(execution_venue, stop=85197.2, target=85387.22)
+        read_broker = h.client._read_broker
+
+        async def answered_late(**kwargs):
+            state = await read_broker(**kwargs)
+            # The lost amend's answer, held behind the read that still shows the take-profit.
+            await h.server.push(protective(85197.2, None, utc=AMEND_FROM))
+            await wait_until(lambda: bool(h.client._buffer))
+            return state
+
+        monkeypatch.setattr(h.client, "_read_broker", answered_late)
+        await corrections_lost(h, held, monkeypatch, lambda: h.client._cancel_order(cancel(TARGET)))
+        await wait_until(lambda: len(h.client._brackets) == 0)
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        await sync(h)
+
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
 
 
 async def test_the_legs_of_a_position_gone_at_the_rebuild_are_cancelled_after_lost_answers(
@@ -3673,44 +3751,67 @@ async def test_the_legs_of_a_position_gone_at_the_rebuild_are_cancelled_after_lo
         )
         await sync(h)
 
-        (refusal,) = refusals(h, h.cache.order(ClientOrderId(STOP)))
-        assert refusal.reason == "the broker holds no such level"
-        assert not refused_for_no_answer(h)
+        assert h.kinds_of(STOP).count("OrderCanceled") == 1
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
+        assert refusals(h, h.cache.order(ClientOrderId(STOP))) == []
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
 
 
-async def test_a_failed_rebuild_after_lost_answers_leaves_the_bracket_for_the_next_settle(
+async def test_a_failed_settling_rebuild_is_retried_after_a_back_off_not_per_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     execution_venue, held = entry_held()
-    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+    config = exec_config(protective_order_timeout_secs=0.2)
+    async with harness(execution_venue=execution_venue, config=config) as h:
         broker_holds(execution_venue, stop=85150.0, target=85387.22)
-        read_broker = h.client._read_broker
-
-        async def failing(**_kwargs):
-            raise CTraderConnectionError("dropped for the test")
-
-        monkeypatch.setattr(h.client, "_read_broker", failing)
+        reads = failing_reads(h, monkeypatch, failures=2)
         await corrections_lost(
             h,
             held,
             monkeypatch,
             lambda: h.client._modify_order(modify(STOP, trigger_price="85150.00")),
         )
-        await wait_until(
-            lambda: any("dropped for the test" in line for line in h.logger.warnings()),
-        )
-        await sync(h)
+        await wait_until(lambda: len(reads) == 1, timeout_secs=5)
         stop = h.cache.order(ClientOrderId(STOP))
+
+        # What an execution event or a command does.
+        h.client._settle_brackets()
+        h.client._settle_brackets()
+        await asyncio.sleep(0.02)
+        assert len(reads) == 1
         assert len(h.client._brackets) == 1
         assert refusals(h, stop) == []
-        assert stop.trigger_price != Price.from_str("85150.00")
 
-        monkeypatch.setattr(h.client, "_read_broker", read_broker)
-        h.client._settle_brackets()
-        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"), timeout_secs=5)
 
+        assert len(reads) == 3
+        # A WARNING for the first failure only.
+        assert len(rebuild_failures(h)) == 1
         assert len(h.client._brackets) == 0
         assert refusals(h, stop) == []
+
+
+async def test_a_failed_rebuild_leaves_a_held_correction_and_its_lost_amend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held, received = refusing_amends(first_only=False)
+    async with harness(execution_venue=execution_venue, config=HOLDING) as h:
+        await lost_correction(h, held, monkeypatch)
+        failing_reads(h, monkeypatch, failures=1)
+
+        with pytest.raises(CTraderConnectionError):
+            await h.client._load()
+        await sync(h)
+
+        # Still held: no new round.
+        assert len(received) == 1
+        assert len(h.client._brackets) == 1
+        # The lost amend's answer, late, is still the node's own.
+        await push(h, protective(85150.0, 85387.22, utc=AMEND_FROM))
+        stop = h.cache.order(ClientOrderId(STOP))
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+        await sync(h)
+        assert h.activity == []
 
 
 @pytest.mark.parametrize("trader_moved", [False, True], ids=["late-answer", "trader-change"])

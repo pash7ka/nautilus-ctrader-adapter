@@ -6,6 +6,7 @@ trader's. Nothing here changes what the model says the broker holds.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -114,6 +115,8 @@ class PendingBracket:
       counts the amends sent.
     - `unanswered`: the levels of the last amend, whose answer was lost; they are not sent again.
     - `answer_lost`: the last amend's answer was lost, held or not.
+    - `rebuild_failures`, `retry`: the failed rebuilds that were to settle the bracket, and the
+      timer of the next one.
     """
 
     entry_id: str
@@ -125,6 +128,13 @@ class PendingBracket:
     rounds: int = 0
     unanswered: dict[Level, Decimal] | None = None
     answer_lost: bool = False
+    rebuild_failures: int = 0
+    retry: asyncio.TimerHandle | None = None
+
+    def stop_retry(self) -> None:
+        if self.retry is not None:
+            self.retry.cancel()
+            self.retry = None
 
 
 class PendingBrackets:
@@ -137,7 +147,9 @@ class PendingBrackets:
         self._by_entry[bracket.entry_id] = bracket
 
     def remove(self, entry_id: str) -> None:
-        self._by_entry.pop(entry_id, None)
+        bracket = self._by_entry.pop(entry_id, None)
+        if bracket is not None:
+            bracket.stop_retry()
 
     def by_entry(self, entry_id: str) -> PendingBracket | None:
         return self._by_entry.get(entry_id)
