@@ -46,15 +46,17 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
 from nautilus_ctrader.common import order_record
+from nautilus_ctrader.common.errors import CTraderRequestError
 from nautilus_ctrader.common.execution_reports import mass_status
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.reconciliation import PositionHistory, Reconciliation, reconcile
+from nautilus_ctrader.common.session import SessionState
 from nautilus_ctrader.common.venue_records import Fill, Level, ReportedOrder, money_of
 from nautilus_ctrader.constants import CTRADER_VENUE, UNLOADED_EXPOSURE_KEY
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.account_venue import ACCOUNT_ID, HeldReplies
+from tests.account_venue import ACCOUNT_ID, HeldReplies, _symbol_by_id
 from tests.execution_replay import (
     FIRST,
     NoOperations,
@@ -921,6 +923,50 @@ async def test_position_reports_are_per_instrument_and_only_what_stands() -> Non
         assert len(await h.client.generate_position_status_reports(positions_command(None))) == 1
 
 
+def orders_command() -> GenerateOrderStatusReports:
+    return GenerateOrderStatusReports(
+        instrument_id=None, start=None, end=None, open_only=True, command_id=UUID4(), ts_init=0
+    )
+
+
+@pytest.mark.parametrize(
+    "generate",
+    [
+        lambda client: client.generate_order_status_reports(orders_command()),
+        lambda client: client.generate_fill_reports(fills_command()),
+        lambda client: client.generate_position_status_reports(positions_command(None)),
+    ],
+    ids=["orders", "fills", "positions"],
+)
+async def test_a_failed_read_raises_instead_of_reporting_nothing_open(generate) -> None:
+    venue = serving()
+    async with harness(execution_venue=venue) as h:
+        venue.fail = {om.PROTO_OA_RECONCILE_REQ}
+
+        with pytest.raises(CTraderRequestError):
+            await generate(h.client)
+
+
+async def test_nautilus_checks_leave_the_cache_unchanged_after_a_failed_read() -> None:
+    cache = await legs_accepted()
+    venue = serving()
+    async with harness(execution_venue=venue, cache=cache) as h:
+
+        def held() -> list[str]:
+            return [
+                *(str(p) for p in h.cache.positions()),
+                *(f"{o.client_order_id} {o.status_string()}" for o in h.cache.orders()),
+            ]
+
+        before = held()
+        venue.fail = {om.PROTO_OA_RECONCILE_REQ}
+
+        await h.engine._check_orders_consistency()
+        await h.engine._check_positions_consistency()
+
+        assert held() == before
+
+
 # -- Reconnect ---------------------------------------------------------------------------------
 
 TP_BACK_AT = 256.5  # FIRST open, its take-profit set again by hand
@@ -1103,6 +1149,71 @@ async def test_a_failed_reconnect_pass_releases_the_buffer() -> None:
         assert h.client._buffer is None
         assert h.client._model_standing.is_set()
         assert h.mass_statuses == []
+
+
+def stepped_by_one_unit(venue: ExecutionVenue) -> ExecutionVenue:
+    """`venue` serving its instruments with a step of one unit, as after the broker raised it."""
+
+    def coarse(request: oa.ProtoOASymbolByIdReq) -> oa.ProtoOASymbolByIdRes:
+        reply = _symbol_by_id(request)
+        for symbol in reply.symbol:
+            symbol.stepVolume = 100
+            for field in ("minVolume", "maxVolume", "lotSize"):
+                if symbol.HasField(field):
+                    setattr(symbol, field, max(100, getattr(symbol, field) // 100 * 100))
+        return reply
+
+    venue.server.on(om.PROTO_OA_SYMBOL_BY_ID_REQ, coarse)
+    return venue
+
+
+def off_step_position(venue: ExecutionVenue, n: int, *, ts: int) -> None:
+    """A foreign position of 1.5 units, its entry and its deal alike: finer than a one-unit step."""
+    foreign_position(venue, n, ts=ts)
+    position_id = 5_100_000 + n
+    venue.snapshot.position[-1].tradeData.volume = 150
+    venue.position_orders[position_id][0].tradeData.volume = 150
+    for deal in venue.position_deals[position_id]:
+        deal.volume = deal.filledVolume = 150
+
+
+async def test_an_off_step_record_is_left_out_of_the_mass_status() -> None:
+    now = int(time.time() * 1000)
+    venue = stepped_by_one_unit(ExecutionVenue())
+    foreign_position(venue, 1, ts=now - 20_000)
+    off_step_position(venue, 2, ts=now - 10_000)
+    async with harness(execution_venue=venue) as h:
+        built = await h.client.generate_mass_status()
+
+        assert built is not None
+        (report,) = built.position_reports[US100_ID]
+        assert report.venue_position_id == PositionId("5100001")
+        assert list(built.order_reports) == [VenueOrderId("6100001")]
+        assert list(built.fill_reports) == [VenueOrderId("6100001")]
+        # One per record left out: the entry, with its fill, and the position.
+        order_error, position_error = h.logger.errors()
+        assert "6100002" in order_error
+        assert "5100002" in position_error
+        assert all("does not fit" in line for line in (order_error, position_error))
+
+
+async def test_an_off_step_record_does_not_fail_the_reconnect_rebuild() -> None:
+    now = int(time.time() * 1000)
+    venue = stepped_by_one_unit(ExecutionVenue())
+    foreign_position(venue, 1, ts=now - 20_000)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        off_step_position(venue, 2, ts=now - 10_000)
+
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        await wait_until(lambda: h.account.session.state is SessionState.READY)
+
+        (built,) = h.mass_statuses
+        (report,) = built.position_reports[US100_ID]
+        assert report.venue_position_id == PositionId("5100001")
+        assert h.account.session.failed_restores == frozenset()
+        assert not any("Restore" in line for line in h.logger.errors())
 
 
 # -- The node's close around a rebuild -------------------------------------------------------

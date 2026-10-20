@@ -461,9 +461,13 @@ closing order reported to Nautilus from the broker's data is reduce-only and car
 id**, whoever placed it; reported with Nautilus's default it would look like an opening order.
 
 Anything on an instrument that is not loaded is left out of the mass status and counted in
-[the unloaded exposure](#6-account-activity). Reports are ordered chronologically, with an
-entry's report before any report whose fill closes that position, because Nautilus applies a fill
-for a position it does not hold yet by opening that position.
+[the unloaded exposure](#6-account-activity). An order or a position whose quantity or price
+does not fit its instrument, such as a volume finer than a step the broker has since raised, is
+left out with an ERROR naming it; the rest of the mass status is still built.
+
+Reports are ordered chronologically, with an entry's report before any report whose fill closes
+that position, because Nautilus applies a fill for a position it does not hold yet by opening
+that position.
 
 Two consequences after a restart:
 
@@ -524,6 +528,11 @@ The three report generators answer from the same read, without rebuilding the mo
 Unlike a mass status's, these order and fill reports name an external order that Nautilus holds
 by the client order id it gave it, as its check of its open orders expects.
 
+**When the broker cannot be read, they raise the error instead of returning an empty list**, and
+so does a record that does not fit its instrument. Nautilus's checks skip a venue whose reports
+failed; an empty list would tell its position check that nothing is open, and it would close
+what it holds with a fill of its own.
+
 ## 5. Order queries and in-flight settings
 
 A `QueryOrder`, and Nautilus's own check of an order left in flight, are answered from the
@@ -578,6 +587,10 @@ inflight_check_threshold_ms × inflight_check_retries  ≥  connect_timeout_secs
 
 For the default `connect_timeout_secs` of 60 seconds, `5000 × 18` (90 seconds) is a sensible
 choice. The engine's default of 5 retries gives 25 seconds, which a reconnect can outlast.
+
+Keep Nautilus's `open_check_open_only=True`. With `False`, Nautilus marks every `ACCEPTED` leg
+`REJECTED` after an outage of `open_check_missing_retries` open-check cycles (5 by default),
+whatever the adapter answers.
 
 The budget need not cover how long a command takes, only how long the adapter cannot answer: while
 the connection is down, and while a leg's entry is still in flight (above). Otherwise a query about

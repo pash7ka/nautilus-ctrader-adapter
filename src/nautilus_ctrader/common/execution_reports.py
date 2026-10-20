@@ -364,6 +364,11 @@ def position_report(
     )
 
 
+def refuse(text: str) -> None:
+    """`mass_status()`'s default for a record that does not fit: raises `ValueError(text)`."""
+    raise ValueError(text)
+
+
 def mass_status(
     client_id: ClientId,
     account_id: AccountId,
@@ -375,6 +380,7 @@ def mass_status(
     *,
     held_price: Callable[[str], Decimal | None],
     known_id: Callable[[str], str | None] = lambda _venue_order_id: None,
+    misfit: Callable[[str], None] = refuse,
 ) -> tuple[ExecutionMassStatus, tuple[ReportedOrder, ...]]:
     """The reconciliation records as one mass status, orders in record order.
 
@@ -387,6 +393,9 @@ def mass_status(
       The report itself names no client order id for such an order: Nautilus finds it by its
       venue order id, and drops a report naming a cached order whose status it already holds,
       a changed price or quantity with it.
+    - `misfit`: called with a line naming each order or position whose price or quantity does
+      not fit its instrument, such as a volume finer than the step; the record is then left
+      out. By default such a record raises `ValueError`.
 
     A leg whose level the broker no longer lists has no price of its own. It is reported at
     the held price: no price change was seen, and Nautilus would otherwise emit an update
@@ -409,20 +418,34 @@ def mass_status(
         else:
             kept.append((priced, instrument))
     gone = {record.client_order_id for record in left_out}
+    built: list[tuple[ReportedOrder, Instrument, OrderStatusReport, list[FillReport]]] = []
+    for record, instrument in kept:
+        try:
+            report, fills = reported_order(record, instrument, account_id, currency, ts_init)
+        except ValueError as e:
+            name = record.client_order_id or record.venue_order_id
+            misfit(f"Order {name} on {instrument.id} is not reported: {e}")
+            gone.add(record.client_order_id)
+        else:
+            built.append((record, instrument, report, fills))
     order_reports: list[OrderStatusReport] = []
     fill_reports: list[FillReport] = []
-    for record, instrument in kept:
+    for record, instrument, report, fills in built:
         if gone.intersection(record.linked_order_ids):
             linked = tuple(i for i in record.linked_order_ids if i not in gone)
-            record = replace(record, linked_order_ids=linked)
-        report, fills = reported_order(record, instrument, account_id, currency, ts_init)
+            unlinked = replace(record, linked_order_ids=linked)
+            report, fills = reported_order(unlinked, instrument, account_id, currency, ts_init)
         order_reports.append(report)
         fill_reports += fills
-    position_reports = [
-        position_report(record, instrument, account_id, ts_init)
-        for record in reconciliation.positions
-        if (instrument := instrument_for(record.symbol_id)) is not None
-    ]
+    position_reports: list[PositionStatusReport] = []
+    for record in reconciliation.positions:
+        instrument = instrument_for(record.symbol_id)
+        if instrument is None:
+            continue
+        try:
+            position_reports.append(position_report(record, instrument, account_id, ts_init))
+        except ValueError as e:
+            misfit(f"Position {record.venue_position_id} on {instrument.id} is not reported: {e}")
     status.add_order_reports(order_reports)
     status.add_fill_reports(fill_reports)
     status.add_position_reports(position_reports)

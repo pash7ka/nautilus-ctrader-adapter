@@ -697,7 +697,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         which it announces on `reports.execution.CTRADER`, or for `connect_timeout_secs` at most:
         applied earlier, an event could address an order Nautilus does not know yet.
 
-        Returns `None`, with a WARNING, when a request of the read fails.
+        Returns `None`, with a WARNING, when a request of the read fails. A record that does not
+        fit its instrument is left out with an ERROR.
         """
         self._lookback_mins = lookback_mins
         margins = dict(self._margins)
@@ -724,7 +725,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._hold_buffer()
         state = await self._read_broker(since_ms=since_ms)
         self._stand(state)
-        status = self._mass_status(state)
+        # One record left out beats a reconciliation that fails every time.
+        status = self._mass_status(state, misfit=self._log.error)
         self._write_exposure()
         fills = sum(len(found) for found in status.fill_reports.values())
         positions = sum(len(found) for found in status.position_reports.values())
@@ -987,11 +989,12 @@ class CTraderExecutionClient(LiveExecutionClient):
         A filled order reaches Nautilus only inside a mass status: without its fills Nautilus
         would infer one with no commission. An external order Nautilus holds is reported under
         the client order id it gave it.
+
+        Raises the `CTraderError` of a failed read, and `ValueError` for a record that does not
+        fit its instrument.
         """
         since_ms = None if command.open_only else self._command_since_ms(command.start)
         status = await self._reports(since_ms)
-        if status is None:
-            return []
         return [
             self._named(report)
             for report in status.order_reports.values()
@@ -1007,11 +1010,12 @@ class CTraderExecutionClient(LiveExecutionClient):
         ]
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
-        """The fills of the window, from `command.start` or the reconciliation lookback."""
+        """The fills of the window, from `command.start` or the reconciliation lookback.
+
+        Raises as `generate_order_status_reports()` does.
+        """
         since_ms = self._command_since_ms(command.start)
         status = await self._reports(since_ms)
-        if status is None:
-            return []
         until = None if command.end is None else reports.nanos(_ms(command.end))
         return [
             self._named(fill)
@@ -1027,10 +1031,11 @@ class CTraderExecutionClient(LiveExecutionClient):
         self,
         command: GeneratePositionStatusReports,
     ) -> list[PositionStatusReport]:
-        """The open positions."""
+        """The open positions.
+
+        Raises as `generate_order_status_reports()` does.
+        """
         status = await self._reports(None)
-        if status is None:
-            return []
         return [
             report
             for instrument_id, found in status.position_reports.items()
@@ -1038,16 +1043,21 @@ class CTraderExecutionClient(LiveExecutionClient):
             for report in found
         ]
 
-    async def _reports(self, since_ms: int | None) -> ExecutionMassStatus | None:
-        """One read of the broker as a mass status, the venue model and the buffer untouched."""
-        try:
-            state = await self._read_broker(since_ms=since_ms)
-        except CTraderError as e:
-            self._log.warning(f"Reports not generated: {e}")
-            return None
+    async def _reports(self, since_ms: int | None) -> ExecutionMassStatus:
+        """One read of the broker as a mass status, the venue model and the buffer untouched.
+
+        A failed read raises rather than answering "nothing open": Nautilus's periodic position
+        check would close what it holds open with a fill of its own. A record that does not fit
+        raises too, for the same reason.
+        """
+        state = await self._read_broker(since_ms=since_ms)
         return self._mass_status(state)
 
-    def _mass_status(self, state: BrokerState) -> ExecutionMassStatus:
+    def _mass_status(
+        self,
+        state: BrokerState,
+        misfit: Callable[[str], None] = reports.refuse,
+    ) -> ExecutionMassStatus:
         found = reconcile(
             state.snapshot,
             state.histories,
@@ -1069,6 +1079,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._clock.timestamp_ns(),
             held_price=self._held_price,
             known_id=self._known_id,
+            misfit=misfit,
         )
         for record in left_out:
             # Normal after a restart without a persistent cache.

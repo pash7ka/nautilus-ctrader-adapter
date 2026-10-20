@@ -424,7 +424,7 @@ def test_position_report_carries_side_quantity_and_id() -> None:
     assert report.ts_init == 6
 
 
-def build(reconciliation: Reconciliation, held=lambda client_order_id: None):
+def build(reconciliation: Reconciliation, held=lambda client_order_id: None, **options):
     return reports.mass_status(
         ClientId("CTRADER"),
         ACCOUNT,
@@ -434,6 +434,7 @@ def build(reconciliation: Reconciliation, held=lambda client_order_id: None):
         USD,
         ts_init=1,
         held_price=held,
+        **options,
     )
 
 
@@ -526,6 +527,33 @@ def test_a_priceless_leg_with_fills_is_priced_at_their_average() -> None:
         TradeId("7000010"),
         TradeId("7000011"),
     ]
+
+
+def test_a_record_that_does_not_fit_is_left_out_unlinked_or_refused() -> None:
+    # Finer than the instrument's hundredths, as after the broker raised the step.
+    stop = leg(units=Decimal("0.995"))
+    positions = (
+        ReportedPosition("5000001", 275, "BUY", Decimal("1.00"), Decimal("85287.21"), 5),
+        ReportedPosition("5000002", 275, "BUY", Decimal("0.005"), Decimal("85287.21"), 5),
+    )
+    records = Reconciliation((entry(), stop, target_leg()), positions, ())
+    misfits: list[str] = []
+
+    status, left_out = build(records, misfit=misfits.append)
+
+    assert left_out == ()
+    kept = status.order_reports
+    assert list(kept) == [VenueOrderId("6000001"), VenueOrderId("6000001-TP")]
+    assert kept[VenueOrderId("6000001")].linked_order_ids == [ClientOrderId(TARGET)]
+    assert kept[VenueOrderId("6000001-TP")].linked_order_ids is None
+    (position,) = status.position_reports[US100.id]
+    assert position.venue_position_id == PositionId("5000001")
+    order_line, position_line = misfits
+    assert STOP in order_line
+    assert "5000002" in position_line
+    assert "does not fit" in order_line
+    with pytest.raises(ValueError, match="does not fit"):
+        build(records)
 
 
 def test_exposure_json_is_sorted_and_plain() -> None:
