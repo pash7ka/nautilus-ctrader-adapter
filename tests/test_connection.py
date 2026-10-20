@@ -595,7 +595,7 @@ class _HeldScheduler:
         await self.release.wait()
         return await send()
 
-    def fail_all(self, error: Exception) -> None:
+    def fail_all(self, error: CTraderNotSentConnectionError) -> None:
         pass
 
     def reset(self) -> None:

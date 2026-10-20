@@ -26,7 +26,11 @@ from typing import NoReturn
 from google.protobuf.message import Message
 from nautilus_trader.common.component import Logger
 
-from nautilus_ctrader.common.errors import CTraderQueueTimeoutError, CTraderRequestError
+from nautilus_ctrader.common.errors import (
+    CTraderNotSentConnectionError,
+    CTraderQueueTimeoutError,
+    CTraderRequestError,
+)
 from nautilus_ctrader.constants import (
     GROUP_HISTORICAL,
     GROUP_OTHER,
@@ -121,7 +125,7 @@ class RequestScheduler:
         self._clock = clock or (lambda: asyncio.get_running_loop().time())
         self._sleep = sleep or asyncio.sleep
         self._sequence = itertools.count()
-        self._failed: Exception | None = None
+        self._failed: CTraderNotSentConnectionError | None = None
         self._groups = {
             GROUP_HISTORICAL: _Group(GROUP_HISTORICAL, pacing.historical_requests_per_window),
             GROUP_OTHER: _Group(GROUP_OTHER, pacing.requests_per_window),
@@ -180,10 +184,11 @@ class RequestScheduler:
                 if not retrying:
                     raise
 
-    def fail_all(self, error: Exception) -> None:
+    def fail_all(self, error: CTraderNotSentConnectionError) -> None:
         """Fail every waiting request with `error`, and every later one until `reset()`.
 
-        Each request gets its own instance of `error`'s type, built from `error.args`.
+        Each request gets its own instance of `error`'s type, built from `error.args`, which is
+        exact only for this error type.
         """
         self._failed = error
         for state in self._groups.values():
@@ -193,7 +198,7 @@ class RequestScheduler:
                     entry.future.set_exception(self._failure())
             state.heap.clear()
 
-    def _failure(self) -> Exception:
+    def _failure(self) -> CTraderNotSentConnectionError:
         """A fresh copy of the `fail_all()` error: a shared instance would gather tracebacks."""
         assert self._failed is not None
         return type(self._failed)(*self._failed.args)

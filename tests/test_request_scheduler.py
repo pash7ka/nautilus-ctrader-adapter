@@ -18,6 +18,7 @@ import pytest
 
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
+    CTraderNotSentConnectionError,
     CTraderQueueTimeoutError,
     CTraderRequestError,
     CTraderTimeoutError,
@@ -501,7 +502,7 @@ async def test_fail_all_fails_every_waiter() -> None:
     clock = VirtualClock()
     s = scheduler(clock)
     sends = Sends(clock)
-    lost = CTraderConnectionError("lost")
+    lost = CTraderNotSentConnectionError("lost")
 
     async def scenario() -> list[BaseException]:
         await fill_window(s, sends, GROUP_HISTORICAL, 5)
@@ -532,7 +533,7 @@ async def test_after_fail_all_a_submit_fails_at_once_until_reset() -> None:
     clock = VirtualClock()
     s = scheduler(clock)
     sends = Sends(clock)
-    lost = CTraderConnectionError("lost")
+    lost = CTraderNotSentConnectionError("lost")
     failed_at: list[float] = []
     raised: list[BaseException] = []
 
@@ -561,7 +562,7 @@ async def test_a_refusal_after_fail_all_is_not_requeued() -> None:
     logger = RecordingLogger()
     s = scheduler(clock, logger=logger)
     sends = Sends(clock)
-    lost = CTraderConnectionError("lost")
+    lost = CTraderNotSentConnectionError("lost")
 
     async def scenario() -> None:
         refused = spawn(
