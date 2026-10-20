@@ -145,8 +145,8 @@ class RequestScheduler:
             The request waited `Pacing.queue_timeout_secs` in the queue, retries included, and
             was dropped unsent. Time inside `send()` does not count.
         Exception
-            The error given to `fail_all()`, for a request waiting then, or queued (a retry
-            included) after it and before `reset()`.
+            A copy of the error given to `fail_all()`, for a request waiting then, or queued (a
+            retry included) after it and before `reset()`.
         """
         state = self._groups[group]
         sequence = next(self._sequence)
@@ -164,7 +164,10 @@ class RequestScheduler:
                 state.paused_until = max(state.paused_until, self._clock() + pause)
                 attempt += 1
                 retrying = attempt <= retries
-                if retrying:
+                if self._failed is not None:
+                    # The requeue below raises the latched error instead.
+                    outcome = "not retried: the connection was lost"
+                elif retrying:
                     outcome = f"retry {attempt} of {retries}"
                 elif retries:
                     outcome = "no retry left"
@@ -178,14 +181,22 @@ class RequestScheduler:
                     raise
 
     def fail_all(self, error: Exception) -> None:
-        """Fail every waiting request with `error`, and every later one until `reset()`."""
+        """Fail every waiting request with `error`, and every later one until `reset()`.
+
+        Each request gets its own instance of `error`'s type, built from `error.args`.
+        """
         self._failed = error
         for state in self._groups.values():
             self._stop_dispatcher(state)
             for _, _, entry in state.heap:
                 if not entry.future.done():
-                    entry.future.set_exception(error)
+                    entry.future.set_exception(self._failure())
             state.heap.clear()
+
+    def _failure(self) -> Exception:
+        """A fresh copy of the `fail_all()` error: a shared instance would gather tracebacks."""
+        assert self._failed is not None
+        return type(self._failed)(*self._failed.args)
 
     def reset(self) -> None:
         """Forget send times, pauses and failure, for a new connection; waiting requests stay."""
@@ -206,7 +217,7 @@ class RequestScheduler:
     ) -> float:
         """Queue one attempt and wait for its grant; returns the time it waited."""
         if self._failed is not None:
-            raise self._failed
+            raise self._failure()
         budget = self._pacing.queue_timeout_secs - waited
         if budget <= 0:
             self._raise_queue_timeout()
@@ -267,7 +278,8 @@ class RequestScheduler:
             priority, _, entry = heapq.heappop(state.heap)
             state.granted.append(now)
             entry.future.set_result(None)
+            waiting = sum(1 for _, _, e in state.heap if not e.future.done())
             self._log.debug(
                 f"Granted a {state.name} request at {RequestPriority(priority).name} after "
-                f"{now - entry.queued_at:.3f} s in the queue, {len(state.heap)} still queued",
+                f"{now - entry.queued_at:.3f} s in the queue, {waiting} still queued",
             )

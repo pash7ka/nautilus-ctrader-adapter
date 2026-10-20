@@ -408,6 +408,25 @@ async def test_a_pause_set_during_a_window_wait_is_honoured() -> None:
     assert sends.times("waiting") == [pytest.approx(1.75)]
 
 
+async def test_a_shorter_refusal_never_shortens_a_pause() -> None:
+    clock = VirtualClock()
+    s = scheduler(clock)
+    sends = Sends(clock)
+
+    async def scenario() -> None:
+        long = spawn(s, GROUP_OTHER, EXECUTION, sends.failing("long", [refusal(5)], takes=0.1))
+        short = spawn(s, GROUP_OTHER, EXECUTION, sends.failing("short", [refusal(1)], takes=0.2))
+        for refused in (long, short):
+            with pytest.raises(CTraderRequestError):
+                await refused
+        await s.submit(GROUP_OTHER, EXECUTION, sends.ok("next"))
+
+    await clock.run(scenario())
+
+    # The first refusal, at 0.1, pauses until 0.1 + 5 + 0.25.
+    assert sends.times("next") == [pytest.approx(5.35)]
+
+
 # -- The ceiling ----------------------------------------------------------------------------
 
 
@@ -499,8 +518,14 @@ async def test_fail_all_fails_every_waiter() -> None:
 
     results = await clock.run(scenario())
 
-    assert all(result is lost for result in results)
+    assert all(is_copy_of(result, lost) for result in results)
+    assert len({id(result) for result in results}) == len(results)
     assert sends.times("historical") == sends.times("other") == []
+
+
+def is_copy_of(error: BaseException, original: Exception) -> bool:
+    """Whether `error` is a fresh instance of `original`'s type, with its message."""
+    return error is not original and type(error) is type(original) and error.args == original.args
 
 
 async def test_after_fail_all_a_submit_fails_at_once_until_reset() -> None:
@@ -509,20 +534,23 @@ async def test_after_fail_all_a_submit_fails_at_once_until_reset() -> None:
     sends = Sends(clock)
     lost = CTraderConnectionError("lost")
     failed_at: list[float] = []
+    raised: list[BaseException] = []
 
     async def scenario() -> None:
         await clock.at(1.0)
         s.fail_all(lost)
         for group in (GROUP_HISTORICAL, GROUP_OTHER):
-            with pytest.raises(CTraderConnectionError) as raised:
+            with pytest.raises(CTraderConnectionError) as e:
                 await s.submit(group, EXECUTION, sends.ok("refused"))
-            assert raised.value is lost
+            raised.append(e.value)
         failed_at.append(clock.now)
         s.reset()
         await s.submit(GROUP_OTHER, EXECUTION, sends.ok("after reset"))
 
     await clock.run(scenario())
 
+    assert all(is_copy_of(error, lost) for error in raised)
+    assert raised[0] is not raised[1]
     assert failed_at == [1.0]
     assert sends.names() == ["after reset"]
 
@@ -530,7 +558,8 @@ async def test_after_fail_all_a_submit_fails_at_once_until_reset() -> None:
 async def test_a_refusal_after_fail_all_is_not_requeued() -> None:
     # The request was already inside `send()` when the connection was lost.
     clock = VirtualClock()
-    s = scheduler(clock)
+    logger = RecordingLogger()
+    s = scheduler(clock, logger=logger)
     sends = Sends(clock)
     lost = CTraderConnectionError("lost")
 
@@ -542,11 +571,38 @@ async def test_a_refusal_after_fail_all_is_not_requeued() -> None:
         s.fail_all(lost)
         with pytest.raises(CTraderConnectionError) as raised:
             await refused
-        assert raised.value is lost
+        assert is_copy_of(raised.value, lost)
 
     await clock.run(scenario())
 
     assert sends.times("refused") == [0.0]
+    (warning,) = logger.warnings()
+    assert warning.endswith("not retried: the connection was lost")
+
+
+async def test_the_debug_line_counts_only_requests_still_waiting() -> None:
+    clock = VirtualClock()
+    logger = RecordingLogger()
+    s = scheduler(clock, Pacing(historical_requests_per_window=1), logger=logger)
+    sends = Sends(clock)
+
+    async def scenario() -> None:
+        await fill_window(s, sends, GROUP_HISTORICAL, 1)
+        first = spawn(s, GROUP_HISTORICAL, EXECUTION, sends.ok("first"))
+        cancelled = spawn(s, GROUP_HISTORICAL, EXECUTION, sends.ok("cancelled"))
+        last = spawn(s, GROUP_HISTORICAL, EXECUTION, sends.ok("last"))
+        await clock.at(0.5)
+        cancelled.cancel()
+        await asyncio.gather(first, last, return_exceptions=True)
+
+    await clock.run(scenario())
+
+    granted = [line for level, line in logger.lines if level == "debug"]
+    assert [line.rsplit(", ", 1)[1] for line in granted] == [
+        "0 still queued",
+        "1 still queued",
+        "0 still queued",
+    ]
 
 
 async def test_a_historical_pause_does_not_delay_the_other_group() -> None:
