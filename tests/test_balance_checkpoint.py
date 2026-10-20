@@ -36,8 +36,7 @@ LAST_CHANGE_MS = 1_600_000_658_056  # version 6, the trader's
 DEPOSIT_MS = 1_599_143_632_165  # version 2
 BALANCE = 5_122_378_460
 AVAILABLE = {"balance": "51223784.60", "currency": "USD", "first_deposit": "51224029.64"}
-# Stands in for the session's default pacing.
-_FAST_HISTORY = partial(Pacing, historical_requests_per_window=1000)
+_FAST_HISTORY = Pacing(historical_requests_per_window=1000)
 
 
 def now_ms() -> int:
@@ -517,13 +516,12 @@ def gated(h, gates: dict) -> object:
     return request
 
 
-async def test_a_task_replaced_by_a_continuation_is_cancelled(monkeypatch) -> None:
-    # The suite need not wait out the venue's historical rate for the whole walk.
-    monkeypatch.setattr("nautilus_ctrader.common.session.Pacing", _FAST_HISTORY)
+async def test_a_task_replaced_by_a_continuation_is_cancelled() -> None:
     t_ms = last_t()
     last_at = t_ms - 12 * WEEK_MS
     venue = history_venue(last_at=last_at, registration=deposit_at(last_at) - 20 * WEEK_MS)
-    async with harness(execution_venue=venue) as h:
+    # The suite need not wait out the venue's historical rate for the whole walk.
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
         gates: dict = {}
         written: list[bytes] = []
         checkpoint = direct(h, {"now": now_ms()}, written, gated(h, gates))
@@ -552,13 +550,12 @@ async def test_a_task_replaced_by_a_continuation_is_cancelled(monkeypatch) -> No
             checkpoint.stop()
 
 
-async def test_a_stopped_checkpoint_starts_no_background_walk(monkeypatch) -> None:
-    # The suite need not wait out the venue's historical rate for the whole walk.
-    monkeypatch.setattr("nautilus_ctrader.common.session.Pacing", _FAST_HISTORY)
+async def test_a_stopped_checkpoint_starts_no_background_walk() -> None:
     t_ms = last_t()
     last_at = t_ms - 12 * WEEK_MS
     venue = history_venue(last_at=last_at, registration=deposit_at(last_at) - 20 * WEEK_MS)
-    async with harness(execution_venue=venue) as h:
+    # The suite need not wait out the venue's historical rate for the whole walk.
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
         gates: dict = {}
         written: list[bytes] = []
         checkpoint = direct(h, {"now": now_ms()}, written, gated(h, gates))

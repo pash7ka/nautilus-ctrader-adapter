@@ -103,8 +103,7 @@ CLOSED_AT = 408.8  # FIRST closed by its stop-loss, nothing open
 OPEN_AT = 358.0  # FIRST open with 0.99 after a manual partial close, both levels set
 REMOVED_AT = 228.8  # FIRST open, its take-profit removed by hand
 UUID_SHAPED = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-# Stands in for the session's default pacing.
-_FAST_HISTORY = functools.partial(Pacing, historical_requests_per_window=1000)
+_FAST_HISTORY = Pacing(historical_requests_per_window=1000)
 
 
 def precision(symbol_id: int) -> int | None:
@@ -618,13 +617,12 @@ async def test_a_failed_list_releases_the_buffer() -> None:
         assert any("INTERNAL_SERVER_ERROR" in line for line in h.logger.warnings())
 
 
-async def test_the_pass_asks_each_position_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The suite need not wait out the venue's historical rate for 50 lists.
-    monkeypatch.setattr("nautilus_ctrader.common.session.Pacing", _FAST_HISTORY)
+async def test_the_pass_asks_each_position_once() -> None:
     venue = ExecutionVenue()
     for n in range(25):
         foreign_position(venue, n, ts=1_600_000_000_000 + n)
-    async with harness(execution_venue=venue) as h:
+    # The suite need not wait out the venue's historical rate for 50 lists.
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
         orders_before = len(h.received(oa.ProtoOAOrderListByPositionIdReq))
         deals_before = len(h.received(oa.ProtoOADealListByPositionIdReq))
 
@@ -637,9 +635,7 @@ async def test_the_pass_asks_each_position_once(monkeypatch: pytest.MonkeyPatch)
         assert any(level == "info" and "52 requests" in line for level, line in h.logger.lines)
 
 
-async def test_a_deal_list_cut_short_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The suite need not wait out the venue's historical rate for 20 pages.
-    monkeypatch.setattr("nautilus_ctrader.common.session.Pacing", _FAST_HISTORY)
+async def test_a_deal_list_cut_short_is_logged() -> None:
     venue = ExecutionVenue()
     venue.page_size = 2
     foreign_position(venue, 1, ts=1_600_000_000_000)
@@ -659,7 +655,8 @@ async def test_a_deal_list_cut_short_is_logged(monkeypatch: pytest.MonkeyPatch) 
             for n in range(25)
         ]
     )
-    async with harness(execution_venue=venue) as h:
+    # The suite need not wait out the venue's historical rate for 20 pages.
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
         built = await h.client.generate_mass_status()
 
         assert any(
