@@ -1123,6 +1123,36 @@ async def test_a_close_is_refused_unsent_while_the_connection_is_down() -> None:
         assert h.client._operations.close_position(CLOSE_ID) is None
 
 
+async def test_a_close_that_waits_out_the_queue_ceiling_is_refused_not_lost() -> None:
+    async with harness(execution_venue=closing_venue(), pacing=Pacing(queue_timeout_secs=0.5)) as h:
+        await opened_market_position(h)
+        await pause_order_requests(h)
+        await submit(h, close_order(h), position_id=PositionId(str(MARKET_POSITION)))
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
+
+        assert rejection(h, CLOSE_ID) == "not sent: waited 0.5 s in the request queue"
+        assert h.kinds_of(CLOSE_ID) == ["OrderSubmitted", "OrderRejected"]
+        assert h.received(oa.ProtoOAClosePositionReq) == []
+        assert h.client._lost_closes == set()
+        assert h.client._operations.close_position(CLOSE_ID) is None
+        assert not any("outcome is unknown" in line for line in h.logger.warnings())
+
+
+async def test_a_cancel_that_waits_out_the_queue_ceiling_is_rejected_and_changes_nothing() -> None:
+    async with harness(execution_venue=resting_venue(), pacing=Pacing(queue_timeout_secs=0.5)) as h:
+        order = await held_resting(h)
+        await pause_order_requests(h)
+        await h.client._cancel_order(cancel(order.client_order_id.value))
+        await wait_until(lambda: sent_about(h, order))
+
+        (rejected,) = sent_about(h, order)
+        assert isinstance(rejected, OrderCancelRejected)
+        assert rejected.reason == "not sent: waited 0.5 s in the request queue"
+        assert foreign_leg(h, str(RESTING)).status == OrderStatus.ACCEPTED
+        assert h.client._book.open_order(RESTING) is not None
+        assert h.received(oa.ProtoOACancelOrderReq) == []
+
+
 async def test_a_close_that_would_add_to_the_position_is_refused() -> None:
     async with harness(execution_venue=closing_venue()) as h:
         await opened_market_position(h)

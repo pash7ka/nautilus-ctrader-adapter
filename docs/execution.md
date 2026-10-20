@@ -295,6 +295,7 @@ What is still refused, unsent:
 | A modify of a stop-loss leg by `price`, or of a take-profit leg by `trigger_price` | "a stop-loss leg moves by its trigger price", "a take-profit leg moves by its price" |
 | A modify of a pending order, or a cancel or a modify of a leg, whose instrument is not loaded | "... is not loaded": the adapter can neither express the request's prices nor read the answer |
 | Any command while not connected | "not connected to the venue"; a level amend first waits for the connection to come back, a few times |
+| Any command whose request never left: it waited out the request queue, or was still queued when the connection dropped | "not sent: ..." followed by the cause, e.g. "waited 60 s in the request queue"; the command may be sent again |
 
 **Commanding an external order from a strategy.** Nautilus does not check which strategy owns an
 order when one cancels or modifies it. A strategy can command an external order in two ways:
