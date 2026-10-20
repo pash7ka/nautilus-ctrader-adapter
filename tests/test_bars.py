@@ -71,10 +71,6 @@ def s(offset: int) -> RawBar:
     return bar(T0 + offset, tag=f"s{offset}")
 
 
-def offsets(emitted: list[RawBar]) -> list[int]:
-    return [b.boundary_secs - T0 for b in emitted]
-
-
 class FetchStub:
     """An async `Fetch` returning queued results in order, `None` once exhausted."""
 
@@ -135,6 +131,20 @@ def make_closer(
         logger=logger,
         label=label,
     )
+
+
+def given_emitted(
+    closer: BarCloser, clock: FakeClock, emitted: list[RawBar], boundary: int
+) -> None:
+    """Leave `closer` as if the stream had closed the bar at `boundary` and nothing since.
+
+    `boundary` must be the bar forming at the clock's time.
+    """
+    closer.on_update(bar(boundary))
+    closer.on_update(bar(boundary + PERIOD))
+    closer.on_disconnect()
+    emitted.clear()
+    clock.timers.clear()
 
 
 def warnings_of(logger: RecordingLogger) -> list[str]:
@@ -316,21 +326,6 @@ async def test_a_history_fetch_in_flight_does_not_double_emit_the_closed_bar() -
     assert calls == [T0]
 
 
-def test_mark_emitted_makes_a_stream_update_at_or_before_it_a_no_op() -> None:
-    clock = FakeClock(T0)
-    fetch = FetchStub([])
-    emitted: list[RawBar] = []
-    closer = make_closer(clock, fetch, emitted, RecordingLogger())
-
-    closer.mark_emitted(T0)
-    closer.on_update(bar(T0, tag="stale"))
-    assert emitted == []
-
-    closer.on_update(bar(T0 + 60, tag="live"))
-    closer.on_update(bar(T0 + 120, tag="live2"))
-    assert emitted == [bar(T0 + 60, tag="live")]
-
-
 async def test_on_disconnect_discards_the_partial_bar_and_queues_a_closed_baseline() -> None:
     clock = FakeClock(T0)
     fetch = FetchStub([])  # history never has it
@@ -358,36 +353,6 @@ async def test_on_disconnect_discards_the_partial_bar_and_queues_a_closed_baseli
     closer.on_update(bar(T0 + 60, tag="fresh"))
     closer.on_update(bar(T0 + 120, tag="fresh2"))
     assert emitted == [bar(T0, tag="late"), bar(T0 + 60, tag="fresh")]
-
-
-async def test_fallback_is_silent_and_preserves_the_warn_once_flag_when_already_covered() -> None:
-    clock = FakeClock(T0)
-    fetch = FetchStub([])  # always None
-    emitted: list[RawBar] = []
-    logger = RecordingLogger()
-    stream_bar = bar(T0, tag="stream")
-    closer = make_closer(clock, fetch, emitted, logger)
-
-    closer.on_update(stream_bar)
-    await clock.advance(61)
-    await clock.advance(1)
-
-    closer.mark_emitted(T0)  # something else has already covered this boundary
-
-    await clock.advance(1)  # exhausted -> would fall back, but is now covered
-
-    assert emitted == []
-    assert logger.lines == []  # neither logged nor counted as a fallback
-
-    second_bar = bar(T0 + 60, tag="second")
-    closer.on_update(second_bar)
-    await clock.advance(58)
-    await clock.advance(1)
-    await clock.advance(1)
-
-    assert emitted == [second_bar]
-    assert len(warnings_of(logger)) == 1  # the warn-once flag was not spent by the silent fallback
-    assert debugs_of(logger) == []
 
 
 async def test_close_stops_updates_timers_and_backfill() -> None:
@@ -565,7 +530,7 @@ async def test_the_stream_close_of_a_later_bar_waits_behind_an_earlier_history_e
         return []  # history has not served T0+60 yet
 
     closer = make_closer(clock, fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 130
     await closer.backfill(fetch_range)  # queues T0+60 as a history-only tail
     await settle()  # the resolver is now waiting on history for T0+60
@@ -589,7 +554,7 @@ async def test_backfill_emits_closed_bars_in_order_and_holds_updates() -> None:
     fetch = FetchStub([])
     emitted: list[RawBar] = []
     closer = make_closer(clock, fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 180  # an aligned boundary
 
     gate = asyncio.Event()
@@ -624,44 +589,37 @@ async def test_backfill_emits_closed_bars_in_order_and_holds_updates() -> None:
     assert emitted == [b1, b2, bar(T0 + 180, tag="live")]
 
 
-async def test_backfill_that_spans_a_boundary_replays_and_dedupes_the_held_update() -> None:
-    """`end` is recomputed when it advances while the fetch is in flight."""
+async def test_a_backfill_fetches_once_and_queues_the_tail() -> None:
     clock = FakeClock(T0 + 5)
-    fetch = FetchStub([])
+    hist = History(clock, lag=3, range_cost_secs=130)
+    hist.range_gate = asyncio.Event()
     emitted: list[RawBar] = []
-    closer = make_closer(clock, fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0)
+    logger = RecordingLogger()
+    closer = make_closer(clock, hist.fetch, emitted, logger)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 200
 
-    gate1 = asyncio.Event()
-    calls: list[tuple[int, int]] = []
-
-    async def fetch_range(start: int, end: int) -> list[RawBar]:
-        calls.append((start, end))
-        if len(calls) == 1:
-            await gate1.wait()
-            clock.t = T0 + 245  # time passes during the request
-            return [bar(T0 + 60, tag="h1"), bar(T0 + 120, tag="h2")]
-        return [bar(T0 + 180, tag="h3")]
-
-    task = asyncio.create_task(closer.backfill(fetch_range))
-    await asyncio.sleep(0)  # backfill starts: fetch_range(T0+60, T0+120), suspends on gate1
-
-    assert calls == [(T0 + 60, T0 + 120)]
-
-    closer.on_update(bar(T0 + 180, tag="stream"))  # held while backfill is in flight
-
-    gate1.set()
+    task = asyncio.create_task(closer.backfill(hist.fetch_range))
+    await asyncio.sleep(0)
+    clock.t = T0 + 250
+    closer.on_update(s(240))  # held: the forming bar, which closes while the fetch runs
+    hist.range_gate.set()
     await task
+    await settle()
 
-    # The advanced range (T0+120, T0+180] is re-fetched once the first call returns.
-    assert calls == [(T0 + 60, T0 + 120), (T0 + 180, T0 + 180)]
-    assert emitted == [
-        bar(T0 + 60, tag="h1"),
-        bar(T0 + 120, tag="h2"),
-        bar(T0 + 180, tag="h3"),
+    # One fetch, up to the last boundary closed when it began. It ran until T0+380, and the
+    # three bars that closed meanwhile came from history one by one.
+    assert hist.range_calls == [(T0 + 60, T0 + 120)]
+    assert hist.calls == [T0 + 180, T0 + 240, T0 + 300]
+    assert emitted == [h(60), h(120), h(180), h(240), h(300)]
+    assert warnings_of(logger) == []
+    assert debugs_of(logger) == [
+        "L: queued 3 bars that closed during the backfill fetch for history"
     ]
-    assert closer.last_emitted == T0 + 180  # exactly once, in order; the held update deduped
+
+    closer.on_update(s(360))  # the stream resumes with the bar forming now
+    closer.on_update(s(420))
+    assert emitted == [h(60), h(120), h(180), h(240), h(300), s(360)]
 
 
 async def test_backfill_cancels_the_forming_bar_timer() -> None:
@@ -718,11 +676,12 @@ async def test_backfill_starts_from_the_bar_forming_at_creation_when_never_emitt
 
 
 async def test_backfill_skips_the_fetch_and_still_resets_baseline_when_nothing_has_closed() -> None:
-    clock = FakeClock(T0 + 240)  # an aligned boundary
+    clock = FakeClock(T0 + 185)
     fetch = FetchStub([])
     emitted: list[RawBar] = []
     closer = make_closer(clock, fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0 + 180)  # an aligned boundary
+    given_emitted(closer, clock, emitted, T0 + 180)
+    clock.t = T0 + 240  # an aligned boundary
 
     calls: list[tuple[int, int]] = []
 
@@ -753,7 +712,7 @@ async def test_backfill_recovers_the_most_recent_boundary_when_history_still_lag
     hist.range_gate = asyncio.Event()
     emitted: list[RawBar] = []
     closer = make_closer(clock, hist.fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 241
 
     task = asyncio.create_task(closer.backfill(hist.fetch_range))
@@ -793,7 +752,7 @@ async def test_backfill_queues_a_history_only_retry_for_a_missing_unheld_tail() 
         return []  # nothing closed has been served yet
 
     closer = make_closer(clock, fetch, emitted, logger)
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 130
 
     await closer.backfill(fetch_range)
@@ -806,32 +765,6 @@ async def test_backfill_queues_a_history_only_retry_for_a_missing_unheld_tail() 
     assert calls == [T0 + 60] * 3
     assert emitted == []  # a bar with no ticks does not exist
     assert logger.lines == []  # silent: there was never a streamed state to fall back to
-
-
-async def test_backfill_caps_refining_then_fetches_the_rest_once_and_warns() -> None:
-    clock = FakeClock(T0)
-    fetch = FetchStub([])
-    emitted: list[RawBar] = []
-    logger = RecordingLogger()
-    closer = make_closer(clock, fetch, emitted, logger)
-
-    clock.t = T0 + 500  # give it a real gap to work through
-
-    calls: list[tuple[int, int]] = []
-
-    async def fetch_range(start: int, end: int) -> list[RawBar]:
-        calls.append((start, end))
-        clock.t += PERIOD  # history is perpetually one period further behind
-        return []
-
-    await closer.backfill(fetch_range)
-
-    assert len(calls) == 6  # five rounds, then one final fetch; never an endless loop
-    assert emitted == []
-    warnings = warnings_of(logger)
-    assert len(warnings) == 1
-    assert "slower than the bar period" in warnings[0]
-    closer.close()
 
 
 async def test_an_emit_callback_exception_during_backfill_is_caught_and_replay_continues() -> None:
@@ -859,7 +792,7 @@ async def test_an_emit_callback_exception_during_backfill_is_caught_and_replay_c
         logger=logger,
         label="L",
     )
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 200
 
     gate = asyncio.Event()
@@ -893,7 +826,7 @@ async def test_probe_a_the_first_forming_update_after_backfill_does_not_drop_the
     hist = History(clock, lag=3)
     emitted: list[RawBar] = []
     closer = make_closer(clock, hist.fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 241
 
     await closer.backfill(hist.fetch_range)  # 180 is not served yet: tail
@@ -953,7 +886,7 @@ async def test_probe_e_a_held_forming_update_does_not_drop_the_tail() -> None:
     hist.range_gate = asyncio.Event()
     emitted: list[RawBar] = []
     closer = make_closer(clock, hist.fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 241
 
     task = asyncio.create_task(closer.backfill(hist.fetch_range))
@@ -979,7 +912,7 @@ async def test_probe_f_a_forming_update_right_after_backfill_keeps_the_tail_in_o
     hist.range_gate = asyncio.Event()
     emitted: list[RawBar] = []
     closer = make_closer(clock, hist.fetch, emitted, RecordingLogger())
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 241
 
     task = asyncio.create_task(closer.backfill(hist.fetch_range))
@@ -1019,34 +952,6 @@ async def test_probe_g_nothing_from_before_the_subscription_is_emitted() -> None
     clock.t = T0 + 60.5
     closer.on_update(s(60))
     assert emitted == [s(0)]
-
-
-async def test_probe_h_hitting_the_round_cap_skips_no_bar() -> None:
-    clock = FakeClock(T0 + 5)
-    hist = History(clock, lag=3, range_cost_secs=130)
-    emitted: list[RawBar] = []
-    logger = RecordingLogger()
-    closer = make_closer(clock, hist.fetch, emitted, logger)
-    closer.mark_emitted(T0)
-    clock.t = T0 + 200
-
-    await closer.backfill(hist.fetch_range)
-    assert hist.range_calls[-1] == (T0 + 720, T0 + 780)  # the one final fetch after the cap
-    assert len(hist.range_calls) == 6
-    assert offsets(emitted) == list(range(60, 781, 60))
-
-    # The final fetch ran until T0+980: 840 and 900 closed meanwhile and go to history alone.
-    assert clock.t == T0 + 980
-    await clock.advance(0)
-    await clock.advance(1)
-    await clock.advance(1)
-
-    assert hist.calls == [T0 + 840, T0 + 900]
-    assert offsets(emitted) == list(range(60, 901, 60))
-    assert len(warnings_of(logger)) == 1
-    assert debugs_of(logger) == [
-        "L: queued 2 bars that closed during the final backfill fetch for history"
-    ]
 
 
 def outage_history(hist: History, down: list[bool], attempts: list[int]):
@@ -1150,7 +1055,7 @@ async def test_a_second_backfill_while_one_is_running_is_a_no_op() -> None:
     emitted: list[RawBar] = []
     logger = RecordingLogger()
     closer = make_closer(clock, FetchStub([]), emitted, logger)
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 180
 
     gate = asyncio.Event()
@@ -1177,7 +1082,7 @@ async def test_on_disconnect_drops_a_held_update() -> None:
     clock = FakeClock(T0 + 5)
     emitted: list[RawBar] = []
     closer = make_closer(clock, FetchStub([]), emitted, RecordingLogger())
-    closer.mark_emitted(T0)
+    given_emitted(closer, clock, emitted, T0)
     clock.t = T0 + 180
 
     gate = asyncio.Event()
@@ -1269,10 +1174,10 @@ async def test_a_shifted_period_learns_its_phase_and_asks_history_for_a_real_bou
     clock.t = B0 + 2 * H4 + 10  # B0+H4 closed 10 s ago, so history does not have it yet
     await closer.backfill(hist.fetch_range)
 
-    # The first range is asked for on the epoch-aligned fallback, whose `end` falls between two
-    # real boundaries. The bar it serves settles the phase, and the rest follows that.
+    # The range is asked for on the epoch-aligned fallback, whose `end` falls between two real
+    # boundaries. The bar it serves settles the phase, and the tail follows that.
+    assert len(hist.range_calls) == 1
     assert hist.range_calls[0][1] == T0 + H4  # not a boundary of this period
-    assert hist.range_calls[-1] == (B0 + H4, B0 + H4)
     assert emitted == [bar(B0, tag="h")]
 
     await clock.advance(0)

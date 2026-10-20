@@ -63,13 +63,19 @@ once, in ascending order, whichever of them got there first:
   rather than flooding the log. A request that finds no connection is not one of those
   attempts: the bar keeps waiting, and the backfill below closes it.
 - **A backfill after a reconnect.** Bars that closed while the connection was down are fetched
-  from history and emitted before the stream resumes. The backfill runs in the background,
-  without delaying the session's readiness, at the lowest request priority, so commands and other requests are
-  not held back by it; live bars arriving meanwhile are held and replayed after it. Another
-  reconnect restarts a running backfill, and an unsubscribe cancels it. A backfill that fails for
-  any reason but the lost connection is logged at ERROR and retried every
-  `restore_retry_interval_secs`, like any other failed restore: a failed retry is a WARNING, and
-  the third failed retry in a row an ERROR again.
+  from history and emitted before the stream resumes. The range is fetched once; bars that close
+  while that fetch runs are then asked from history one by one. The backfill runs in the
+  background, without delaying the session's readiness, at the lowest request priority, so
+  commands and other requests are not held back by it; live bars arriving meanwhile are held
+  and replayed after it. Another reconnect restarts a running backfill, and an unsubscribe
+  cancels it, as does a disconnect, which returns only once every backfill has ended. A
+  backfill that fails for any reason but the lost connection is logged at ERROR and retried
+  every `restore_retry_interval_secs`, like any other failed restore: a failed retry is a
+  WARNING, and the third failed retry in a row an ERROR again.
+- **A backfill after the live trendbars come back.** If the live trendbar subscription itself
+  could not be restored, or a first subscribe got no answer, no stream follows the backfill.
+  The subscription is retried like any failed restore, and the first live trendbar after it
+  starts another backfill, so the bars that closed in between are emitted, in order, before it.
 
 Two rules follow from this, and applications depend on both:
 
@@ -112,10 +118,13 @@ def on_start(self) -> None:
 In the other order — request first, subscribe afterwards — the bars that close between the two
 calls belong to neither, and nothing reports them missing.
 
-Doing it this way is safe because the client remembers what a request delivered: the newest bar
-a request served is marked as emitted for that subscription, so the live stream will not send
-it a second time. A historical request is paged backwards from its end, and the forming bar the
-venue also serves is dropped, since it is not a bar yet. A request with a `start` delivers no
+A request never changes what the live stream emits. Nautilus hands a response to the requester
+only, never to live bar subscribers, so the two are independent, and a bar can reach both: if
+the request is answered after the bar forming at subscription time has closed, the response
+holds that bar too. Compare `ts_event` if a strategy must not count it twice.
+
+A historical request is paged backwards from its end, and the forming bar the venue also serves
+is dropped, since it is not a bar yet. A request with a `start` delivers no
 bar opening before it, although the venue's pages reach back past it, and one with a `limit`
 delivers the newest `limit` closed bars. With neither a `start` nor a `limit` exactly one page
 is fetched: that call is asking for "the most recent bars", not for the whole history the venue

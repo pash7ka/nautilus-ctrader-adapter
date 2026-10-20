@@ -174,14 +174,17 @@ class _LoopClock:
 class _BarSub:
     """One live bar subscription: where its trendbars come from, and what closes them."""
 
+    bar_type: BarType
     symbol_id: int
     period: int
     closer: BarCloser
-    # The backfill started by the latest restore, the session bring-up it was started for, and
-    # the failures in a row within that bring-up.
+    # The latest backfill, the session bring-up it was started for, and the failures in a row
+    # within that bring-up.
     backfill: asyncio.Task | None = None
     backfill_generation: tuple[CTraderSession, int] | None = None
     backfill_failures: int = 0
+    # Set while the live trendbars are not restored: the next one to arrive starts a backfill.
+    owes_backfill: bool = False
 
     def cancel_backfill(self) -> None:
         if self.backfill is not None:
@@ -295,6 +298,8 @@ class CTraderDataClient(LiveMarketDataClient):
         self._unanswered: dict[UUID4, RequestData] = {}
         self._task_count_warned = False
         self._bars: dict[BarType, _BarSub] = {}
+        # Every backfill task not yet done, whichever subscription it was started for.
+        self._backfills: set[asyncio.Task] = set()
         # The same subscriptions by the `(symbol id, period)` a live trendbar identifies itself
         # with, which is how a spot event's trendbars are routed.
         self._bar_routes: dict[tuple[int, int], _BarSub] = {}
@@ -319,6 +324,7 @@ class CTraderDataClient(LiveMarketDataClient):
         # registry: a `_disconnect` cut short would otherwise make a later subscribe a silent
         # no-op against a session that is gone.
         self._forget_subscriptions()
+        await self._cancel_backfills()
         await self._release_subscriptions(None)
         self._converted.clear()
         # A problem that survives a reconnect is worth reporting at full volume again.
@@ -349,21 +355,24 @@ class CTraderDataClient(LiveMarketDataClient):
         self._preparing.clear()
         session, self._session = self._session, None
         self._account.remove_reload_listener(self._on_instrument_reloaded)
-        backfills = {sub.backfill for sub in self._bars.values() if sub.backfill is not None}
         try:
             await self._release_subscriptions(session)
             self._converted.clear()
         finally:
             # Releasing cancels them, unless it failed first. Either way none outlives this.
-            for task in backfills:
-                task.cancel()
             try:
-                if backfills:
-                    await asyncio.wait(backfills)
+                await self._cancel_backfills()
             finally:
                 if self._holds_account:
                     self._holds_account = False
                     await self._account.disconnect()
+
+    async def _cancel_backfills(self) -> None:
+        """Cancel every backfill and wait until each has ended, those started meanwhile too."""
+        while running := {task for task in self._backfills if not task.done()}:
+            for task in running:
+                task.cancel()
+            await asyncio.wait(running)
 
     async def _release_subscriptions(self, session: CTraderSession | None) -> None:
         """Release everything the registry still counts for this client.
@@ -893,7 +902,7 @@ class CTraderDataClient(LiveMarketDataClient):
         # Created before the venue request: the closer ignores every boundary below the bar
         # forming at its construction, so building it afterwards would drop a bar that closed
         # while the request was in flight.
-        sub = _BarSub(symbol_id, period, self._make_closer(bar_type, symbol_id, period))
+        sub = _BarSub(bar_type, symbol_id, period, self._make_closer(bar_type, symbol_id, period))
         self._bars[bar_type] = sub
         self._bar_routes[(symbol_id, period)] = sub
         self._sync_listener(symbol_id)
@@ -903,12 +912,13 @@ class CTraderDataClient(LiveMarketDataClient):
         finally:
             # What is kept here must match what the registry counts, whatever the outcome:
             # - a counted trendbar leg, unknown outcomes included, keeps the bars and needs the
-            #   backfill restore;
+            #   backfill restore; an unknown outcome also owes a backfill once trendbars arrive;
             # - without one there are no live bars, so the bar type is freed for another try;
             #   a spot leg left counted is released with this client's other holds;
             # - an unsubscribe that ran meanwhile has already forgotten `sub`.
             if self._bars.get(bar_type) is sub:
                 if consumer in subscriptions.trendbar_consumers(symbol_id, period, self._owner):
+                    sub.owes_backfill = subscriptions.trendbar_restore_failed(symbol_id, period)
                     if self._session is not None:
                         # Added after the registry's own restore for this key, and so run after
                         # it: the backfill's history needs the reconnected subscription in place.
@@ -968,21 +978,36 @@ class CTraderDataClient(LiveMarketDataClient):
         The session becomes ready only once every restore has returned, and every command waits
         for that. A backfill still running from an earlier restore is replaced: the closer would
         ignore a second one, leaving the new gap unfilled.
+
+        If the trendbar restore failed, this backfill ends with no stream to take over from it,
+        so the first live trendbar to arrive once a retry restored them starts another.
         """
+        # In a bring-up the trendbar restore has run by now: restores run in the order their keys
+        # were added.
+        sub.owes_backfill = self._account.subscriptions.trendbar_restore_failed(
+            sub.symbol_id,
+            sub.period,
+        )
+        sub.closer.on_disconnect()
+        self._start_backfill(sub)
+
+    def _start_backfill(self, sub: _BarSub) -> None:
         generation = self._backfill_generation()
         if generation != sub.backfill_generation:
             # The first backfill of this bring-up: a failure is the first since the reconnect.
             sub.backfill_generation = generation
             sub.backfill_failures = 0
-        sub.closer.on_disconnect()
         previous = sub.backfill
         sub.cancel_backfill()
         # Eager, so the closer holds stream updates before this returns.
-        sub.backfill = asyncio.Task(
-            self._backfill(bar_type, sub, previous, generation),
+        task = asyncio.Task(
+            self._backfill(sub.bar_type, sub, previous, generation),
             loop=asyncio.get_running_loop(),
             eager_start=True,
         )
+        sub.backfill = task
+        self._backfills.add(task)
+        task.add_done_callback(self._backfills.discard)
 
     def _backfill_generation(self) -> tuple[CTraderSession, int] | None:
         """The session and its `bring_up_generation`, which a backfill is started for."""
@@ -1049,8 +1074,14 @@ class CTraderDataClient(LiveMarketDataClient):
             if not trendbar.HasField("period"):
                 continue
             sub = self._bar_routes.get((symbol_id, trendbar.period))
-            if sub is not None:
-                sub.closer.on_update(_raw_bar(trendbar))
+            if sub is None:
+                continue
+            if sub.owes_backfill:
+                sub.owes_backfill = False
+                # A running backfill covers the gap already: its tail reaches past this moment.
+                if sub.backfill is None or sub.backfill.done():
+                    self._start_backfill(sub)
+            sub.closer.on_update(_raw_bar(trendbar))
 
     def _emit_bar(self, bar_type: BarType, symbol_id: int, period_secs: int, raw: RawBar) -> None:
         self._note_bar_phase(bar_type, period_secs, raw.boundary_secs)
@@ -1192,12 +1223,7 @@ class CTraderDataClient(LiveMarketDataClient):
             )
             for raw in closed
         ]
-        # Only once every bar converted: a request that fails delivers nothing, so the stream
-        # must still deliver these.
-        sub = self._bars.get(bar_type)
-        if sub is not None and closed:
-            # What this request delivered must not go out a second time from the stream.
-            sub.closer.mark_emitted(closed[-1].boundary_secs)
+        # Nautilus never hands a response to live bar subscribers, so a live closer is left alone.
         return bars
 
     async def _page_trendbars(

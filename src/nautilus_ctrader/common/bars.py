@@ -47,9 +47,6 @@ class Logger(Protocol):
 Fetch = Callable[[int], Awaitable[RawBar | None]]
 Emit = Callable[[RawBar], None]
 
-# How many times `backfill` re-fetches a growing range before it fetches the rest once and stops.
-_MAX_BACKFILL_ROUNDS = 5
-
 
 @dataclass(eq=False)
 class _Pending:
@@ -87,8 +84,8 @@ class BarCloser:
     Where this period's boundaries fall is learnt from the bars seen, never assumed: see
     `_observe()`.
 
-    `on_update`, `mark_emitted`, `close` and the clock's timer callbacks must run on the event
-    loop thread: queueing a boundary may start the resolver task.
+    `on_update`, `close` and the clock's timer callbacks must run on the event loop thread:
+    queueing a boundary may start the resolver task.
 
     The warn-once fallback flags - one for a failed history request, one for history simply
     having no bar - are per closer instance, i.e. per subscription.
@@ -138,15 +135,6 @@ class BarCloser:
     @property
     def last_emitted(self) -> int | None:
         return self._last_emitted
-
-    def mark_emitted(self, boundary_secs: int) -> None:
-        self._observe(boundary_secs)
-        if self._last_emitted is None or boundary_secs > self._last_emitted:
-            self._last_emitted = boundary_secs
-        while self._queue and self._is_covered(self._queue[0].boundary):
-            self._queue.popleft()
-        if not self._queue and self._resolver is None:
-            self._drained.set()
 
     def on_update(self, bar: RawBar) -> None:
         if self._closed:
@@ -203,18 +191,15 @@ class BarCloser:
         `fetch_range(start, end)` returns bars for the **inclusive** range `[start, end]`, and
         bars outside it are ignored. `start` continues from `last_emitted`, never earlier than
         the bar forming at construction, so it is a plain lower bound rather than a boundary;
-        `end` is the last boundary the clock says has closed.
+        `end` is the last boundary the clock says has closed when the backfill starts.
 
-        - If the closed range advances while a fetch and its emits are in flight, the new part
-          is fetched again, for up to `_MAX_BACKFILL_ROUNDS` rounds; past that, a WARNING is
-          logged and the rest is fetched once more, with no further rounds.
-        - History can lag behind a just-closed bar, so if the newest closed boundary is still
-          missing afterwards, it is queued for history alone. Earlier gaps in a served range
-          are genuinely empty periods and are not retried.
-        - After a capped final fetch, every boundary that closed while it ran is also queued
-          for history alone, since no fetch covered it.
-        - Until a bar has settled where this period's boundaries fall, that last step is skipped
-          rather than run on a guessed boundary.
+        - The range is fetched once. Every boundary that closed while the fetch and its emits
+          ran is then queued for history alone, since no fetch covered it.
+        - History can lag behind a just-closed bar, so if `end` itself is still missing
+          afterwards, it is queued for history alone too. Earlier gaps in a served range are
+          genuinely empty periods and are not retried.
+        - Until a bar has settled where this period's boundaries fall, those queued boundaries
+          are skipped rather than guessed.
         - Stream updates are held meanwhile; the latest is replayed afterwards.
         """
         if self._closed:
@@ -227,10 +212,11 @@ class BarCloser:
         self._cancel_timer()
         self._current = None
         # There is a connection again, so an entry the resolver left queued when it went down
-        # can be asked for now. Done here because the rounds below may enqueue nothing.
+        # can be asked for now. Done here because the fetch below may enqueue nothing.
         self._pump()
         try:
-            end = await self._backfill_rounds(fetch_range)
+            end = self._last_closed_boundary()
+            await self._fetch_and_drain(fetch_range, end)
             if self._closed:
                 return
             self._queue_tail(end)
@@ -241,34 +227,13 @@ class BarCloser:
         if held is not None:
             self.on_update(held)
 
-    async def _backfill_rounds(
-        self, fetch_range: Callable[[int, int], Awaitable[list[RawBar]]]
-    ) -> int:
-        """Run the fetch rounds; return the last `end` fetched up to."""
-        rounds = 0
-        while True:
-            end = self._last_closed_boundary()
-            if not await self._fetch_and_drain(fetch_range, end) or self._closed:
-                return end
-            rounds += 1
-            if self._last_closed_boundary() <= end:
-                return end
-            if rounds >= _MAX_BACKFILL_ROUNDS:
-                self._log.warning(
-                    f"{self._label}: history fetch is slower than the bar period; "
-                    f"fetching the rest once after {rounds} rounds"
-                )
-                end = self._last_closed_boundary()
-                await self._fetch_and_drain(fetch_range, end)
-                return end
-
     def _queue_tail(self, end: int) -> None:
-        """Queue for history alone every closed boundary the fetches may not have covered.
+        """Queue for history alone every closed boundary from `end` on that may not be covered.
 
-        That is the newest closed boundary, which history can lag by seconds, and anything that
-        closed during a capped final fetch. While no bar has settled where this period's
-        boundaries fall, nothing is queued: an entry for a boundary that never existed can only
-        resolve to nothing, and the first bar seen settles the phase within a period.
+        That is `end`, which history can lag by seconds, and anything that closed during the
+        fetch. While no bar has settled where this period's boundaries fall, nothing is queued:
+        an entry for a boundary that never existed can only resolve to nothing, and the first
+        bar seen settles the phase within a period.
         """
         if self._phase is None:
             return
@@ -280,30 +245,26 @@ class BarCloser:
         if newest > first:
             self._log.debug(
                 f"{self._label}: queued {(newest - first) // self._period} bars that closed "
-                "during the final backfill fetch for history"
+                "during the backfill fetch for history"
             )
 
     async def _fetch_and_drain(
         self, fetch_range: Callable[[int, int], Awaitable[list[RawBar]]], end: int
-    ) -> bool:
-        """Fetch `[start, end]`, queue the result and wait until it is emitted.
-
-        Return false if there was nothing to fetch.
-        """
+    ) -> None:
+        """Fetch `[start, end]`, if anything is left in it, and wait until the result is emitted."""
         start = self._floor
         if self._last_emitted is not None:
             start = max(start, self._last_emitted + self._period)
         if start > end:
-            return False
+            return
         bars = await fetch_range(start, end)
         if self._closed:
-            return True
+            return
         for bar in sorted(bars, key=lambda b: b.boundary_secs):
             self._observe(bar.boundary_secs)
             if start <= bar.boundary_secs <= end:
                 self._enqueue(bar.boundary_secs, bar, needs_history=False)
         await self._wait_drained()
-        return True
 
     async def _wait_drained(self) -> None:
         """Wait for the queue to drain, but never longer than its own retries can take.

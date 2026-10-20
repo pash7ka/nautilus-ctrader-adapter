@@ -270,6 +270,12 @@ class SubscriptionRegistry:
         key = _trendbar_key(symbol_id, period)
         return frozenset(name for o, name in self._consumers.get(key, ()) if o == owner)
 
+    def trendbar_restore_failed(self, symbol_id: int, period: int) -> bool:
+        """Whether `symbol_id`'s live trendbars for `period` wait for a restore retry."""
+        session = self._session
+        key = _trendbar_key(symbol_id, period)
+        return session is not None and key in session.failed_restores
+
     def active_consumers(self, symbol_id: int, owner: str) -> frozenset[str]:
         """`owner`'s consumers of `symbol_id`'s spots that should receive data now.
 
