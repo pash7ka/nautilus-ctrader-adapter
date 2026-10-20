@@ -997,7 +997,7 @@ async def test_an_order_without_an_answer_is_never_sent_again() -> None:
         assert any("not resent" in line for line in h.logger.warnings())
 
 
-async def test_an_order_waits_for_its_answer_as_long_as_configured() -> None:
+async def test_an_order_waits_for_its_answer_as_long_as_configured_and_sends_once() -> None:
     # The venue never answers a new order.
     async with harness(config=exec_config(order_request_timeout_secs=0.3)) as h:
         loop = asyncio.get_running_loop()
@@ -1008,6 +1008,24 @@ async def test_an_order_waits_for_its_answer_as_long_as_configured() -> None:
         assert 0.3 <= waited < 2.0
         assert status(h, MARKET_ID) == OrderStatus.SUBMITTED
         assert any("not resent" in line for line in h.logger.warnings())
+        assert len(h.received(oa.ProtoOANewOrderReq)) == 1
+
+
+async def test_a_close_that_got_no_answer_on_a_live_connection_is_sent_once() -> None:
+    # The venue opens the position and never answers its close.
+    venue = answered(market_events())
+    async with harness(
+        execution_venue=venue, config=exec_config(order_request_timeout_secs=0.3)
+    ) as h:
+        await opened_market_position(h)
+        await submit(h, close_order(h), position_id=PositionId(str(MARKET_POSITION)))
+        await wait_until(
+            lambda: any("Close" in w and "not resent" in w for w in h.logger.warnings())
+        )
+
+        assert h.account.session.is_ready
+        assert status(h, CLOSE_ID) == OrderStatus.SUBMITTED
+        assert len(h.received(oa.ProtoOAClosePositionReq)) == 1
 
 
 async def pause_order_requests(h) -> None:

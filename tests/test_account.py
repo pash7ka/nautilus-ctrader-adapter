@@ -1,6 +1,7 @@
 """The per-account client: host selection, session ownership, reference data."""
 
 import asyncio
+import contextlib
 import time
 
 import pytest
@@ -18,6 +19,7 @@ from nautilus_ctrader.common.account import (
 from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
+    CTraderError,
     CTraderTimeoutError,
 )
 from nautilus_ctrader.common.session import SessionState
@@ -379,6 +381,37 @@ async def test_a_session_that_never_becomes_ready_times_out() -> None:
         await wait_until(lambda: server.open_connection_count == 0, description="all closed")
     finally:
         await server.stop()
+
+
+async def test_the_account_client_uses_tls_by_default() -> None:
+    first_bytes: list[bytes] = []
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(asyncio.IncompleteReadError, ConnectionError):
+            first_bytes.append(await reader.readexactly(1))
+        writer.close()
+
+    listener = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = listener.sockets[0].getsockname()[1]
+    client = CTraderAccountClient(
+        trader_login=TRADER_LOGIN,
+        credentials=credentials(),
+        environment="demo",
+        logger=RecordingLogger(),
+        demo_host="127.0.0.1",
+        port=port,
+        connect_timeout_secs=2.0,
+    )
+    try:
+        with pytest.raises(CTraderError):
+            await client.connect()
+
+        # 0x16 is the TLS handshake record type that opens a ClientHello.
+        assert first_bytes == [b"\x16"]
+    finally:
+        await client.disconnect()
+        listener.close()
+        await listener.wait_closed()
 
 
 async def test_missing_token_expiry_logs_a_warning() -> None:
