@@ -7,6 +7,7 @@ recorded rather than raised, unless `fail_on_instrument_error` is set.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -82,6 +83,8 @@ class CTraderInstrumentProvider(InstrumentProvider):
         # Chain queries awaiting the venue: a per-symbol reset cannot tell whether their answers
         # use the symbol, so it treats them as stale.
         self._chain_queries = 0
+        # The query in flight per chain key, shared by every caller that needs that chain.
+        self._chain_tasks: dict[tuple[int, int], asyncio.Task[list[om.ProtoOALightSymbol]]] = {}
         # Symbol names dropped by `remove_failed`: refused until explicitly requested again,
         # so a chain or a reload cannot quietly resurrect an instrument that must not trade.
         self._blocked: set[str] = set()
@@ -134,9 +137,10 @@ class CTraderInstrumentProvider(InstrumentProvider):
         """Chain instruments needed to convert `instrument`'s quote currency into the deposit
         currency (empty if they are already equal). Loads them (both legs are currencies, so
         they build as `CurrencyPair`s, the instrument kind `Cache.get_xrate` reads rates from).
-        The chain is cached per `(quote_asset_id, deposit_asset_id)`, and a leg already loaded
-        is reused rather than rebuilt. Raises `InstrumentLoadError` if the chain cannot be
-        built, or `instrument` was not loaded by this provider.
+        The chain is cached per `(quote_asset_id, deposit_asset_id)`, concurrent callers for one
+        pair share one venue query, and a leg already loaded is reused rather than rebuilt.
+        Raises `InstrumentLoadError` if the chain cannot be built, or `instrument` was not
+        loaded by this provider; a failed request raises its own `CTraderError`.
         """
         self._require_connected()
         quote_asset_id = self._quote_asset_id.get(instrument.id)
@@ -149,19 +153,13 @@ class CTraderInstrumentProvider(InstrumentProvider):
         cache_key = (quote_asset_id, deposit_asset_id)
         chain = self._chains.get(cache_key)
         if chain is None:
-            generation = self._chain_generation
-            self._chain_queries += 1
-            try:
-                chain = await self._account.conversion_chain(quote_asset_id, deposit_asset_id)
-            finally:
-                self._chain_queries -= 1
+            # Shielded: a cancelled caller must not cancel the query for the others sharing it.
+            chain = await asyncio.shield(self._chain_query(cache_key))
             if not chain:
                 raise InstrumentLoadError(
                     f"no conversion chain from {instrument.quote_currency.code} to "
                     f"{self._account.deposit_asset.name}",
                 )
-            if generation == self._chain_generation:
-                self._chains[cache_key] = chain
 
         missing = [leg for leg in chain if self.instrument_for_symbol_id(leg.symbolId) is None]
         specs = (
@@ -176,6 +174,32 @@ class CTraderInstrumentProvider(InstrumentProvider):
             else:
                 instruments.append(self._build_or_fail(specs.get(leg.symbolId), leg))
         return instruments
+
+    def _chain_query(self, key: tuple[int, int]) -> asyncio.Task[list[om.ProtoOALightSymbol]]:
+        """The venue query for `key`'s chain already in flight, or a new one."""
+        task = self._chain_tasks.get(key)
+        if task is None:
+            task = asyncio.get_running_loop().create_task(self._query_chain(key))
+            # Retrieved here, so a failure whose callers were all cancelled is not reported
+            # as never retrieved.
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            self._chain_tasks[key] = task
+        return task
+
+    async def _query_chain(self, key: tuple[int, int]) -> list[om.ProtoOALightSymbol]:
+        generation = self._chain_generation
+        task = asyncio.current_task()
+        self._chain_queries += 1
+        try:
+            chain = await self._account.conversion_chain(*key)
+        finally:
+            self._chain_queries -= 1
+            # A reset since the start may already have replaced this query.
+            if self._chain_tasks.get(key) is task:
+                del self._chain_tasks[key]
+        if chain and generation == self._chain_generation:
+            self._chains[key] = chain
+        return chain
 
     @property
     def conversion_generation(self) -> int:
@@ -209,6 +233,8 @@ class CTraderInstrumentProvider(InstrumentProvider):
             del self._chains[key]
         if symbol_id is None or stale or self._chain_queries:
             self._chain_generation += 1
+            # A query already in flight may answer for the old chains: a later caller asks again.
+            self._chain_tasks.clear()
         if symbol_id is None:
             # A full reset is a fresh start for the connection, so a dropped instrument gets
             # another chance to load.

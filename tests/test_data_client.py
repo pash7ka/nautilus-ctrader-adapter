@@ -64,6 +64,7 @@ from tests.account_venue import (
     TRADER_LOGIN,
     HeldReplies,
     account_client,
+    for_account,
     received,
     venue,
 )
@@ -1192,6 +1193,131 @@ async def test_an_unanswered_chain_request_keeps_the_instrument_and_retries(
 
         assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
         assert GER40_ID in h.client._converted
+
+
+def refusal(error_code: str) -> Callable[[Message], Message]:
+    return lambda r: oa.ProtoOAErrorRes(
+        ctidTraderAccountId=r.ctidTraderAccountId,
+        errorCode=error_code,
+    )
+
+
+def recorded_chain(request: oa.ProtoOASymbolsForConversionReq) -> Message:
+    return for_account(RECORDED["conversion_eur_usd"][0], request.ctidTraderAccountId)
+
+
+def assert_kept_unconverted(h: Harness, error_code: str) -> None:
+    assert h.provider.find(GER40_ID) is not None
+    assert not any(f.symbol == "GER40.cash" for f in h.provider.failures)
+    assert GER40_ID not in h.client._converted
+    assert not h.logger.errors()
+    warnings = [w for w in h.logger.warnings() if str(GER40_ID) in w]
+    assert len(warnings) == 1
+    assert error_code in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "BLOCKED_PAYLOAD_TYPE",
+        "SERVER_IS_UNDER_MAINTENANCE",
+        "CH_SERVER_NOT_REACHABLE",
+        "UNKNOWN_ERROR",
+    ],
+)
+async def test_a_refused_conversion_keeps_the_instrument_loaded(error_code: str) -> None:
+    server = data_venue()
+    server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, refusal(error_code))
+    async with harness(server=server, logged=True) as h:
+        await h.client._connect()
+
+        assert_kept_unconverted(h, error_code)
+
+
+async def test_a_refused_leg_spec_request_keeps_the_instrument_loaded() -> None:
+    server = data_venue()
+    refuse = refusal("SERVER_IS_UNDER_MAINTENANCE")
+    specs = RECORDED["symbol_specs"][0]
+    server.on(
+        om.PROTO_OA_SYMBOL_BY_ID_REQ,
+        lambda r: (
+            refuse(r)
+            if EURUSD_SYMBOL_ID in r.symbolId
+            else oa.ProtoOASymbolByIdRes(
+                ctidTraderAccountId=r.ctidTraderAccountId,
+                symbol=[s for s in specs.symbol if s.symbolId in r.symbolId],
+            )
+        ),
+    )
+    async with harness(server=server, logged=True) as h:
+        await h.client._connect()
+
+        assert_kept_unconverted(h, "SERVER_IS_UNDER_MAINTENANCE")
+
+
+async def test_the_next_subscribe_retries_a_refused_conversion() -> None:
+    server = data_venue()
+    server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, refusal("BLOCKED_PAYLOAD_TYPE"))
+    async with harness(server=server) as h:
+        await h.client._connect()
+        assert GER40_ID not in h.client._converted
+
+        h.server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+        await subscribe_quotes(h, GER40_ID)
+
+        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 2
+        assert GER40_ID in h.client._converted
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+
+
+def second_eur_quoted_venue() -> FakeCTraderServer:
+    """The data venue with US100.cash quoted in EUR too, so two instruments need one chain."""
+    server = data_venue()
+    symbols = for_account(RECORDED["symbols"][0], ACCOUNT_ID)
+    lights = {s.symbolName: s for s in symbols.symbol}
+    lights["US100.cash"].quoteAssetId = lights["GER40.cash"].quoteAssetId
+    server.on(om.PROTO_OA_SYMBOLS_LIST_REQ, lambda r: for_account(symbols, r.ctidTraderAccountId))
+    return server
+
+
+async def test_concurrent_subscribes_share_one_chain_request() -> None:
+    async with harness(client_config=load_all_config(), server=second_eur_quoted_venue()) as h:
+        await h.client._connect()
+        held = HeldReplies(h.server, om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+        subscribes = [
+            asyncio.create_task(subscribe_quotes(h, GER40_ID)),
+            asyncio.create_task(subscribe_quotes(h, US100_ID)),
+        ]
+        await held.arrived.wait()
+        # One round-trip, so a second chain request sent meanwhile has reached the venue.
+        await h.account.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+
+        await held.stop_holding()
+        await asyncio.gather(*subscribes)
+
+        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 1
+        assert {GER40_ID, US100_ID} <= h.client._converted
+        consumers = h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert {GER40_CONVERSION, US100_CONVERSION} <= consumers
+
+
+async def test_a_cancelled_subscribe_leaves_the_shared_chain_request_to_the_other() -> None:
+    async with harness(client_config=load_all_config(), server=second_eur_quoted_venue()) as h:
+        await h.client._connect()
+        held = HeldReplies(h.server, om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+        cancelled = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await held.arrived.wait()
+        other = asyncio.create_task(subscribe_quotes(h, US100_ID))
+        await h.account.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await held.stop_holding()
+        await other
+
+        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 1
+        assert US100_ID in h.client._converted
 
 
 async def test_a_conversion_leg_that_is_also_subscribed_emits_one_quote() -> None:

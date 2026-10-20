@@ -230,16 +230,17 @@ its first subscription instead — quotes or bars alike, since the valuation nee
 way: resolving a chain for every symbol a broker offers would be pointless work. Chains are
 resolved once each time the account connects, and again if the venue announces that one of
 their symbols changed. A network drop the connection recovers from on its own keeps them.
+Instruments that need the same chain at the same time share one request for it.
 
 Two different failures are reported differently, because they need different responses:
 
-- The chain cannot be built at all — the venue has no route, or one of its symbols cannot be
-  loaded. The instrument can never be valued in the account currency, so it is dropped from the
-  provider and recorded as a load failure, at ERROR.
-- The request was refused or never answered — a venue refusal, a timeout, or a session that is
-  reconnecting. The instrument is fine; the request was not, and nothing has been learned about
-  the chain. It stays loaded and unconverted, with a WARNING, and the next subscribe tries
-  again.
+- The chain cannot be built at all — the venue answers with an empty chain, or one of its
+  symbols cannot be built as an instrument. The instrument can never be valued in the account
+  currency, so it is dropped from the provider and recorded as a load failure, at ERROR.
+- The request was refused or never answered — a venue refusal of the chain request or of a
+  leg's symbol request, whatever its error code, a timeout, or a session that is reconnecting.
+  The instrument is fine; the request was not, and nothing has been learned about the chain.
+  It stays loaded and unconverted, with a WARNING, and the next subscribe tries again.
 
 ## `synthetic_quote_size`
 

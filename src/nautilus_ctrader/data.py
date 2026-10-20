@@ -632,17 +632,18 @@ class CTraderDataClient(LiveMarketDataClient):
             return []
         try:
             chain = await self._instrument_provider.conversion_instruments_for(instrument)
-        except (InstrumentLoadError, CTraderRequestError, CTraderProtocolError) as e:
-            # Only these say something about the chain itself: no route, a leg that cannot be
-            # built, or an answer that could not be read.
+        except InstrumentLoadError as e:
+            # Only this says something about the chain itself: no route, or a leg that cannot
+            # be built.
+            # TODO(verify): whether the venue answers an impossible pair with an empty chain or
+            # with an error code. One live conversion request for such a pair would settle it.
             self._instrument_provider.remove_failed(instrument.id, f"conversion failed: {e}")
             if self._config.fail_on_instrument_error:
                 raise
             return None
         except CTraderError as e:
-            # Everything else - a lost connection, a timeout, a session that cannot
-            # authenticate - says nothing about the instrument, and dropping it would lose it
-            # for the whole process over one reconnect.
+            # Everything else - a venue refusal, a lost connection, a timeout - says nothing
+            # about the instrument, and dropping it would lose it for the whole process.
             self._conversion_not_subscribed(instrument.id, e, during_connect=during_connect)
             return None
         consumer = _conversion_consumer(instrument.id)
