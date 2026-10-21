@@ -272,6 +272,41 @@ def _with_positions(
     return merged
 
 
+def _closing_event(
+    account_id: int, position_id: int, found: PositionHistory
+) -> oa.ProtoOAExecutionEvent | None:
+    """The execution event the broker sends for a closed position's last deal.
+
+    `None` when the lists are incomplete, leave the position open, or lack the deal's order.
+    """
+    entry = venue_book.entry_of(found.orders)
+    if not found.complete or not found.deals or entry is None or open_volume(found) > 0:
+        return None
+    deal = max(found.deals, key=lambda d: (d.executionTimestamp, d.dealId))
+    order = _with_id(found.orders, deal.orderId)
+    if order is None:
+        return None
+    position = om.ProtoOAPosition(
+        positionId=position_id,
+        tradeData=om.ProtoOATradeData(
+            symbolId=deal.symbolId, volume=0, tradeSide=entry.tradeData.tradeSide
+        ),
+        positionStatus=om.POSITION_STATUS_CLOSED,
+        utcLastUpdateTimestamp=deal.executionTimestamp,
+    )
+    return oa.ProtoOAExecutionEvent(
+        ctidTraderAccountId=account_id,
+        executionType=om.ORDER_FILLED,
+        order=order,
+        deal=deal,
+        position=position,
+        # As recorded: a protective order's fill is the broker's own, a close by hand is not.
+        # TODO(verify): that a listed stop-out order carries `isStopOut` as its event does; none
+        # was recorded.
+        isServerEvent=order.orderType == om.STOP_LOSS_TAKE_PROFIT,
+    )
+
+
 @dataclass(frozen=True)
 class BrokerState:
     """One read of the broker: what stands now, and the lists of the positions it covers.
@@ -981,7 +1016,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._log.debug(f"Bracket {entry_id}: its entry filled; left to the rebuild under way")
             return
         try:
-            await self._load()
+            await self._load(keep_gone=True)
         except CTraderError as e:
             self._log.warning(
                 f"Bracket {entry_id}: its entry filled, but the venue model was not rebuilt: {e}",
@@ -1305,17 +1340,24 @@ class CTraderExecutionClient(LiveExecutionClient):
         )
         return response.trader
 
-    async def _load(self, stood: Callable[[], None] | None = None) -> None:
+    async def _load(
+        self, stood: Callable[[], None] | None = None, *, keep_gone: bool = False
+    ) -> None:
         """Rebuild the venue model from the broker's open positions and their order lists.
 
         Execution events that arrive meanwhile are applied once it stands, in order; `stood`
         runs before them.
+
+        `keep_gone`: a position with a live leg that the snapshot lacks is kept, for its close
+        event; if none comes, its deals answer it (`_close_from_deals()`).
         """
         self._hold_buffer()
         rebuilt = False
         try:
-            self._stand(await self._read_broker(since_ms=None, deals=False))
+            self._stand(await self._read_broker(since_ms=None, deals=False), keep_gone=keep_gone)
             rebuilt = True
+            for position_id in self._book.kept():
+                self._await_close(position_id, retried=False)
             if stood is not None:
                 stood()
         finally:
@@ -1436,10 +1478,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             snapshot = _with_positions(snapshot, await read_snapshot(), lacking)
         return BrokerState(snapshot, histories, tuple(window.values()), requests)
 
-    def _stand(self, state: BrokerState) -> None:
+    def _stand(self, state: BrokerState, *, keep_gone: bool = False) -> None:
         """Rebuild the venue model and the margins from `state`'s snapshot."""
         orders = {position_id: found.orders for position_id, found in state.histories.items()}
-        records = self._book.load(state.snapshot, orders)
+        records = self._book.load(state.snapshot, orders, keep_gone=keep_gone)
         for record in records:
             # Its order list was just read: reading it again would find no entry either.
             if isinstance(record, EntryUnknown):
@@ -2244,6 +2286,67 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _protection_waited(self, position_id: int) -> None:
         self._handle_records(self._book.protection_timed_out(position_id))
 
+    def _await_close(self, position_id: int, *, retried: bool) -> None:
+        """Read kept position `position_id`'s deals unless an event of it comes in time."""
+
+        def waited() -> None:
+            self._protection_timers.discard(timer)
+            if position_id in self._book.kept():
+                self.create_task(
+                    self._close_from_deals(position_id, retried=retried),
+                    log_msg=f"read the deals of position {position_id}",
+                )
+
+        timer = self._loop.call_later(self._config.protective_order_timeout_secs, waited)
+        self._protection_timers.add(timer)
+
+    async def _close_from_deals(self, position_id: int, *, retried: bool) -> None:
+        """Apply a kept position's closing deal as its execution event would have been applied.
+
+        A rebuild's snapshot lacked the position and no event of it came since. A failed read is
+        tried once more after `protective_order_timeout_secs`.
+        """
+        wait_secs = self._config.protective_order_timeout_secs
+        unanswered = (
+            f"Position {position_id} is gone from the broker's list and no event closed it; "
+        )
+        try:
+            state = await self._read_broker(since_ms=None, positions=[position_id])
+        except CTraderError as e:
+            if self._session is None or position_id not in self._book.kept():
+                return
+            if retried:
+                self._log.error(
+                    f"{unanswered}its deals could not be read ({e}), so its legs stay open in "
+                    "Nautilus and need a check by hand",
+                )
+            else:
+                self._log.warning(
+                    f"{unanswered}its deals could not be read ({e}); tried again in {wait_secs:g}s",
+                )
+                self._await_close(position_id, retried=True)
+            return
+        # An event of it came during the read.
+        if self._session is None or position_id not in self._book.kept():
+            return
+        found = state.histories.get(position_id)
+        if found is not None and found.complete and open_volume(found) > 0:
+            self._log.warning(
+                f"Position {position_id} is gone from the broker's list but open by its deals; "
+                "it stays as held",
+            )
+            self._book.end_keep(position_id)
+            return
+        account_id = self._account.account_id
+        event = None if found is None else _closing_event(account_id, position_id, found)
+        if event is None:
+            self._log.error(
+                f"{unanswered}its deals name no close, so its legs stay open in Nautilus and "
+                "need a check by hand",
+            )
+            return
+        self._on_execution_event(event)
+
     def _end_bracket(self, entry_id: str, reason: str) -> None:
         """Forget a bracket whose levels will never be corrected; a modify waiting on it fails."""
         bracket = self._brackets.by_entry(entry_id)
@@ -3020,7 +3123,12 @@ class CTraderExecutionClient(LiveExecutionClient):
                     bracket.entry_id, "the position closed before its levels were set"
                 )
                 continue
-            if view is None or view.protective_order_id is None:
+            # A kept position is gone at the broker: no amend can reach it.
+            if (
+                view is None
+                or view.protective_order_id is None
+                or view.position_id in self._book.kept()
+            ):
                 continue
             wanted = self._wanted_levels(bracket, view)
             if wanted == view.levels:
@@ -3168,9 +3276,8 @@ class CTraderExecutionClient(LiveExecutionClient):
           command, all of them in one amend; a modify the broker holds already is answered with
           an `OrderUpdated`, as is a leg whose level moved.
 
-        A position gone at the rebuild answers none of its legs: the rebuild reads no deals, so
-        it cannot tell a leg that filled from one cancelled. Their own events, or Nautilus's
-        in-flight check, settle them.
+        A position the rebuild's snapshot lacks answers none of its legs here: the model keeps
+        it, and its close event, else its deals (`_close_from_deals()`), ends them.
 
         A leg ended by an event held during the rebuild was reported by that event. A rebuild
         held off by one under way is left to that one's release. A failed rebuild is tried again
@@ -3178,10 +3285,13 @@ class CTraderExecutionClient(LiveExecutionClient):
         """
         alive_stood: set[Level] = set()
         position_stood = False
+        kept = False
 
         def stood() -> None:
-            nonlocal position_stood
-            position_stood = self._bracket_position(bracket) is not None
+            nonlocal position_stood, kept
+            view = self._bracket_position(bracket)
+            kept = view is not None and view.position_id in self._book.kept()
+            position_stood = view is not None and not kept
             alive_stood.update(self._alive_legs(bracket))
 
         try:
@@ -3189,7 +3299,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             if self._buffer is not None:
                 return
             alive_before = self._alive_legs(bracket)
-            await self._load(stood)
+            await self._load(stood, keep_gone=True)
         except Exception as e:
             if not isinstance(e, CTraderError):
                 self._log.exception(
@@ -3204,10 +3314,16 @@ class CTraderExecutionClient(LiveExecutionClient):
         if self._session is None or self._brackets.by_entry(bracket.entry_id) is not bracket:
             return
         self._brackets.remove(bracket.entry_id)
+        if kept:
+            self._log.warning(
+                f"Bracket {bracket.entry_id}: its corrections got no answer and its position is "
+                "gone from the broker's list; its legs are answered by the position's close",
+            )
+            return
         if not position_stood:
             self._log.warning(
                 f"Bracket {bracket.entry_id}: its corrections got no answer and its position is "
-                "gone; its legs are left to their own events or Nautilus's in-flight check",
+                "gone; its legs are left to their own events",
             )
             return
         self._log.warning(

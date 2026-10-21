@@ -280,6 +280,8 @@ class VenueBook:
         self._open_orders: dict[int, om.ProtoOAOrder] = {}
         self._seen: set[tuple] = set()
         self._synced_deals: set[int] = set()
+        # Positions a load kept though its snapshot lacked them, until an event of theirs comes.
+        self._kept: set[int] = set()
 
     def view(self, position_id: int) -> PositionView | None:
         position = self._positions.get(position_id)
@@ -359,13 +361,32 @@ class VenueBook:
         self,
         snapshot: oa.ProtoOAReconcileRes,
         position_orders: Mapping[int, Sequence[om.ProtoOAOrder]],
+        *,
+        keep_gone: bool = False,
     ) -> list[Record]:
         """Rebuild the model from a snapshot asked with protection orders.
 
         `position_orders` holds each open position's own order list. Reporting the rebuilt state
         to Nautilus is reconciliation's job; this returns only notices, and an `EntryUnknown` for
         each foreign position with a level whose order list names no entry.
+
+        `keep_gone`: a position with a live leg that the snapshot lacks is kept as it stood, so
+        its close event, held or late, still ends its legs. It stays in `kept()` until an event
+        of it is applied.
         """
+        listed = {position.positionId for position in snapshot.position}
+        gone = {
+            position_id: position
+            for position_id, position in self._positions.items()
+            if keep_gone
+            and position_id not in listed
+            and position.open
+            and (
+                any(leg.alive for leg in position.legs.values())
+                or any(leg.alive for leg in position.foreign_legs.values())
+            )
+        }
+        self._kept = set(gone)
         self._positions = {}
         self._unloaded_orders = {}
         self._reported = set()
@@ -415,7 +436,16 @@ class VenueBook:
         for position in self._positions.values():
             if not position.ours and position.levels:
                 notices += foreign_leg_rules.open_legs(position, self._held_closed)
+        self._positions.update(gone)
         return notices
+
+    def kept(self) -> frozenset[int]:
+        """The positions the last load kept that no event has named since."""
+        return frozenset(self._kept)
+
+    def end_keep(self, position_id: int) -> None:
+        """Position `position_id` is known open after all: it stays as held, kept no longer."""
+        self._kept.discard(position_id)
 
     def apply(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
         """What `event` means to Nautilus; an event seen before means nothing new.
@@ -432,6 +462,8 @@ class VenueBook:
         records = self._handle(event, operations)
         # Marked only once handled, so an event whose handling raised can be applied again.
         self._seen.add(key)
+        # The broker still states the position: its events, not a deal read, answer its legs.
+        self._kept.discard(event.order.positionId)
         return records
 
     def trailing_stop_moved(self, event: oa.ProtoOATrailingSLChangedEvent) -> list[Record]:
