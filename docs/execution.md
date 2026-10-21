@@ -105,15 +105,19 @@ exists, the adapter amends the position's levels to the exact prices requested.
   modify of a leg that arrives meanwhile is sent at once, in a new round.
 - If the third round ends as unknown too, nothing the bracket carries is refused for the lost
   answer. The venue model is rebuilt from the broker, a WARNING is logged, and each leg is answered
-  as the broker holds it. A leg whose level (or position) is gone is cancelled, which also answers
-  a modify it carried. A carried modify the broker already holds ends in an `OrderUpdated`. A
-  carried cancel of a level that still stands, or a modify to another price, is sent as an ordinary
-  cancel or modify of the leg, a cancel or modify that arrives once the rounds have run out
-  included. A standing leg whose level moved reports it in an `OrderUpdated`. If the rebuild fails,
-  a WARNING says so and it is tried again after `protective_order_timeout_secs`, then after twice
-  as long each time, up to `connect_timeout_secs`. The rebuild is of the whole account: it may end
-  the legs of other pending brackets whose levels the broker no longer holds, without an event.
-  Nautilus's in-flight check then settles such a leg's pending cancel.
+  as the broker holds it. A leg whose level is gone from the position is cancelled, which also
+  answers a modify it carried. A carried modify the broker already holds ends in an `OrderUpdated`.
+  A carried cancel of a level that still stands, or a modify to another price, is sent as an
+  ordinary cancel or modify of the leg, a cancel or modify that arrives once the rounds have run
+  out included; the position's cancels and modifies go in one amend. A standing leg whose level
+  moved reports it in an `OrderUpdated`. If the position itself is gone, no leg is answered: the
+  rebuild reads no deals, so it cannot tell a leg that filled from one cancelled. A WARNING says
+  so, and the legs' own events or Nautilus's in-flight check settle them, a carried cancel or
+  modify included. If the rebuild fails, a WARNING says so (a failure in the adapter itself is
+  also logged at ERROR) and it is tried again after `protective_order_timeout_secs`, then after
+  twice as long each time, up to `connect_timeout_secs`. The rebuild is of the whole account: it
+  may end the legs of other pending brackets whose levels the broker no longer holds, without an
+  event. Nautilus's in-flight check then settles such a leg's pending cancel.
 - If no protective order follows the fill within `protective_order_timeout_secs`, the levels are
   set by an amend instead. If that is refused too, the legs are rejected and an ERROR is logged:
   the position stands without its levels. If it gets no answer, an ERROR says that whether the

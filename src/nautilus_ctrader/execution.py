@@ -581,6 +581,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         # The reconnect's rebuild settles them again.
         for bracket in self._brackets:
             bracket.stop_retry()
+            bracket.rebuild_failures = 0
         if self._outbox_task is not None:
             self._outbox_task.cancel()
             self._outbox_task = None
@@ -2264,7 +2265,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._settle_brackets()
         await asyncio.gather(
             *(
-                self._cancel_guarded(self._remove_levels(position_id, legs), legs.values())
+                self._cancel_guarded(self._amend_legs(position_id, cancels=legs), legs.values())
                 for position_id, legs in by_position.items()
             ),
             *(
@@ -2328,30 +2329,80 @@ class CTraderExecutionClient(LiveExecutionClient):
             for client_order_id in client_order_ids:
                 self._cancel_rejected(client_order_id, reason)
 
-    async def _remove_levels(self, position_id: int, legs: dict[Level, ClientOrderId]) -> None:
-        what = _command("Cancel", legs.values())
-        outcome = await self._amend(
-            position_id,
-            lambda view: {lv: p for lv, p in view.levels.items() if lv not in legs},
-            what=what,
+    async def _amend_legs(
+        self,
+        position_id: int,
+        *,
+        cancels: dict[Level, ClientOrderId] | None = None,
+        moves: dict[Level, tuple[ClientOrderId, Decimal]] | None = None,
+    ) -> None:
+        """Remove the levels of the node's legs `cancels` and move those of `moves`, in one amend.
+
+        `moves` holds each leg with the price its level is to move to.
+        """
+        cancels = cancels or {}
+        moves = moves or {}
+        what = "; ".join(
+            _command(verb, client_order_ids)
+            for verb, client_order_ids in (
+                ("Cancel", list(cancels.values())),
+                ("Modify", [client_order_id for client_order_id, _ in moves.values()]),
+            )
+            if client_order_ids
         )
+
+        def levels_of(view: PositionView) -> dict[Level, Decimal]:
+            levels = {lv: p for lv, p in view.levels.items() if lv not in cancels}
+            levels.update((lv, wanted) for lv, (_, wanted) in moves.items())
+            return levels
+
+        outcome = await self._amend(position_id, levels_of, what=what)
         if outcome is None:
             return
         if isinstance(outcome, _Refused):
-            for client_order_id in legs.values():
+            for client_order_id in cancels.values():
                 self._cancel_rejected(client_order_id, outcome.reason)
+            for client_order_id, _ in moves.values():
+                self._modify_rejected(client_order_id, outcome.reason)
             return
-        with self._after_send(what, sent=outcome.sent):
-            # Answered from what the broker holds now, not from what was asked.
+        if cancels:
+            with self._after_send(what, sent=outcome.sent):
+                self._answer_cancels(position_id, cancels)
+        for level, (client_order_id, wanted) in moves.items():
+            with self._after_send(what, sent=outcome.sent):
+                self._answer_move(outcome, client_order_id, position_id, level, wanted)
+
+    def _answer_cancels(self, position_id: int, legs: dict[Level, ClientOrderId]) -> None:
+        # Answered from what the broker holds now, not from what was asked.
+        view = self._book.view(position_id)
+        ts_ms = self._clock.timestamp_ms()
+        for level, client_order_id in legs.items():
+            if view is not None and level in view.levels:
+                self._cancel_rejected(client_order_id, "the broker kept the level")
+            else:
+                # A level the broker did not hold was not in its answer: nothing cancelled
+                # the leg.
+                self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
+
+    def _answer_move(
+        self,
+        outcome: _Amended,
+        client_order_id: ClientOrderId,
+        position_id: int,
+        level: Level,
+        wanted: Decimal,
+    ) -> None:
+        held_price = self._held_level(outcome, position_id, level)
+        if held_price != wanted:
+            self._modify_rejected(client_order_id, _not_moved(held_price))
+            return
+        if not _updated(outcome.records, client_order_id=client_order_id.value):
+            # The level stood there already, or a trailing move overtook the answer: no
+            # event says where it stands, and the modify still needs one.
             view = self._book.view(position_id)
-            ts_ms = self._clock.timestamp_ms()
-            for level, client_order_id in legs.items():
-                if view is not None and level in view.levels:
-                    self._cancel_rejected(client_order_id, "the broker kept the level")
-                else:
-                    # A level the broker did not hold was not in its answer: nothing cancelled
-                    # the leg.
-                    self._handle_records(self._book.cancel_leg(position_id, level, ts_ms))
+            standing = None if view is None else view.levels.get(level)
+            if standing is not None:
+                self._leg_updated(client_order_id, level, standing)
 
     async def _remove_foreign_levels(
         self,
@@ -2528,33 +2579,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             # A bracket holding a lost amend sends the modify now, or once its rounds run out.
             self._settle_brackets()
             return
-        await self._move_level(client_order_id, found[0], level, price.as_decimal())
-
-    async def _move_level(
-        self, client_order_id: ClientOrderId, position_id: int, level: Level, wanted: Decimal
-    ) -> None:
-        """Move the level of the node's leg `client_order_id` to `wanted` by an amend."""
-        what = _command("Modify", [client_order_id])
-        outcome = await self._amend(
-            position_id, lambda view: {**view.levels, level: wanted}, what=what
-        )
-        if outcome is None:
-            return
-        if isinstance(outcome, _Refused):
-            self._modify_rejected(client_order_id, outcome.reason)
-            return
-        with self._after_send(what, sent=outcome.sent):
-            held_price = self._held_level(outcome, position_id, level)
-            if held_price != wanted:
-                self._modify_rejected(client_order_id, _not_moved(held_price))
-                return
-            if not _updated(outcome.records, client_order_id=client_order_id.value):
-                # The level stood there already, or a trailing move overtook the answer: no
-                # event says where it stands, and the modify still needs one.
-                view = self._book.view(position_id)
-                standing = None if view is None else view.levels.get(level)
-                if standing is not None:
-                    self._leg_updated(client_order_id, level, standing)
+        await self._amend_legs(found[0], moves={level: (client_order_id, price.as_decimal())})
 
     async def _modify_foreign_leg(
         self,
@@ -3116,40 +3141,63 @@ class CTraderExecutionClient(LiveExecutionClient):
 
         The lost amend may have applied, so nothing the bracket carries is refused for it:
 
-        - a leg the rebuild ended, its level or its position gone, is cancelled, which also
+        - a leg the rebuild ended, its level gone from the position, is cancelled, which also
           answers a modify it carried;
         - a standing leg's carried cancel, or modify of another price, is sent as an ordinary
-          command; a modify the broker holds already is answered with an `OrderUpdated`, as is a
-          leg whose level moved.
+          command, all of them in one amend; a modify the broker holds already is answered with
+          an `OrderUpdated`, as is a leg whose level moved.
+
+        A position gone at the rebuild answers none of its legs: the rebuild reads no deals, so
+        it cannot tell a leg that filled from one cancelled. Their own events, or Nautilus's
+        in-flight check, settle them.
 
         A leg ended by an event held during the rebuild was reported by that event. A rebuild
         held off by one under way is left to that one's release. A failed rebuild is tried again
         by a timer, from `protective_order_timeout_secs` doubling up to `connect_timeout_secs`.
         """
         alive_stood: set[Level] = set()
+        position_stood = False
+
+        def stood() -> None:
+            nonlocal position_stood
+            position_stood = self._bracket_position(bracket) is not None
+            alive_stood.update(self._alive_legs(bracket))
+
         try:
             # As in `_learn_position()`: the rebuild under way settles again once released.
             if self._buffer is not None:
                 return
             alive_before = self._alive_legs(bracket)
-            await self._load(lambda: alive_stood.update(self._alive_legs(bracket)))
-        except CTraderError as e:
+            await self._load(stood)
+        except Exception as e:
+            if not isinstance(e, CTraderError):
+                self._log.exception(
+                    f"Bracket {bracket.entry_id}: the rebuild to settle it failed in the adapter "
+                    f"({type(e).__name__})",
+                    e,
+                )
             self._retry_settle(bracket, e)
             return
         finally:
             bracket.correcting = False
         if self._session is None or self._brackets.by_entry(bracket.entry_id) is not bracket:
             return
+        self._brackets.remove(bracket.entry_id)
+        if not position_stood:
+            self._log.warning(
+                f"Bracket {bracket.entry_id}: its corrections got no answer and its position is "
+                "gone; its legs are left to their own events or Nautilus's in-flight check",
+            )
+            return
         self._log.warning(
             f"Bracket {bracket.entry_id}: its corrections got no answer; its legs are answered "
             "as the broker holds them",
         )
-        self._brackets.remove(bracket.entry_id)
         ended = alive_before - alive_stood
         view = self._bracket_position(bracket)
         ts_ms = self._clock.timestamp_ms()
         cancels: dict[Level, ClientOrderId] = {}
-        moves: dict[Level, Decimal] = {}
+        moves: dict[Level, tuple[ClientOrderId, Decimal]] = {}
         for level, leg_id in bracket.legs.items():
             client_order_id = ClientOrderId(leg_id)
             if level in ended:
@@ -3167,23 +3215,23 @@ class CTraderExecutionClient(LiveExecutionClient):
             if level in bracket.cancels:
                 cancels[level] = client_order_id
             elif level in bracket.modified and held != bracket.requested[level]:
-                moves[level] = bracket.requested[level]
+                moves[level] = (client_order_id, bracket.requested[level])
             elif level in bracket.modified or held != self._held_price(leg_id):
                 self._leg_updated(client_order_id, level, held)
-        if view is None:
+        if view is None or not (cancels or moves):
             return
-        if cancels:
-            await self._cancel_guarded(
-                self._remove_levels(view.position_id, cancels), cancels.values()
-            )
-        for level, wanted in moves.items():
-            client_order_id = ClientOrderId(bracket.legs[level])
-            try:
-                await self._move_level(client_order_id, view.position_id, level, wanted)
-            except Exception as e:
-                self._modify_rejected(client_order_id, self._failed("Modify", [client_order_id], e))
+        # One amend: a move sent after a cancel whose answer was lost would set the level again.
+        try:
+            await self._amend_legs(view.position_id, cancels=cancels, moves=moves)
+        except Exception as e:
+            moved = [client_order_id for client_order_id, _ in moves.values()]
+            reason = self._failed("Amend", [*cancels.values(), *moved], e)
+            for client_order_id in cancels.values():
+                self._cancel_rejected(client_order_id, reason)
+            for client_order_id in moved:
+                self._modify_rejected(client_order_id, reason)
 
-    def _retry_settle(self, bracket: PendingBracket, error: CTraderError) -> None:
+    def _retry_settle(self, bracket: PendingBracket, error: Exception) -> None:
         """Try a failed rebuild of `_settle_from_broker()` again later, unless the client left."""
         if self._session is None or self._brackets.by_entry(bracket.entry_id) is not bracket:
             return

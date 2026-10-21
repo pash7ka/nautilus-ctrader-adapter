@@ -3602,15 +3602,20 @@ def entry_held() -> tuple[ExecutionVenue, HeldReplies]:
 LOSING = exec_config(protective_order_timeout_secs=0.05)
 
 
-def failing_reads(h, monkeypatch: pytest.MonkeyPatch, failures: int) -> list:
-    """The first `failures` reads of the broker fail; returns one entry per read."""
+def failing_reads(
+    h,
+    monkeypatch: pytest.MonkeyPatch,
+    failures: int,
+    error: type[Exception] = CTraderConnectionError,
+) -> list:
+    """The first `failures` reads of the broker raise `error`; returns one entry per read."""
     read_broker = h.client._read_broker
     reads: list = []
 
     async def read(**kwargs):
         reads.append(kwargs)
         if len(reads) <= failures:
-            raise CTraderConnectionError("dropped for the test")
+            raise error("dropped for the test")
         return await read_broker(**kwargs)
 
     monkeypatch.setattr(h.client, "_read_broker", read)
@@ -3751,12 +3756,12 @@ async def test_a_level_removed_during_the_settling_rebuild_cancels_its_leg_once(
         assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
 
 
-async def test_the_legs_of_a_position_gone_at_the_rebuild_are_cancelled_after_lost_answers(
+async def test_the_legs_of_a_position_gone_at_the_rebuild_are_left_to_their_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     execution_venue, held = entry_held()
     async with harness(execution_venue=execution_venue, config=LOSING) as h:
-        # The rebuild reads no open position.
+        # The rebuild reads no open position: a leg may have filled, which it cannot tell.
         await corrections_lost(
             h,
             held,
@@ -3764,18 +3769,43 @@ async def test_the_legs_of_a_position_gone_at_the_rebuild_are_cancelled_after_lo
             lambda: h.client._modify_order(modify(STOP, trigger_price="85150.00")),
         )
         await wait_until(lambda: len(h.client._brackets) == 0)
+        await sync(h)
+
+        for leg in (STOP, TARGET):
+            assert "OrderCanceled" not in h.kinds_of(leg)
+            assert refusals(h, h.cache.order(ClientOrderId(leg))) == []
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+        assert any("its position is gone" in w for w in h.logger.warnings())
+
+
+async def test_a_carried_cancel_and_move_on_one_position_go_in_one_amend_after_lost_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        broker_holds(execution_venue, stop=85197.2, target=85387.22)
+
+        async def cancel_and_move() -> None:
+            await h.client._cancel_order(cancel(TARGET))
+            await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+
+        await corrections_lost(h, held, monkeypatch, cancel_and_move)
+        stop = h.cache.order(ClientOrderId(STOP))
+        await wait_until(lambda: len(h.client._brackets) == 0)
         await wait_until(
             lambda: (
-                status(h, STOP) == OrderStatus.CANCELED
+                stop.trigger_price == Price.from_str("85150.00")
                 and status(h, TARGET) == OrderStatus.CANCELED
             ),
         )
         await sync(h)
 
-        assert h.kinds_of(STOP).count("OrderCanceled") == 1
-        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
-        assert refusals(h, h.cache.order(ClientOrderId(STOP))) == []
-        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+        (amend,) = amends
+        assert amend.stopLoss == 85150.0
+        assert not amend.HasField("takeProfit")
+        assert refusals(h, stop) == []
+        assert refusals(h, h.cache.order(ClientOrderId(TARGET))) == []
 
 
 async def test_a_failed_settling_rebuild_is_retried_after_a_back_off_not_per_event(
@@ -3810,6 +3840,58 @@ async def test_a_failed_settling_rebuild_is_retried_after_a_back_off_not_per_eve
         assert len(rebuild_failures(h)) == 1
         assert len(h.client._brackets) == 0
         assert refusals(h, stop) == []
+
+
+async def test_a_settling_rebuild_failing_in_the_adapter_is_retried_after_a_back_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    config = exec_config(protective_order_timeout_secs=0.2)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        broker_holds(execution_venue, stop=85150.0, target=85387.22)
+        reads = failing_reads(h, monkeypatch, failures=1, error=RuntimeError)
+        await corrections_lost(
+            h,
+            held,
+            monkeypatch,
+            lambda: h.client._modify_order(modify(STOP, trigger_price="85150.00")),
+        )
+        await wait_until(lambda: len(reads) == 1, timeout_secs=5)
+        stop = h.cache.order(ClientOrderId(STOP))
+
+        h.client._settle_brackets()
+        await asyncio.sleep(0.02)
+        assert len(reads) == 1
+        assert len(h.client._brackets) == 1
+
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"), timeout_secs=5)
+
+        assert len(reads) == 2
+        assert any("RuntimeError" in e for e in h.logger.errors())
+        assert refusals(h, stop) == []
+
+
+async def test_a_detach_forgets_the_failed_settling_rebuilds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    config = exec_config(protective_order_timeout_secs=0.2)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        failing_reads(h, monkeypatch, failures=100)
+        await corrections_lost(
+            h,
+            held,
+            monkeypatch,
+            lambda: h.client._modify_order(modify(STOP, trigger_price="85150.00")),
+        )
+        (bracket,) = h.client._brackets
+        await wait_until(lambda: bracket.rebuild_failures > 0, timeout_secs=5)
+
+        h.client._detach()
+
+        # The next connect's first failure waits the shortest time again.
+        assert bracket.rebuild_failures == 0
+        assert bracket.retry is None
 
 
 async def test_a_failed_rebuild_leaves_a_held_correction_and_its_lost_amend(
