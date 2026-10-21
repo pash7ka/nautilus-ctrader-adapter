@@ -655,14 +655,10 @@ class CTraderExecutionClient(LiveExecutionClient):
                 await self._account.disconnect()
 
     def _detach(self) -> None:
-        for timer in (*self._protection_timers, *self._close_timers.values()):
+        for timer in self._protection_timers:
             timer.cancel()
         self._protection_timers.clear()
-        self._close_timers.clear()
-        for held in self._kept_brackets.values():
-            for kept in held:
-                self._brackets.add(kept.bracket)
-        self._kept_brackets.clear()
+        self._unstash()
         # The reconnect's rebuild settles them again.
         for bracket in self._brackets:
             bracket.stop_retry()
@@ -701,6 +697,20 @@ class CTraderExecutionClient(LiveExecutionClient):
         session.remove_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
         session.remove_restore(self._restore_key)
 
+    def _unstash(self) -> None:
+        """Stop the kept positions' waits and hand their stashed brackets back to `_brackets`.
+
+        A rebuild that keeps nothing answers their legs through its own reports; left stashed,
+        they would be answered a second time.
+        """
+        for timer in self._close_timers.values():
+            timer.cancel()
+        self._close_timers.clear()
+        for held in self._kept_brackets.values():
+            for kept in held:
+                self._brackets.add(kept.bracket)
+        self._kept_brackets.clear()
+
     async def _reload(self) -> None:
         """Reconcile again on a reconnect: the broker may have changed meanwhile.
 
@@ -718,6 +728,8 @@ class CTraderExecutionClient(LiveExecutionClient):
             await asyncio.wait({self._outbox_task})
             if self._session is None:
                 return
+        # The pass keeps no position: its reports answer the legs of every kept one.
+        self._unstash()
         try:
             trader = await self._trader()
             self._take_trader(trader)
@@ -749,11 +761,11 @@ class CTraderExecutionClient(LiveExecutionClient):
             await self._checkpoint.refresh(trader, bounded=True)
 
     def _end_closed_brackets(self, status: ExecutionMassStatus) -> None:
-        """End each pending bracket whose entry filled at the broker but whose position is gone.
+        """End each pending bracket whose entry filled but whose position is gone.
 
-        Such a position opened and closed while the connection was down: no protective order
-        will come for it. An entry the broker does not list stays pending, for Nautilus's own
-        in-flight check.
+        Such a position closed while the connection was down, or while it was kept: no
+        protective order will come for it. An entry neither the broker lists nor Nautilus holds
+        filled stays pending, for Nautilus's own in-flight check.
         """
         filled = {
             report.client_order_id.value
@@ -761,7 +773,10 @@ class CTraderExecutionClient(LiveExecutionClient):
             if report.client_order_id is not None and report.filled_qty.as_decimal() > 0
         }
         for bracket in self._brackets:
-            if bracket.entry_id not in filled:
+            entry = self._cache.order(ClientOrderId(bracket.entry_id))
+            if bracket.entry_id not in filled and (
+                entry is None or entry.filled_qty.as_decimal() == 0
+            ):
                 continue
             view = self._bracket_position(bracket)
             if view is None or not view.open:
@@ -2441,7 +2456,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Answer the stashed brackets of each position no longer kept.
 
         On an open position their carried commands go out as for a standing one. On a closed
-        one, its events answered the legs, but a leg a rebuild ended still gets its cancel.
+        one, its events answered the legs, but a leg a rebuild ended still gets its cancel unless
+        Nautilus holds it closed already.
         """
         for position_id in list(self._kept_brackets):
             if position_id in self._book.kept():
@@ -2459,12 +2475,24 @@ class CTraderExecutionClient(LiveExecutionClient):
                     )
                     continue
                 ts_ms = self._clock.timestamp_ms()
+                legs = [
+                    kept.bracket.legs[level] for level in sorted(ended, key=lambda lv: lv.value)
+                ]
                 self._handle_records(
                     [
-                        OrderEvent(OrderEventKind.CANCELED, None, kept.bracket.legs[level], ts_ms)
-                        for level in sorted(ended, key=lambda lv: lv.value)
+                        OrderEvent(OrderEventKind.CANCELED, None, leg_id, ts_ms)
+                        for leg_id in legs
+                        if not self._closed_in_nautilus(leg_id)
                     ]
                 )
+
+    def _closed_in_nautilus(self, leg_id: str) -> bool:
+        """Whether Nautilus holds leg `leg_id` closed already, so no end of it may be reported."""
+        order = self._cache.order(ClientOrderId(leg_id))
+        if order is None or not order.is_closed:
+            return False
+        self._log.debug(f"Leg {leg_id} is closed in Nautilus already; its cancel is not sent")
+        return True
 
     def _pending_leg(self, leg_id: str) -> tuple[PendingBracket, Level] | None:
         """The bracket that carries a command on leg `leg_id`, held or stashed, and its level."""
@@ -3491,7 +3519,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         for level, leg_id in bracket.legs.items():
             client_order_id = ClientOrderId(leg_id)
             if level in ended:
-                self._handle_records([OrderEvent(OrderEventKind.CANCELED, None, leg_id, ts_ms)])
+                if not self._closed_in_nautilus(leg_id):
+                    self._handle_records([OrderEvent(OrderEventKind.CANCELED, None, leg_id, ts_ms)])
                 continue
             # A leg dead before the rebuild was answered then, even if the rebuild revived it.
             if (

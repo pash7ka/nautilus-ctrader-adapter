@@ -27,6 +27,7 @@ from nautilus_trader.execution.reports import FillReport, OrderStatusReport
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.events import (
+    OrderCanceled,
     OrderCancelRejected,
     OrderFilled,
     OrderModifyRejected,
@@ -4090,6 +4091,66 @@ async def test_a_kept_position_whose_deals_name_no_close_is_an_error(
         for leg in (STOP, TARGET):
             assert status(h, leg) == OrderStatus.ACCEPTED
         assert h.reports == []
+
+
+async def reconnect_after_a_stashed_close(
+    h, held: HeldReplies, monkeypatch: pytest.MonkeyPatch, execution_venue: ExecutionVenue
+) -> None:
+    """A kept position whose deals cannot be read closes by its stop; the session reconnects."""
+    read_broker = h.client._read_broker
+
+    async def deals_dropped(**kwargs):
+        if kwargs.get("positions") is None:
+            return await read_broker(**kwargs)
+        raise CTraderConnectionError("dropped for the test")
+
+    monkeypatch.setattr(h.client, "_read_broker", deals_dropped)
+    await stop_modify_lost(h, held, monkeypatch)
+    await wait_until(lambda: any("check by hand" in e for e in h.logger.errors()))
+    assert h.client._kept_brackets
+
+    closed_by_stop(execution_venue)
+    await h.client._reload()
+    await asyncio.sleep(LOSING.protective_order_timeout_secs * 4)
+    await sync(h)
+
+
+def assert_each_leg_ended_once(h) -> None:
+    """The stop filled and the take-profit cancelled, each once, by the reconnect's reports."""
+    for leg, kind, end in (
+        (STOP, OrderFilled, OrderStatus.FILLED),
+        (TARGET, OrderCanceled, OrderStatus.CANCELED),
+    ):
+        order = h.cache.order(ClientOrderId(leg))
+        assert order.status == end
+        assert [type(e) for e in order.events].count(kind) == 1
+        # Nautilus's reconciliation reported the end; the client adds none of its own.
+        assert "OrderCanceled" not in h.kinds_of(leg)
+
+
+async def test_a_reconnect_answers_a_stashed_brackets_legs_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await reconnect_after_a_stashed_close(h, held, monkeypatch, execution_venue)
+
+        assert_each_leg_ended_once(h)
+        assert h.client._kept_brackets == {}
+        assert len(h.client._brackets) == 0
+
+
+async def test_a_stashed_leg_nautilus_holds_closed_is_not_cancelled_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        # The bracket stays stashed across the reconnect: only the guard stands.
+        monkeypatch.setattr(h.client, "_unstash", lambda: None)
+        await reconnect_after_a_stashed_close(h, held, monkeypatch, execution_venue)
+
+        assert_each_leg_ended_once(h)
+        assert h.client._kept_brackets == {}
 
 
 SLOW = exec_config(protective_order_timeout_secs=0.2)
