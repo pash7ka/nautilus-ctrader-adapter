@@ -465,6 +465,46 @@ async def test_a_timed_out_subscribe_is_retried_by_the_restore_retry(
         await client.disconnect()
 
 
+async def test_a_trendbar_subscription_confirmed_by_a_retry_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    server: FakeCTraderServer,
+    logger: RecordingLogger,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    monkeypatch.setattr(
+        account_module,
+        "CTraderSession",
+        functools.partial(account_module.CTraderSession, request_timeout_secs=0.2),
+    )
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ,
+        lambda r: oa.ProtoOASubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+    )
+    client = account_client(server, logger=logger)
+    recovered: list[tuple[int, int]] = []
+    client.subscriptions.add_trendbar_recovery_listener(lambda *key: recovered.append(key))
+    await client.connect()
+    try:
+        await client.subscriptions.subscribe_trendbars(EURUSD, M15, "bars", "data")
+        await held.stop_holding()
+        assert recovered == []
+
+        await client.session.retry_failed_restores()
+        assert recovered == [(EURUSD, M15)]
+
+        # A bring-up restoring the key is not a recovery.
+        connections = server.connection_count
+        await server.drop_connections()
+        await wait_until(
+            lambda: server.connection_count > connections and client.session.is_ready,
+            description="session ready again",
+        )
+        assert recovered == [(EURUSD, M15)]
+    finally:
+        await client.disconnect()
+
+
 async def test_a_cancelled_unsubscribe_keeps_the_reference_and_a_repeat_re_sends_it(
     server: FakeCTraderServer,
     client: CTraderAccountClient,

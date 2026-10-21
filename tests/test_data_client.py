@@ -3447,6 +3447,83 @@ async def test_bars_closed_while_a_first_trendbar_subscribe_was_unconfirmed_are_
         ]
 
 
+async def test_a_recovered_trendbar_restore_backfills_without_a_live_trendbar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fast_reconnect(monkeypatch)
+    monkeypatch.setitem(RECORDED_HISTORY, (EURUSD_SYMBOL_ID, M1), repeated_m1_history(8))
+    server = trendbar_venue()
+    switch = refuse_trendbar_subscribe(server)
+    async with harness(server=server) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_bars(h, EURUSD_M1)
+        sub = h.client._bars[EURUSD_M1]
+        session = h.account.session
+
+        switch["refuse"] = True
+        clock.t = (FIRST_M1_MINUTE + 1) * 60 + 5
+        await reconnected(h.server, h.account)
+        await asyncio.wait_for(asyncio.shield(sub.backfill), timeout=10.0)
+        after_reconnect = sub.backfill
+
+        # The market is quiet: no live trendbar follows the retry.
+        clock.t = (FIRST_M1_MINUTE + 6) * 60 + 5
+        switch["refuse"] = False
+        await session.retry_failed_restores()
+
+        assert sub.backfill is not after_reconnect
+        await asyncio.wait_for(asyncio.shield(sub.backfill), timeout=10.0)
+        assert [b.ts_event for b in h.bars()] == [
+            close_ns(FIRST_M1_MINUTE + i, 60) for i in range(6)
+        ]
+
+
+@pytest.mark.parametrize("first", ["confirmation", "live trendbar"])
+async def test_a_first_subscribe_confirmed_late_backfills_once(
+    first: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(RECORDED_HISTORY, (EURUSD_SYMBOL_ID, M1), repeated_m1_history(8))
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        clock = pin_clock(h, FIRST_M1_MINUTE)
+        session = h.account.session
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ,
+            lambda r: oa.ProtoOASubscribeLiveTrendbarRes(ctidTraderAccountId=r.ctidTraderAccountId),
+        )
+        cancelled = asyncio.create_task(subscribe_bars(h, EURUSD_M1))
+        await held.arrived.wait()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        # The venue took that subscribe, and its answer comes too late to count.
+        await held.stop_holding()
+        sub = h.client._bars[EURUSD_M1]
+        started = []
+        start = h.client._start_backfill
+        h.client._start_backfill = lambda s: (started.append(s), start(s))
+
+        clock.t = (FIRST_M1_MINUTE + 5) * 60 + 5
+        if first == "confirmation":
+            await session.retry_failed_restores()
+            assert started == [sub]
+            await push_spot(h, forming_spot(M1, FIRST_M1_MINUTE + 5))
+        else:
+            await push_spot(h, forming_spot(M1, FIRST_M1_MINUTE + 5))
+            assert started == [sub]
+            await session.retry_failed_restores()
+        assert EURUSD_M1_TRENDBARS not in session.failed_restores
+        await asyncio.wait_for(asyncio.shield(sub.backfill), timeout=10.0)
+
+        assert started == [sub]
+        assert [b.ts_event for b in h.bars()] == [
+            close_ns(FIRST_M1_MINUTE + i, 60) for i in range(5)
+        ]
+
+
 # -- Carry-over fixes -----------------------------------------------------------------------
 
 

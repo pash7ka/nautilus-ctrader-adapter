@@ -74,8 +74,11 @@ once, in ascending order, whichever of them got there first:
   WARNING, and the third failed retry in a row an ERROR again.
 - **A backfill after the live trendbars come back.** If the live trendbar subscription itself
   could not be restored, or a first subscribe got no answer, no stream follows the backfill.
-  The subscription is retried like any failed restore, and the first live trendbar after it
-  starts another backfill, so the bars that closed in between are emitted, in order, before it.
+  The subscription is retried like any failed restore, and the retry that the venue confirms
+  starts another backfill at once, so the bars that closed in between are emitted, in order,
+  without waiting for the market to trade. A subscribe whose answer was lost may still have
+  reached the venue; if its live trendbars arrive before a retry confirms it, the first of them
+  starts that backfill instead. Either way it runs once.
 
 Two rules follow from this, and applications depend on both:
 

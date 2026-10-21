@@ -188,7 +188,8 @@ class _BarSub:
     backfill: asyncio.Task | None = None
     backfill_generation: tuple[CTraderSession, int] | None = None
     backfill_failures: int = 0
-    # Set while the live trendbars are not restored: the next one to arrive starts a backfill.
+    # Set while the live trendbars are not restored: the venue confirming them, or the first one
+    # to arrive if that comes sooner, starts a backfill.
     owes_backfill: bool = False
 
     def cancel_backfill(self) -> None:
@@ -386,6 +387,7 @@ class CTraderDataClient(LiveMarketDataClient):
 
         # Only once nothing above can fail, so a failed connect leaves no listener behind.
         self._account.add_reload_listener(self._on_instrument_reloaded)
+        self._account.subscriptions.add_trendbar_recovery_listener(self._on_trendbars_recovered)
         for instrument in self._instrument_provider.list_all():
             self._handle_data(instrument)
 
@@ -394,6 +396,7 @@ class CTraderDataClient(LiveMarketDataClient):
         self._preparing.clear()
         session, self._session = self._session, None
         self._account.remove_reload_listener(self._on_instrument_reloaded)
+        self._account.subscriptions.remove_trendbar_recovery_listener(self._on_trendbars_recovered)
         try:
             # First, so the release below also covers what a cancelled attempt took.
             await self._cancel_conversion_retries()
@@ -1125,7 +1128,7 @@ class CTraderDataClient(LiveMarketDataClient):
         finally:
             # What is kept here must match what the registry counts, whatever the outcome:
             # - a counted trendbar leg, unknown outcomes included, keeps the bars and needs the
-            #   backfill restore; an unknown outcome also owes a backfill once trendbars arrive;
+            #   backfill restore; an unknown outcome also owes a backfill once they are confirmed;
             # - without one there are no live bars, so the bar type is freed for another try;
             #   a spot leg left counted is released with this client's other holds;
             # - an unsubscribe that ran meanwhile has already forgotten `sub`.
@@ -1195,7 +1198,7 @@ class CTraderDataClient(LiveMarketDataClient):
         ignore a second one, leaving the new gap unfilled.
 
         If the trendbar restore failed, this backfill ends with no stream to take over from it,
-        so the first live trendbar to arrive once a retry restored them starts another.
+        so the retry that restores them starts another: see `_on_trendbars_recovered()`.
         """
         # In a bring-up the trendbar restore has run by now: restores run in the order their keys
         # were added.
@@ -1291,15 +1294,25 @@ class CTraderDataClient(LiveMarketDataClient):
             sub = self._bar_routes.get((symbol_id, trendbar.period))
             if sub is None:
                 continue
-            # TODO(verify): that a trendbar re-subscribe is promptly followed by a spot event
-            # carrying a trendbar, as the owed backfill starts only then. One live re-subscribe
-            # on a quiet symbol would settle it.
-            if sub.owes_backfill:
-                sub.owes_backfill = False
-                # A running backfill covers the gap already: its tail reaches past this moment.
-                if sub.backfill is None or sub.backfill.done():
-                    self._start_backfill(sub)
+            # A subscribe whose answer was lost may still have reached the venue, so its stream
+            # can come before any retry confirms it. The backfill must then run before that
+            # stream emits a bar: it never reaches back behind the last one emitted.
+            self._pay_backfill(sub)
             sub.closer.on_update(_raw_bar(trendbar))
+
+    def _on_trendbars_recovered(self, symbol_id: int, period: int) -> None:
+        sub = self._bar_routes.get((symbol_id, period))
+        if sub is not None:
+            self._pay_backfill(sub)
+
+    def _pay_backfill(self, sub: _BarSub) -> None:
+        """Start the backfill `sub` owes, once, whichever of its two triggers comes first."""
+        if not sub.owes_backfill:
+            return
+        sub.owes_backfill = False
+        # A running backfill covers the gap already: its tail reaches past this moment.
+        if sub.backfill is None or sub.backfill.done():
+            self._start_backfill(sub)
 
     def _emit_bar(self, bar_type: BarType, symbol_id: int, period_secs: int, raw: RawBar) -> None:
         self._note_bar_phase(bar_type, period_secs, raw.boundary_secs)

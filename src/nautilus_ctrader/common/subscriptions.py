@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     from nautilus_ctrader.common.session import CTraderSession
 
 SpotListener = Callable[[oa.ProtoOASpotEvent], None]
+# Called with `(symbol_id, period)`.
+TrendbarRecoveryListener = Callable[[int, int], None]
 
 _Key = tuple[str, int] | tuple[str, int, int]
 # `(owner, name)`: the same name under two owners is two consumers.
@@ -110,6 +112,8 @@ class SubscriptionRegistry:
       and `detach`es it when dropping it.
     - It keeps each symbol's last spot for `last_spot()`. A consumer joining a live subscription
       sends the venue nothing, so it would otherwise have no price until the next spot.
+    - It tells each trendbar recovery listener when the venue confirms live trendbars whose
+      restore had failed or whose first subscribe got no answer, on the retry that confirms them.
     """
 
     def __init__(self, account: CTraderAccountClient, logger: Logger) -> None:
@@ -131,6 +135,7 @@ class SubscriptionRegistry:
         self._failing_listeners: set[int] = set()
         # Symbol id -> the session bring-up the spot came in, and the spot.
         self._last_spots: dict[int, tuple[int, LastSpot]] = {}
+        self._recovery_listeners: list[TrendbarRecoveryListener] = []
 
     def attach(self, session: CTraderSession) -> None:
         """Route `session`'s spot events here and register a restore for every live key."""
@@ -239,6 +244,14 @@ class SubscriptionRegistry:
         self._failing_listeners.discard(id(stored))
         if not listeners:
             del self._spot_listeners[symbol_id]
+
+    def add_trendbar_recovery_listener(self, listener: TrendbarRecoveryListener) -> None:
+        if listener not in self._recovery_listeners:
+            self._recovery_listeners.append(listener)
+
+    def remove_trendbar_recovery_listener(self, listener: TrendbarRecoveryListener) -> None:
+        if listener in self._recovery_listeners:
+            self._recovery_listeners.remove(listener)
 
     def last_spot(self, symbol_id: int) -> LastSpot | None:
         """`symbol_id`'s latest bid and ask since the session last connected, if any came.
@@ -470,8 +483,18 @@ class SubscriptionRegistry:
                         return
                     await _subscribe(session, [request])
             self._maybe_unsubscribed.discard(key)
+            # A bring-up clears the failed restores before running any, so only a retry finds it.
+            if key[0] == "trendbar" and key in session.failed_restores:
+                self._notify_recovered(key[1], key[2])
 
         return restore
+
+    def _notify_recovered(self, symbol_id: int, period: int) -> None:
+        for listener in tuple(self._recovery_listeners):
+            try:
+                listener(symbol_id, period)
+            except Exception as e:
+                self._log.exception(f"Trendbar recovery listener for symbol {symbol_id} raised", e)
 
     def _subscribe_request(self, key: _Key) -> Message:
         account_id = self._account.account_id
