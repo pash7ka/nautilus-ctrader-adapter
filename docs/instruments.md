@@ -21,7 +21,8 @@ application's job, not the adapter's.
 Instruments are loaded through the standard `InstrumentProviderConfig`: `load_ids` for a named
 set, `load_all` for everything the account is offered. Full specifications are fetched in
 batches; a symbol the account is not offered is a load failure (see
-[Load failures](#load-failures)).
+[Load failures](#load-failures)). The `filters` argument of the `load_*_async` methods is not
+supported: a non-empty one is ignored, with one WARNING.
 
 ## `CurrencyPair` or `Cfd`
 

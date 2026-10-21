@@ -92,7 +92,11 @@ from nautilus_trader.model.orders import Order
 from nautilus_trader.portfolio.portfolio import Portfolio
 
 from nautilus_ctrader.common import codec
-from nautilus_ctrader.common.account import AccountCredentials, CTraderAccountClient
+from nautilus_ctrader.common.account import (
+    AccountCredentials,
+    AccountsResult,
+    CTraderAccountClient,
+)
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
     CTraderError,
@@ -276,6 +280,16 @@ class Recorder:
         if isinstance(message, oa.ProtoOATraderRes) and message.trader.HasField("brokerName"):
             self.recording.add_name(message.trader.brokerName)
 
+    def take_broker_title(self, granted: AccountsResult, trader_login: int) -> None:
+        """Scrub the short broker title of the account `trader_login` names, if the list has one.
+
+        The trader message carries only the full broker name; the short title is in the account
+        list.
+        """
+        for account in granted.accounts:
+            if account.trader_login == trader_login and account.broker_title_short is not None:
+                self.recording.add_name(account.broker_title_short)
+
 
 class Guard:
     """The one place every request of the session passes; it refuses all but what is allowed.
@@ -419,6 +433,12 @@ class GuardedAccount(CTraderAccountClient):
         self._guard.instrument(connection)
         self._guard.recorder.tap(connection)
         return session
+
+    async def _list_accounts(self, connection: CTraderConnection) -> AccountsResult:
+        # Read over a pre-connection the recorder does not tap.
+        granted = await super()._list_accounts(connection)
+        self._guard.recorder.take_broker_title(granted, self.trader_login)
+        return granted
 
 
 class ScriptLogger:

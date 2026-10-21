@@ -53,8 +53,8 @@ Keeping an open position protected is the strategy's job: close first, then clea
 remaining legs. The adapter never refuses or ignores a cancel to keep a stop in place; that
 would break the Nautilus contract for every other strategy.
 
-Whether the account is hedging or netting is read from the broker and mapped to `OmsType`,
-never assumed.
+The adapter is hedging-only: whether the account is hedging or netting is read from the
+broker, and a netting account is refused at connect.
 
 ## 2. Language
 

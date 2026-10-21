@@ -22,7 +22,7 @@ from google.protobuf.message import Message
 from nautilus_trader.model.identifiers import ClientOrderId, VenueOrderId
 
 from nautilus_ctrader.common import codec, order_record
-from nautilus_ctrader.common.account import AccountCredentials
+from nautilus_ctrader.common.account import AccountCredentials, AccountRecord, AccountsResult
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import CTraderConnectionError
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -1733,6 +1733,23 @@ def test_the_parser_gives_the_watch_two_minutes() -> None:
 def test_a_guard_must_be_told_what_it_may_let_through() -> None:
     with pytest.raises(TypeError):
         vec.Guard(vec.Recorder(vec.record_execution.Recording(0)))
+
+
+def test_the_recorder_scrubs_the_short_broker_title_of_the_named_account() -> None:
+    recorder = vec.Recorder(vec.record_execution.Recording(0))
+    granted = AccountsResult(
+        permission_scope=1,
+        accounts=[
+            AccountRecord(1, True, 111, "Examplia"),
+            AccountRecord(2, True, 222, "Otherco"),
+            AccountRecord(3, True, 333, None),
+        ],
+    )
+
+    recorder.take_broker_title(granted, 111)
+    recorder.take_broker_title(granted, 333)
+
+    assert recorder.recording.names == ["Examplia"]
 
 
 def watch_guard() -> vec.Guard:

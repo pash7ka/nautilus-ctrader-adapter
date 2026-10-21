@@ -1765,33 +1765,6 @@ def test_the_host_rule_sends_an_unknown_live_flag_to_demo(is_live: bool | None, 
     assert account_module.account_host(is_live, demo_host="demo", live_host="live") == host
 
 
-async def test_the_account_list_helper_returns_the_records_and_scope_without_the_token() -> None:
-    server = venue(logins=(TRADER_LOGIN,))
-    await server.start()
-    try:
-        result = await account_module.list_granted_accounts(
-            "client-id",
-            "client-secret",
-            "access-token",
-            host=server.host,
-            port=server.port,
-            tls=False,
-        )
-    finally:
-        await server.stop()
-
-    assert result.permission_scope == RECORDED["account_list"][0].permissionScope
-    assert result.accounts == [
-        account_module.AccountRecord(
-            ctid_trader_account_id=ACCOUNT_ID,
-            is_live=True,
-            trader_login=TRADER_LOGIN,
-            broker_title_short=None,
-        ),
-    ]
-    assert "access-token" not in repr(result)
-
-
 async def test_last_connect_error_is_none_before_any_connect() -> None:
     server = venue()
     assert account_client(server).last_connect_error is None

@@ -224,9 +224,10 @@ the position id.
   quantity follows the protective order's raised volume.
 - **Finding a leg's position.** An open leg carries no position id of its own: Nautilus sets one
   only from a fill. `leg_position_id(cache, order)` reads it from the leg's venue order id, which
-  names the entry, and returns the entry's position id. An open leg resolves only once its entry
-  has a position id, which Nautilus sets from a fill. It returns `None` when the order is not a
-  leg, the entry is not in the cache or is on another instrument or account, or the entry has no
+  names the entry, and returns the entry's position id; a filled leg answers with its own. An
+  open leg resolves only once its entry has a position id, which Nautilus sets from a fill. It
+  returns `None` when the order is not a leg (an ordinary order gives `None` even once filled),
+  the entry is not in the cache or is on another instrument or account, or the entry has no
   position id yet. A strategy ties each external stop to its position with
   `leg_position_id(self.cache, order)`; it reads the node's legs and foreign ones alike.
 - **A level put back is a new order.** Nautilus cannot reopen an order it holds as closed. A level
@@ -405,10 +406,7 @@ broker. A cached position the broker refuses to list, or lists nothing of, is le
 WARNING; it never fails the pass.
 
 The Nautilus account id is `CTRADER-` followed by the account's trader login, so the state of
-different accounts does not mix in one cache. A persistent cache written by an earlier build,
-which used the fixed id `CTRADER-001`, holds its orders and positions under that id. Reset it
-once when upgrading, or close its positions and clear it; otherwise those positions are asked
-about, found unknown and left open in Nautilus.
+different accounts does not mix in one cache.
 
 The broker keeps trading while these are read, so the reads do not describe one moment. Their
 order keeps them consistent:

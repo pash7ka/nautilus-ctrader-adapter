@@ -30,8 +30,10 @@ from nautilus_ctrader import oauth
 from nautilus_ctrader.common.account import (
     AccountRecord,  # noqa: F401 - re-exported: `AccountsResult.accounts` holds these
     AccountsResult,
-    list_granted_accounts,
+    NullLogger,
+    request_granted_accounts,
 )
+from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.common.errors import (
     CTraderAuthorizationDenied,
     CTraderAuthorizationTimeout,
@@ -40,6 +42,7 @@ from nautilus_ctrader.common.errors import (
     CTraderTokenExchangeError,
 )
 from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST, PROTOBUF_PORT
+from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 
 # Kept here so the tests can point `main()` at a local token endpoint.
@@ -164,17 +167,23 @@ async def list_accounts(
 ) -> AccountsResult:
     """Authenticate the application on `host`, then list the accounts the access token grants.
 
+    The list is served on either host. A venue rejection is raised as its `CTraderRequestError`.
     Only the account records and the permission scope are returned, never the token itself.
     """
-    return await list_granted_accounts(
-        client_id,
-        client_secret,
-        access_token,
-        host=host,
-        port=port,
+    connection = CTraderConnection(
+        host,
+        port,
+        logger=NullLogger() if logger is None else logger,
         tls=tls,
-        logger=logger,
     )
+    await connection.connect()
+    try:
+        await connection.request(
+            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
+        )
+        return await request_granted_accounts(connection, access_token)
+    finally:
+        await connection.close()
 
 
 def _print_accounts(result: AccountsResult, *, live: bool) -> None:

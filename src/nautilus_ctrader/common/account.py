@@ -131,36 +131,6 @@ async def request_granted_accounts(
     return AccountsResult(permission_scope=response.permissionScope, accounts=accounts)
 
 
-async def list_granted_accounts(
-    client_id: str,
-    client_secret: str,
-    access_token: str,
-    *,
-    host: str,
-    port: int = PROTOBUF_PORT,
-    tls: ssl.SSLContext | bool = True,
-    logger: Logger | None = None,
-) -> AccountsResult:
-    """Authenticate the application on `host`, then list the accounts `access_token` grants.
-
-    The list is served on either host. A venue rejection is raised as its `CTraderRequestError`.
-    """
-    connection = CTraderConnection(
-        host,
-        port,
-        logger=NullLogger() if logger is None else logger,
-        tls=tls,
-    )
-    await connection.connect()
-    try:
-        await connection.request(
-            oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret),
-        )
-        return await request_granted_accounts(connection, access_token)
-    finally:
-        await connection.close()
-
-
 @dataclass(frozen=True)
 class AccountCredentials:
     client_id: str = field(repr=False)
