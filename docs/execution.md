@@ -21,9 +21,10 @@ what is still open.
 - **One adapter node per account.** A node recognises its own positions by the record it writes
   into each order ([Restarts](#4-restarts-and-reconnects)), and every node of this adapter writes
   the same record. A second node on the same account, or `scripts/first_orders.py` run while a
-  node is connected, therefore takes the first node's positions as its own, and the first node
-  can report the second one's orders and closes as manual changes. Run one node per account. An execution event for an order
-  that carries the record but that the node does not hold is logged at ERROR, naming the order.
+  node is connected, therefore takes the first node's positions as its own at its start. To the
+  first node, the second one's entries and legs carry the record but are unknown: their events
+  are dropped, with one ERROR per order naming it. The second node's closes and level amends can
+  reach the first node as manual changes. Run one node per account.
 - **The account's instruments.** The execution client trades the instruments the account's
   instrument provider holds, which the data client's configuration builds. A data client for the
   same account must therefore be configured, and `instrument_provider` must not be set on the

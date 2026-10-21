@@ -505,6 +505,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._outbox: deque[Record | _Resent | _Deferred] = deque()
         self._outbox_task: asyncio.Task | None = None
         self._delivering = False
+        # Unknown orders carrying the adapter's record that were logged at ERROR: one line each.
+        self._unknown_ours: set[str] = set()
 
     @property
     def instrument_provider(self) -> CTraderInstrumentProvider:
@@ -591,6 +593,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         held, self._outbox = self._outbox, deque()
         self._unapplied.clear()
         self._expired_held = 0
+        self._unknown_ours.clear()
         # The held records are dropped, as a rebuild replaces them; the client's own answers to
         # commands are not, since no reconciliation restores them.
         for item in held:
@@ -1842,11 +1845,20 @@ class CTraderExecutionClient(LiveExecutionClient):
         order = self._nautilus_order(record)
         if order is None and record.client_order_id is not None:
             # Named by the adapter's record, yet unknown here: another node's order, or one a
-            # failed reconciliation left out.
+            # failed or late reconciliation left out.
+            client_order_id = record.client_order_id
+            if client_order_id in self._unknown_ours:
+                self._log.debug(
+                    f"No Nautilus order for {client_order_id}; its {record.kind.value} event is "
+                    "not reported",
+                )
+                return
+            self._unknown_ours.add(client_order_id)
             self._log.error(
-                f"No Nautilus order for {record.client_order_id}, which carries this adapter's "
-                "record; another node may be trading this account, or a failed reconciliation "
-                f"left the order out. Its {record.kind.value} event is not reported",
+                f"No Nautilus order for {client_order_id}, which carries this adapter's record; "
+                "another node may be trading this account, or a failed or late reconciliation "
+                f"left the order out. Its {record.kind.value} event is not reported; later ones "
+                "go to DEBUG while it stays unknown",
             )
             return
         if order is None:

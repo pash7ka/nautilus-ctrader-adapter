@@ -9,11 +9,11 @@ recognised as the node's own and its protective legs restored under their origin
 
 Anyone may write to these fields - a trader, another robot. Parsing is therefore strict: a text
 that is not exactly a record written here is not a record, and the position is not the node's.
-Another program's text can then only make a position look foreign, never the node's own.
+Such a text can then only make a position look foreign.
 
-The record does not say which node wrote it. A second node of this adapter on the same account
-writes the same records, and each node takes the other's positions for its own, so only one
-node may run per account.
+The record does not say who wrote it. A program writing an exact record (the codec is exported)
+cannot be told from this node, and nor can a second node of this adapter on the same account:
+each takes the other's positions for its own, so only one node may run per account.
 """
 
 from __future__ import annotations

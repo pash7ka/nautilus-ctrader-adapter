@@ -492,6 +492,14 @@ async def test_an_event_for_an_unknown_order_with_our_record_logs_an_error() -> 
         assert h.events == []
 
 
+async def test_an_unknown_order_with_our_record_logs_one_error() -> None:
+    async with harness() as h:
+        accepted, filled = FIRST_EVENTS[:2]
+        await push(h, accepted, filled)
+
+        assert len([line for line in h.logger.errors() if ENTRY in line]) == 1
+
+
 async def test_an_event_for_an_unknown_foreign_order_keeps_its_level() -> None:
     async with harness() as h:
         h.client._handle_records([OrderEvent(OrderEventKind.CANCELED, "7000001", None, 0)])

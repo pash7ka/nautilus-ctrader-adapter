@@ -98,6 +98,11 @@ from nautilus_ctrader.common.account import account_host
 from nautilus_ctrader.common.errors import CTraderError, CTraderRequestError
 from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import termios
+
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # scripts/ is not a package; get_tokens.py is loaded by file path, as verify_live_data.py does.
@@ -446,14 +451,26 @@ class EventLog:
 # -- The Nautilus side --------------------------------------------------------------------
 
 
+def _discard_typed_ahead() -> None:
+    """Drop console input typed before now, so that it cannot answer a question not yet shown."""
+    if not sys.stdin.isatty():
+        return
+    if sys.platform == "win32":
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    else:
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+
 def wait_for_enter(on_answer: Callable[[bool], None]) -> None:
-    """Read one console line, then call `on_answer` on the running loop.
+    """Read one console line typed from now on, then call `on_answer` on the running loop.
 
     `on_answer` gets `True` for a line and `False` at the end of input. The read blocks, and an
     asyncio loop cannot watch a Windows console, so it runs in a daemon thread that never keeps
     the process alive.
     """
     loop = asyncio.get_running_loop()
+    _discard_typed_ahead()
 
     def read() -> None:
         try:
