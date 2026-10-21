@@ -1,13 +1,16 @@
 """Configuration for the cTrader clients.
 
-The application passes a typed config object; nothing here reads a file or an environment
-variable. Credentials live in the config only to be handed to the account client, and are
+The application passes a typed config object; nothing here reads a file. A secret left out of
+the config is read from its environment variable when the account client is built, so a config
+Nautilus writes to disk carries only the secrets the application put in it. Credentials are
 never logged.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
+from typing import Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from nautilus_trader.config import (
@@ -45,15 +48,67 @@ def parse_asset_class_overrides(overrides: Mapping[str, str]) -> dict[str, Asset
     return parsed
 
 
+class _SecretSettings(Protocol):
+    client_id: str | None
+    client_secret: str | None
+    access_token: str | None
+    refresh_token: str | None
+    token_expires_at: float | None
+
+
+def _from_environment(value: str | None, variable: str) -> str | None:
+    if value is not None:
+        return value
+    # An empty variable counts as unset: no credential is the empty string.
+    return os.environ.get(variable) or None
+
+
+def _required(value: str | None, setting: str, variable: str) -> str:
+    resolved = _from_environment(value, variable)
+    if resolved is None:
+        raise ValueError(f"{setting} is not set: set it in the config or in {variable}")
+    return resolved
+
+
+def _expiry(value: float | None) -> float | None:
+    if value is not None:
+        return value
+    text = _from_environment(None, "CTRADER_TOKEN_EXPIRES_AT")
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        raise ValueError(
+            "token_expires_at: CTRADER_TOKEN_EXPIRES_AT is not a number of Unix seconds",
+        ) from None
+
+
+def _resolve_credentials(config: _SecretSettings) -> AccountCredentials:
+    """The config's credentials, each one it leaves `None` read from its environment variable.
+
+    Raises `ValueError`, naming the setting and the variable but never a value, if the client
+    id, client secret or access token is set in neither, or `CTRADER_TOKEN_EXPIRES_AT` is not
+    a number.
+    """
+    return AccountCredentials(
+        client_id=_required(config.client_id, "client_id", "CTRADER_CLIENT_ID"),
+        client_secret=_required(config.client_secret, "client_secret", "CTRADER_CLIENT_SECRET"),
+        access_token=_required(config.access_token, "access_token", "CTRADER_ACCESS_TOKEN"),
+        refresh_token=_from_environment(config.refresh_token, "CTRADER_REFRESH_TOKEN"),
+        token_expires_at=_expiry(config.token_expires_at),
+    )
+
+
 class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     """
     Configuration for `CTraderDataClient` instances.
 
     Parameters
     ----------
-    client_id, client_secret : str
+    client_id, client_secret : str, optional
         The registered application's credentials.
-    access_token : str
+    access_token : str, optional
         An access token granting this application the account.
     trader_login : int
         The account number the broker gave you, the one the cTrader interface shows. It is
@@ -114,11 +169,15 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     Every client of one account shares one connection: the connection settings of the first
     config built for the account win, the request pacing included.
 
+    Each of the five credentials left `None` is read when the account client is built, from
+    `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`, `CTRADER_ACCESS_TOKEN`,
+    `CTRADER_REFRESH_TOKEN` or `CTRADER_TOKEN_EXPIRES_AT`. A value in the config wins.
+
     """
 
-    client_id: str
-    client_secret: str
-    access_token: str
+    client_id: str | None = None
+    client_secret: str | None = None
+    access_token: str | None = None
     trader_login: int
     refresh_token: str | None = None
     token_expires_at: float | None = None
@@ -154,13 +213,11 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
             )
 
     def credentials(self) -> AccountCredentials:
-        return AccountCredentials(
-            client_id=self.client_id,
-            client_secret=self.client_secret,
-            access_token=self.access_token,
-            refresh_token=self.refresh_token,
-            token_expires_at=self.token_expires_at,
-        )
+        """The credentials, those left `None` read from the environment.
+
+        Raises `ValueError` if a required one is set in neither.
+        """
+        return _resolve_credentials(self)
 
     def pacing(self) -> Pacing:
         """The request pacing settings; raises `ValueError` if they are impossible."""
@@ -182,9 +239,9 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
 
     Parameters
     ----------
-    client_id, client_secret : str
+    client_id, client_secret : str, optional
         The registered application's credentials.
-    access_token : str
+    access_token : str, optional
         An access token granting this application the account.
     trader_login : int
         The account number the broker gave you, as for `CTraderDataClientConfig`. The Nautilus
@@ -242,11 +299,13 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     Every client of one account shares one connection: the connection settings of the first
     config built for the account win, the request pacing included.
 
+    Credentials left `None` are read from the environment as for `CTraderDataClientConfig`.
+
     """
 
-    client_id: str
-    client_secret: str
-    access_token: str
+    client_id: str | None = None
+    client_secret: str | None = None
+    access_token: str | None = None
     trader_login: int
     refresh_token: str | None = None
     token_expires_at: float | None = None
@@ -301,13 +360,11 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
             ) from e
 
     def credentials(self) -> AccountCredentials:
-        return AccountCredentials(
-            client_id=self.client_id,
-            client_secret=self.client_secret,
-            access_token=self.access_token,
-            refresh_token=self.refresh_token,
-            token_expires_at=self.token_expires_at,
-        )
+        """The credentials, those left `None` read from the environment.
+
+        Raises `ValueError` if a required one is set in neither.
+        """
+        return _resolve_credentials(self)
 
     def pacing(self) -> Pacing:
         """The request pacing settings; raises `ValueError` if they are impossible."""

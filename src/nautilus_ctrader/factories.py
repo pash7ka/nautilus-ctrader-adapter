@@ -68,9 +68,10 @@ class CTraderLiveDataClientFactory(LiveDataClientFactory):
         ------
         ValueError
             If `config.asset_class_overrides` holds a value that is not an `AssetClass` name,
-            or the account's instrument provider was already built from other instrument
+            the account's instrument provider was already built from other instrument
             settings (`instrument_provider`, `asset_class_overrides`,
-            `fail_on_instrument_error`).
+            `fail_on_instrument_error`), or a required credential is set neither in the config
+            nor in its environment variable.
 
         Notes
         -----
@@ -141,8 +142,9 @@ class CTraderLiveExecClientFactory(LiveExecClientFactory):
         Raises
         ------
         ValueError
-            If the account has no instrument provider yet: a cTrader data client for the same
-            account must be configured, and the node builds data clients first.
+            If the account has no instrument provider yet (a cTrader data client for the same
+            account must be configured, and the node builds data clients first), or a required
+            credential is set neither in the config nor in its environment variable.
 
         """
         logger = Logger(name)

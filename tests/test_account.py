@@ -744,6 +744,107 @@ def test_an_impossible_pacing_is_refused_at_config_time(config_class, bad) -> No
         _client_config(config_class, **bad)
 
 
+_SECRET_SETTINGS = {
+    "client_id": "CTRADER_CLIENT_ID",
+    "client_secret": "CTRADER_CLIENT_SECRET",
+    "access_token": "CTRADER_ACCESS_TOKEN",
+    "refresh_token": "CTRADER_REFRESH_TOKEN",
+}
+_ENV_SECRETS = {name: f"env-{setting}" for setting, name in _SECRET_SETTINGS.items()}
+
+
+def _set_secret_environment(monkeypatch, **overrides) -> None:
+    values = {**_ENV_SECRETS, "CTRADER_TOKEN_EXPIRES_AT": "1700000000", **overrides}
+    for name, value in values.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+def test_secrets_come_from_the_environment_when_the_config_has_none(
+    config_class, monkeypatch
+) -> None:
+    _set_secret_environment(monkeypatch)
+    config = config_class(trader_login=TRADER_LOGIN)
+
+    client = account_client_from_config(config, RecordingLogger())
+
+    assert client._credentials.client_id == "env-client_id"
+    assert client._credentials.client_secret == "env-client_secret"
+    assert client._credentials.access_token == "env-access_token"
+    assert client._credentials.refresh_token == "env-refresh_token"
+    assert client._credentials.token_expires_at == 1_700_000_000.0
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+def test_a_config_value_wins_over_the_environment(config_class, monkeypatch) -> None:
+    _set_secret_environment(monkeypatch)
+    config = _client_config(
+        config_class, refresh_token="refresh-token", token_expires_at=_EXPIRES_AT
+    )
+
+    credentials = config.credentials()
+
+    assert credentials.client_id == "client-id"
+    assert credentials.client_secret == "client-secret"
+    assert credentials.access_token == "access-token"
+    assert credentials.refresh_token == "refresh-token"
+    assert credentials.token_expires_at == _EXPIRES_AT
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+@pytest.mark.parametrize("setting", ["client_id", "client_secret", "access_token"])
+def test_a_missing_secret_names_the_setting_not_a_value(config_class, setting, monkeypatch) -> None:
+    variable = _SECRET_SETTINGS[setting]
+    _set_secret_environment(monkeypatch, **{variable: None})
+    config = config_class(trader_login=TRADER_LOGIN)
+
+    with pytest.raises(ValueError) as raised:
+        account_client_from_config(config, RecordingLogger())
+
+    message = str(raised.value)
+    assert setting in message
+    assert variable in message
+    assert not any(value in message for value in _ENV_SECRETS.values())
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+def test_an_empty_optional_secret_in_the_environment_is_unset(config_class, monkeypatch) -> None:
+    _set_secret_environment(monkeypatch, CTRADER_REFRESH_TOKEN="", CTRADER_TOKEN_EXPIRES_AT=None)
+
+    credentials = config_class(trader_login=TRADER_LOGIN).credentials()
+
+    assert credentials.refresh_token is None
+    assert credentials.token_expires_at is None
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+def test_an_unreadable_token_expiry_names_the_variable_not_the_value(
+    config_class, monkeypatch
+) -> None:
+    _set_secret_environment(monkeypatch, CTRADER_TOKEN_EXPIRES_AT="not-a-number")
+
+    with pytest.raises(ValueError) as raised:
+        config_class(trader_login=TRADER_LOGIN).credentials()
+
+    assert "CTRADER_TOKEN_EXPIRES_AT" in str(raised.value)
+    assert "not-a-number" not in str(raised.value)
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+def test_a_config_without_secrets_serialises_without_them(config_class, monkeypatch) -> None:
+    _set_secret_environment(monkeypatch)
+    config = config_class(trader_login=TRADER_LOGIN)
+    account_client_from_config(config, RecordingLogger())
+
+    encoded = config.json()
+
+    assert not any(value.encode() in encoded for value in _ENV_SECRETS.values())
+    assert b"1700000000" not in encoded
+
+
 async def test_the_last_disconnect_closes_the_session() -> None:
     server = venue()
     await server.start()

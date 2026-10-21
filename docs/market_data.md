@@ -335,6 +335,11 @@ second config for the same account gets that same client, and its connection set
 timeouts, retry intervals — are ignored; an `environment` that differs from the first one is
 ignored too and logged at WARNING, because it would have chosen a different host.
 
+When the config leaves the tokens to the environment (`CTRADER_ACCESS_TOKEN` and the others;
+see [execution.md](execution.md#3-configuration)), the adapter only reads them there. The
+listener must store the new pair wherever the next process start will find it in its
+environment, for example the file the environment is loaded from.
+
 If the listener raises, the failure is logged at ERROR and the session carries on with the new
 tokens in memory. Persisting them is the only thing that survives a restart, so a listener that
 can fail should say so loudly.

@@ -840,6 +840,9 @@ def account_client_from_config(
 
     An application that persists refreshed tokens calls this with the same config object the
     node config holds, before building the node, and registers its listener on the result.
+
+    The credentials the config leaves `None` are read from the environment here; a required
+    one set in neither raises `ValueError`.
     """
     return get_cached_ctrader_account_client(
         trader_login=config.trader_login,

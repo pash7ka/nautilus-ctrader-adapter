@@ -332,11 +332,11 @@ connection, and the connection settings of the first config built for the accoun
 
 | Field | Default | Meaning |
 |---|---|---|
-| `client_id`, `client_secret` | required | The registered application's credentials |
-| `access_token` | required | An access token granting the application the account |
+| `client_id`, `client_secret` | `None`: `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET` | The registered application's credentials; required in the config or the environment |
+| `access_token` | `None`: `CTRADER_ACCESS_TOKEN` | An access token granting the application the account; required in the config or the environment |
 | `trader_login` | required | The broker's own account number; the adapter looks up the protocol's account id itself. The Nautilus account id is `CTRADER-<trader_login>` |
-| `refresh_token` | `None` | Renews `access_token`; without it an expired token ends the session |
-| `token_expires_at` | `None` | Unix seconds the access token expires at; without it no proactive refresh happens |
+| `refresh_token` | `None`: `CTRADER_REFRESH_TOKEN` | Renews `access_token`; without it an expired token ends the session |
+| `token_expires_at` | `None`: `CTRADER_TOKEN_EXPIRES_AT` | Unix seconds the access token expires at; without it no proactive refresh happens |
 | `environment` | `"auto"` | `"auto"` reads the account's own live flag and picks the host; `"demo"` or `"live"` force it |
 | `connect_timeout_secs` | `60.0` | Bound on the whole account bring-up. It also bounds how long events are held while the start's reconciliation is applied, and how long a request waits for a rebuilt model: past it, a waiting amend or close goes ahead on the old model, with a WARNING |
 | `restore_retry_interval_secs` | `30.0` | How often to retry what a reconnect failed to restore |
@@ -351,6 +351,12 @@ connection, and the connection settings of the first config built for the accoun
 | `reconciliation_default_lookback_mins` | `1440` | How far back reconciliation reads fills and closed orders when Nautilus passes no lookback of its own |
 | `balance_checkpoint_hour` | `None` | The hour of day, 0 to 23, at which the balance is kept in the cache key `ctrader.balance_checkpoint`. Unset, the key says `"off"` |
 | `balance_checkpoint_timezone` | `"UTC"` | The IANA time zone `balance_checkpoint_hour` is in |
+
+A credential left `None` is read from the environment variable named in the table when the
+account client is built; a value in the config wins, and a required one set in neither fails
+the build with a `ValueError` naming the setting and the variable. With `StreamingConfig`,
+Nautilus writes the whole node config to `config.json`, so leave the secrets out of the config
+and set the environment instead.
 
 The config refuses, with a `ValueError`: an `instrument_provider`, an `environment` other than
 the three above, a value that is not positive in `reference_price_max_age_secs`,
