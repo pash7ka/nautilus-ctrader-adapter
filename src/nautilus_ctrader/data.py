@@ -44,6 +44,7 @@ from nautilus_ctrader.common.bars import BarCloser, Clock, RawBar
 from nautilus_ctrader.common.errors import (
     CTraderConnectionError,
     CTraderError,
+    CTraderNotSentError,
     CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
@@ -121,6 +122,9 @@ def _failure_reason(error: Exception) -> str:
         return "timed out"
     if isinstance(error, CTraderConnectionError):
         return "connection lost"
+    # Before the protocol check: a request that could not be encoded is both.
+    if isinstance(error, CTraderNotSentError):
+        return "not sent"
     if isinstance(error, CTraderProtocolError):
         return "invalid venue response"
     if isinstance(error, CTraderError):
@@ -729,7 +733,8 @@ class CTraderDataClient(LiveMarketDataClient):
             return
 
         consumer = _quote_consumer(instrument_id)
-        if not await self._convert_before_subscribing(instrument, "quotes", consumer):
+        unrecord = functools.partial(self._remove_subscription_quote_ticks, instrument_id)
+        if not await self._convert_before_subscribing(instrument, "quotes", consumer, unrecord):
             return
 
         await self._hold_spots(instrument.info["symbol_id"], consumer)
@@ -739,11 +744,16 @@ class CTraderDataClient(LiveMarketDataClient):
         instrument: Instrument,
         what: str,
         consumer: str,
+        unrecord: Callable[[], None],
     ) -> bool:
         """Resolve and publish `instrument`'s conversion chain; report and refuse if it fails.
 
         Run before the venue subscription, so nothing is ever published for an instrument that
         cannot be priced in the account currency. `what` names the subscription being refused.
+
+        A refusal that leaves the instrument loaded calls `unrecord`, which drops Nautilus's record
+        of the subscription: its engine passes a repeated subscribe on only while the client does
+        not report it subscribed, and subscribing again is how the chain is retried.
 
         Also refuses, silently, if `consumer` was unsubscribed meanwhile: that unsubscribe found
         no hold to release. The chain stays held, as after a completed subscribe and unsubscribe.
@@ -771,24 +781,30 @@ class CTraderDataClient(LiveMarketDataClient):
             await self._retire_old_legs(_conversion_consumer(instrument.id), set())
             return False
         if chain is None:
-            self._report_missing_conversion(instrument.id, what)
+            # Not after an unsubscribe meanwhile: the record is then a later subscribe's, if any.
+            if self._report_missing_conversion(instrument.id, what) and wanted:
+                unrecord()
             return False
         for leg in chain:
             self._handle_data(leg)
         return wanted
 
-    def _report_missing_conversion(self, instrument_id: InstrumentId, what: str) -> None:
-        """Say which of the two ways the conversion failed, because they need different acts."""
+    def _report_missing_conversion(self, instrument_id: InstrumentId, what: str) -> bool:
+        """Say which of the two ways the conversion failed, because they need different acts.
+
+        Returns whether the instrument is still loaded, so subscribing again can retry.
+        """
         if self._instrument_provider.find(instrument_id) is None:
             self._log.error(
                 f"Cannot subscribe {what}: {instrument_id} cannot be priced in the account "
                 f"currency and has been dropped",
             )
-        else:
-            self._log.warning(
-                f"Not subscribing {what} for {instrument_id}: its conversion chain was not "
-                f"subscribed; subscribe again to retry",
-            )
+            return False
+        self._log.warning(
+            f"Not subscribing {what} for {instrument_id}: its conversion chain was not "
+            f"subscribed; subscribe again to retry",
+        )
+        return True
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         # Found by consumer name rather than through the instrument's symbol id, because the
@@ -895,7 +911,8 @@ class CTraderDataClient(LiveMarketDataClient):
         # A bars-only subscriber needs the account valued just as much as a quote subscriber
         # does. Before anything below is recorded, so a refused chain leaves nothing behind.
         consumer = _bar_consumer(bar_type)
-        if not await self._convert_before_subscribing(instrument, "bars", consumer):
+        unrecord = functools.partial(self._remove_subscription_bars, bar_type)
+        if not await self._convert_before_subscribing(instrument, "bars", consumer, unrecord):
             return
 
         symbol_id = instrument.info["symbol_id"]
@@ -1076,6 +1093,9 @@ class CTraderDataClient(LiveMarketDataClient):
             sub = self._bar_routes.get((symbol_id, trendbar.period))
             if sub is None:
                 continue
+            # TODO(verify): that a trendbar re-subscribe is promptly followed by a spot event
+            # carrying a trendbar, as the owed backfill starts only then. One live re-subscribe
+            # on a quiet symbol would settle it.
             if sub.owes_backfill:
                 sub.owes_backfill = False
                 # A running backfill covers the gap already: its tail reaches past this moment.

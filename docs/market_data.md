@@ -123,6 +123,12 @@ only, never to live bar subscribers, so the two are independent, and a bar can r
 the request is answered after the bar forming at subscription time has closed, the response
 holds that bar too. Compare `ts_event` if a strategy must not count it twice.
 
+Nautilus does put the response's bars in its cache, though. With
+`DataEngineConfig.validate_data_sequence=True` (default `False`), its engine then drops, with a
+WARNING, a live bar whose `ts_event` is older than the newest bar cached for its bar type, so a
+live bar that closes before a response's last bar but arrives after the response never reaches
+the subscribers.
+
 A historical request is paged backwards from its end, and the forming bar the venue also serves
 is dropped, since it is not a bar yet. A request with a `start` delivers no
 bar opening before it, although the venue's pages reach back past it, and one with a `limit`
@@ -182,7 +188,7 @@ The failure always arrives before the callback, with the live and the plain data
 `request_id` is the id `request_bars` returned and the callback receives;
 `data_type.metadata["bar_type"]` names the bar type. `reason` is short and fit to show a person:
 `venue refused: <error code>`, `timed out`, `not connected`, `connection lost`,
-`connection closed`, `instrument <id> is not loaded`, `invalid venue response`,
+`connection closed`, `not sent`, `instrument <id> is not loaded`, `invalid venue response`,
 `<data> requests are not supported`, why a bar type has no trendbars (such as
 `trendbars are only available for the BID price type`), and `request failed` or
 `internal error` for anything else. It carries no venue text beyond an error code.
@@ -249,7 +255,8 @@ Two different failures are reported differently, because they need different res
 - The request was refused or never answered — a venue refusal of the chain request or of a
   leg's symbol request, whatever its error code, a timeout, or a session that is reconnecting.
   The instrument is fine; the request was not, and nothing has been learned about the chain.
-  It stays loaded and unconverted, with a WARNING, and the next subscribe tries again.
+  It stays loaded and unconverted, with a WARNING. A quote or bar subscription refused this way
+  is not kept as subscribed, so subscribing to it again tries again; nothing retries on its own.
 
 ## `synthetic_quote_size`
 

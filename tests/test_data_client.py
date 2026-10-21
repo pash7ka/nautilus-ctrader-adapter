@@ -47,6 +47,7 @@ from nautilus_ctrader.common.account import CTraderAccountClient
 from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
+    CTraderNotSentProtocolError,
     CTraderProtocolError,
     CTraderRequestError,
     CTraderTimeoutError,
@@ -137,6 +138,7 @@ class Harness:
     published: list
     responses: list
     logger: RecordingLogger
+    engine: DataEngine
 
     def instruments(self) -> list[Instrument]:
         return [d for d in self.published if isinstance(d, Instrument)]
@@ -217,7 +219,9 @@ async def harness(
         LoggedDataClient(**arguments, logger=logger) if logged else CTraderDataClient(**arguments)
     )
     try:
-        yield Harness(server, account, provider, client, cache, published, responses, logger)
+        yield Harness(
+            server, account, provider, client, cache, published, responses, logger, engine
+        )
     finally:
         await account.disconnect()
         await server.stop()
@@ -1268,6 +1272,48 @@ async def test_the_next_subscribe_retries_a_refused_conversion() -> None:
         assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 2
         assert GER40_ID in h.client._converted
         assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+
+
+@pytest.mark.parametrize("what", ["quotes", "bars"])
+async def test_subscribing_again_through_the_engine_retries_a_refused_conversion(
+    what: str,
+) -> None:
+    server = with_trendbars(data_venue())
+    server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, refusal("BLOCKED_PAYLOAD_TYPE"))
+    async with harness(server=server) as h:
+        await h.client._connect()
+        h.engine.register_client(h.client)
+
+        async def subscribe() -> None:
+            fields = {
+                "client_id": None,
+                "venue": CTRADER_VENUE,
+                "command_id": UUID4(),
+                "ts_init": 0,
+            }
+            h.engine.execute(
+                SubscribeQuoteTicks(instrument_id=GER40_ID, **fields)
+                if what == "quotes"
+                else SubscribeBars(bar_type=GER40_M1, **fields),
+            )
+            await asyncio.gather(*list(h.client._tasks))
+
+        await subscribe()
+        assert GER40_ID not in h.client._converted
+
+        h.server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+        await subscribe()
+
+        # The connect's request, the refused subscribe's and the retry's.
+        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 3
+        assert GER40_ID in h.client._converted
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        if what == "quotes":
+            assert h.client.subscribed_quote_ticks() == [GER40_ID]
+            assert GER40_SYMBOL_ID in h.subscribed_symbol_ids()
+        else:
+            assert h.client.subscribed_bars() == [GER40_M1]
+            assert len(received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)) == 1
 
 
 def second_eur_quoted_venue() -> FakeCTraderServer:
@@ -2563,6 +2609,24 @@ async def test_a_failed_request_covering_a_live_subscription_leaves_the_bar_to_t
 
         # The request delivered nothing, so the stream still owes the bar.
         assert [b.ts_event for b in h.bars()] == [close_ns(FIRST_M1_MINUTE, 60)]
+
+
+async def test_a_bar_request_that_could_not_be_encoded_fails_as_not_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        async def unencodable(*_args: object) -> list[Bar]:
+            raise CTraderNotSentProtocolError("the request could not be encoded")
+
+        monkeypatch.setattr(h.client, "_historical_bars", unencodable)
+        failures: list = []
+        h.client._msgbus.subscribe(topic=REQUEST_FAILED_TOPIC, handler=failures.append)
+        served = await request_bars(h, EURUSD_M1, limit=10)
+
+        assert served == []
+        assert [f.reason for f in failures] == ["not sent"]
 
 
 # -- Reconnect ------------------------------------------------------------------------------
