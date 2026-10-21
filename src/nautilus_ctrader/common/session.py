@@ -22,6 +22,7 @@ from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
     CTraderNotSentError,
+    CTraderQueueTimeoutError,
     CTraderRequestError,
     CTraderTimeoutError,
 )
@@ -118,8 +119,8 @@ class CTraderSession:
         self._supervisor: asyncio.Task | None = None
         self._refresh_task: asyncio.Task | None = None
         self._last_refresh_at: float | None = None
-        # Clear while a sent refresh request can still be answered: no pair taken since, and its
-        # connection not torn down. See `_on_late_refresh_reply()`.
+        # Clear while a written refresh request can still be answered: no pair taken since, and
+        # its connection not closed. See `_on_late_refresh_reply()`.
         self._refresh_settled = asyncio.Event()
         self._refresh_settled.set()
         self._pair_taken = asyncio.Event()
@@ -223,7 +224,7 @@ class CTraderSession:
             self._lost.set()
             self._state = SessionState.STOPPED
             self._ready.clear()
-            self._refresh_settled.set()
+            self._give_up_refresh_reply()
             tasks = {t for t in (self._supervisor, self._refresh_task) if t is not None}
             self._supervisor = None
             self._refresh_task = None
@@ -482,6 +483,10 @@ class CTraderSession:
         except CTraderAuthError:
             # Logged by `refresh_tokens()`.
             return
+        except CTraderQueueTimeoutError:
+            self._log.warning(
+                "Token refresh was not sent in time, authenticating with the current token",
+            )
         except CTraderTimeoutError as timed_out:
             try:
                 await self._wait_for_late_pair(timed_out)
@@ -544,14 +549,18 @@ class CTraderSession:
     async def _teardown_connection(self) -> None:
         self._state = SessionState.CONNECTING
         self._ready.clear()
-        if not self._refresh_settled.is_set():
-            # No reply can come once this connection closes, and the refresh token is spent.
-            self._refresh_settled.set()
-            self._log.error(
-                "Token refresh reply lost with its connection; the refresh token it sent may be "
-                "spent, so re-run the OAuth authorization if account authentication keeps failing",
-            )
+        self._give_up_refresh_reply()
         await self._connection.close()
+
+    def _give_up_refresh_reply(self) -> None:
+        """Settle an awaited refresh before its connection closes: no reply can come after."""
+        if self._refresh_settled.is_set():
+            return
+        self._refresh_settled.set()
+        self._log.error(
+            "Token refresh reply lost with its connection; the refresh token it sent may be "
+            "spent, so re-run the OAuth authorization if account authentication keeps failing",
+        )
 
     def _on_disconnect(self, error: Exception) -> None:
         self._connection_dropped.set()
@@ -580,19 +589,21 @@ class CTraderSession:
             raise CTraderAuthError("no refresh token available")
 
         self._last_refresh_at = time.time()
-        # Recorded before sending: after a timeout, the reply can reach the event path before
-        # this call resumes.
-        earlier = not self._refresh_settled.is_set()
-        self._refresh_settled.clear()
+        # Whether an earlier refresh was still awaited when this one was written.
+        earlier = False
+
+        def written() -> None:
+            # Recorded on the write, not after: the reply can reach the event path before this
+            # call resumes. A request that never leaves the queue changes nothing.
+            nonlocal earlier
+            earlier = not self._refresh_settled.is_set()
+            self._refresh_settled.clear()
+
         try:
             response = await self._connection.request(
                 oa.ProtoOARefreshTokenReq(refreshToken=self._refresh_token),
+                on_written=written,
             )
-        except CTraderNotSentError:
-            # Never left, so no reply is coming to it; an earlier refresh stays as it was.
-            if not earlier:
-                self._refresh_settled.set()
-            raise
         except CTraderRequestError as e:
             # Answered. An earlier refresh still without a reply stays adoptable: this refusal
             # may be the venue saying that one already spent the refresh token - unless a pair
@@ -689,9 +700,10 @@ class CTraderSession:
                     self._log.error(f"Proactive token refresh failed: {e!r}")
                 continue
             if self._lost.is_set():
-                # A loss landed while the refresh completed, and keeps its backoff. The venue's
-                # own end of the old session lands here too (confirmed live) when it comes before
-                # the reply: the supervisor holds the teardown for that reply.
+                # A loss landed while the refresh completed, and keeps its backoff. The venue
+                # ends the old session after a refresh (confirmed live), so that end can land
+                # here too. Whether it comes before or after the reply is unconfirmed; the
+                # supervisor holds the teardown for an awaited reply either way.
                 continue
             # Re-authenticate with the new token through the ordinary reconnect path, rather
             # than relying on the venue to end the old session.

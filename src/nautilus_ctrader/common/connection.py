@@ -203,11 +203,15 @@ class CTraderConnection:
         *,
         timeout_secs: float | None = None,
         priority: RequestPriority = RequestPriority.EXECUTION,
+        on_written: Callable[[], None] | None = None,
     ) -> Message:
         """Send a request and await its correlated response.
 
         `timeout_secs` bounds only the wait for the response. Time spent in the scheduler's
         queue, including a venue-ordered pause and any retry, comes on top of it.
+
+        `on_written` is called each time the frame is handed to the socket, before any reply
+        can be read.
 
         A failure before the frame is written raises a `CTraderNotSentError`; any other
         connection error or timeout leaves unknown whether the venue received the request.
@@ -218,20 +222,26 @@ class CTraderConnection:
         deadline = self._request_timeout_secs if timeout_secs is None else timeout_secs
 
         async def exchange() -> Message:
-            return await self._exchange(payload, deadline, generation)
+            return await self._exchange(payload, deadline, generation, on_written)
 
         if self._scheduler is None:
             return await exchange()
         return await self._scheduler.submit(group_of(payload), priority, exchange)
 
-    async def _exchange(self, payload: Message, deadline: float, generation: int) -> Message:
+    async def _exchange(
+        self,
+        payload: Message,
+        deadline: float,
+        generation: int,
+        on_written: Callable[[], None] | None = None,
+    ) -> Message:
         """Write `payload` under a fresh `clientMsgId` and await its response."""
         client_msg_id = str(uuid.uuid4())
         future: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
         self._pending[client_msg_id] = future
         try:
             frame = _encode(payload, client_msg_id)
-            await self._write(payload, client_msg_id, frame, generation)
+            await self._write(payload, client_msg_id, frame, generation, on_written)
             return await asyncio.wait_for(future, deadline)
         except TimeoutError as e:
             raise CTraderTimeoutError(
@@ -263,6 +273,7 @@ class CTraderConnection:
         client_msg_id: str | None,
         frame: bytes,
         generation: int,
+        on_written: Callable[[], None] | None = None,
     ) -> None:
         # A wait in the queue, or between retries, can outlast the connection it began on
         # (`generation`). A frame meant for a closed socket must fail, never go out on the next.
@@ -274,6 +285,9 @@ class CTraderConnection:
         )
         self._writer.write(frame)
         self._last_send = asyncio.get_running_loop().time()
+        # Before the drain: the read loop can run while it awaits.
+        if on_written is not None:
+            on_written()
         try:
             await self._writer.drain()
         except (ConnectionError, OSError) as e:

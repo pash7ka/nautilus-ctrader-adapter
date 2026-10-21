@@ -566,6 +566,7 @@ async def test_a_refresh_reply_dispatched_as_its_request_times_out_is_adopted(
 
     async def reply_then_time_out(payload, **kwargs):
         if isinstance(payload, oa.ProtoOARefreshTokenReq):
+            kwargs["on_written"]()
             session._on_event(_pair_reply("late-access", "late-refresh")(payload))
             raise CTraderTimeoutError("no response in time")
         return await send(payload, **kwargs)
@@ -606,6 +607,7 @@ async def test_a_refusal_after_the_earlier_reply_was_adopted_leaves_nothing_awai
         if not isinstance(payload, oa.ProtoOARefreshTokenReq):
             return await send(payload, **kwargs)
         attempts += 1
+        kwargs["on_written"]()
         if attempts == 1:
             raise CTraderTimeoutError("no response in time")
         session._on_event(_pair_reply("late-access", "late-refresh")(payload))
@@ -1340,12 +1342,14 @@ async def test_a_reply_arriving_during_the_held_teardown_is_kept(
         await server.stop()
 
 
-async def test_a_stop_leaves_no_refresh_reply_awaited(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Otherwise a restarted session would hold its first teardown for a reply that cannot come.
+async def test_a_stop_logs_a_refresh_reply_it_loses(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Nothing stays awaited, or a restarted session would hold its first teardown for a reply
+    # that cannot come.
     server = _server()
     held = _HeldRefresh(server)
     await server.start()
-    session = _session(server, expires_at_secs=_due_after_ready(monkeypatch))
+    logger = RecordingLogger()
+    session = _session(server, logger, expires_at_secs=_due_after_ready(monkeypatch))
     try:
         await session.start()
         await asyncio.wait_for(held.arrived.wait(), 5.0)
@@ -1353,6 +1357,94 @@ async def test_a_stop_leaves_no_refresh_reply_awaited(monkeypatch: pytest.Monkey
         await session.stop()
 
         assert session._refresh_settled.is_set()
+        assert any("reply lost" in m for m in logger.errors())
+        assert not _lines_with_a_token(logger)
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_refresh_still_queued_at_a_teardown_is_neither_held_nor_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hold_secs = 0.5
+    monkeypatch.setattr("nautilus_ctrader.common.session.LATE_REFRESH_WAIT_SECS", hold_secs)
+    server = _server()
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(
+        server,
+        logger,
+        expires_at_secs=_due_after_ready(monkeypatch),
+        backoff_base_secs=0.05,
+    )
+    send = session._connection.request
+    queued = asyncio.Event()
+
+    async def wait_in_the_queue(payload, **kwargs):
+        if isinstance(payload, oa.ProtoOARefreshTokenReq):
+            queued.set()
+            # Never written.
+            await asyncio.Event().wait()
+        return await send(payload, **kwargs)
+
+    monkeypatch.setattr(session._connection, "request", wait_in_the_queue)
+    try:
+        await session.start()
+        await asyncio.wait_for(queued.wait(), 5.0)
+
+        loop = asyncio.get_running_loop()
+        ended_at = loop.time()
+        await server.push(
+            oa.ProtoOAAccountsTokenInvalidatedEvent(ctidTraderAccountIds=[ACCOUNT_ID])
+        )
+        await server.push(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
+        await wait_until(lambda: server.connection_count >= 2, description="the reconnect")
+
+        assert loop.time() - ended_at < hold_secs
+        assert not any("reply lost" in m for m in logger.errors())
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_late_reply_arriving_during_the_held_teardown_is_adopted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The refresh timed out, the venue ends the session, then the late reply comes.
+    server = _server()
+    held = _HeldRefresh(server)
+    await server.start()
+    logger = RecordingLogger()
+    persisted: list[tuple[str, str, float]] = []
+    session = _session(
+        server,
+        logger,
+        expires_at_secs=_due_after_ready(monkeypatch),
+        request_timeout_secs=0.2,
+        backoff_base_secs=0.05,
+        on_tokens_refreshed=lambda a, r, e: persisted.append((a, r, e)),
+    )
+    try:
+        await session.start()
+        await asyncio.wait_for(held.arrived.wait(), 5.0)
+        await wait_until(
+            lambda: any("Proactive token refresh failed" in m for _, m in logger.lines),
+            description="the refresh timing out",
+        )
+
+        await held.end_the_session()
+        await asyncio.sleep(0.1)
+        await held.answer()
+        await wait_until(lambda: server.connection_count >= 2, description="the reconnect")
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert [(a, r) for a, r, _ in persisted] == [("new-access", "new-refresh")]
+        assert _account_auths(server)[-1].accessToken == "new-access"
+        assert any("late token refresh reply" in m for m in logger.warnings())
+        assert not any("reply lost" in m for m in logger.errors())
+        # The session was already lost, so the adoption asked for no re-authentication.
+        assert ("info", "Re-authenticating with the refreshed token") not in logger.lines
     finally:
         await session.stop()
         await server.stop()
@@ -1363,14 +1455,15 @@ async def test_the_refresh_loop_ending_is_logged(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
+    hold_secs = 5.0
+    monkeypatch.setattr("nautilus_ctrader.common.session.LATE_REFRESH_WAIT_SECS", hold_secs)
     server = _server()
+    held = _HeldRefresh(server)
     if failure == "refused":
         server.on(
             oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
             lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID"),
         )
-    else:
-        server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
     await server.start()
     logger = RecordingLogger()
     session = _session(
@@ -1383,7 +1476,18 @@ async def test_the_refresh_loop_ending_is_logged(
         await session.start()
         await wait_until(lambda: bool(_refreshes(server)), description="the refresh request")
         if failure == "connection-lost":
+            # The venue ends the session, so the teardown is held; then it drops the socket,
+            # which must end the hold at once.
+            await held.end_the_session()
+            await asyncio.sleep(0.1)
+            loop = asyncio.get_running_loop()
+            dropped_at = loop.time()
             await server.drop_connections()
+            await wait_until(
+                lambda: any("reply lost" in m for m in logger.errors()),
+                description="the lost reply being logged",
+            )
+            assert loop.time() - dropped_at < 1.0
 
         await wait_until(
             lambda: any("Proactive token refresh stopped" in m for m in logger.warnings()),
@@ -1421,6 +1525,34 @@ async def test_a_refresh_that_never_left_does_not_wait_for_a_late_pair(
 
         assert isinstance(session.last_error, CTraderQueueTimeoutError)
         assert session._refresh_settled.is_set()
+        assert not any("reply lost" in m for m in logger.errors())
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_refresh_before_account_auth_that_was_not_sent_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _server()
+    await server.start()
+    logger = RecordingLogger()
+    session = _session(server, logger, expires_at_secs=time.time() + 1.0)
+    send = session._connection.request
+
+    async def time_out_in_the_queue(payload, **kwargs):
+        if isinstance(payload, oa.ProtoOARefreshTokenReq):
+            raise CTraderQueueTimeoutError("dropped unsent")
+        return await send(payload, **kwargs)
+
+    monkeypatch.setattr(session._connection, "request", time_out_in_the_queue)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        assert [m.accessToken for m in _account_auths(server)] == ["old-access"]
+        assert any("not sent" in m for m in logger.warnings())
+        assert not any("got no reply" in m for m in logger.warnings())
     finally:
         await session.stop()
         await server.stop()
