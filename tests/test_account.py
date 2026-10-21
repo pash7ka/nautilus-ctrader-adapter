@@ -1591,6 +1591,42 @@ async def test_a_failed_reload_is_reported_once_and_notifies_nobody() -> None:
         await server.stop()
 
 
+async def test_a_reload_that_cannot_build_is_one_error_and_no_recorded_failure() -> None:
+    server = venue()
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    provider = _instrument_provider(client)
+    try:
+        await client.connect()
+        await provider.initialize()
+
+        loaded = provider.find(GER40_ID)
+
+        def unbuildable(request: oa.ProtoOASymbolByIdReq) -> oa.ProtoOASymbolByIdRes:
+            spec = oa_model.ProtoOASymbol()
+            spec.CopyFrom(
+                next(s for s in RECORDED["symbol_specs"][0].symbol if s.symbolId == GER40_SYMBOL_ID)
+            )
+            spec.digits = 6
+            return oa.ProtoOASymbolByIdRes(
+                ctidTraderAccountId=request.ctidTraderAccountId, symbol=[spec]
+            )
+
+        server.on(oa_model.PROTO_OA_SYMBOL_BY_ID_REQ, unbuildable)
+
+        await server.push(_symbol_changed(GER40_SYMBOL_ID))
+        await wait_until(lambda: logger.errors(), description="the failure reported")
+        await _round_trip(client)
+
+        assert len(logger.errors()) == 1
+        assert not provider.failures
+        assert provider.find(GER40_ID) is loaded
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_a_change_of_a_symbol_dropped_by_remove_failed_is_ignored() -> None:
     server = venue()
     await server.start()

@@ -203,6 +203,15 @@ def test_an_ordinary_order_gives_none(book: Book, make: Callable[[Book], Order])
     assert leg_position_id(book.cache, order) is None
 
 
+def test_a_filled_ordinary_order_gives_none(book: Book) -> None:
+    order = book.fill(
+        book.accept(book.factory.market(EURUSD.id, OrderSide.BUY, QUANTITY), "77"), POSITION
+    )
+
+    assert order.position_id == POSITION
+    assert leg_position_id(book.cache, order) is None
+
+
 def test_an_order_without_a_venue_order_id_gives_none(book: Book) -> None:
     book.entry()
     order = book.stop(None)

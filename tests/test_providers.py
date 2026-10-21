@@ -86,6 +86,50 @@ async def test_unknown_symbol_is_a_recorded_failure() -> None:
         await server.stop()
 
 
+@pytest.mark.parametrize("load", ["all", "ids", "one"])
+async def test_non_empty_filters_log_one_warning(load: str) -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    logger = RecordingLogger()
+    try:
+        await client.connect()
+        provider = _provider(client, logger=logger)
+        filters = {"anything": 1}
+
+        if load == "all":
+            await provider.load_all_async(filters)
+        elif load == "ids":
+            await provider.load_ids_async([EURUSD_ID], filters)
+        else:
+            await provider.load_async(EURUSD_ID, filters)
+
+        assert [w for w in logger.warnings() if "filters" in w] == [
+            "Instrument filters are not supported and are ignored"
+        ]
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_no_filters_log_no_warning() -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    logger = RecordingLogger()
+    try:
+        await client.connect()
+        provider = _provider(client, logger=logger)
+
+        await provider.load_ids_async([EURUSD_ID], {})
+        await provider.load_ids_async([EURUSD_ID], None)
+
+        assert not [w for w in logger.warnings() if "filters" in w]
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_unknown_symbol_raises_when_configured_to_fail() -> None:
     server = venue()
     await server.start()

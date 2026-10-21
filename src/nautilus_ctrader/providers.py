@@ -55,6 +55,9 @@ class CTraderInstrumentProvider(InstrumentProvider):
     `asset_class_overrides` applies only to symbols that resolve to a `Cfd`; an override for a
     symbol that resolves to a `CurrencyPair` is ignored (with a WARNING), since a currency pair
     derives its class from its currencies.
+
+    The `filters` argument of the `load_*_async` methods is unsupported: a non-empty one is
+    ignored with one WARNING.
     """
 
     def __init__(
@@ -102,7 +105,12 @@ class CTraderInstrumentProvider(InstrumentProvider):
     def instrument_for_symbol_id(self, symbol_id: int) -> Instrument | None:
         return self._by_symbol_id.get(symbol_id)
 
+    def _warn_if_filtered(self, filters: dict | None) -> None:
+        if filters:
+            self._log.warning("Instrument filters are not supported and are ignored")
+
     async def load_all_async(self, filters: dict | None = None) -> None:
+        self._warn_if_filtered(filters)
         self._require_connected()
         failures = await self._load_names(list(self._account.light_symbols))
         self._raise_if_configured(failures)
@@ -112,6 +120,7 @@ class CTraderInstrumentProvider(InstrumentProvider):
         instrument_ids: list[InstrumentId],
         filters: dict | None = None,
     ) -> None:
+        self._warn_if_filtered(filters)
         self._require_connected()
         if not instrument_ids:
             return
@@ -130,7 +139,7 @@ class CTraderInstrumentProvider(InstrumentProvider):
         self._raise_if_configured(failures)
 
     async def load_async(self, instrument_id: InstrumentId, filters: dict | None = None) -> None:
-        """Inherited unchanged from `InstrumentProvider`: delegates to `load_ids_async`."""
+        """Delegates to `load_ids_async`; `filters` is unsupported (see there)."""
         await super().load_async(instrument_id, filters)
 
     async def conversion_instruments_for(self, instrument: Instrument) -> list[Instrument]:
@@ -258,7 +267,8 @@ class CTraderInstrumentProvider(InstrumentProvider):
         """Refetch and rebuild the instrument for `symbol_id`, bypassing the spec cache.
 
         For `ProtoOASymbolChangedEvent`. Raises `InstrumentLoadError` if the symbol is no
-        longer offered, or if it fails to build.
+        longer offered, or if it fails to build. A failure is only raised: it is not added to
+        `failures`, and the previous instrument stays loaded.
         """
         self._require_connected()
         light = next(
@@ -270,7 +280,7 @@ class CTraderInstrumentProvider(InstrumentProvider):
                 f"symbol id {symbol_id} not offered by the venue for this account",
             )
         specs = await self._account.symbol_specs([symbol_id], refresh=True)
-        return self._build_or_fail(specs.get(symbol_id), light)
+        return self._build_or_fail(specs.get(symbol_id), light, record_failure=False)
 
     def _require_connected(self) -> None:
         if self._account.session is None:
@@ -280,11 +290,14 @@ class CTraderInstrumentProvider(InstrumentProvider):
         self,
         spec: om.ProtoOASymbol | None,
         light: om.ProtoOALightSymbol,
+        *,
+        record_failure: bool = True,
     ) -> Instrument:
         """Build the instrument for `light`/`spec`, or record the failure and raise.
 
-        Every place that can fail to build an instrument routes through here, so a failure is
-        never raised without first landing in `failures` with an ERROR line.
+        Every place that builds a new instrument routes through here, so a failure is never
+        raised without first landing in `failures` with an ERROR line. With `record_failure`
+        off, the failure is only raised, for the caller to report.
         """
         name = light.symbolName
         if name in self._blocked:
@@ -304,7 +317,8 @@ class CTraderInstrumentProvider(InstrumentProvider):
             # Nautilus validates the constructor arguments itself and reports what it rejects
             # as a `ValueError` or a `TypeError`. Caught here so one unusable symbol is a
             # recorded failure like any other, never the end of the batch it arrived in.
-            self._record_failure(name, str(e))
+            if record_failure:
+                self._record_failure(name, str(e))
             raise InstrumentLoadError(str(e)) from e
         self._finish_load(instrument, spec, light)
         return instrument
