@@ -559,7 +559,8 @@ async def test_an_event_during_the_start_pass_is_applied_after_reconciliation() 
 
         await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
         assert kinds(h, STOP)[-1] == "OrderFilled"
-        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+        logged = h.logger.warnings() + h.logger.errors()
+        assert not any("No Nautilus order" in line for line in logged)
 
 
 async def test_buffer_is_released_when_reconciliation_never_comes() -> None:
@@ -615,7 +616,10 @@ async def test_a_failed_list_releases_the_buffer() -> None:
         await push(h, *FIRST_EVENTS[-2:])
 
         assert not h.client._book.view(FIRST).open
-        assert h.logger.errors() == []
+        # Nautilus got none of the node's orders, so the events of their legs are dropped.
+        errors = h.logger.errors()
+        assert errors
+        assert all("No Nautilus order" in line for line in errors)
         assert any("INTERNAL_SERVER_ERROR" in line for line in h.logger.warnings())
 
 
@@ -1019,7 +1023,8 @@ async def test_a_reconnect_during_the_start_wait_releases_after_its_own_mass_sta
         assert held_when_reconciled == [2]
         assert h.client._buffer is None
         await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
-        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+        logged = h.logger.warnings() + h.logger.errors()
+        assert not any("No Nautilus order" in line for line in logged)
 
 
 async def test_a_close_in_flight_across_a_reconnect_keeps_the_node_id() -> None:

@@ -4,10 +4,14 @@
 hand, watching the trading terminal, and only with `--send-live-orders`; it then asks for the
 symbol to be typed again before anything starts. Nothing in the test suite runs it.
 
+**No adapter node may be running on the account meanwhile.** The script is a node of its own,
+and the other one would take the positions it opens for its own.
+
 It builds a `TradingNode` with this adapter's data and execution clients and, on one symbol,
 does exactly this:
 
-1. waits for a quote;
+1. waits for a quote, shows the trader login, the host, the volume and its approximate notional,
+   and waits for Enter;
 2. buys the instrument's minimum volume with a bracket: a stop-loss `--distance` below the ask
    and a take-profit `--distance` above it;
 3. once both levels are accepted, cancels the take-profit;
@@ -26,7 +30,8 @@ stops it.
 
     uv run python scripts/first_orders.py --symbol EURUSD --distance 0.00100 --send-live-orders
 
-Credentials and the trader login come from `.env` in the repository root. The script does no
+Credentials and the trader login come from `.env` in the repository root. The host shown is read
+from the account list the access token grants, as the adapter reads it. The script does no
 token refresh, so it refuses to start with an access token whose `CTRADER_TOKEN_EXPIRES_AT` has
 passed. Every order event, position event and account activity is appended to a JSONL file under
 `--log-dir` (by default `tests/recordings/`, which git ignores). A line carries only the fixed
@@ -38,6 +43,8 @@ compare between the two.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import datetime
 import enum
 import importlib.util
@@ -45,7 +52,9 @@ import json
 import math
 import pathlib
 import sys
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TextIO
@@ -85,6 +94,9 @@ from nautilus_ctrader import (
     CTraderLiveDataClientFactory,
     CTraderLiveExecClientFactory,
 )
+from nautilus_ctrader.common.account import account_host
+from nautilus_ctrader.common.errors import CTraderError, CTraderRequestError
+from nautilus_ctrader.constants import DEMO_HOST, LIVE_HOST
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -434,10 +446,34 @@ class EventLog:
 # -- The Nautilus side --------------------------------------------------------------------
 
 
+def wait_for_enter(on_answer: Callable[[bool], None]) -> None:
+    """Read one console line, then call `on_answer` on the running loop.
+
+    `on_answer` gets `True` for a line and `False` at the end of input. The read blocks, and an
+    asyncio loop cannot watch a Windows console, so it runs in a daemon thread that never keeps
+    the process alive.
+    """
+    loop = asyncio.get_running_loop()
+
+    def read() -> None:
+        try:
+            input()
+            answer = True
+        except EOFError:
+            answer = False
+        # The node may be gone by then, its loop closed.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(on_answer, answer)
+
+    threading.Thread(target=read, name="first-orders-enter", daemon=True).start()
+
+
 class _Driver(Strategy):
     """Feeds the run's events to `Steps` and carries out what it answers.
 
-    `Steps` is built in `on_start`, once the instrument, and so the volumes, are known.
+    `Steps` is built in `on_start`, once the instrument, and so the volumes, are known. Quotes
+    reach it only after the owner has confirmed the first quote's summary with Enter;
+    `wait_for_enter` is called once, with the callback that takes the answer.
     """
 
     def __init__(
@@ -447,14 +483,23 @@ class _Driver(Strategy):
         distance: Decimal,
         manual_wait_secs: float,
         log: EventLog,
+        trader_login: int,
+        host: str,
+        wait_for_enter: Callable[[Callable[[bool], None]], None],
     ) -> None:
         super().__init__(StrategyConfig(order_id_tag="001"))
         self._instrument_id = instrument_id
         self._distance = distance
         self._manual_wait_secs = manual_wait_secs
         self._event_log = log
+        self._trader_login = trader_login
+        self._host = host
+        self._wait_for_enter = wait_for_enter
         self._instrument: Instrument | None = None
         self._steps: Steps | None = None
+        self._last_quote: QuoteTick | None = None
+        self._confirmed = False
+        self._stopped = False
 
     @property
     def finished(self) -> bool:
@@ -480,13 +525,46 @@ class _Driver(Strategy):
         self.subscribe_quote_ticks(self._instrument_id)
 
     def on_stop(self) -> None:
+        self._stopped = True
         if self._instrument is not None:
             self.msgbus.unsubscribe(topic=ACCOUNT_ACTIVITY_TOPIC, handler=self._on_activity)
         if not self.finished:
             print("\n>>> Stopped before the sequence finished: check the terminal.\n")
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
-        self._feed(tick)
+        if self._confirmed:
+            self._feed(tick)
+            return
+        if self._last_quote is None:
+            self._ask_to_go_on(tick)
+        self._last_quote = tick
+
+    def _ask_to_go_on(self, tick: QuoteTick) -> None:
+        if self._steps is None:
+            return
+        sizes, ask = bracket_sizes(self._instrument), tick.ask_price
+        kind = "LIVE" if self._host == LIVE_HOST else "demo"
+        print(
+            f"\n>>> Account {self._trader_login} on the {kind} host {self._host}.\n"
+            f">>> First buy: {sizes.first} {self._instrument_id}, about "
+            f"{self._instrument.notional_value(sizes.first, ask)} at the ask {ask}; then "
+            f"{sizes.second}, about {self._instrument.notional_value(sizes.second, ask)}.\n"
+            ">>> No other node may be running on this account: it would take these positions "
+            "for its own.\n"
+            ">>> Press Enter to send the orders, or Ctrl+C to stop.\n",
+        )
+        self._wait_for_enter(self._on_answer)
+
+    def _on_answer(self, go_on: bool) -> None:
+        if self._stopped:
+            return
+        if not go_on:
+            print("\n>>> Not confirmed; nothing was sent.\n")
+            self.shutdown_system("first orders not confirmed")
+            return
+        self._confirmed = True
+        # The latest quote, so that the levels are measured from a fresh ask.
+        self._feed(self._last_quote)
 
     def on_event(self, event: object) -> None:
         if isinstance(event, OrderEvent):
@@ -619,6 +697,23 @@ def token_expired(env: dict[str, str], now_secs: float) -> bool:
     return expires_at <= now_secs
 
 
+async def account_host_of(env: dict[str, str], trader_login: int) -> str:
+    """The host the node will trade the account on, from its live flag as the adapter reads it.
+
+    Raises `MissingCredentials` when the access token grants no account with `trader_login`.
+    """
+    result = await get_tokens.list_accounts(
+        env[get_tokens.ACCESS_TOKEN_KEY],
+        env[get_tokens.CLIENT_ID_KEY],
+        env[get_tokens.CLIENT_SECRET_KEY],
+        host=DEMO_HOST,
+    )
+    for record in result.accounts:
+        if record.trader_login == trader_login:
+            return account_host(record.is_live)
+    raise MissingCredentials(f"the access token grants no account with login {trader_login}")
+
+
 def build_node(config: TradingNodeConfig, driver: _Driver) -> TradingNode:
     node = TradingNode(config=config)
     node.trader.add_strategy(driver)
@@ -740,6 +835,19 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    trader_login = config.exec_clients[CTRADER].trader_login
+    try:
+        host = asyncio.run(account_host_of(env, trader_login))
+    except MissingCredentials as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except CTraderRequestError as e:
+        # The code only: the venue's description may echo what it was sent.
+        print(f"error: the account list was refused: {e.error_code}", file=sys.stderr)
+        return 1
+    except (CTraderError, OSError) as e:
+        print(f"error: the account list could not be read: {type(e).__name__}", file=sys.stderr)
+        return 1
 
     args.log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -750,6 +858,9 @@ def main(argv: list[str] | None = None) -> int:
             distance=args.distance,
             manual_wait_secs=args.manual_wait_secs,
             log=log,
+            trader_login=trader_login,
+            host=host,
+            wait_for_enter=wait_for_enter,
         )
         node = build_node(config, driver)
         try:

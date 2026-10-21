@@ -18,6 +18,12 @@ what is still open.
   fails with a `CTraderAccountError` naming the reason when the account is not a hedging account,
   when its access rights are not full, or when it is a limited-risk account (which needs a
   guaranteed stop on every order). Nautilus sees `OmsType.HEDGING` and a margin account.
+- **One adapter node per account.** A node recognises its own positions by the record it writes
+  into each order ([Restarts](#4-restarts-and-reconnects)), and every node of this adapter writes
+  the same record. A second node on the same account, or `scripts/first_orders.py` run while a
+  node is connected, therefore takes the first node's positions as its own, and the first node
+  can report the second one's orders and closes as manual changes. Run one node per account. An execution event for an order
+  that carries the record but that the node does not hold is logged at ERROR, naming the order.
 - **The account's instruments.** The execution client trades the instruments the account's
   instrument provider holds, which the data client's configuration builds. A data client for the
   same account must therefore be configured, and `instrument_provider` must not be set on the
@@ -434,8 +440,11 @@ A **persistent Nautilus cache is not needed** for the node's own positions to be
 adapter writes its own record into each order it sends: the `label` holds a marker and the
 entry's client order id, the `comment` holds the client order ids of the legs. A trader or another
 program can write those fields too, so parsing is strict: a text that is not exactly a record
-written by the adapter is not a record, and the position is then treated as foreign. The mistake
-can only be "not the node's", never the node taking someone else's position for its own.
+written by the adapter is not a record, and the position is then treated as foreign. Such a text
+can only make a position look foreign, never make the node take someone else's position for its
+own. The record does not say which node wrote it, though: a second adapter node on the account
+writes the same records, which is why only [one node per account](#1-what-it-trades) is
+supported.
 
 The package exports the codec, for an application that checks what the broker stored:
 `encode_label(entry_id)` and `encode_comment(LegIds(stop_loss, take_profit))` give the texts the

@@ -9,7 +9,11 @@ recognised as the node's own and its protective legs restored under their origin
 
 Anyone may write to these fields - a trader, another robot. Parsing is therefore strict: a text
 that is not exactly a record written here is not a record, and the position is not the node's.
-A mistake can then only be "not ours", never the node managing someone else's position.
+Another program's text can then only make a position look foreign, never the node's own.
+
+The record does not say which node wrote it. A second node of this adapter on the same account
+writes the same records, and each node takes the other's positions for its own, so only one
+node may run per account.
 """
 
 from __future__ import annotations

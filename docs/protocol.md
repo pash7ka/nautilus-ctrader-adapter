@@ -159,7 +159,10 @@ How tokens behave was checked on a live connection, on the account's own (live) 
   refresh of the second pair affected the first pair's access or refresh token.
 - **One access token can authenticate the same account on two connections at once**
   (confirmed). Neither connection received a disconnect or token-invalidation event within
-  15 seconds, and a trader read succeeded on each.
+  15 seconds, and a trader read succeeded on each. This is what the protocol allows, not a
+  supported deployment: two adapter nodes on one account take each other's positions for their
+  own, so only one node per account is supported
+  ([Execution](execution.md#1-what-it-trades)).
 
 **Unconfirmed**: a refresh for a live account's token over the short pre-connection to the
 demo host that resolves the account's host (Section 1). This adapter refreshes there at

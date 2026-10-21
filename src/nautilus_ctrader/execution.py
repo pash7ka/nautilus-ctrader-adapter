@@ -1840,6 +1840,15 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     def _order_event(self, record: OrderEvent) -> None:
         order = self._nautilus_order(record)
+        if order is None and record.client_order_id is not None:
+            # Named by the adapter's record, yet unknown here: another node's order, or one a
+            # failed reconciliation left out.
+            self._log.error(
+                f"No Nautilus order for {record.client_order_id}, which carries this adapter's "
+                "record; another node may be trading this account, or a failed reconciliation "
+                f"left the order out. Its {record.kind.value} event is not reported",
+            )
+            return
         if order is None:
             self._log.warning(
                 f"No Nautilus order for {record.client_order_id or record.venue_order_id}; "

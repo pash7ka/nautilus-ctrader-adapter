@@ -13,6 +13,7 @@ import json
 import pathlib
 import sys
 import time
+from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
@@ -88,6 +89,7 @@ def nothing_may_be_built(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     )
     monkeypatch.setattr(fo, "build_node", recorder("build_node"))
     monkeypatch.setattr(fo.get_tokens, "load_env", recorder("load_env"))
+    monkeypatch.setattr(fo.get_tokens, "list_accounts", recorder("list_accounts"))
     return calls
 
 
@@ -651,7 +653,17 @@ class RecordingDriver:
         self.cache = Cache()
         self.cache.add_instrument(EURUSD)
         msgbus = MessageBus(trader_id=TraderId("TESTER-001"), clock=self.clock)
-        self.driver = fo._Driver(EURUSD.id, distance=DISTANCE, manual_wait_secs=WAIT_SECS, log=log)
+        # The callbacks waiting for the owner's Enter; a test calls one to answer.
+        self.answers: list[Callable[[bool], None]] = []
+        self.driver = fo._Driver(
+            EURUSD.id,
+            distance=DISTANCE,
+            manual_wait_secs=WAIT_SECS,
+            log=log,
+            trader_login=FAKE_LOGIN,
+            host="demo.ctraderapi.com",
+            wait_for_enter=self.answers.append,
+        )
         self.driver.register(
             trader_id=TraderId("TESTER-001"),
             portfolio=Portfolio(msgbus=msgbus, cache=self.cache, clock=self.clock),
@@ -688,6 +700,18 @@ def test_the_driver_carries_out_the_sequence(tmp_path: pathlib.Path, capsys) -> 
         r = RecordingDriver(log)
         r.driver.on_start()
         r.driver.on_quote_tick(venue.quote("1.10000", "1.10010"))
+        r.driver.on_quote_tick(venue.quote("1.10000", "1.10010"))
+
+        # Nothing goes out until the owner has seen the account and the size and pressed Enter.
+        assert r.sent == []
+        shown = capsys.readouterr().out
+        assert f"Account {FAKE_LOGIN}" in shown
+        assert "demo host demo.ctraderapi.com" in shown
+        assert "1000 EURUSD" in shown
+        assert "about 1100.10 USD" in shown
+        assert "No other node may be running on this account" in shown
+        (answer,) = r.answers
+        answer(True)
 
         (kind, orders), *_ = r.sent
         assert kind == "bracket"

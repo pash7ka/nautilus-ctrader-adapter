@@ -58,7 +58,7 @@ from nautilus_ctrader.common.errors import (
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.venue_book import terms_of
-from nautilus_ctrader.common.venue_records import Level, LevelTerms
+from nautilus_ctrader.common.venue_records import Level, LevelTerms, OrderEvent, OrderEventKind
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
 from nautilus_ctrader.execution import _AMEND_ATTEMPTS, CTraderExecutionClient, _distances
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
@@ -480,11 +480,24 @@ async def test_an_event_the_model_cannot_apply_is_an_error_and_the_client_carrie
         assert h.cache.position(PositionId("5000001")).quantity == Quantity.from_str("1.00")
 
 
-async def test_an_event_for_an_order_nautilus_does_not_hold_is_a_warning() -> None:
+async def test_an_event_for_an_unknown_order_with_our_record_logs_an_error() -> None:
     async with harness() as h:
+        # The entry carries the adapter's record, but this node never submitted it.
         await push(h, FIRST_EVENTS[0])
 
-        assert any("No Nautilus order" in line for line in h.logger.warnings())
+        (error,) = [line for line in h.logger.errors() if "No Nautilus order" in line]
+        assert ENTRY in error
+        assert "another node" in error
+        assert not any("No Nautilus order" in line for line in h.logger.warnings())
+        assert h.events == []
+
+
+async def test_an_event_for_an_unknown_foreign_order_keeps_its_level() -> None:
+    async with harness() as h:
+        h.client._handle_records([OrderEvent(OrderEventKind.CANCELED, "7000001", None, 0)])
+
+        assert any("No Nautilus order for 7000001" in line for line in h.logger.warnings())
+        assert h.logger.errors() == []
         assert h.events == []
 
 
