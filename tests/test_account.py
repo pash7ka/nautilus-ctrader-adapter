@@ -821,16 +821,32 @@ def test_an_empty_optional_secret_in_the_environment_is_unset(config_class, monk
 
 
 @pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
-def test_an_unreadable_token_expiry_names_the_variable_not_the_value(
+def test_an_inline_access_token_takes_no_refresh_or_expiry_from_the_environment(
     config_class, monkeypatch
 ) -> None:
-    _set_secret_environment(monkeypatch, CTRADER_TOKEN_EXPIRES_AT="not-a-number")
+    # The environment holds another grant.
+    _set_secret_environment(monkeypatch)
+    config = _client_config(config_class)
+
+    credentials = config.credentials()
+
+    assert credentials.access_token == "access-token"
+    assert credentials.refresh_token is None
+    assert credentials.token_expires_at is None
+
+
+@pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])
+@pytest.mark.parametrize("expiry", ["not-a-number", "inf", "-inf", "nan"])
+def test_an_unreadable_token_expiry_names_the_variable_not_the_value(
+    config_class, expiry, monkeypatch
+) -> None:
+    _set_secret_environment(monkeypatch, CTRADER_TOKEN_EXPIRES_AT=expiry)
 
     with pytest.raises(ValueError) as raised:
         config_class(trader_login=TRADER_LOGIN).credentials()
 
     assert "CTRADER_TOKEN_EXPIRES_AT" in str(raised.value)
-    assert "not-a-number" not in str(raised.value)
+    assert expiry not in str(raised.value)
 
 
 @pytest.mark.parametrize("config_class", [CTraderDataClientConfig, CTraderExecClientConfig])

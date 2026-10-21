@@ -8,6 +8,7 @@ never logged.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from typing import Protocol
@@ -76,27 +77,41 @@ def _expiry(value: float | None) -> float | None:
     text = _from_environment(None, "CTRADER_TOKEN_EXPIRES_AT")
     if text is None:
         return None
+    unreadable = ValueError(
+        "token_expires_at: CTRADER_TOKEN_EXPIRES_AT is not a number of Unix seconds",
+    )
     try:
-        return float(text)
+        expires_at = float(text)
     except ValueError:
-        raise ValueError(
-            "token_expires_at: CTRADER_TOKEN_EXPIRES_AT is not a number of Unix seconds",
-        ) from None
+        raise unreadable from None
+    if not math.isfinite(expires_at):
+        raise unreadable
+    return expires_at
 
 
 def _resolve_credentials(config: _SecretSettings) -> AccountCredentials:
     """The config's credentials, each one it leaves `None` read from its environment variable.
 
+    The refresh token and the expiry are read from the environment only when the access token
+    is: an inline grant is never completed with another's.
+
     Raises `ValueError`, naming the setting and the variable but never a value, if the client
     id, client secret or access token is set in neither, or `CTRADER_TOKEN_EXPIRES_AT` is not
-    a number.
+    a finite number.
     """
+    grant_from_environment = config.access_token is None
     return AccountCredentials(
         client_id=_required(config.client_id, "client_id", "CTRADER_CLIENT_ID"),
         client_secret=_required(config.client_secret, "client_secret", "CTRADER_CLIENT_SECRET"),
         access_token=_required(config.access_token, "access_token", "CTRADER_ACCESS_TOKEN"),
-        refresh_token=_from_environment(config.refresh_token, "CTRADER_REFRESH_TOKEN"),
-        token_expires_at=_expiry(config.token_expires_at),
+        refresh_token=(
+            _from_environment(config.refresh_token, "CTRADER_REFRESH_TOKEN")
+            if grant_from_environment
+            else config.refresh_token
+        ),
+        token_expires_at=(
+            _expiry(config.token_expires_at) if grant_from_environment else config.token_expires_at
+        ),
     )
 
 
@@ -172,7 +187,8 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
 
     Each of the five credentials left `None` is read when the account client is built, from
     `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`, `CTRADER_ACCESS_TOKEN`,
-    `CTRADER_REFRESH_TOKEN` or `CTRADER_TOKEN_EXPIRES_AT`. A value in the config wins.
+    `CTRADER_REFRESH_TOKEN` or `CTRADER_TOKEN_EXPIRES_AT`. A value in the config wins. The
+    last two are read only when the access token is too, never to complete an inline one.
 
     """
 

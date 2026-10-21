@@ -353,8 +353,8 @@ connection, and the connection settings of the first config built for the accoun
 | `client_id`, `client_secret` | `None`: `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET` | The registered application's credentials; required in the config or the environment |
 | `access_token` | `None`: `CTRADER_ACCESS_TOKEN` | An access token granting the application the account; required in the config or the environment |
 | `trader_login` | required | The broker's own account number; the adapter looks up the protocol's account id itself. The Nautilus account id is `CTRADER-<trader_login>` |
-| `refresh_token` | `None`: `CTRADER_REFRESH_TOKEN` | Renews `access_token`; without it an expired token ends the session |
-| `token_expires_at` | `None`: `CTRADER_TOKEN_EXPIRES_AT` | Unix seconds the access token expires at; without it no proactive refresh happens |
+| `refresh_token` | `None`: `CTRADER_REFRESH_TOKEN`, only with the access token from the environment | Renews `access_token`; without it an expired token ends the session |
+| `token_expires_at` | `None`: `CTRADER_TOKEN_EXPIRES_AT`, only with the access token from the environment | Unix seconds the access token expires at; without it no proactive refresh happens |
 | `environment` | `"auto"` | `"auto"` reads the account's own live flag and picks the host; `"demo"` or `"live"` force it |
 | `connect_timeout_secs` | `60.0` | Bound on the whole account bring-up. It also bounds how long events are held while the start's reconciliation is applied, and how long a request waits for a rebuilt model: past it, a waiting amend or close goes ahead on the old model, with a WARNING |
 | `restore_retry_interval_secs` | `30.0` | How often to retry what a reconnect failed to restore |

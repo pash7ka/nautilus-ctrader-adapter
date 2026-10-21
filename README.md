@@ -97,7 +97,8 @@ looks that one up from the accounts the token grants and uses it for every reque
 The adapter receives these values from the host application, in the client config or in the
 environment. A credential the config leaves out is read, when the account client is built,
 from `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`, `CTRADER_ACCESS_TOKEN`,
-`CTRADER_REFRESH_TOKEN` or `CTRADER_TOKEN_EXPIRES_AT`; a value in the config wins. With
+`CTRADER_REFRESH_TOKEN` or `CTRADER_TOKEN_EXPIRES_AT`; a value in the config wins. The last
+two are read only when the access token is too, never to complete one set in the config. With
 `StreamingConfig`, Nautilus writes the whole node config to `config.json`, so leave the secrets
 out of the config and set the environment instead. `clientSecret` and both tokens are treated
 as secrets and are never written to logs: the transport logs no payload bytes at all.

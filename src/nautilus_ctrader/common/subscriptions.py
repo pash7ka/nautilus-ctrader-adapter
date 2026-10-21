@@ -483,7 +483,8 @@ class SubscriptionRegistry:
                         return
                     await _subscribe(session, [request])
             self._maybe_unsubscribed.discard(key)
-            # A bring-up clears the failed restores before running any, so only a retry finds it.
+            # A bring-up clears the failed restores before running any, so normally only a retry
+            # finds it.
             if key[0] == "trendbar" and key in session.failed_restores:
                 self._notify_recovered(key[1], key[2])
 

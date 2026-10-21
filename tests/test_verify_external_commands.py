@@ -1752,6 +1752,24 @@ def test_the_recorder_scrubs_the_short_broker_title_of_the_named_account() -> No
     assert recorder.recording.names == ["Examplia"]
 
 
+async def test_the_guarded_account_reads_the_account_list_through_its_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    # A rename of the account client's hook would leave the override, and the scrub, unreached.
+    taken: list[int] = []
+    take = vec.Recorder.take_broker_title
+
+    def spy(self, granted, trader_login: int) -> None:
+        taken.append(trader_login)
+        take(self, granted, trader_login)
+
+    monkeypatch.setattr(vec.Recorder, "take_broker_title", spy)
+    await run(owner_venue(), tmp_path)
+
+    assert taken
+    assert set(taken) == {TRADER_LOGIN}
+
+
 def watch_guard() -> vec.Guard:
     return vec.Guard(vec.Recorder(vec.record_execution.Recording(0)), vec.READ_REQUESTS)
 

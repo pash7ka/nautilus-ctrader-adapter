@@ -1425,6 +1425,26 @@ async def test_the_third_failed_conversion_retry_in_a_row_is_an_error() -> None:
         assert f"quotes:{GER40_ID}" in errors[0]
 
 
+async def test_conversion_retries_while_the_session_is_not_ready_count_no_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with refusing_conversion_harness(logged=True) as h:
+        await h.client._connect()
+        h.engine.register_client(h.client)
+        await through_engine(h, engine_subscribe("quotes"))
+        await refused_retry_then_asleep(h)
+        session = h.client._session
+        ready = session.is_ready
+        # An outage of many retry intervals.
+        monkeypatch.setattr(type(session), "is_ready", property(lambda _s: False))
+        await asyncio.sleep(0.5)
+        monkeypatch.setattr(type(session), "is_ready", property(lambda _s: ready))
+        # The first refusal after the outage is the second in a row.
+        await refused_retry_then_asleep(h)
+
+        assert not [e for e in h.logger.errors() if str(GER40_ID) in e]
+
+
 async def test_subscriptions_of_one_instrument_share_its_conversion_retry() -> None:
     async with refusing_conversion_harness(logged=True, retry_secs=0.3) as h:
         await h.client._connect()

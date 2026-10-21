@@ -871,6 +871,9 @@ class CTraderDataClient(LiveMarketDataClient):
     async def _retry_conversion(self, retry: _ConversionRetry, instrument_id: InstrumentId) -> None:
         while True:
             await asyncio.sleep(self._config.restore_retry_interval_secs)
+            # Not an attempt: an outage must not count towards the ERROR.
+            if self._session is None or not self._session.is_ready:
+                continue
             instrument = self._instrument_provider.find(instrument_id)
             if instrument is None:
                 # Whatever dropped it has reported it.
