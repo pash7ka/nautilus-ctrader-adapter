@@ -280,6 +280,8 @@ class VenueBook:
         self._open_orders: dict[int, om.ProtoOAOrder] = {}
         self._seen: set[tuple] = set()
         self._synced_deals: set[int] = set()
+        # Deals whose fill events were applied, by deal id.
+        self._applied_deals: set[int] = set()
         # Positions a load kept though its snapshot lacked them, until an event of theirs comes.
         self._kept: set[int] = set()
 
@@ -447,6 +449,10 @@ class VenueBook:
         """Position `position_id` is known open after all: it stays as held, kept no longer."""
         self._kept.discard(position_id)
 
+    def deal_applied(self, deal_id: int) -> bool:
+        """Whether a fill event carrying deal `deal_id` was applied."""
+        return deal_id in self._applied_deals
+
     def apply(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
         """What `event` means to Nautilus; an event seen before means nothing new.
 
@@ -457,11 +463,15 @@ class VenueBook:
             # Swap and cash-flow events change the account, not an order.
             return []
         key = self._key(event)
-        if key in self._seen:
+        # A deal fills once, whatever execution type its events name.
+        fill = event.executionType in _FILLS and event.HasField("deal")
+        if key in self._seen or (fill and event.deal.dealId in self._applied_deals):
             return []
         records = self._handle(event, operations)
         # Marked only once handled, so an event whose handling raised can be applied again.
         self._seen.add(key)
+        if fill:
+            self._applied_deals.add(event.deal.dealId)
         # The broker still states the position: its events, not a deal read, answer its legs.
         self._kept.discard(event.order.positionId)
         return records

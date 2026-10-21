@@ -121,15 +121,17 @@ exists, the adapter amends the position's levels to the exact prices requested.
   answers no leg, and a WARNING says so. The model keeps the position as it stood, so its close
   event, held during the rebuild or arriving later, reports the leg that filled as filled and the
   others as cancelled. If no event of it comes within `protective_order_timeout_secs`, the
-  position's deals are read and its closing deal is applied as its event would have been. A failed
-  read is tried once more after the same time, then an ERROR says the legs need a check by hand.
-  Nothing else settles such a leg: Nautilus's in-flight check skips an accepted order, and so does
-  its open-order check with `open_check_open_only=True`. If the rebuild fails, a WARNING says so
-  (a failure in the adapter itself is also logged at ERROR) and it is tried again after
-  `protective_order_timeout_secs`, then after twice as long each time, up to
-  `connect_timeout_secs`. The rebuild is of the whole account: it
-  may end the legs of other pending brackets whose levels the broker no longer holds, without an
-  event. Nautilus's in-flight check then settles such a leg's pending cancel.
+  position's deals are read, and each closing deal the model has not applied is applied, in order,
+  as its event would have been. A failed read is tried once more after the same time, then an
+  ERROR says the legs need a check by hand. Nothing else settles such a leg: Nautilus's in-flight
+  check skips an accepted order, and so does its open-order check with `open_check_open_only=True`.
+  If an event of the position, or its deals, or a later rebuild shows it open after all, the
+  bracket's carried cancel or modify is answered or sent as for a standing position. If the rebuild
+  fails, a WARNING says so (a failure in the adapter itself is also logged at ERROR) and it is tried
+  again after `protective_order_timeout_secs`, then after twice as long each time, up to
+  `connect_timeout_secs`. The rebuild is of the whole account: it may end the legs of other pending
+  brackets whose levels the broker no longer holds, without an event. Nautilus's in-flight check
+  then settles such a leg's pending cancel.
 - If no protective order follows the fill within `protective_order_timeout_secs`, the levels are
   set by an amend instead. If that is refused too, the legs are rejected and an ERROR is logged:
   the position stands without its levels. If it gets no answer, an ERROR says that whether the
