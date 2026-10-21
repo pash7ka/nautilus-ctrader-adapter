@@ -145,7 +145,8 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     connect_timeout_secs : float, default 60.0
         Bound on the whole account bring-up.
     restore_retry_interval_secs : float, default 30.0
-        How often to retry subscriptions whose restore failed.
+        How often to retry subscriptions whose restore failed, and a conversion chain refused
+        during a subscribe.
     request_window_secs : float, default 1.25
         The sliding window the request limits count within.
     historical_requests_per_window : int, default 5

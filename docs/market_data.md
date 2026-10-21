@@ -256,7 +256,11 @@ Two different failures are reported differently, because they need different res
   leg's symbol request, whatever its error code, a timeout, or a session that is reconnecting.
   The instrument is fine; the request was not, and nothing has been learned about the chain.
   It stays loaded and unconverted, with a WARNING. A quote or bar subscription refused this way
-  is not kept as subscribed, so subscribing to it again tries again; nothing retries on its own.
+  stays subscribed in Nautilus, and its chain is retried every `restore_retry_interval_secs` of
+  the data client's own config, with a WARNING for each failed retry. Once a retry succeeds,
+  the subscription completes as if the first attempt had succeeded, for every subscriber, and
+  one INFO line reports it. An unsubscribe or a disconnect stops the retry. A chain refused
+  during connect is retried by the first subscription to the instrument.
 
 ## `synthetic_quote_size`
 

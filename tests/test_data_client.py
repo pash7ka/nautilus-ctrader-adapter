@@ -1274,46 +1274,137 @@ async def test_the_next_subscribe_retries_a_refused_conversion() -> None:
         assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
 
 
-@pytest.mark.parametrize("what", ["quotes", "bars"])
-async def test_subscribing_again_through_the_engine_retries_a_refused_conversion(
-    what: str,
-) -> None:
+async def through_engine(h: Harness, command: object) -> None:
+    """Hand `command` to the data engine, and return once the client's tasks for it are done."""
+    h.engine.execute(command)
+    await asyncio.gather(*list(h.client._tasks))
+
+
+def engine_subscribe(what: str) -> SubscribeQuoteTicks | SubscribeBars:
+    fields = {"client_id": None, "venue": CTRADER_VENUE, "command_id": UUID4(), "ts_init": 0}
+    if what == "quotes":
+        return SubscribeQuoteTicks(instrument_id=GER40_ID, **fields)
+    return SubscribeBars(bar_type=GER40_M1, **fields)
+
+
+def engine_unsubscribe(what: str) -> UnsubscribeQuoteTicks | UnsubscribeBars:
+    fields = {"client_id": None, "venue": CTRADER_VENUE, "command_id": UUID4(), "ts_init": 0}
+    if what == "quotes":
+        return UnsubscribeQuoteTicks(instrument_id=GER40_ID, **fields)
+    return UnsubscribeBars(bar_type=GER40_M1, **fields)
+
+
+def chain_requests(h: Harness) -> int:
+    return len(received(h.server, oa.ProtoOASymbolsForConversionReq))
+
+
+def refusing_conversion_harness(*, logged: bool = False, retry_secs: float = 0.05):
+    """The client against a trendbar venue refusing every conversion request until told not to."""
     server = with_trendbars(data_venue())
     server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, refusal("BLOCKED_PAYLOAD_TYPE"))
-    async with harness(server=server) as h:
+    client_config = config(restore_retry_interval_secs=retry_secs)
+    return harness(client_config=client_config, server=server, logged=logged)
+
+
+async def refused_retry_then_asleep(h: Harness) -> None:
+    """Wait until the retry of a refused subscribe has been refused once too, and is waiting.
+
+    The round-trip lets the refusal reach the retry before this returns.
+    """
+    requests = chain_requests(h)
+    await wait_until(lambda: chain_requests(h) > requests, description="a refused retry")
+    await h.account.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+
+
+@pytest.mark.parametrize("what", ["quotes", "bars"])
+async def test_a_refused_subscribe_completes_when_the_conversion_retry_succeeds(
+    what: str,
+) -> None:
+    async with refusing_conversion_harness(logged=True) as h:
         await h.client._connect()
         h.engine.register_client(h.client)
+        pin_clock(h, FIRST_M1_MINUTE)
+        topic = f"data.quotes.{GER40_ID.venue}.{GER40_ID.symbol}"
+        if what == "bars":
+            topic = f"data.bars.{GER40_M1}"
+        first: list = []
+        second: list = []
 
-        async def subscribe() -> None:
-            fields = {
-                "client_id": None,
-                "venue": CTRADER_VENUE,
-                "command_id": UUID4(),
-                "ts_init": 0,
-            }
-            h.engine.execute(
-                SubscribeQuoteTicks(instrument_id=GER40_ID, **fields)
-                if what == "quotes"
-                else SubscribeBars(bar_type=GER40_M1, **fields),
-            )
-            await asyncio.gather(*list(h.client._tasks))
+        h.client._msgbus.subscribe(topic=topic, handler=first.append)
+        await through_engine(h, engine_subscribe(what))
+        # Nautilus keeps the subscription on record, and so passes a second subscriber over.
+        h.client._msgbus.subscribe(topic=topic, handler=second.append)
+        await through_engine(h, engine_subscribe(what))
+        await refused_retry_then_asleep(h)
 
-        await subscribe()
         assert GER40_ID not in h.client._converted
-
-        h.server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
-        await subscribe()
-
-        # The connect's request, the refused subscribe's and the retry's.
-        assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 3
-        assert GER40_ID in h.client._converted
-        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
         if what == "quotes":
             assert h.client.subscribed_quote_ticks() == [GER40_ID]
-            assert GER40_SYMBOL_ID in h.subscribed_symbol_ids()
         else:
             assert h.client.subscribed_bars() == [GER40_M1]
+
+        h.server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+        await wait_until(
+            lambda: GER40_SYMBOL_ID in h.subscribed_symbol_ids(),
+            description="the subscription completed",
+        )
+        await wait_until(
+            lambda: any(
+                "retry" in m and str(GER40_ID) in m for k, m in h.logger.lines if k == "info"
+            ),
+            description="the completion reported",
+        )
+
+        assert GER40_ID in h.client._converted
+        assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
+        assert h.subscribed_symbol_ids().count(GER40_SYMBOL_ID) == 1
+        if what == "quotes":
+            await push_spot(h, GER40_SPOT)
+        else:
             assert len(received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)) == 1
+            for event in spots_until(GER40_SYMBOL_ID, FIRST_M1_MINUTE + 1):
+                await push_spot(h, event)
+        assert len(first) == 1
+        assert second == first
+
+
+@pytest.mark.parametrize("what", ["quotes", "bars"])
+async def test_an_unsubscribe_cancels_the_conversion_retry(what: str) -> None:
+    async with refusing_conversion_harness(retry_secs=0.2) as h:
+        await h.client._connect()
+        h.engine.register_client(h.client)
+        await through_engine(h, engine_subscribe(what))
+        await refused_retry_then_asleep(h)
+
+        await through_engine(h, engine_unsubscribe(what))
+        h.server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+        requests = chain_requests(h)
+        await asyncio.sleep(0.6)
+
+        assert chain_requests(h) == requests
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        assert not received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)
+        assert not h.client._bars
+
+
+async def test_a_disconnect_cancels_the_conversion_retry() -> None:
+    async with refusing_conversion_harness(retry_secs=0.2) as h:
+        # Another user keeps the session up, so a retry left running could still reach the venue.
+        await h.account.connect()
+        await h.client._connect()
+        h.engine.register_client(h.client)
+        await through_engine(h, engine_subscribe("quotes"))
+        await refused_retry_then_asleep(h)
+
+        await h.client._disconnect()
+        h.server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+        requests = chain_requests(h)
+        await asyncio.sleep(0.6)
+
+        assert chain_requests(h) == requests
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+        assert not h.account.subscriptions.spot_holds(h.client._owner)
 
 
 def second_eur_quoted_venue() -> FakeCTraderServer:

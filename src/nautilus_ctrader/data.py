@@ -11,9 +11,10 @@ import asyncio
 import functools
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum, auto
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
@@ -195,6 +196,24 @@ class _BarSub:
             self.backfill.cancel()
 
 
+class _Conversion(Enum):
+    """How a subscribe's conversion ended: subscribe now, retry later, or do nothing more."""
+
+    READY = auto()
+    REFUSED = auto()
+    ABANDONED = auto()
+
+
+@dataclass(eq=False)
+class _ConversionRetry:
+    """The timer retrying a subscribe whose conversion chain was refused."""
+
+    task: asyncio.Task | None = None
+    # Set while an attempt runs. An unsubscribe then leaves the attempt to find its marker gone,
+    # as it does for a first subscribe, rather than cancel it half-way through a subscription.
+    attempting: bool = False
+
+
 class CTraderDataClient(LiveMarketDataClient):
     """
     Market data for one cTrader account: instruments, currency conversion, quote ticks and bars.
@@ -295,6 +314,9 @@ class CTraderDataClient(LiveMarketDataClient):
         # Subscribes still preparing their conversion, by consumer name. An unsubscribe drops
         # the entry, and a subscribe whose marker is gone then takes no hold.
         self._preparing: dict[str, set[object]] = {}
+        # Subscribes whose conversion chain was refused, by consumer name. Nautilus keeps them on
+        # record and passes a repeat over, so only this retry can complete them.
+        self._conversion_retries: dict[str, _ConversionRetry] = {}
         # Advanced by every `_connect` and `_disconnect`, so a subscribe that awaited across one
         # knows its preparation belongs to a connection that is gone.
         self._connection_generation = 0
@@ -328,6 +350,7 @@ class CTraderDataClient(LiveMarketDataClient):
         # registry: a `_disconnect` cut short would otherwise make a later subscribe a silent
         # no-op against a session that is gone.
         self._forget_subscriptions()
+        await self._cancel_conversion_retries()
         await self._cancel_backfills()
         await self._release_subscriptions(None)
         self._converted.clear()
@@ -360,6 +383,8 @@ class CTraderDataClient(LiveMarketDataClient):
         session, self._session = self._session, None
         self._account.remove_reload_listener(self._on_instrument_reloaded)
         try:
+            # First, so the release below also covers what a cancelled attempt took.
+            await self._cancel_conversion_retries()
             await self._release_subscriptions(session)
             self._converted.clear()
         finally:
@@ -376,6 +401,15 @@ class CTraderDataClient(LiveMarketDataClient):
         while running := {task for task in self._backfills if not task.done()}:
             for task in running:
                 task.cancel()
+            await asyncio.wait(running)
+
+    async def _cancel_conversion_retries(self) -> None:
+        """Cancel every conversion retry, one in the middle of an attempt too, and wait for each."""
+        retries, self._conversion_retries = self._conversion_retries, {}
+        running = {r.task for r in retries.values() if r.task is not None and not r.task.done()}
+        for task in running:
+            task.cancel()
+        if running:
             await asyncio.wait(running)
 
     async def _release_subscriptions(self, session: CTraderSession | None) -> None:
@@ -619,7 +653,7 @@ class CTraderDataClient(LiveMarketDataClient):
           priced in the account currency, so it is unloaded rather than left tradable by
           accident, and `fail_on_instrument_error` raises instead of returning.
         - the request could not be made or was refused. Nothing is known about the chain yet,
-          so the instrument stays loaded and unconverted and the next subscribe tries again -
+          so the instrument stays loaded and unconverted, and a subscribe retries on a timer -
           unless this is the bring-up and `fail_on_instrument_error` is set, which asks for an
           instrument that cannot be priced to fail the connect rather than start unpriced.
         """
@@ -695,10 +729,9 @@ class CTraderDataClient(LiveMarketDataClient):
         detail = (
             error.error_code if isinstance(error, CTraderRequestError) else type(error).__name__
         )
-        self._log.warning(
-            f"Conversion for {instrument_id} not subscribed ({detail}); "
-            f"retrying on the next subscribe",
-        )
+        # A subscribe says how it retries itself.
+        retry = "; retrying on the next subscribe" if during_connect else ""
+        self._log.warning(f"Conversion for {instrument_id} not subscribed ({detail}){retry}")
 
     async def _hold_chain(self, chain: list[Instrument], consumer: str) -> None:
         """Subscribe every leg's spots, releasing the ones this call added if one is refused."""
@@ -732,37 +765,125 @@ class CTraderDataClient(LiveMarketDataClient):
             self._log.error(f"Cannot subscribe quotes: {instrument_id} is not loaded")
             return
 
-        consumer = _quote_consumer(instrument_id)
-        unrecord = functools.partial(self._remove_subscription_quote_ticks, instrument_id)
-        if not await self._convert_before_subscribing(instrument, "quotes", consumer, unrecord):
-            return
+        await self._subscribe_converted(
+            instrument,
+            "quotes",
+            _quote_consumer(instrument_id),
+            self._hold_quotes,
+        )
 
-        await self._hold_spots(instrument.info["symbol_id"], consumer)
+    async def _hold_quotes(self, instrument: Instrument) -> None:
+        await self._hold_spots(instrument.info["symbol_id"], _quote_consumer(instrument.id))
+
+    async def _subscribe_converted(
+        self,
+        instrument: Instrument,
+        what: str,
+        consumer: str,
+        subscribe: Callable[[Instrument], Awaitable[None]],
+    ) -> None:
+        """Run `subscribe` once `instrument`'s conversion chain is subscribed.
+
+        A refused chain is retried every `restore_retry_interval_secs` until `subscribe` runs,
+        or `consumer` is unsubscribed, or the client disconnects. Nautilus keeps the subscription
+        on record meanwhile, so the retry serves every subscriber its engine passed over.
+        """
+        # Superseded by this subscribe.
+        self._stop_conversion_retry(consumer)
+        conversion = await self._convert_before_subscribing(instrument, what, consumer)
+        if conversion is _Conversion.READY:
+            await subscribe(instrument)
+        elif conversion is _Conversion.REFUSED:
+            retry = _ConversionRetry()
+            self._conversion_retries[consumer] = retry
+            retry.task = asyncio.get_running_loop().create_task(
+                self._retry_conversion(retry, instrument.id, what, consumer, subscribe),
+            )
+            retry.task.add_done_callback(
+                functools.partial(self._forget_conversion_retry, consumer, retry),
+            )
+
+    async def _retry_conversion(
+        self,
+        retry: _ConversionRetry,
+        instrument_id: InstrumentId,
+        what: str,
+        consumer: str,
+        subscribe: Callable[[Instrument], Awaitable[None]],
+    ) -> None:
+        while True:
+            await asyncio.sleep(self._config.restore_retry_interval_secs)
+            instrument = self._instrument_provider.find(instrument_id)
+            if instrument is None:
+                self._log.error(f"Cannot subscribe {what}: {instrument_id} is no longer loaded")
+                return
+            retry.attempting = True
+            try:
+                conversion = await self._convert_before_subscribing(
+                    instrument,
+                    what,
+                    consumer,
+                    retrying=True,
+                )
+                if conversion is _Conversion.READY:
+                    await subscribe(instrument)
+            except Exception as e:
+                self._log.exception(
+                    f"Retrying the {what} subscription of {instrument_id} raised", e
+                )
+                return
+            finally:
+                retry.attempting = False
+            if self._conversion_retries.get(consumer) is not retry:
+                # Stopped during the attempt.
+                return
+            if conversion is _Conversion.READY:
+                self._log.info(
+                    f"Subscribed {what} for {instrument_id} on a retry: its conversion chain is "
+                    f"subscribed now",
+                )
+            if conversion is not _Conversion.REFUSED:
+                return
+
+    def _stop_conversion_retry(self, consumer: str) -> None:
+        """Stop `consumer`'s retry; one in the middle of an attempt is left to find it stopped."""
+        retry = self._conversion_retries.pop(consumer, None)
+        if retry is not None and retry.task is not None and not retry.attempting:
+            retry.task.cancel()
+
+    def _forget_conversion_retry(
+        self,
+        consumer: str,
+        retry: _ConversionRetry,
+        _task: asyncio.Task,
+    ) -> None:
+        if self._conversion_retries.get(consumer) is retry:
+            del self._conversion_retries[consumer]
 
     async def _convert_before_subscribing(
         self,
         instrument: Instrument,
         what: str,
         consumer: str,
-        unrecord: Callable[[], None],
-    ) -> bool:
-        """Resolve and publish `instrument`'s conversion chain; report and refuse if it fails.
+        *,
+        retrying: bool = False,
+    ) -> _Conversion:
+        """Resolve and publish `instrument`'s conversion chain before it is subscribed.
 
         Run before the venue subscription, so nothing is ever published for an instrument that
-        cannot be priced in the account currency. `what` names the subscription being refused.
+        cannot be priced in the account currency. `what` names the subscription.
 
-        A refusal that leaves the instrument loaded calls `unrecord`, which drops Nautilus's record
-        of the subscription: its engine passes a repeated subscribe on only while the client does
-        not report it subscribed, and subscribing again is how the chain is retried.
+        Returns `REFUSED` if the chain was refused and the instrument stays loaded, reported at
+        WARNING unless `retrying`. Returns `ABANDONED` if:
 
-        Also refuses, silently, if `consumer` was unsubscribed meanwhile: that unsubscribe found
-        no hold to release. The chain stays held, as after a completed subscribe and unsubscribe.
-
-        Refuses silently too if the client connected or disconnected meanwhile, releasing the
-        instrument's chain: the release that came with it did not see what was still being held.
+        - the instrument was dropped, at ERROR;
+        - `consumer` was unsubscribed meanwhile: that unsubscribe found no hold to release. The
+          chain stays held, as after a completed subscribe and unsubscribe;
+        - the client connected or disconnected meanwhile. The instrument's chain is released:
+          the release that came with it did not see what was still being held.
         """
         if not self._config.subscribe_conversion_quotes:
-            return True
+            return _Conversion.READY
         connection = self._connection_generation
         marker = object()
         self._preparing.setdefault(consumer, set()).add(marker)
@@ -779,37 +900,32 @@ class CTraderDataClient(LiveMarketDataClient):
             # same instrument does not take the chain as converted.
             self._converted.discard(instrument.id)
             await self._retire_old_legs(_conversion_consumer(instrument.id), set())
-            return False
+            return _Conversion.ABANDONED
         if chain is None:
-            # Not after an unsubscribe meanwhile: the record is then a later subscribe's, if any.
-            if self._report_missing_conversion(instrument.id, what) and wanted:
-                unrecord()
-            return False
+            if self._instrument_provider.find(instrument.id) is None:
+                self._log.error(
+                    f"Cannot subscribe {what}: {instrument.id} cannot be priced in the account "
+                    f"currency and has been dropped",
+                )
+                return _Conversion.ABANDONED
+            if not wanted:
+                return _Conversion.ABANDONED
+            if not retrying:
+                interval = self._config.restore_retry_interval_secs
+                self._log.warning(
+                    f"Not subscribing {what} for {instrument.id} yet: its conversion chain was "
+                    f"not subscribed; retrying every {interval:g} s",
+                )
+            return _Conversion.REFUSED
         for leg in chain:
             self._handle_data(leg)
-        return wanted
-
-    def _report_missing_conversion(self, instrument_id: InstrumentId, what: str) -> bool:
-        """Say which of the two ways the conversion failed, because they need different acts.
-
-        Returns whether the instrument is still loaded, so subscribing again can retry.
-        """
-        if self._instrument_provider.find(instrument_id) is None:
-            self._log.error(
-                f"Cannot subscribe {what}: {instrument_id} cannot be priced in the account "
-                f"currency and has been dropped",
-            )
-            return False
-        self._log.warning(
-            f"Not subscribing {what} for {instrument_id}: its conversion chain was not "
-            f"subscribed; subscribe again to retry",
-        )
-        return True
+        return _Conversion.READY if wanted else _Conversion.ABANDONED
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         # Found by consumer name rather than through the instrument's symbol id, because the
         # instrument may have been dropped since and the hold must be released even then.
         consumer = _quote_consumer(command.instrument_id)
+        self._stop_conversion_retry(consumer)
         self._preparing.pop(consumer, None)
         held = self._account.subscriptions.spot_holds(self._owner)
         symbol_id = next((s for s, c in held if c == consumer), None)
@@ -909,12 +1025,24 @@ class CTraderDataClient(LiveMarketDataClient):
             self._log.error(f"Cannot subscribe bars: {bar_type.instrument_id} is not loaded")
             return
         # A bars-only subscriber needs the account valued just as much as a quote subscriber
-        # does. Before anything below is recorded, so a refused chain leaves nothing behind.
-        consumer = _bar_consumer(bar_type)
-        unrecord = functools.partial(self._remove_subscription_bars, bar_type)
-        if not await self._convert_before_subscribing(instrument, "bars", consumer, unrecord):
-            return
+        # does. Before the bars are recorded, so a refused chain leaves nothing behind.
+        await self._subscribe_converted(
+            instrument,
+            "bars",
+            _bar_consumer(bar_type),
+            functools.partial(self._subscribe_trendbars, bar_type, period),
+        )
 
+    async def _subscribe_trendbars(
+        self,
+        bar_type: BarType,
+        period: int,
+        instrument: Instrument,
+    ) -> None:
+        if bar_type in self._bars:
+            # Another subscribe completed it during the conversion.
+            return
+        consumer = _bar_consumer(bar_type)
         symbol_id = instrument.info["symbol_id"]
         # Created before the venue request: the closer ignores every boundary below the bar
         # forming at its construction, so building it afterwards would drop a bar that closed
@@ -947,7 +1075,9 @@ class CTraderDataClient(LiveMarketDataClient):
                     self._forget_bars(bar_type, sub)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
-        self._preparing.pop(_bar_consumer(command.bar_type), None)
+        consumer = _bar_consumer(command.bar_type)
+        self._stop_conversion_retry(consumer)
+        self._preparing.pop(consumer, None)
         await self._drop_bars(command.bar_type, self._session)
 
     async def _drop_bars(self, bar_type: BarType, session: CTraderSession | None) -> None:
