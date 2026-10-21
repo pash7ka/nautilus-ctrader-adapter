@@ -257,10 +257,14 @@ Two different failures are reported differently, because they need different res
   The instrument is fine; the request was not, and nothing has been learned about the chain.
   It stays loaded and unconverted, with a WARNING. A quote or bar subscription refused this way
   stays subscribed in Nautilus, and its chain is retried every `restore_retry_interval_secs` of
-  the data client's own config, with a WARNING for each failed retry. Once a retry succeeds,
-  the subscription completes as if the first attempt had succeeded, for every subscriber, and
-  one INFO line reports it. An unsubscribe or a disconnect stops the retry. A chain refused
-  during connect is retried by the first subscription to the instrument.
+  the data client's own config: once per instrument, however many of its subscriptions wait.
+  A failed retry is a WARNING, and the third failed retry in a row an ERROR. Once a retry
+  succeeds, every waiting subscription of the instrument completes as if the first attempt had
+  succeeded, for every subscriber, and one INFO line reports each. If a retry finds that the
+  chain cannot be built at all, the instrument is dropped with an ERROR and the retry ends. An
+  unsubscribe of the last waiting subscription, or a disconnect, stops the retry; a subscription
+  refused while the client is not connected is not retried. A chain refused during connect is
+  retried by the first subscription to the instrument.
 
 ## `synthetic_quote_size`
 

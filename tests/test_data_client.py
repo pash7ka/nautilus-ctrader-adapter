@@ -1176,7 +1176,10 @@ async def test_an_unanswered_chain_request_keeps_the_instrument_and_retries(
     error: Exception,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client_config = config(instrument_provider=InstrumentProviderConfig(load_all=True))
+    client_config = config(
+        instrument_provider=InstrumentProviderConfig(load_all=True),
+        restore_retry_interval_secs=0.05,
+    )
     async with harness(client_config=client_config) as h:
         await h.client._connect()
 
@@ -1193,10 +1196,9 @@ async def test_an_unanswered_chain_request_keeps_the_instrument_and_retries(
         assert not h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
 
         monkeypatch.undo()
-        await subscribe_quotes(h, GER40_ID)
+        await wait_until(lambda: GER40_ID in h.client._converted, description="the retry")
 
         assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
-        assert GER40_ID in h.client._converted
 
 
 def refusal(error_code: str) -> Callable[[Message], Message]:
@@ -1405,6 +1407,108 @@ async def test_a_disconnect_cancels_the_conversion_retry() -> None:
         assert chain_requests(h) == requests
         assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
         assert not h.account.subscriptions.spot_holds(h.client._owner)
+
+
+async def test_the_third_failed_conversion_retry_in_a_row_is_an_error() -> None:
+    async with refusing_conversion_harness(logged=True) as h:
+        await h.client._connect()
+        h.engine.register_client(h.client)
+        await through_engine(h, engine_subscribe("quotes"))
+        requests = chain_requests(h)
+
+        await wait_until(lambda: chain_requests(h) >= requests + 4, description="four retries")
+        await h.account.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+
+        errors = [e for e in h.logger.errors() if str(GER40_ID) in e]
+        assert len(errors) == 1
+        assert "BLOCKED_PAYLOAD_TYPE" in errors[0]
+        assert f"quotes:{GER40_ID}" in errors[0]
+
+
+async def test_subscriptions_of_one_instrument_share_its_conversion_retry() -> None:
+    async with refusing_conversion_harness(logged=True, retry_secs=0.3) as h:
+        await h.client._connect()
+        h.engine.register_client(h.client)
+        pin_clock(h, FIRST_M1_MINUTE)
+        requests = chain_requests(h)
+
+        await through_engine(h, engine_subscribe("quotes"))
+        await through_engine(h, engine_subscribe("bars"))
+        # The bars wait on the retry the quotes started.
+        assert chain_requests(h) == requests + 1
+        await refused_retry_then_asleep(h)
+        await asyncio.sleep(0.1)
+        assert chain_requests(h) == requests + 2
+
+        h.server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+
+        def completed() -> list[str]:
+            return [m for k, m in h.logger.lines if k == "info" and "on a retry" in m]
+
+        await wait_until(lambda: len(completed()) == 2, description="both completed")
+        assert chain_requests(h) == requests + 3
+        holds = h.account.subscriptions.spot_holds(h.client._owner)
+        assert (GER40_SYMBOL_ID, f"quotes:{GER40_ID}") in holds
+        assert h.client.subscribed_bars() == [GER40_M1]
+        assert GER40_M1 in h.client._bars
+
+
+async def test_a_conversion_refused_while_disconnected_is_not_retried() -> None:
+    async with refusing_conversion_harness() as h:
+        # Another user keeps the venue reachable, so a retry would reach it.
+        await h.account.connect()
+        await h.client._connect()
+        await h.client._disconnect()
+        requests = chain_requests(h)
+
+        await subscribe_quotes(h, GER40_ID)
+        assert chain_requests(h) == requests + 1
+        await asyncio.sleep(0.3)
+
+        assert chain_requests(h) == requests + 1
+
+
+async def held_retry_attempt(h: Harness) -> tuple[HeldReplies, asyncio.Task]:
+    """Hold the next retry's chain request, answering it with the chain once released."""
+    held = HeldReplies(h.server, om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+    await held.arrived.wait()
+    (retry,) = h.client._conversion_retries.values()
+    return held, retry.task
+
+
+async def test_a_retry_attempt_its_unsubscribe_overtook_subscribes_nothing() -> None:
+    async with refusing_conversion_harness() as h:
+        await h.client._connect()
+        h.engine.register_client(h.client)
+        await through_engine(h, engine_subscribe("quotes"))
+        held, task = await held_retry_attempt(h)
+
+        await through_engine(h, engine_unsubscribe("quotes"))
+        await held.stop_holding()
+        await asyncio.wait({task}, timeout=3.0)
+
+        assert task.done()
+        assert not task.cancelled()
+        assert not h.client._conversion_retries
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+
+
+async def test_a_disconnect_ends_a_retry_attempt_its_unsubscribe_overtook() -> None:
+    async with refusing_conversion_harness() as h:
+        await h.account.connect()
+        await h.client._connect()
+        h.engine.register_client(h.client)
+        await through_engine(h, engine_subscribe("quotes"))
+        held, task = await held_retry_attempt(h)
+        await through_engine(h, engine_unsubscribe("quotes"))
+
+        await h.client._disconnect()
+
+        assert task.done()
+        await held.stop_holding()
+        await h.account.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+        assert not h.account.subscriptions.spot_holds(h.client._owner)
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
 
 
 def second_eur_quoted_venue() -> FakeCTraderServer:
