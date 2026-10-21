@@ -145,7 +145,14 @@ How tokens behave was checked on a live connection, on the account's own (live) 
   value under about 15 seconds (the 5-second request timeout plus this wait) cuts the wait
   short, and a pair arriving after that is lost. A bring-up the session runs on its own after a
   connection loss has no such bound, and there the wait delays the reconnect backoff by up to
-  ten seconds.
+  ten seconds. A refresh made on a ready session ends that session, and **unconfirmed** is
+  whether the venue's events come before or after the reply. So when the session is lost while
+  a reply is still awaited, the connection stays open up to the same ten seconds for it, and
+  closes at once if the venue drops it. A refresh whose reply never came is logged at ERROR
+  when its connection closes: its refresh token is likely spent, and if account authentication
+  then keeps failing, only a new OAuth authorization recovers. A refresh request that never
+  left the client (it waited out the request queue, or the connection was lost before it was
+  written) spent nothing, and no reply is waited for.
 - **A refreshed access token expires 30 days after it is issued** (confirmed).
 - **Each authorization is an independent grant** (confirmed). Authorizing the same application
   twice for one cTrader ID gave two token pairs; neither the second authorization nor a
