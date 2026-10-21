@@ -122,11 +122,14 @@ exists, the adapter amends the position's levels to the exact prices requested.
   event, held during the rebuild or arriving later, reports the leg that filled as filled and the
   others as cancelled. If no event of it comes within `protective_order_timeout_secs`, the
   position's deals are read, and each closing deal the model has not applied is applied, in order,
-  as its event would have been. A failed read is tried once more after the same time, then an
-  ERROR says the legs need a check by hand. Nothing else settles such a leg: Nautilus's in-flight
-  check skips an accepted order, and so does its open-order check with `open_check_open_only=True`.
-  If an event of the position, or its deals, or a later rebuild shows it open after all, the
-  bracket's carried cancel or modify is answered or sent as for a standing position. If the rebuild
+  as its event would have been; if they do not add up to the volume the model held, an ERROR says
+  so. A failed read is tried once more after the same time, then an ERROR says the legs need a
+  check by hand. Nothing else settles such a leg: Nautilus's in-flight check skips an accepted
+  order, and so does its open-order check with `open_check_open_only=True`. An event dated before
+  the rebuild's read ends the wait only if it closes the position. If a newer event of
+  the position, or its deals, or a later rebuild shows it open after all, even after that ERROR,
+  the bracket's carried cancel or modify is answered or sent as for a standing position; a cancel
+  or modify of one of its legs that arrives meanwhile is carried with them. If the rebuild
   fails, a WARNING says so (a failure in the adapter itself is also logged at ERROR) and it is tried
   again after `protective_order_timeout_secs`, then after twice as long each time, up to
   `connect_timeout_secs`. The rebuild is of the whole account: it may end the legs of other pending

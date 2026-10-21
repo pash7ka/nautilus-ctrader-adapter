@@ -181,6 +181,16 @@ def _opened_ms(position: om.ProtoOAPosition) -> int | None:
     return data.openTimestamp if data.HasField("openTimestamp") else None
 
 
+def _event_ms(event: oa.ProtoOAExecutionEvent) -> int:
+    """The broker's newest time an execution event carries, in ms."""
+    times = [event.order.utcLastUpdateTimestamp]
+    if event.HasField("position"):
+        times.append(event.position.utcLastUpdateTimestamp)
+    if event.HasField("deal"):
+        times.append(event.deal.executionTimestamp)
+    return max(times)
+
+
 def _opposite(side: int) -> int:
     return om.SELL if side == om.BUY else om.BUY
 
@@ -282,8 +292,10 @@ class VenueBook:
         self._synced_deals: set[int] = set()
         # Deals whose fill events were applied, by deal id.
         self._applied_deals: set[int] = set()
-        # Positions a load kept though its snapshot lacked them, until an event of theirs comes.
+        # Positions a load kept though its snapshot lacked them, until an event of theirs comes,
+        # and the broker's time of that snapshot.
         self._kept: set[int] = set()
+        self._kept_ms = -1
 
     def view(self, position_id: int) -> PositionView | None:
         position = self._positions.get(position_id)
@@ -365,6 +377,7 @@ class VenueBook:
         position_orders: Mapping[int, Sequence[om.ProtoOAOrder]],
         *,
         keep_gone: bool = False,
+        read_ms: int = -1,
     ) -> list[Record]:
         """Rebuild the model from a snapshot asked with protection orders.
 
@@ -374,8 +387,10 @@ class VenueBook:
 
         `keep_gone`: a position with a live leg that the snapshot lacks is kept as it stood, so
         its close event, held or late, still ends its legs. It stays in `kept()` until an event
-        of it is applied.
+        of it dated at or after `read_ms`, the broker's time of the snapshot, or one that closes
+        it, is applied.
         """
+        self._kept_ms = read_ms
         listed = {position.positionId for position in snapshot.position}
         gone = {
             position_id: position
@@ -464,6 +479,8 @@ class VenueBook:
             return []
         key = self._key(event)
         # A deal fills once, whatever execution type its events name.
+        # TODO(verify): that one deal id is one fill increment; the recordings hold no partial
+        # fill to show otherwise.
         fill = event.executionType in _FILLS and event.HasField("deal")
         if key in self._seen or (fill and event.deal.dealId in self._applied_deals):
             return []
@@ -472,8 +489,13 @@ class VenueBook:
         self._seen.add(key)
         if fill:
             self._applied_deals.add(event.deal.dealId)
-        # The broker still states the position: its events, not a deal read, answer its legs.
-        self._kept.discard(event.order.positionId)
+        position_id = event.order.positionId
+        if position_id in self._kept:
+            position = self._positions.get(position_id)
+            # The broker states the position since the snapshot: its events, not a deal read,
+            # answer its legs. An older event says nothing the snapshot did not.
+            if _event_ms(event) >= self._kept_ms or position is None or not position.open:
+                self._kept.discard(position_id)
         return records
 
     def trailing_stop_moved(self, event: oa.ProtoOATrailingSLChangedEvent) -> list[Record]:

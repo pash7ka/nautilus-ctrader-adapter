@@ -4172,6 +4172,152 @@ async def test_a_kept_foreign_position_reports_its_legs_from_its_deals() -> None
         assert not any(r.venue_order_id == protective_id for r in h.reports[reported:])
 
 
+def open_at_broker(execution_venue: ExecutionVenue) -> None:
+    """The venue lists the first position open, its entry its only deal."""
+    execution_venue.position_orders = {FIRST: [FIRST_EVENTS[1].order]}
+    execution_venue.position_deals = {FIRST: [FIRST_EVENTS[1].deal]}
+
+
+async def test_a_direct_modify_of_a_kept_brackets_leg_is_carried_not_replayed_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    amends = echo_amends(execution_venue)
+    open_at_broker(execution_venue)
+    async with harness(execution_venue=execution_venue, config=SLOW) as h:
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(lambda: len(h.client._brackets) == 0, timeout_secs=5)
+        await h.client._modify_order(modify(STOP, trigger_price="85120.00"))
+        stop = h.cache.order(ClientOrderId(STOP))
+        await wait_until(lambda: len(deal_reads(h)) == 1, timeout_secs=5)
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85120.00"))
+        await asyncio.sleep(SLOW.protective_order_timeout_secs)
+        await sync(h)
+
+        assert [amend.stopLoss for amend in amends] == [85120.0]
+        assert stop.trigger_price == Price.from_str("85120.00")
+        assert refusals(h, stop) == []
+
+
+async def test_a_kept_brackets_carried_modify_survives_the_error_and_goes_out_once_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(lambda: any("name no close" in e for e in h.logger.errors()))
+
+        # The position states itself open after all.
+        await push(h, protective(85197.2, 85387.22, utc=AMEND_FROM + 50))
+        stop = h.cache.order(ClientOrderId(STOP))
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+
+        (amend,) = amends
+        assert amend.stopLoss == 85150.0
+        assert refusals(h, stop) == []
+
+
+async def test_a_carried_cancel_a_later_rebuild_shows_applied_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    async with harness(execution_venue=execution_venue, config=SLOW) as h:
+        await corrections_lost(h, held, monkeypatch, lambda: h.client._cancel_order(cancel(TARGET)))
+        await wait_until(lambda: len(h.client._brackets) == 0, timeout_secs=5)
+        assert h.client._book.kept() == frozenset({FIRST})
+
+        # The lost amend applied: the broker lists the position without its take-profit.
+        broker_holds(execution_venue, stop=85197.2, target=None)
+        await h.client._load()
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        await asyncio.sleep(SLOW.protective_order_timeout_secs * 2)
+        await sync(h)
+
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+
+
+async def test_a_zero_volume_deal_of_a_kept_position_is_not_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    stop_fill = closed_by_stop(execution_venue)
+    refused = type(stop_fill.deal)()
+    refused.CopyFrom(stop_fill.deal)
+    refused.dealId = stop_fill.deal.dealId + 10
+    refused.executionTimestamp = stop_fill.deal.executionTimestamp - 1
+    refused.filledVolume = 0
+    execution_venue.position_deals[FIRST].append(refused)
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(
+            lambda: status(h, STOP) == OrderStatus.FILLED, description="the stop leg filled"
+        )
+        await sync(h)
+
+        (fill,) = [e for e in h.events_of(STOP) if isinstance(e, OrderFilled)]
+        assert fill.trade_id == TradeId(str(stop_fill.deal.dealId))
+        # Only the lost rounds' own ERRORs.
+        assert [e for e in h.logger.errors() if "wait up to" not in e] == []
+
+
+async def test_closing_deals_short_of_the_held_volume_are_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    stop_fill = closed_by_stop(execution_venue)
+    stop_fill.deal.filledVolume = 60
+    # A partial close the model never saw, dated before the state it holds.
+    early = type(stop_fill.deal)()
+    early.CopyFrom(stop_fill.deal)
+    early.dealId = stop_fill.deal.dealId + 20
+    early.executionTimestamp = FIRST_EVENTS[1].deal.executionTimestamp
+    early.filledVolume = 40
+    execution_venue.position_deals = {FIRST: [FIRST_EVENTS[1].deal, early, stop_fill.deal]}
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(lambda: any("check by hand" in e for e in h.logger.errors()))
+        await sync(h)
+
+        (error,) = [e for e in h.logger.errors() if "check by hand" in e]
+        assert "fill 0.6 of the 1 " in error
+
+
+async def test_an_older_event_released_after_the_rebuild_does_not_end_the_keep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue, config=SLOW) as h:
+        read_broker = h.client._read_broker
+        pushed: list = []
+        older = FIRST_EVENTS[2].order.utcLastUpdateTimestamp - 1
+
+        async def missed(**kwargs):
+            state = await read_broker(**kwargs)
+            if not pushed:
+                pushed.append(True)
+                await h.server.push(protective(85197.2, 85387.22, utc=older))
+                await wait_until(lambda: bool(h.client._buffer))
+            return state
+
+        monkeypatch.setattr(h.client, "_read_broker", missed)
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(lambda: len(h.client._brackets) == 0, timeout_secs=5)
+        await sync(h)
+        assert h.client._book.kept() == frozenset({FIRST})
+
+        await push(h, stop_filled_whole())
+        await wait_until(lambda: status(h, STOP) == OrderStatus.FILLED)
+        await sync(h)
+
+        assert amends == []
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert h.reports == []
+
+
 async def test_a_carried_cancel_and_move_on_one_position_go_in_one_amend_after_lost_answers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

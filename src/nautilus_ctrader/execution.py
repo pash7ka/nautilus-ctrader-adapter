@@ -114,6 +114,7 @@ from nautilus_ctrader.common.venue_records import (
     ReportedOrder,
     money_of,
     parse_leg_venue_order_id,
+    units_of,
 )
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
@@ -282,7 +283,8 @@ def _closing_events(
 ) -> list[oa.ProtoOAExecutionEvent] | None:
     """The execution events the broker sends for a closed position's closing deals, in order.
 
-    Only deals after `after_ms` that `applied` does not name are taken: the model holds the rest.
+    Only filled deals after `after_ms` that `applied` does not name are taken: the model holds
+    the rest.
     The last event carries the closed position. `None` when the lists are incomplete, leave the
     position open, show no such deal, or lack a deal's order.
     """
@@ -295,6 +297,7 @@ def _closing_events(
             deal
             for deal in found.deals
             if deal.tradeSide != side
+            and deal.filledVolume > 0
             and deal.executionTimestamp > after_ms
             and not applied(deal.dealId)
         ),
@@ -436,6 +439,19 @@ class _Refused:
     retryable: bool = False
 
 
+@dataclass
+class _KeptBracket:
+    """A bracket settled while its position was kept; answered once the keep ends.
+
+    - `alive_before`: its legs alive before the settling rebuild.
+    - `ended`: its legs a later rebuild ended without an event, so not yet reported.
+    """
+
+    bracket: PendingBracket
+    alive_before: set[Level]
+    ended: set[Level]
+
+
 class CTraderExecutionClient(LiveExecutionClient):
     """
     Order execution on one cTrader hedging account.
@@ -527,9 +543,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._protection_timers: set[asyncio.TimerHandle] = set()
         # Each kept position's wait for an event of its own, by position id.
         self._close_timers: dict[int, asyncio.TimerHandle] = {}
-        # Brackets settled while their position was kept, with the legs alive before that
-        # rebuild: their carried commands go out if the position proves open.
-        self._kept_brackets: dict[int, list[tuple[PendingBracket, set[Level]]]] = {}
+        # Brackets settled while their position was kept, by position id: their carried commands
+        # go out if the position proves open.
+        self._kept_brackets: dict[int, list[_KeptBracket]] = {}
         # Events held while the model is rebuilt, or `None` when it stands.
         self._buffer: list[_ModelEvent] | None = None
         # Set whenever no buffer is held, so an amend whose answer was held can wait for it.
@@ -644,8 +660,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._protection_timers.clear()
         self._close_timers.clear()
         for held in self._kept_brackets.values():
-            for bracket, _ in held:
-                self._brackets.add(bracket)
+            for kept in held:
+                self._brackets.add(kept.bracket)
         self._kept_brackets.clear()
         # The reconnect's rebuild settles them again.
         for bracket in self._brackets:
@@ -1338,6 +1354,8 @@ class CTraderExecutionClient(LiveExecutionClient):
                 for bracket in self._brackets:
                     bracket.unanswered = None
                 self._operations.forget_lost_amends()
+            # A rebuild that lists a kept position ends its keep without an event.
+            self._release_unkept()
             # A protective order that came during an outage arrives with the rebuild, no event.
             self._settle_brackets()
         finally:
@@ -1513,7 +1531,23 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _stand(self, state: BrokerState, *, keep_gone: bool = False) -> None:
         """Rebuild the venue model and the margins from `state`'s snapshot."""
         orders = {position_id: found.orders for position_id, found in state.histories.items()}
-        records = self._book.load(state.snapshot, orders, keep_gone=keep_gone)
+        snapshot = state.snapshot
+        # The snapshot carries no time of its own: the newest the node knows bounds it.
+        # TODO(verify): whether the broker states the snapshot's time anywhere; an event made
+        # between that bound and the snapshot still counts as newer.
+        read_ms = max(
+            [
+                self._broker_ms,
+                *(p.utcLastUpdateTimestamp for p in snapshot.position),
+                *(o.utcLastUpdateTimestamp for o in snapshot.order),
+            ]
+        )
+        stashed = [kept for held in self._kept_brackets.values() for kept in held]
+        alive = [self._alive_legs(kept.bracket) for kept in stashed]
+        records = self._book.load(snapshot, orders, keep_gone=keep_gone, read_ms=read_ms)
+        # A leg of a stashed bracket that this rebuild ended had no event to report it.
+        for kept, before in zip(stashed, alive, strict=True):
+            kept.ended |= before - self._alive_legs(kept.bracket)
         for record in records:
             # Its order list was just read: reading it again would find no entry either.
             if isinstance(record, EntryUnknown):
@@ -1699,6 +1733,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         if any(isinstance(r, Activity) and r.kind in _EXPOSURE_KINDS for r in records):
             self._write_exposure()
         self._update_account(event)
+        self._release_unkept()
         self._settle_brackets()
         self._drop_amend_locks()
         return records
@@ -2333,8 +2368,6 @@ class CTraderExecutionClient(LiveExecutionClient):
                     self._close_from_deals(position_id, retried=retried),
                     log_msg=f"read the deals of position {position_id}",
                 )
-            else:
-                self._release_kept_brackets(position_id)
 
         timer = self._loop.call_later(self._config.protective_order_timeout_secs, waited)
         self._close_timers[position_id] = timer
@@ -2343,7 +2376,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Apply a kept position's closing deals as their execution events would have been applied.
 
         A rebuild's snapshot lacked the position and no event of it came since. A failed read is
-        tried once more after `protective_order_timeout_secs`.
+        tried once more after `protective_order_timeout_secs`. After an ERROR the position stays
+        kept, so a later event or rebuild still answers its brackets.
         """
         wait_secs = self._config.protective_order_timeout_secs
         unanswered = (
@@ -2352,27 +2386,21 @@ class CTraderExecutionClient(LiveExecutionClient):
         try:
             state = await self._read_broker(since_ms=None, positions=[position_id])
         except CTraderError as e:
-            if self._session is None:
+            if self._session is None or position_id not in self._book.kept():
                 return
-            if position_id not in self._book.kept():
-                self._release_kept_brackets(position_id)
-            elif retried:
+            if retried:
                 self._log.error(
                     f"{unanswered}its deals could not be read ({e}), so its legs stay open in "
                     "Nautilus and need a check by hand",
                 )
-                self._kept_brackets.pop(position_id, None)
             else:
                 self._log.warning(
                     f"{unanswered}its deals could not be read ({e}); tried again in {wait_secs:g}s",
                 )
                 self._await_close(position_id, retried=True)
             return
-        if self._session is None:
-            return
-        # An event of it came during the read.
-        if position_id not in self._book.kept():
-            self._release_kept_brackets(position_id)
+        # Or an event of it came during the read.
+        if self._session is None or position_id not in self._book.kept():
             return
         found = state.histories.get(position_id)
         if found is not None and found.complete and open_volume(found) > 0:
@@ -2381,10 +2409,11 @@ class CTraderExecutionClient(LiveExecutionClient):
                 "it stays as held",
             )
             self._book.end_keep(position_id)
-            self._release_kept_brackets(position_id)
+            self._release_unkept()
             return
+        view = self._book.view(position_id)
         events = None
-        if found is not None:
+        if found is not None and view is not None:
             events = _closing_events(
                 self._account.account_id,
                 position_id,
@@ -2397,27 +2426,57 @@ class CTraderExecutionClient(LiveExecutionClient):
                 f"{unanswered}its deals name no close, so its legs stay open in Nautilus and "
                 "need a check by hand",
             )
-            self._kept_brackets.pop(position_id, None)
             return
-        # The events close the position, so they answer its legs, even when a rebuild holds them.
-        self._kept_brackets.pop(position_id, None)
+        filled = units_of(sum(event.deal.filledVolume for event in events))
+        if filled != view.units:
+            # A deal missed or taken twice: the legs' fills do not add up to the position.
+            self._log.error(
+                f"Position {position_id}: its closing deals fill {filled} of the {view.units} "
+                "the model held, so its legs need a check by hand",
+            )
         for event in events:
             self._on_execution_event(event)
 
-    def _release_kept_brackets(self, position_id: int) -> None:
-        """The keep of `position_id` ended: its brackets' carried commands go out if it is open.
+    def _release_unkept(self) -> None:
+        """Answer the stashed brackets of each position no longer kept.
 
-        A closed position's events answered its legs.
+        On an open position their carried commands go out as for a standing one. On a closed
+        one, its events answered the legs, but a leg a rebuild ended still gets its cancel.
         """
-        held = self._kept_brackets.pop(position_id, [])
-        view = self._book.view(position_id)
-        if view is None or not view.open:
-            return
-        for bracket, alive_before in held:
-            self.create_task(
-                self._answer_as_held(bracket, ended=set(), alive_before=alive_before),
-                log_msg=f"settle bracket {bracket.entry_id} from the broker",
-            )
+        for position_id in list(self._kept_brackets):
+            if position_id in self._book.kept():
+                continue
+            held = self._kept_brackets.pop(position_id)
+            view = self._book.view(position_id)
+            for kept in held:
+                ended = kept.ended & kept.alive_before
+                if view is not None and view.open:
+                    self.create_task(
+                        self._answer_as_held(
+                            kept.bracket, ended=ended, alive_before=kept.alive_before
+                        ),
+                        log_msg=f"settle bracket {kept.bracket.entry_id} from the broker",
+                    )
+                    continue
+                ts_ms = self._clock.timestamp_ms()
+                self._handle_records(
+                    [
+                        OrderEvent(OrderEventKind.CANCELED, None, kept.bracket.legs[level], ts_ms)
+                        for level in sorted(ended, key=lambda lv: lv.value)
+                    ]
+                )
+
+    def _pending_leg(self, leg_id: str) -> tuple[PendingBracket, Level] | None:
+        """The bracket that carries a command on leg `leg_id`, held or stashed, and its level."""
+        found = self._brackets.by_leg(leg_id)
+        if found is not None:
+            return found
+        for held in self._kept_brackets.values():
+            for kept in held:
+                for level, client_order_id in kept.bracket.legs.items():
+                    if client_order_id == leg_id:
+                        return kept.bracket, level
+        return None
 
     def _end_bracket(self, entry_id: str, reason: str) -> None:
         """Forget a bracket whose levels will never be corrected; a modify waiting on it fails."""
@@ -2485,7 +2544,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         orders: list[tuple[ClientOrderId, om.ProtoOAOrder]],
     ) -> None:
         """Add the cancel of `client_order_id` to what goes out, or refuse it."""
-        pending = self._brackets.by_leg(client_order_id.value)
+        pending = self._pending_leg(client_order_id.value)
         if pending is not None:
             bracket, level = pending
             # Carried by the bracket's correcting amend.
@@ -2716,7 +2775,7 @@ class CTraderExecutionClient(LiveExecutionClient):
     async def _modify(self, command: ModifyOrder) -> None:
         client_order_id = command.client_order_id
         order = self._cache.order(client_order_id)
-        pending = self._brackets.by_leg(client_order_id.value)
+        pending = self._pending_leg(client_order_id.value)
         found = self._book.leg_position(client_order_id.value)
         foreign_leg = (
             self._foreign_leg(client_order_id)
@@ -3394,7 +3453,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         )
         if kept and not proven_open:
             if view is not None and view.open:
-                self._kept_brackets.setdefault(view.position_id, []).append((bracket, alive_before))
+                self._kept_brackets.setdefault(view.position_id, []).append(
+                    _KeptBracket(bracket, alive_before, set())
+                )
             self._log.warning(
                 f"Bracket {bracket.entry_id}: its corrections got no answer and its position is "
                 "gone from the broker's list; its legs are answered by the position's close, "
