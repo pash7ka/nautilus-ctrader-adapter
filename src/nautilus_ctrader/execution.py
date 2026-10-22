@@ -147,7 +147,8 @@ _EXPOSURE_KINDS = (ActivityKind.UNLOADED_SYMBOL, ActivityKind.STOP_OUT)
 # How long an event not yet applied holds back the reports and activity behind it. Nautilus
 # publishes an event its order's state machine refuses, but never applies it.
 _EVENT_WAIT_SECS = 0.1
-# Nautilus publishes order events on `events.order.{strategy_id}`, after applying them.
+# Nautilus publishes order events on `events.order.{strategy_id}` once handled. An event its
+# order's state machine refuses is published unapplied; some failures publish nothing.
 _ORDER_EVENTS_TOPIC = "events.order.*"
 
 
@@ -3338,9 +3339,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 and not view.open
                 and not any(alive for _, alive in view.legs.values())
             ):
-                self._end_bracket(
-                    bracket.entry_id, "the position closed before its levels were set"
-                )
+                self._end_closed_bracket(bracket)
                 continue
             # A kept position is gone at the broker: no amend can reach it.
             if (

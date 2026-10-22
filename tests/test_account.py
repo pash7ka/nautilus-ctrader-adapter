@@ -259,11 +259,7 @@ async def test_a_raising_token_listener_is_logged_and_the_session_carries_on() -
     )
     await server.start()
     logger = RecordingLogger()
-    client = account_client(
-        server,
-        logger=logger,
-        credentials=credentials(token_expires_at=time.time() + 600),
-    )
+    client = account_client(server, logger=logger)
 
     def explode(_access: str, _refresh: str, _expires_at: float) -> None:
         raise RuntimeError("storage unavailable")
@@ -273,10 +269,15 @@ async def test_a_raising_token_listener_is_logged_and_the_session_carries_on() -
     client.add_token_listener(lambda a, r, e: notified.append((a, r)))
     try:
         await client.connect()
+        # Nothing was due at the connect: the refresh below is the session's own.
+        assert notified == []
+        assert client.session is not None
+
+        await client.session.refresh_tokens()
 
         assert any("not saved" in line for line in logger.errors())
         assert notified == [("new-access", "new-refresh")]
-        assert received(server, oa.ProtoOAAccountAuthReq)[-1].accessToken == "new-access"
+        assert client.session.is_ready
         assert not any("new-access" in m or "new-refresh" in m for _, m in logger.lines)
     finally:
         await client.disconnect()

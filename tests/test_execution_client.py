@@ -4605,6 +4605,25 @@ async def test_a_connect_ends_a_pending_bracket_whose_position_closed_meanwhile(
         assert report.order_status == OrderStatus.CANCELED
 
 
+async def test_a_close_event_ending_a_bracket_whose_amend_lost_its_answer_refuses_no_modify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held, _ = refusing_amends(first_only=False)
+    async with harness(execution_venue=execution_venue, config=HOLDING) as h:
+        await lost_correction(h, held, monkeypatch)
+        assert len(h.client._brackets) == 1
+
+        await push(h, stop_filled_whole())
+        await wait_until(lambda: len(h.client._brackets) == 0)
+        await sync(h)
+
+        stop = h.cache.order(ClientOrderId(STOP))
+        # The lost amend may have carried the stop's modify: the stop's own end answers it.
+        assert refusals(h, stop) == []
+        assert status(h, STOP) == OrderStatus.FILLED
+        assert status(h, TARGET) == OrderStatus.CANCELED
+
+
 async def test_answering_as_held_sends_no_cancel_for_a_leg_nautilus_holds_closed() -> None:
     execution_venue = answered(FIRST_EVENTS[:3])
     async with harness(execution_venue=execution_venue, config=LOSING) as h:

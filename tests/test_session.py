@@ -1013,7 +1013,10 @@ async def test_a_second_start_and_an_overlapping_stop_leak_no_task() -> None:
         await asyncio.sleep(0)
         await session.start()
         await session.wait_ready(timeout_secs=3.0)
-        await asyncio.gather(first_stop, session.stop(), session.stop())
+        # Bounded: a stop that never returns must fail the test, not hang it.
+        await asyncio.wait_for(
+            asyncio.gather(first_stop, session.stop(), session.stop()), timeout=10.0
+        )
 
         owned = ("CTraderSession.", "CTraderConnection.")
         leftovers = [

@@ -99,7 +99,7 @@ async def test_an_activity_behind_an_event_never_applied_is_published_after_a_wa
         assert h.logger.errors() == []
 
 
-async def test_the_outbox_does_not_poll_without_a_pending_event(
+async def test_the_outbox_does_not_spin_the_loop_while_an_event_is_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
