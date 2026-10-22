@@ -428,9 +428,10 @@ order keeps them consistent:
   snapshot still holds it. An open position is reported with the volume its deals leave, so a
   partial close after the snapshot does not make Nautilus add a fill of its own.
 - A position that closed before the snapshot is reported closed from its lists, with its real
-  fills. The events of those fills, held during the pass or arriving later, add nothing: applied
-  to a venue model rebuilt without the position, they would report the fill again, as an order
-  the node never sent.
+  fills. Its execution events, held during the pass or arriving later, add no order, fill or
+  activity; the balance they carry is still taken. Applied to a venue model rebuilt without the
+  position, they would reopen it as a foreign one. A close learnt this way, a stop-out included,
+  reaches Nautilus only through the mass status, as a close during an outage does.
 - A deal list that did not end, which a WARNING reports, may miss deals. It then never closes a
   position the snapshot holds open, and the position's volume is the snapshot's.
 - A position whose deals leave it open but which the snapshot lacks makes the pass read the

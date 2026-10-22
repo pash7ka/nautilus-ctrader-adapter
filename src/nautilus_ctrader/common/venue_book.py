@@ -296,6 +296,8 @@ class VenueBook:
         # and the broker's time of that snapshot.
         self._kept: set[int] = set()
         self._kept_ms = -1
+        # See `closed_in_reconciliation()`.
+        self._closed_in_reconciliation: set[int] = set()
 
     def view(self, position_id: int) -> PositionView | None:
         position = self._positions.get(position_id)
@@ -468,9 +470,12 @@ class VenueBook:
         """Whether a fill event carrying deal `deal_id` was applied."""
         return deal_id in self._applied_deals
 
-    def deals_reported(self, deal_ids: Iterable[int]) -> None:
-        """Deals a mass status carried as fills: their events, held or late, are not applied."""
-        self._applied_deals.update(deal_ids)
+    def closed_in_reconciliation(self, position_ids: Iterable[int]) -> None:
+        """Positions a reconciliation reported closed and the model lacks; replaces the last set.
+
+        No event of theirs, held or late, is applied: the mass status carried their close.
+        """
+        self._closed_in_reconciliation = set(position_ids)
 
     def apply(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
         """What `event` means to Nautilus; an event seen before means nothing new.
@@ -480,6 +485,8 @@ class VenueBook:
         """
         if not event.HasField("order"):
             # Swap and cash-flow events change the account, not an order.
+            return []
+        if event.order.positionId in self._closed_in_reconciliation:
             return []
         key = self._key(event)
         # A deal fills once, whatever execution type its events name.

@@ -1611,6 +1611,8 @@ async def test_a_position_closed_after_the_snapshot_is_reported_closed() -> None
         assert h.cache.position(PositionId(str(FIRST))).is_closed
         assert h.cache.positions_open() == []
         assert reconciliation_orders(h) == []
+        # The model held the position, so its close event still closed it there.
+        assert not h.client._book.view(FIRST).open
 
 
 def stop_filled_once(h: Harness) -> None:
@@ -1627,32 +1629,50 @@ def stop_filled_once(h: Harness) -> None:
     assert reconciliation_orders(h) == []
 
 
+async def held_in_the_start_pass(h: Harness, *events: Message) -> None:
+    """Run the start's reconciliation with `events` pushed, and held, after its snapshot."""
+    held = HeldReplies(
+        h.server,
+        om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+        h.venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+    )
+    passing = asyncio.create_task(h.client.generate_mass_status())
+    await asyncio.wait_for(held.arrived.wait(), timeout=10)
+    await push(h, *events)
+    await held.stop_holding()
+    built = await asyncio.wait_for(passing, timeout=10)
+
+    h.engine.reconcile_execution_mass_status(built)
+    await wait_until(lambda: h.client._buffer is None)
+    await sync(h)
+
+
 async def test_a_stop_filled_during_the_start_reconciliation_is_the_nodes_leg() -> None:
     cache = await legs_accepted()
-    # The stop filled before the snapshot, which lacks the position; its event comes during the
-    # pass and is held.
-    venue = serving(CLOSED_AT)
-    async with harness(execution_venue=venue, cache=cache) as h:
-        held = HeldReplies(
-            h.server,
-            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
-            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
-        )
-        passing = asyncio.create_task(h.client.generate_mass_status())
-        await asyncio.wait_for(held.arrived.wait(), timeout=10)
-        await push(h, FIRST_EVENTS[-1])
-        await held.stop_holding()
-        built = await asyncio.wait_for(passing, timeout=10)
-
-        h.engine.reconcile_execution_mass_status(built)
-        await wait_until(lambda: h.client._buffer is None)
-        await sync(h)
+    # The stop filled before the snapshot, which lacks the position.
+    async with harness(execution_venue=serving(CLOSED_AT), cache=cache) as h:
+        await held_in_the_start_pass(h, FIRST_EVENTS[-1])
 
         stop_filled_once(h)
         for leg in (STOP, TARGET):
             assert h.events_of(leg) == []
         assert h.reports == []
         assert h.activity == []
+        assert h.client._book.view(FIRST) is None
+
+
+async def test_no_event_of_a_position_closed_before_the_start_snapshot_reopens_it() -> None:
+    cache = await legs_accepted()
+    async with harness(execution_venue=serving(CLOSED_AT), cache=cache) as h:
+        # The stop-loss moved by hand, then the protective order filled at it.
+        await held_in_the_start_pass(h, *FIRST_EVENTS[-2:])
+
+        stop_filled_once(h)
+        for leg in (STOP, TARGET):
+            assert h.events_of(leg) == []
+        assert h.reports == []
+        assert h.activity == []
+        assert h.client._book.view(FIRST) is None
 
 
 async def test_a_stop_filled_during_the_reconnect_pass_is_the_nodes_leg() -> None:
@@ -1684,6 +1704,7 @@ async def test_a_stop_filled_during_the_reconnect_pass_is_the_nodes_leg() -> Non
         assert h.events[events:] == []
         assert h.reports[reported:] == []
         assert h.activity[activity:] == []
+        assert h.client._book.view(FIRST) is None
 
 
 async def test_a_partial_close_after_the_snapshot_sizes_the_position_by_the_lists() -> None:
