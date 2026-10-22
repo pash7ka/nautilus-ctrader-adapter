@@ -103,18 +103,6 @@ def _raw_bar(trendbar: om.ProtoOATrendbar) -> RawBar:
     )
 
 
-def _trendbar(raw: RawBar) -> om.ProtoOATrendbar:
-    """`raw` back as a trendbar, with no period: `bar_from_trendbar` takes it from the bar type."""
-    return om.ProtoOATrendbar(
-        volume=raw.volume,
-        low=raw.low,
-        deltaOpen=raw.delta_open,
-        deltaHigh=raw.delta_high,
-        deltaClose=raw.delta_close,
-        utcTimestampInMinutes=raw.boundary_secs // 60,
-    )
-
-
 def _failure_reason(error: Exception) -> str:
     """The published reason for `error`: a fixed phrase or a venue error code, never its text."""
     if isinstance(error, CTraderRequestError):
@@ -1308,7 +1296,7 @@ class CTraderDataClient(LiveMarketDataClient):
             return
         try:
             bar = bar_from_trendbar(
-                _trendbar(raw),
+                raw,
                 bar_type,
                 instrument.price_precision,
                 instrument.size_precision,
@@ -1421,12 +1409,12 @@ class CTraderDataClient(LiveMarketDataClient):
             closed = closed[-request.limit :]
         elif request.start is None:
             # One page of the newest bars, although a page asks the venue for two more.
-            closed = closed[-self._page_size() :]
+            closed = closed[-self._config.history_page_size :]
 
         ts_init = self._clock.timestamp_ns()
         bars = [
             bar_from_trendbar(
-                _trendbar(raw),
+                raw,
                 bar_type,
                 instrument.price_precision,
                 instrument.size_precision,
@@ -1465,7 +1453,7 @@ class CTraderDataClient(LiveMarketDataClient):
         reaches back to the window's own start.
         """
         period_secs = PERIOD_SECS[period]
-        span = self._page_size() * period_secs
+        span = self._config.history_page_size * period_secs
         bars: dict[int, RawBar] = {}
         to_secs = end_secs
         while True:
@@ -1480,7 +1468,7 @@ class CTraderDataClient(LiveMarketDataClient):
                 # Two more than the page: one for the bar the venue repeats at `toTimestamp` or
                 # the forming bar, and one for an answer a bar short of `count`, which the venue
                 # gives at times.
-                count=self._page_size() + 2,
+                count=self._config.history_page_size + 2,
                 priority=priority,
             )
             for raw in page:
@@ -1519,9 +1507,6 @@ class CTraderDataClient(LiveMarketDataClient):
     @staticmethod
     def _closed_count(bars: dict[int, RawBar], period_secs: int, closed_secs: int) -> int:
         return sum(1 for boundary in bars if boundary + period_secs <= closed_secs)
-
-    def _page_size(self) -> int:
-        return max(1, self._config.history_page_size)
 
     async def _fetch_bar(self, symbol_id: int, period: int, boundary_secs: int) -> RawBar | None:
         """The one closed bar opening at `boundary_secs`, or `None` if history has none yet."""

@@ -44,10 +44,6 @@ class InstrumentLoadFailure:
     reason: str
 
 
-def _now_ns() -> int:
-    return time.time_ns()
-
-
 class CTraderInstrumentProvider(InstrumentProvider):
     """
     Builds Nautilus instruments from a connected `CTraderAccountClient`'s reference data.
@@ -137,10 +133,6 @@ class CTraderInstrumentProvider(InstrumentProvider):
         self._blocked.difference_update(names)
         failures.extend(await self._load_names(names))
         self._raise_if_configured(failures)
-
-    async def load_async(self, instrument_id: InstrumentId, filters: dict | None = None) -> None:
-        """Delegates to `load_ids_async`; `filters` is unsupported (see there)."""
-        await super().load_async(instrument_id, filters)
 
     async def conversion_instruments_for(self, instrument: Instrument) -> list[Instrument]:
         """Chain instruments needed to convert `instrument`'s quote currency into the deposit
@@ -311,7 +303,7 @@ class CTraderInstrumentProvider(InstrumentProvider):
                 light,
                 self._account.assets,
                 self._overrides,
-                ts_init=_now_ns(),
+                ts_init=time.time_ns(),
             )
         except (CTraderProtocolError, ValueError, TypeError) as e:
             # Nautilus validates the constructor arguments itself and reports what it rejects

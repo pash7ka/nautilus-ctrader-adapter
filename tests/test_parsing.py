@@ -17,6 +17,7 @@ from nautilus_trader.model.objects import Price, Quantity
 
 from nautilus_ctrader.common import parsing
 from nautilus_ctrader.common.errors import CTraderProtocolError
+from nautilus_ctrader.data import _raw_bar
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.fixtures import load_recorded
 
@@ -157,7 +158,7 @@ def test_recorded_h1_trendbar_converts_with_close_timestamp() -> None:
     instrument = _inst(light.symbolName)
     bar_type = BarType.from_str(f"{light.symbolName}.CTRADER-1-HOUR-BID-EXTERNAL")
     bar = parsing.bar_from_trendbar(
-        tb,
+        _raw_bar(tb),
         bar_type,
         spec.digits,
         instrument.size_precision,
@@ -183,7 +184,7 @@ def test_a_venue_open_time_off_the_epoch_grid_is_never_moved() -> None:
 
     for step, period_secs in (("1-DAY", 86_400), ("4-HOUR", 14_400)):
         bar_type = BarType.from_str(f"{light.symbolName}.CTRADER-{step}-BID-EXTERNAL")
-        bar = parsing.bar_from_trendbar(tb, bar_type, spec.digits, 2, ts_init=0)
+        bar = parsing.bar_from_trendbar(_raw_bar(tb), bar_type, spec.digits, 2, ts_init=0)
         assert bar.ts_event == (open_secs + period_secs) * 1_000_000_000
 
 
@@ -194,18 +195,6 @@ def test_only_the_periods_observed_epoch_aligned_are_checked_for_alignment() -> 
     # H4 and longer carry the trading day's own phase, so nothing is expected of them.
     assert not parsing.is_unaligned_boundary(open_secs, 14_400)
     assert not parsing.is_unaligned_boundary(open_secs, 86_400)
-
-
-def test_bar_from_trendbar_rejects_a_period_that_disagrees_with_the_bar_type() -> None:
-    res = REC["trendbars_h1"][0]
-    tb = om.ProtoOATrendbar()
-    tb.CopyFrom(res.trendbar[-1])
-    tb.period = om.ProtoOATrendbarPeriod.Value("M15")
-    light = next(s for s in LIGHT.values() if s.symbolId == res.symbolId)
-    spec = SPECS[res.symbolId]
-    bar_type = BarType.from_str(f"{light.symbolName}.CTRADER-1-HOUR-BID-EXTERNAL")
-    with pytest.raises(CTraderProtocolError, match="period"):
-        parsing.bar_from_trendbar(tb, bar_type, spec.digits, 2, ts_init=0)
 
 
 @pytest.mark.parametrize(
@@ -230,17 +219,16 @@ def test_bar_from_trendbar_rejects_values_no_bar_can_hold(
     spec = SPECS[res.symbolId]
     bar_type = BarType.from_str(f"{light.symbolName}.CTRADER-1-HOUR-BID-EXTERNAL")
     with pytest.raises(CTraderProtocolError, match=match):
-        parsing.bar_from_trendbar(tb, bar_type, spec.digits, 2, ts_init=0)
+        parsing.bar_from_trendbar(_raw_bar(tb), bar_type, spec.digits, 2, ts_init=0)
 
 
-def test_bar_from_trendbar_accepts_a_live_bar_whose_period_matches() -> None:
-    # Live spot-event trend bars, unlike historical ones, do set `period`.
+def test_bar_from_trendbar_accepts_a_live_bar() -> None:
     event = next(e for e in REC["spot_events"] if e.trendbar)
     tb = event.trendbar[0]
     light = next(s for s in LIGHT.values() if s.symbolId == event.symbolId)
     spec = SPECS[event.symbolId]
     bar_type = BarType.from_str(f"{light.symbolName}.CTRADER-1-MINUTE-BID-EXTERNAL")
-    bar = parsing.bar_from_trendbar(tb, bar_type, spec.digits, 2, ts_init=0)
+    bar = parsing.bar_from_trendbar(_raw_bar(tb), bar_type, spec.digits, 2, ts_init=0)
     assert bar.low <= bar.close <= bar.high
 
 

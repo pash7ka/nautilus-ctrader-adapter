@@ -18,6 +18,7 @@ from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.instruments import Cfd, CurrencyPair
 from nautilus_trader.model.objects import Currency, Price, Quantity
 
+from nautilus_ctrader.common.bars import RawBar
 from nautilus_ctrader.common.errors import CTraderProtocolError
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.enums import PERIOD_SECS, trendbar_period_for
@@ -277,41 +278,31 @@ def instrument_from_symbol(
 
 
 def bar_from_trendbar(
-    tb: om.ProtoOATrendbar,
+    raw: RawBar,
     bar_type: BarType,
     price_precision: int,
     size_precision: int,
     ts_init: int,
 ) -> Bar:
-    """A closed `Bar` from a `ProtoOATrendbar`.
+    """A closed `Bar` from a trendbar in venue units.
 
-    `ts_event` is the bar's close time: the venue's own open time plus the period.
+    `ts_event` is the bar's close time: the venue's own open time plus the period of `bar_type`.
 
-    The period comes from `bar_type`, not `tb.period`: recorded historical responses leave
-    `ProtoOATrendbar.period` unset on every individual bar (the real period is only carried on
-    the enclosing `ProtoOAGetTrendbarsRes`), so reading it here would silently default to M1.
-    Live bars (from a spot event subscription) do set `tb.period`; when they do, it must agree
-    with `bar_type`, or `CTraderProtocolError` is raised rather than silently trusting one over
-    the other. So does a value Nautilus refuses: a price or volume out of its range, or a high
-    and low that do not enclose the open and close. The error's text does not name the bar type.
+    Raises `CTraderProtocolError` for a value Nautilus refuses: a price or volume out of its
+    range, or a high and low that do not enclose the open and close. The error's text does not
+    name the bar type.
     """
-    period = trendbar_period_for(bar_type)
-    if tb.HasField("period") and tb.period != period:
-        raise CTraderProtocolError(
-            f"trendbar period {tb.period} does not match the bar type's period {period}",
-        )
-
-    period_secs = PERIOD_SECS[period]
-    ts_event = (bar_boundary_secs(tb.utcTimestampInMinutes) + period_secs) * 1_000_000_000
+    period_secs = PERIOD_SECS[trendbar_period_for(bar_type)]
+    ts_event = (raw.boundary_secs + period_secs) * 1_000_000_000
     try:
         return Bar(
             bar_type,
-            price_from_raw(tb.low + tb.deltaOpen, price_precision),
-            price_from_raw(tb.low + tb.deltaHigh, price_precision),
-            price_from_raw(tb.low, price_precision),
-            price_from_raw(tb.low + tb.deltaClose, price_precision),
+            price_from_raw(raw.low + raw.delta_open, price_precision),
+            price_from_raw(raw.low + raw.delta_high, price_precision),
+            price_from_raw(raw.low, price_precision),
+            price_from_raw(raw.low + raw.delta_close, price_precision),
             # TODO(verify): trendbar volume is a tick count, not scaled.
-            Quantity(tb.volume, size_precision),
+            Quantity(raw.volume, size_precision),
             ts_event,
             ts_init,
         )
