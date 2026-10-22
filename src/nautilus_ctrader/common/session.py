@@ -68,6 +68,7 @@ class CTraderSession:
         logger: Logger,
         refresh_token: str | None = None,
         expires_at_secs: float | None = None,
+        # Must not raise: the new pair is already taken when it is called.
         on_tokens_refreshed: Callable[[str, str, float], None] | None = None,
         # `True` (verified TLS) is the only safe choice against a real venue; `False` is for
         # tests against the local fake server.
@@ -614,19 +615,11 @@ class CTraderSession:
         self._refresh_settled.set()
         self._pair_taken.set()
         if self._on_tokens_refreshed is not None:
-            try:
-                self._on_tokens_refreshed(
-                    self._access_token,
-                    self._refresh_token,
-                    self._expires_at_secs,
-                )
-            except Exception as e:
-                # The refresh itself succeeded, so carry on with the new tokens - but loudly:
-                # they exist in memory only, and the old refresh token no longer works. Only the
-                # type is logged, since the application's message could contain the tokens.
-                self._log.error(
-                    f"Token persistence callback raised {type(e).__name__}; new tokens not saved",
-                )
+            self._on_tokens_refreshed(
+                self._access_token,
+                self._refresh_token,
+                self._expires_at_secs,
+            )
 
     async def _authenticate_account(self) -> None:
         self._account_auth_sent = True

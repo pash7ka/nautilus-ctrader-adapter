@@ -885,37 +885,6 @@ async def test_a_token_rejection_refreshes_again_once_the_interval_has_passed(
         await server.stop()
 
 
-async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_on(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The refresh succeeded, so the session must keep working on the new tokens - but the
-    # operator must hear that they were not saved, without the tokens reaching the log.
-    server = _server()
-    await server.start()
-    logger = RecordingLogger()
-
-    def explode(_access: str, _refresh: str, _expires_at: float) -> None:
-        raise RuntimeError("storage unavailable")
-
-    session = _session(
-        server,
-        logger,
-        expires_at_secs=_due_after_ready(monkeypatch),
-        on_tokens_refreshed=explode,
-    )
-    try:
-        await session.start()
-        await wait_until(lambda: server.connection_count >= 2, description="re-authentication")
-        await session.wait_ready(timeout_secs=3.0)
-
-        assert any("not saved" in line for line in logger.errors())
-        assert _account_auths(server)[-1].accessToken == "new-access"
-        assert not any("new-access" in m or "new-refresh" in m for _, m in logger.lines)
-    finally:
-        await session.stop()
-        await server.stop()
-
-
 async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

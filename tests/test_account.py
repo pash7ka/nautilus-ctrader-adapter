@@ -244,6 +244,45 @@ async def test_a_token_due_for_refresh_at_start_up_is_refreshed_before_the_sessi
         await server.stop()
 
 
+async def test_a_raising_token_listener_is_logged_and_the_session_carries_on() -> None:
+    # The refresh succeeded, so the session must keep working on the new tokens - but the
+    # operator must hear that they were not saved, without the tokens reaching the log.
+    server = venue()
+    server.on(
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOARefreshTokenRes(
+            accessToken="new-access",
+            tokenType="bearer",
+            expiresIn=2_592_000,
+            refreshToken="new-refresh",
+        ),
+    )
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(
+        server,
+        logger=logger,
+        credentials=credentials(token_expires_at=time.time() + 600),
+    )
+
+    def explode(_access: str, _refresh: str, _expires_at: float) -> None:
+        raise RuntimeError("storage unavailable")
+
+    notified = []
+    client.add_token_listener(explode)
+    client.add_token_listener(lambda a, r, e: notified.append((a, r)))
+    try:
+        await client.connect()
+
+        assert any("not saved" in line for line in logger.errors())
+        assert notified == [("new-access", "new-refresh")]
+        assert received(server, oa.ProtoOAAccountAuthReq)[-1].accessToken == "new-access"
+        assert not any("new-access" in m or "new-refresh" in m for _, m in logger.lines)
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_a_refresh_reply_that_misses_its_timeout_at_start_up_is_adopted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
