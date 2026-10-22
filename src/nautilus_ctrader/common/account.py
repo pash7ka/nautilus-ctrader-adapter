@@ -152,7 +152,9 @@ class CTraderAccountClient:
     - `environment="auto"` takes the trading host from that entry's `isLive` flag;
       `"demo"`/`"live"` force it.
     - A cached client whose session was brought up on another event loop, one closed without
-      `disconnect()`, forgets that session at the next `connect()` and brings up a new one.
+      `disconnect()`, forgets that session and everything the old node's clients held or
+      registered, and brings up a new session at the next `connect()`; see
+      `forget_another_loop()`.
     - `connect()` returns once the session is ready and the reference data is loaded; bad
       credentials fail it at once rather than after `connect_timeout_secs`.
     - A loaded symbol the venue reports as changed is reloaded here, once for all clients;
@@ -332,11 +334,11 @@ class CTraderAccountClient:
         and one queued behind a failed attempt tries again. A failed or cancelled attempt
         stops what it started and leaves the user count unchanged.
 
-        A session brought up on another event loop is forgotten with a WARNING, together with
-        its users, and a new one is brought up: nothing on a closed loop can be stopped or
+        A session brought up on another event loop is forgotten first, as `forget_another_loop()`
+        describes, and a new one is brought up: nothing on a closed loop can be stopped or
         reused.
         """
-        self._forget_session_on_another_loop()
+        self.forget_another_loop()
         async with self._lifecycle_lock:
             try:
                 if self._users > 0:
@@ -354,7 +356,22 @@ class CTraderAccountClient:
                 raise
             self._last_connect_error = None
 
-    def _forget_session_on_another_loop(self) -> None:
+    def forget_another_loop(self) -> None:
+        """Drop what an earlier node left on an event loop other than the running one.
+
+        For a node rebuilt in the same process after its loop closed without `disconnect()`.
+        Does nothing while the last bring-up's loop is the running one. Every client calls it
+        first in its own connect, before it touches the subscription registry; `connect()` and
+        `disconnect()` call it too.
+
+        - Dropped: the session and its user count, every subscription hold, per-key lock and
+          spot or trendbar-recovery listener in the registry, and the reload listeners. All of
+          them belong to the old node's clients, and the new clients register their own.
+        - Kept: this instance, the application's token listeners, the instrument provider and
+          the reference data.
+
+        A session or user dropped is reported in one WARNING.
+        """
         loop = self._session_loop
         if loop is None or loop is asyncio.get_running_loop():
             return
@@ -362,21 +379,25 @@ class CTraderAccountClient:
         # A lock is bound to the loop it was first contended on, and one held when that loop
         # closed is never released.
         self._lifecycle_lock = asyncio.Lock()
-        if self.session is None and self._users == 0:
-            return
-        self._log.warning(
-            "Account session was brought up on another event loop; forgetting it and "
-            "bringing up a new one",
-        )
+        if self.session is not None or self._users > 0:
+            self._log.warning(
+                "Account session was brought up on another event loop; forgetting it and "
+                "bringing up a new one",
+            )
         # Dropped, not stopped or cancelled: both would schedule work on the old loop.
         self.session = None
         self._users = 0
         self._retry_task = None
         self._reload_tasks = set()
-        self.subscriptions.detach()
+        self._reload_listeners.clear()
+        self.subscriptions.reset()
 
     async def disconnect(self) -> None:
-        """Release one user; the last one stops the session."""
+        """Release one user; the last one stops the session.
+
+        A session left on another event loop is forgotten instead, with all its users.
+        """
+        self.forget_another_loop()
         async with self._lifecycle_lock:
             if self._users == 0:
                 return
@@ -786,7 +807,8 @@ def get_cached_ctrader_account_client(
 
     Later calls with the same key return the first instance; their other arguments are ignored.
     That holds across event loops too: a node rebuilt in the same process gets the same client,
-    its listeners included, and its `connect()` replaces a session left on the old loop.
+    with the application's token listeners, and its clients' connect drops what the old node
+    left on the old loop (`CTraderAccountClient.forget_another_loop()`).
     A differing `environment` or credential is reported in one WARNING: the first client's
     host and tokens win, and the second config would otherwise be ignored in silence. The
     comparison is against the credentials the client was built from, so a token the client

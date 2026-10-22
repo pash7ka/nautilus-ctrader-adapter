@@ -335,6 +335,8 @@ class CTraderDataClient(LiveMarketDataClient):
         return self._instrument_provider
 
     async def _connect(self) -> None:
+        # Before the leftovers below are released: an old node's would go to its dead session.
+        self._account.forget_another_loop()
         self._connection_generation += 1
         # Nothing from an earlier connection may survive here, in this client or in the
         # registry: a `_disconnect` cut short would otherwise make a later subscribe a silent

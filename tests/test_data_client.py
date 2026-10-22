@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import gc
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -62,12 +63,15 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from nautilus_ctrader.providers import CTraderInstrumentProvider, InstrumentLoadError
 from tests.account_venue import (
     ACCOUNT_ID,
+    DEMO_HOST_NAME,
+    LIVE_HOST_NAME,
     RECORDED,
     TRADER_LOGIN,
     HeldReplies,
     account_client,
     for_account,
     received,
+    two_host_account_client,
     venue,
 )
 from tests.execution_venue import STRATEGY_ID, TRADER_ID, ExecutionVenue
@@ -720,6 +724,106 @@ async def test_a_client_joining_a_running_account_keeps_the_chains_already_resol
             assert len(received(h.server, oa.ProtoOASymbolsForConversionReq)) == 1
         finally:
             await second._disconnect()
+
+
+def _node_data_client(
+    account: CTraderAccountClient,
+    client_config: CTraderDataClientConfig,
+) -> tuple[CTraderDataClient, list]:
+    """A data client of a node of its own on the running loop, and the list it publishes to."""
+    published: list = []
+    msgbus = TestComponentStubs.msgbus()
+    msgbus.register(endpoint="DataEngine.process", handler=published.append)
+    client = CTraderDataClient(
+        loop=asyncio.get_running_loop(),
+        account=account,
+        msgbus=msgbus,
+        cache=TestComponentStubs.cache(),
+        clock=TestComponentStubs.clock(),
+        instrument_provider=account.get_instrument_provider(
+            config=client_config.instrument_provider,
+            asset_class_overrides=parse_asset_class_overrides(client_config.asset_class_overrides),
+            fail_on_instrument_error=client_config.fail_on_instrument_error,
+            logger=RecordingLogger(),
+        ),
+        config=client_config,
+    )
+    return client, published
+
+
+# What the first loop leaves behind fails to close once it is collected, which is the scenario.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_a_data_client_rebuilt_after_its_loop_closed_drops_what_the_old_node_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_symbol_id = 2
+    servers: dict[str, FakeCTraderServer] = {}
+    client_config = config()
+    account = two_host_account_client(
+        monkeypatch,
+        servers,
+        credentials=client_config.credentials(),
+    )
+    old_node: dict[str, list] = {}
+
+    async def run_the_old_node() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = data_venue()
+        await servers[LIVE_HOST_NAME].start()
+        client, old_node["published"] = _node_data_client(account, client_config)
+        # Holds EURUSD for its GER40 conversion, under the owner the new node reuses.
+        await client._connect()
+        # Two holds of one key at once: the second waits on the key's lock, binding it here.
+        await asyncio.gather(
+            account.subscriptions.subscribe_spots(other_symbol_id, "first", "data:OTHER"),
+            account.subscriptions.subscribe_spots(other_symbol_id, "second", "data:OTHER"),
+        )
+
+    first_loop = asyncio.new_event_loop()
+    try:
+        first_loop.run_until_complete(run_the_old_node())
+    finally:
+        # Without `_disconnect()`, as an unclean stop leaves it.
+        first_loop.close()
+
+    second_server = data_venue()
+
+    def subscribed() -> list[int]:
+        return [i for r in received(second_server, oa.ProtoOASubscribeSpotsReq) for i in r.symbolId]
+
+    async def run_the_new_node() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = second_server
+        await second_server.start()
+        client, published = _node_data_client(account, client_config)
+        try:
+            started = time.monotonic()
+            async with asyncio.timeout(10.0):
+                await client._connect()
+            assert time.monotonic() - started < 2.0
+            assert subscribed() == [EURUSD_SYMBOL_ID]
+
+            old_published = len(old_node["published"])
+            await second_server.push(TWO_SIDED)
+            await account.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
+            assert any(isinstance(d, QuoteTick) for d in published)
+            assert len(old_node["published"]) == old_published
+
+            await asyncio.gather(
+                account.subscriptions.subscribe_spots(other_symbol_id, "first", "data:THIRD"),
+                account.subscriptions.subscribe_spots(other_symbol_id, "second", "data:THIRD"),
+            )
+            assert subscribed() == [EURUSD_SYMBOL_ID, other_symbol_id]
+        finally:
+            async with asyncio.timeout(5.0):
+                await client._disconnect()
+            await second_server.stop()
+
+    second_loop = asyncio.new_event_loop()
+    try:
+        second_loop.run_until_complete(run_the_new_node())
+    finally:
+        second_loop.close()
+        # Inside this test, so the filter above applies.
+        gc.collect()
 
 
 async def test_a_conversion_is_prepared_again_once_the_provider_resets_its_chains() -> None:

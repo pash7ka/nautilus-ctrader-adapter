@@ -880,6 +880,50 @@ def test_a_client_cached_on_a_closed_loop_brings_up_a_new_session(
         gc.collect()
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_a_disconnect_on_a_new_loop_after_an_unclean_stop_returns_and_leaves_it_connectable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    servers: dict[str, FakeCTraderServer] = {}
+    client = two_host_account_client(monkeypatch, servers)
+
+    async def connect_on_the_first_loop() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = venue()
+        await servers[LIVE_HOST_NAME].start()
+        await client.connect()
+
+    first_loop = asyncio.new_event_loop()
+    try:
+        first_loop.run_until_complete(connect_on_the_first_loop())
+    finally:
+        first_loop.close()
+
+    second_server = venue()
+
+    async def disconnect_then_connect_on_the_second_loop() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = second_server
+        await second_server.start()
+        try:
+            async with asyncio.timeout(1.0):
+                await client.disconnect()
+
+            async with asyncio.timeout(10.0):
+                await client.connect()
+            assert client.session.is_ready
+            assert received(second_server, oa.ProtoOAAccountAuthReq)
+        finally:
+            async with asyncio.timeout(5.0):
+                await client.disconnect()
+            await second_server.stop()
+
+    second_loop = asyncio.new_event_loop()
+    try:
+        second_loop.run_until_complete(disconnect_then_connect_on_the_second_loop())
+    finally:
+        second_loop.close()
+        gc.collect()
+
+
 def test_unknown_environment_is_rejected() -> None:
     with pytest.raises(ValueError, match="environment"):
         CTraderAccountClient(
