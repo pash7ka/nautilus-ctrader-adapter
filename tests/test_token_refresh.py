@@ -1015,17 +1015,10 @@ async def test_a_proactive_reauth_is_not_treated_as_a_failed_session(
     server = _server()
     await server.start()
     logger = RecordingLogger()
-    session = CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="old-access",
-        refresh_token="old-refresh",
+    session = _session(
+        server,
+        logger,
         expires_at_secs=_due_after_ready(monkeypatch),
-        logger=logger,
-        tls=False,
         backoff_base_secs=5.0,
     )
     loop = asyncio.get_running_loop()
@@ -1108,17 +1101,7 @@ async def test_an_auth_loss_during_bring_up_is_reported_without_a_stale_error() 
     server = _server()
     await server.start()
     logger = RecordingLogger()
-    session = CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="old-access",
-        logger=logger,
-        tls=False,
-        backoff_base_secs=0.05,
-    )
+    session = _session(server, logger, refresh_token=None, backoff_base_secs=0.05)
     seen: list[object] = []
     session.add_event_handler(oa.ProtoOAAccountDisconnectEvent, seen.append)
     attempts: list[int] = []
