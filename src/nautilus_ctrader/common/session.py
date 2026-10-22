@@ -142,7 +142,6 @@ class CTraderSession:
         # Bumped at the start of every bring-up, so a retry that spans a reconnect can tell its
         # result is stale rather than overwrite what the new bring-up already decided.
         self._bring_up_generation = 0
-        self._retry_in_progress = False
 
     @property
     def state(self) -> SessionState:
@@ -376,37 +375,30 @@ class CTraderSession:
     async def retry_failed_restores(self) -> None:
         """Re-run each failed restore once while READY; success removes it from failed_restores.
 
-        An overlapping call returns immediately without running anything, rather than re-running
-        every factory a second time.
+        Not safe to overlap with itself: the account's retry loop is its one caller.
         """
-        if self._retry_in_progress:
-            return
-        self._retry_in_progress = True
-        try:
-            for key in list(self._failed_restores):
-                if self._state is not SessionState.READY:
-                    return
-                factory = self._restores.get(key)
-                if factory is None:
-                    # Defensive: `remove_restore()` may have discarded this key concurrently.
-                    self._failed_restores.discard(key)
-                    continue
-                generation = self._bring_up_generation
-                try:
-                    detail = await self._run_restore(key, factory)
-                except CTraderConnectionError:
-                    return
-                # A reconnect landing while the factory awaited starts a new bring-up, which
-                # clears and re-populates `_failed_restores` itself; this result is then stale
-                # and must not overwrite what that bring-up decided.
-                if generation != self._bring_up_generation or self._state is not SessionState.READY:
-                    return
-                if detail is None:
-                    self._failed_restores.discard(key)
-                else:
-                    self._log.warning(f"Restore {key!r} failed: {detail}")
-        finally:
-            self._retry_in_progress = False
+        for key in list(self._failed_restores):
+            if self._state is not SessionState.READY:
+                return
+            factory = self._restores.get(key)
+            if factory is None:
+                # Defensive: `remove_restore()` may have discarded this key concurrently.
+                self._failed_restores.discard(key)
+                continue
+            generation = self._bring_up_generation
+            try:
+                detail = await self._run_restore(key, factory)
+            except CTraderConnectionError:
+                return
+            # A reconnect landing while the factory awaited starts a new bring-up, which
+            # clears and re-populates `_failed_restores` itself; this result is then stale
+            # and must not overwrite what that bring-up decided.
+            if generation != self._bring_up_generation or self._state is not SessionState.READY:
+                return
+            if detail is None:
+                self._failed_restores.discard(key)
+            else:
+                self._log.warning(f"Restore {key!r} failed: {detail}")
 
     def _raise_if_lost(self) -> None:
         """Fail bring-up if the connection or authentication was lost mid-flight.

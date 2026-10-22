@@ -392,7 +392,7 @@ class SubscriptionRegistry:
         # and is recorded as an intent, so the consumer's unsubscribe still cleans it up and
         # the next bring-up makes the venue consistent.
         try:
-            await _subscribe(session, [self._subscribe_request(key)])
+            await _subscribe(session, self._subscribe_request(key))
         except CTraderRequestError:
             raise
         except (CTraderConnectionError, CTraderTimeoutError):
@@ -483,7 +483,7 @@ class SubscriptionRegistry:
                 async with self._lock(key):
                     if key not in self._consumers:
                         return
-                    await _subscribe(session, [request])
+                    await _subscribe(session, request)
             self._maybe_unsubscribed.discard(key)
             # A bring-up clears the failed restores before running any, so normally only a retry
             # finds it.
@@ -568,10 +568,9 @@ class SubscriptionRegistry:
         return any(key[1] == symbol_id for key in self._intents)
 
 
-async def _subscribe(session: CTraderSession, requests: list[Message]) -> None:
-    for request in requests:
-        try:
-            await session.request(request)
-        except CTraderRequestError as e:
-            if e.error_code != _ALREADY_SUBSCRIBED:
-                raise
+async def _subscribe(session: CTraderSession, request: Message) -> None:
+    try:
+        await session.request(request)
+    except CTraderRequestError as e:
+        if e.error_code != _ALREADY_SUBSCRIBED:
+            raise

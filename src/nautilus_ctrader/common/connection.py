@@ -54,7 +54,7 @@ def _retrieve_exception(task: asyncio.Task) -> None:
         task.exception()
 
 
-def _encode(payload: Message, client_msg_id: str | None) -> bytes:
+def _encode(payload: Message, client_msg_id: str) -> bytes:
     """`payload` as a frame; an encode failure happens before any write, so nothing was sent."""
     try:
         return codec.encode_frame(payload, client_msg_id)
@@ -252,25 +252,10 @@ class CTraderConnection:
             if future.done() and not future.cancelled():
                 future.exception()
 
-    async def send(self, payload: Message, *, client_msg_id: str | None = None) -> None:
-        """Send a message without awaiting a response, paced like a request at `EXECUTION`."""
-        if not self._connected:
-            raise CTraderNotSentConnectionError("not connected")
-        generation = self._generation
-
-        async def write() -> None:
-            frame = _encode(payload, client_msg_id)
-            await self._write(payload, client_msg_id, frame, generation)
-
-        if self._scheduler is None:
-            await write()
-        else:
-            await self._scheduler.submit(group_of(payload), RequestPriority.EXECUTION, write)
-
     async def _write(
         self,
         payload: Message,
-        client_msg_id: str | None,
+        client_msg_id: str,
         frame: bytes,
         generation: int,
         on_written: Callable[[], None] | None = None,
@@ -281,7 +266,7 @@ class CTraderConnection:
             raise CTraderNotSentConnectionError("connection lost while waiting to send")
         self._log.debug(
             f"send payloadType={payload.payloadType} "
-            f"clientMsgId={client_msg_id or '-'} bytes={len(frame)}",
+            f"clientMsgId={client_msg_id} bytes={len(frame)}",
         )
         self._writer.write(frame)
         self._last_send = asyncio.get_running_loop().time()

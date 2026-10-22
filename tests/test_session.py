@@ -999,6 +999,34 @@ async def test_a_stop_after_a_waiting_start_wins_as_separate_tasks() -> None:
         await server.stop()
 
 
+async def test_a_second_start_and_an_overlapping_stop_leak_no_task() -> None:
+    server = authenticating_server()
+    await server.start()
+    session = session_for(server, backoff_base_secs=0.01, pacing=FAST)
+    slow_restore = _SlowRestore()
+    try:
+        session.add_restore("slow", slow_restore)
+        await session.start()
+        await _break_session_into_a_slow_restore(session, server, slow_restore)
+
+        first_stop = asyncio.create_task(session.stop())
+        await asyncio.sleep(0)
+        await session.start()
+        await session.wait_ready(timeout_secs=3.0)
+        await asyncio.gather(first_stop, session.stop(), session.stop())
+
+        owned = ("CTraderSession.", "CTraderConnection.")
+        leftovers = [
+            task
+            for task in asyncio.all_tasks()
+            if not task.done() and task.get_coro().__qualname__.startswith(owned)
+        ]
+        assert leftovers == []
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_stop_returns_promptly_after_the_server_drops_the_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

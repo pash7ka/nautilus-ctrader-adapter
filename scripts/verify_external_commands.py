@@ -368,14 +368,11 @@ class Guard:
 
     def covers(self, connection: CTraderConnection) -> bool:
         """Whether `connection` still sends through this guard."""
-        return all(
-            getattr(method, "guarded_by", None) is self
-            for method in (connection.request, connection.send)
-        )
+        return getattr(connection.request, "guarded_by", None) is self
 
     def instrument(self, connection: CTraderConnection) -> None:
-        """Make `connection` check every request and send through this guard, and log them."""
-        request, send = connection.request, connection.send
+        """Make `connection` check every request through this guard, and log them."""
+        request = connection.request
 
         async def guarded_request(payload: Message, **kwargs) -> Message:
             self.check(payload)
@@ -397,15 +394,8 @@ class Guard:
                 exchange.answered_at = self.recorder.now()
             return exchange.answer
 
-        async def guarded_send(payload: Message, **kwargs) -> None:
-            self.check(payload)
-            self.recorder.mark(f"send {type(payload).__name__}")
-            await send(payload, **kwargs)
-
         guarded_request.guarded_by = self
-        guarded_send.guarded_by = self
         connection.request = guarded_request
-        connection.send = guarded_send
 
 
 def _same(price: float, other: float) -> bool:

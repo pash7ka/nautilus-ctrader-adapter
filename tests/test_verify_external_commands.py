@@ -628,8 +628,6 @@ async def test_a_guarded_connection_refuses_before_the_socket_and_logs_every_ans
         for forbidden in OPENING_OR_CLOSING:
             with pytest.raises(vec.CommandRefused):
                 await connection.request(forbidden(ctidTraderAccountId=ACCOUNT_ID))
-            with pytest.raises(vec.CommandRefused):
-                await connection.send(forbidden(ctidTraderAccountId=ACCOUNT_ID))
         await connection.request(oa.ProtoOAReconcileReq(ctidTraderAccountId=ACCOUNT_ID))
         with pytest.raises(vec.CTraderRequestError):
             await connection.request(
@@ -716,7 +714,7 @@ async def test_a_request_lost_with_the_connection_keeps_its_error_on_the_exchang
     async def lost(_payload, **_kwargs):
         raise CTraderConnectionError("connection lost")
 
-    connection = SimpleNamespace(request=lost, send=None)
+    connection = SimpleNamespace(request=lost)
     checked = guard()
     checked.instrument(connection)
 

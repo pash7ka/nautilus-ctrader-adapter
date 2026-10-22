@@ -337,50 +337,6 @@ async def test_retry_stops_when_the_connection_is_lost_mid_retry() -> None:
         await server.stop()
 
 
-async def test_overlapping_retries_do_not_rerun_a_factory_twice() -> None:
-    server = authenticating_server()
-    server.on(
-        oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
-        lambda _r: oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone"),
-    )
-    await server.start()
-    session = session_for(server, backoff_base_secs=0.05)
-    attempts: list[int] = []
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def subscribe() -> None:
-        attempts.append(1)
-        if len(attempts) == 2:
-            entered.set()
-            await release.wait()
-        await session.request(
-            oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=ACCOUNT_ID, symbolId=[1]),
-        )
-
-    try:
-        session.add_restore(("spots", 1), subscribe)
-        await session.start()
-        await session.wait_ready(timeout_secs=2.0)
-        assert len(attempts) == 1
-
-        first = asyncio.create_task(session.retry_failed_restores())
-        await wait_until(entered.is_set, description="the first retry's factory in flight")
-
-        second = asyncio.create_task(session.retry_failed_restores())
-        await asyncio.sleep(0.05)
-        assert second.done(), "an overlapping retry must return immediately"
-
-        release.set()
-        await first
-        await second
-
-        assert len(attempts) == 2
-    finally:
-        await session.stop()
-        await server.stop()
-
-
 async def test_a_retry_spanning_a_reconnect_does_not_clear_a_newly_failed_key() -> None:
     # The connection drops while the retry's own factory call is in flight. The supervisor's
     # next bring-up clears `_failed_restores` and marks the same key failed again on its own

@@ -596,8 +596,6 @@ async def test_an_encode_failure_is_not_sent() -> None:
             await connection.request(unencodable)
         assert isinstance(raised.value, CTraderProtocolError)
         assert isinstance(raised.value, CTraderNotSentError)
-        with pytest.raises(CTraderNotSentProtocolError):
-            await connection.send(unencodable)
 
         # A fixed wait is right here: this checks that nothing arrives.
         await asyncio.sleep(0.2)
@@ -871,44 +869,6 @@ async def test_a_raising_disconnect_handler_still_marks_the_connection_down() ->
         await server.stop()
 
 
-async def test_send_delivers_and_passes_the_client_msg_id_through() -> None:
-    server = FakeCTraderServer()
-    await server.start()
-    connection = await _connected(server)
-    try:
-        await connection.send(
-            oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=5),
-            client_msg_id="fire-1",
-        )
-        for _ in range(200):
-            if server.received:
-                break
-            await asyncio.sleep(0.01)
-        assert isinstance(server.received[0], oa.ProtoOASubscribeSpotsReq)
-        assert server.received[0].ctidTraderAccountId == 5
-        assert server.received_client_msg_ids == ["fire-1"]
-    finally:
-        await connection.close()
-        await server.stop()
-
-
-async def test_send_without_a_client_msg_id_sends_none() -> None:
-    # The counterpart that makes the test above discriminating: an id appears only when given.
-    server = FakeCTraderServer()
-    await server.start()
-    connection = await _connected(server)
-    try:
-        await connection.send(oa.ProtoOASubscribeSpotsReq(ctidTraderAccountId=5))
-        for _ in range(200):
-            if server.received:
-                break
-            await asyncio.sleep(0.01)
-        assert server.received_client_msg_ids == [None]
-    finally:
-        await connection.close()
-        await server.stop()
-
-
 @pytest.mark.parametrize(
     ("heartbeat_idle_secs", "inbound_silence_secs"),
     [(10.0, 0.0), (10.0, -1.0)],
@@ -926,14 +886,3 @@ def test_an_invalid_silence_threshold_is_rejected(
             heartbeat_idle_secs=heartbeat_idle_secs,
             inbound_silence_secs=inbound_silence_secs,
         )
-
-
-async def test_send_before_connecting_fails_fast() -> None:
-    connection = CTraderConnection(
-        host="127.0.0.1",
-        port=1,
-        logger=Logger("test"),
-        tls=False,
-    )
-    with pytest.raises(CTraderNotSentConnectionError, match="not connected"):
-        await connection.send(oa.ProtoOATraderReq(ctidTraderAccountId=1))
