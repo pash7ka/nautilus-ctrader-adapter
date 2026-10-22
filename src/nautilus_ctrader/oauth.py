@@ -49,6 +49,9 @@ TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 _LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1"})
 _CALLBACK_BIND_HOST = "127.0.0.1"
 
+# Ten years: a granted lifetime beyond it is taken for a broken response.
+_MAX_EXPIRES_IN_SECS = 10 * 365 * 86400
+
 
 @dataclass(frozen=True, repr=False)
 class TokenPair:
@@ -173,8 +176,9 @@ def wait_for_authorization_code(
     - So does a request whose `state` is missing or differs from `state` (compared in constant
       time): it could be a stray page rather than the real redirect, and must not be able to
       inject a code or abort the wait.
-    - `timeout_secs` is an exact deadline from this call. Every connection is served on its own
-      thread, so an idle browser preconnect or a slow client never delays the real redirect.
+    - `timeout_secs` is an exact deadline from when the socket listens and `on_listening` has
+      returned. Every connection is served on its own thread, so an idle browser preconnect or
+      a slow client never delays the real redirect.
     - `on_listening`, if given, runs once the socket listens: the cue to open the browser.
     - `bind_host` is the IPv4 address the callback listens on, 127.0.0.1 by default. "0.0.0.0"
       is for a redirect that arrives through a forwarded port, where the process's loopback is
@@ -370,9 +374,11 @@ def exchange_code(
         raise CTraderTokenExchangeError("token endpoint response has an invalid refreshToken")
 
     expires_in = data.get("expiresIn")
+    # The bound comes before `isfinite`, which raises `OverflowError` for an int beyond a float.
     if (
         not isinstance(expires_in, int | float)
         or isinstance(expires_in, bool)
+        or expires_in > _MAX_EXPIRES_IN_SECS
         or not math.isfinite(expires_in)
         or expires_in < 1
     ):

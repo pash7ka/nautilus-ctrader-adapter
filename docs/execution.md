@@ -363,6 +363,7 @@ connection, and the connection settings of the first config built for the accoun
 | `requests_per_window` | `50` | The most other requests sent within one window |
 | `rate_limit_retries` | `3` | Resends of a historical request the venue refused for its rate limit; other requests are never resent |
 | `request_queue_timeout_secs` | `60.0` | The longest a request waits in the queue, retries included, before it fails unsent |
+| `rate_limit_max_pause_secs` | `10.0` | The longest pause after a rate-limit refusal; a longer `retryAfter` is cut to it and logged as an ERROR |
 | `reference_price_max_age_secs` | `10.0` | The oldest spot a bracket's levels may be measured from |
 | `protective_order_timeout_secs` | `2.0` | How long after a bracket's fill to wait for the broker's protective order before setting the levels by an amend |
 | `order_request_timeout_secs` | `30.0` | Response timeout for an order, a close or a level amend. An order or close with no answer by then is never resent, so a slow answer must not be taken for a lost one |

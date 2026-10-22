@@ -8,7 +8,8 @@ behind a timer, and a message is either sent or its caller sees an error.
 requests by priority.
 
 The venue reports a breach as `BLOCKED_PAYLOAD_TYPE` carrying `retryAfter`, so the scheduler
-does not have to guess the real limits after a refusal: it pauses for what the venue asked.
+does not have to guess the real limits after a refusal: it pauses for what the venue asked, up
+to a cap.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from nautilus_ctrader.constants import (
     GROUP_HISTORICAL,
     GROUP_OTHER,
     HISTORICAL_PAYLOAD_TYPES,
+    RATE_LIMIT_MAX_PAUSE_SECS,
     RATE_LIMIT_PAUSE_MARGIN_SECS,
     RATE_LIMIT_RETRIES,
     REQUEST_QUEUE_TIMEOUT_SECS,
@@ -60,7 +62,8 @@ class Pacing:
     - `requests_per_window`, `historical_requests_per_window`: the most requests of the other
       and the historical group granted within any `window_secs`;
     - `retries`: resends of a historical request the venue refused for its rate limit;
-    - `queue_timeout_secs`: the longest a request may wait in the queue, retries included.
+    - `queue_timeout_secs`: the longest a request may wait in the queue, retries included;
+    - `max_pause_secs`: the longest pause after a rate-limit refusal, whatever the venue asks.
     """
 
     requests_per_window: int = VENUE_REQUESTS_PER_SEC
@@ -68,6 +71,7 @@ class Pacing:
     window_secs: float = REQUEST_WINDOW_SECS
     retries: int = RATE_LIMIT_RETRIES
     queue_timeout_secs: float = REQUEST_QUEUE_TIMEOUT_SECS
+    max_pause_secs: float = RATE_LIMIT_MAX_PAUSE_SECS
 
     def __post_init__(self) -> None:
         if self.requests_per_window < 1 or self.historical_requests_per_window < 1:
@@ -76,6 +80,8 @@ class Pacing:
             raise ValueError("window_secs must be positive")
         if not (self.queue_timeout_secs > 0):
             raise ValueError("queue_timeout_secs must be positive")
+        if not (self.max_pause_secs > 0):
+            raise ValueError("max_pause_secs must be positive")
         if self.retries < 0:
             raise ValueError("retries must not be negative")
 
@@ -139,9 +145,10 @@ class RequestScheduler:
     ) -> T:
         """Wait for the turn of a `group` request, then return what `send()` returns.
 
-        A rate-limit refusal (a `CTraderRequestError` with `retry_after_secs`) pauses the group.
-        A historical request is then resent, ahead of its level, up to `Pacing.retries` times;
-        any other is not. Every other error from `send()` propagates untouched.
+        A rate-limit refusal (a `CTraderRequestError` with `retry_after_secs`) pauses the group,
+        for no longer than `Pacing.max_pause_secs`. A historical request is then resent, ahead
+        of its level, up to `Pacing.retries` times; any other is not. Every other error from
+        `send()` propagates untouched.
 
         Raises
         ------
@@ -164,7 +171,8 @@ class RequestScheduler:
             except CTraderRequestError as error:
                 if error.retry_after_secs is None:
                     raise
-                pause = error.retry_after_secs + RATE_LIMIT_PAUSE_MARGIN_SECS
+                cap = self._pacing.max_pause_secs
+                pause = min(error.retry_after_secs + RATE_LIMIT_PAUSE_MARGIN_SECS, cap)
                 state.paused_until = max(state.paused_until, self._clock() + pause)
                 attempt += 1
                 retrying = attempt <= retries
@@ -177,10 +185,17 @@ class RequestScheduler:
                     outcome = "no retry left"
                 else:
                     outcome = "not retried"
-                self._log.warning(
+                refused = (
                     f"Venue rate limit refused a {state.name} request ({error.error_code}, "
-                    f"retryAfter {error.retry_after_secs} s): group paused {pause:g} s, {outcome}",
+                    f"retryAfter {error.retry_after_secs} s)"
                 )
+                if error.retry_after_secs > cap:
+                    self._log.error(
+                        f"{refused}, above the {cap:g} s cap: group paused only {pause:g} s, "
+                        f"{outcome}",
+                    )
+                else:
+                    self._log.warning(f"{refused}: group paused {pause:g} s, {outcome}")
                 if not retrying:
                     raise
 

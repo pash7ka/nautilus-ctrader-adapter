@@ -797,6 +797,21 @@ def test_exchange_code_raises_on_an_unusable_body(token_url: str, body: object) 
     assert exc_info.value.__context__ is None
 
 
+@pytest.mark.parametrize(
+    "expires_in",
+    [10**400, 10**300, 0, -5, "abc"],
+    ids=["1e400", "1e300", "zero", "negative", "text"],
+)
+def test_a_token_response_with_an_absurd_expires_in_is_refused(
+    token_url: str,
+    expires_in: object,
+) -> None:
+    _respond({"accessToken": "AT", "refreshToken": "RT", "expiresIn": expires_in})
+
+    with pytest.raises(CTraderTokenExchangeError, match="expiresIn"):
+        _exchange(token_url)
+
+
 def test_exchange_code_sanitizes_error_code_and_description(token_url: str) -> None:
     nasty = "bad\x07\x1b[31mtext"
     _respond({"errorCode": nasty, "description": nasty})

@@ -31,7 +31,8 @@ dev = [
     # protoc, used by scripts/gen_protobuf.py to regenerate bindings.
     # Its protoc stamps a protobuf version into the generated code, and protobuf refuses
     # generated code newer than the runtime: the `protobuf` floor above moves with this pin.
-    # Changes together with REQUIRED_PROTOBUF_MAJOR in scripts/gen_protobuf.py.
+    # scripts/gen_protobuf.py reads that floor with `declared_protobuf()` and refuses
+    # bindings stamped newer than it.
     "grpcio-tools~=1.84.0",
 ]
 

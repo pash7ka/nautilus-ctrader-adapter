@@ -24,6 +24,7 @@ from nautilus_trader.model.enums import AssetClass
 from nautilus_ctrader.common.account import ENVIRONMENTS, AccountCredentials, Environment
 from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.constants import (
+    RATE_LIMIT_MAX_PAUSE_SECS,
     RATE_LIMIT_RETRIES,
     REQUEST_QUEUE_TIMEOUT_SECS,
     REQUEST_WINDOW_SECS,
@@ -115,6 +116,14 @@ def _resolve_credentials(config: _SecretSettings) -> AccountCredentials:
     )
 
 
+def _require_positive(config: object, *names: str) -> None:
+    """Raises `ValueError` for the first of the `names` settings that is not positive, NaN too."""
+    for name in names:
+        value = getattr(config, name)
+        if not (value > 0):
+            raise ValueError(f"{name} must be positive, got {value}")
+
+
 class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     """
     Configuration for `CTraderDataClient` instances.
@@ -172,13 +181,17 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
         Resends of a historical request the venue refused for its rate limit.
     request_queue_timeout_secs : float, default 60.0
         The longest a request waits in the queue, retries included, before it fails unsent.
+    rate_limit_max_pause_secs : float, default 10.0
+        The longest pause after a rate-limit refusal. A longer `retryAfter` is cut to it and
+        logged as an error.
 
     Raises
     ------
     ValueError
         If `history_page_size` is below 1, `environment` is not one of "auto", "demo",
-        "live", or the request pacing is impossible (a count below 1, a window or queue
-        timeout that is not positive, negative retries).
+        "live", a duration is not positive, `bar_close_history_retries` is negative, or the
+        request pacing is impossible (a count below 1, a window, queue timeout or pause cap
+        that is not positive, negative retries).
 
     Notes
     -----
@@ -215,12 +228,25 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     requests_per_window: int = VENUE_REQUESTS_PER_SEC
     rate_limit_retries: int = RATE_LIMIT_RETRIES
     request_queue_timeout_secs: float = REQUEST_QUEUE_TIMEOUT_SECS
+    rate_limit_max_pause_secs: float = RATE_LIMIT_MAX_PAUSE_SECS
 
     def __post_init__(self) -> None:
         self.pacing()
         if self.history_page_size < 1:
             raise ValueError(
                 f"history_page_size must be at least 1, got {self.history_page_size}",
+            )
+        _require_positive(
+            self,
+            "bar_close_grace_secs",
+            "history_request_timeout_secs",
+            "connect_timeout_secs",
+            "restore_retry_interval_secs",
+        )
+        if self.bar_close_history_retries < 0:
+            raise ValueError(
+                "bar_close_history_retries must not be negative, "
+                f"got {self.bar_close_history_retries}",
             )
         # msgspec does not enforce the `Literal` on direct construction, and the account
         # client checks it only when it is the one building the client.
@@ -244,6 +270,7 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
             window_secs=self.request_window_secs,
             retries=self.rate_limit_retries,
             queue_timeout_secs=self.request_queue_timeout_secs,
+            max_pause_secs=self.rate_limit_max_pause_secs,
         )
 
 
@@ -283,6 +310,9 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
         Resends of a historical request the venue refused for its rate limit.
     request_queue_timeout_secs : float, default 60.0
         The longest a request waits in the queue, retries included, before it fails unsent.
+    rate_limit_max_pause_secs : float, default 10.0
+        The longest pause after a rate-limit refusal. A longer `retryAfter` is cut to it and
+        logged as an error.
     reference_price_max_age_secs : float, default 10.0
         The oldest spot a bracket's levels may be measured from, by the time since it arrived.
         The venue takes a market order's levels only as distances, which it applies to the fill.
@@ -308,8 +338,8 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
         If `instrument_provider` is set, `environment` is not one of "auto", "demo", "live", a
         duration or `reconciliation_default_lookback_mins` is not positive,
         `balance_checkpoint_hour` is outside 0-23, `balance_checkpoint_timezone` is not a
-        known time zone, or the request pacing is impossible (a count below 1, a window or
-        queue timeout that is not positive, negative retries).
+        known time zone, or the request pacing is impossible (a count below 1, a window,
+        queue timeout or pause cap that is not positive, negative retries).
 
     Notes
     -----
@@ -334,6 +364,7 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
     requests_per_window: int = VENUE_REQUESTS_PER_SEC
     rate_limit_retries: int = RATE_LIMIT_RETRIES
     request_queue_timeout_secs: float = REQUEST_QUEUE_TIMEOUT_SECS
+    rate_limit_max_pause_secs: float = RATE_LIMIT_MAX_PAUSE_SECS
     reference_price_max_age_secs: float = 10.0
     protective_order_timeout_secs: float = 2.0
     order_request_timeout_secs: float = 30.0
@@ -353,14 +384,15 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
             raise ValueError(
                 f"environment must be one of {ENVIRONMENTS}, got {self.environment!r}",
             )
-        for name in (
+        _require_positive(
+            self,
+            "connect_timeout_secs",
+            "restore_retry_interval_secs",
             "reference_price_max_age_secs",
             "protective_order_timeout_secs",
             "order_request_timeout_secs",
             "reconciliation_default_lookback_mins",
-        ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        )
         hour = self.balance_checkpoint_hour
         if hour is not None and not 0 <= hour <= 23:
             raise ValueError(f"balance_checkpoint_hour must be 0-23, got {hour}")
@@ -391,4 +423,5 @@ class CTraderExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
             window_secs=self.request_window_secs,
             retries=self.rate_limit_retries,
             queue_timeout_secs=self.request_queue_timeout_secs,
+            max_pause_secs=self.rate_limit_max_pause_secs,
         )

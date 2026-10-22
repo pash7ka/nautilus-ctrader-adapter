@@ -428,12 +428,76 @@ async def test_a_shorter_refusal_never_shortens_a_pause() -> None:
     assert sends.times("next") == [pytest.approx(5.35)]
 
 
+async def test_a_pause_longer_than_the_cap_is_cut_to_the_cap_and_logged_as_error() -> None:
+    clock = VirtualClock()
+    logger = RecordingLogger()
+    s = scheduler(clock, Pacing(max_pause_secs=10.0), logger)
+    sends = Sends(clock)
+
+    async def scenario() -> None:
+        with pytest.raises(CTraderRequestError):
+            await s.submit(GROUP_OTHER, EXECUTION, sends.failing("refused", [refusal(60)]))
+        await clock.at(0.5)
+        await s.submit(GROUP_OTHER, EXECUTION, sends.ok("next"))
+
+    await clock.run(scenario())
+
+    assert sends.times("next") == [pytest.approx(10.0)]
+    (error,) = logger.errors()
+    assert "retryAfter 60 s" in error
+    assert "10 s" in error
+    assert logger.warnings() == []
+
+
+async def test_a_pause_within_the_cap_is_unchanged_and_a_warning() -> None:
+    clock = VirtualClock()
+    logger = RecordingLogger()
+    s = scheduler(clock, Pacing(max_pause_secs=10.0), logger)
+    sends = Sends(clock)
+
+    async def scenario() -> None:
+        with pytest.raises(CTraderRequestError):
+            await s.submit(GROUP_OTHER, EXECUTION, sends.failing("refused", [refusal(1)]))
+        await s.submit(GROUP_OTHER, EXECUTION, sends.ok("next"))
+
+    await clock.run(scenario())
+
+    assert sends.times("next") == [pytest.approx(1.25)]
+    (warning,) = logger.warnings()
+    assert "1.25 s" in warning
+    assert logger.errors() == []
+
+
+async def test_a_repeated_long_refusal_pauses_again_without_spinning() -> None:
+    clock = VirtualClock()
+    logger = RecordingLogger()
+    s = scheduler(clock, Pacing(max_pause_secs=10.0, retries=3), logger)
+    sends = Sends(clock)
+    errors = [refusal(60) for _ in range(10)]
+
+    async def scenario() -> None:
+        await s.submit(GROUP_HISTORICAL, DATA, sends.failing("refused", errors))
+
+    with pytest.raises(CTraderRequestError) as raised:
+        await clock.run(scenario())
+
+    assert raised.value.retry_after_secs == 60
+    assert sends.times("refused") == [
+        0.0,
+        pytest.approx(10.0),
+        pytest.approx(20.0),
+        pytest.approx(30.0),
+    ]
+    assert len(logger.errors()) == 4
+    assert logger.warnings() == []
+
+
 # -- The ceiling ----------------------------------------------------------------------------
 
 
 async def test_the_ceiling_drops_a_request_unsent() -> None:
     clock = VirtualClock()
-    s = scheduler(clock, Pacing(queue_timeout_secs=60.0))
+    s = scheduler(clock, Pacing(queue_timeout_secs=60.0, max_pause_secs=2000.0))
     sends = Sends(clock)
     failed_at: list[float] = []
     errors: list[Exception] = []
@@ -456,7 +520,7 @@ async def test_the_ceiling_drops_a_request_unsent() -> None:
 
 async def test_the_ceiling_counts_retry_waits() -> None:
     clock = VirtualClock()
-    s = scheduler(clock, Pacing(queue_timeout_secs=60.0))
+    s = scheduler(clock, Pacing(queue_timeout_secs=60.0, max_pause_secs=100.0))
     sends = Sends(clock)
     errors = [refusal(30) for _ in range(3)]
     failed_at: list[float] = []
@@ -658,8 +722,9 @@ async def test_reset_forgets_the_window_and_the_pause() -> None:
         {"window_secs": 0.0},
         {"queue_timeout_secs": 0.0},
         {"retries": -1},
+        {"max_pause_secs": 0.0},
     ],
-    ids=["count", "historical count", "window", "ceiling", "retries"],
+    ids=["count", "historical count", "window", "ceiling", "retries", "pause cap"],
 )
 def test_pacing_rejects_impossible_values(overrides) -> None:
     with pytest.raises(ValueError):

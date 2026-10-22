@@ -37,7 +37,8 @@ INBOUND_SILENCE_SECS: float = 90.0
 # Client.send in their SDK defaults to a 5 s response timeout.
 DEFAULT_REQUEST_TIMEOUT_SECS: float = 5.0
 
-# Bounds the TCP connect and TLS handshake, which would otherwise wait on the OS timeout.
+# Bounds only the TCP connect and TLS handshake, which would otherwise wait on the OS timeout.
+# Not the client configs' `connect_timeout_secs`, which bounds the whole account bring-up.
 CONNECT_TIMEOUT_SECS: float = 10.0
 
 # The broker's order types that rest until they trigger; the others fill at once.
@@ -53,6 +54,9 @@ VENUE_HISTORICAL_REQUESTS_PER_SEC: int = 5
 REQUEST_WINDOW_SECS: float = 1.25
 # Added to the venue's `retryAfter` before a refused group sends again.
 RATE_LIMIT_PAUSE_MARGIN_SECS: float = 0.25
+# The longest pause a refusal can order, whatever `retryAfter` asks. Every refusal recorded
+# so far asked 1 s.
+RATE_LIMIT_MAX_PAUSE_SECS: float = 10.0
 # Resends of a refused historical request; other requests are never resent.
 RATE_LIMIT_RETRIES: int = 3
 # The longest a request may wait in the queue, retries included, before it fails unsent.
@@ -96,9 +100,10 @@ MIN_TOKEN_REFRESH_INTERVAL_SECS: float = 300.0
 
 # How long a refresh that timed out still waits for its reply before its connection is closed.
 # A refresh token is single-use, so a reply lost that way leaves no working token pair. Inside
-# `connect()` the wait counts against `connect_timeout_secs`, and a value under about 15 s cuts
-# it short; a bring-up the session runs after a connection loss has no such bound, so there it
-# delays the reconnect backoff.
+# `connect()` the wait counts against the client config's `connect_timeout_secs` (the whole
+# bring-up, default 60 s), and only a setting under about 15 s cuts it short; a bring-up the
+# session runs after a connection loss has no such bound, so there it delays the reconnect
+# backoff.
 LATE_REFRESH_WAIT_SECS: float = 10.0
 
 # Reconnect backoff.

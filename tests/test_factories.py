@@ -265,3 +265,26 @@ def test_the_checkpoint_zone_is_an_iana_name() -> None:
     for name in ("Mars/Olympus_Mons", "", "../UTC"):
         with pytest.raises(ValueError, match="balance_checkpoint_timezone"):
             exec_config(balance_checkpoint_timezone=name)
+
+
+_DATA_DURATIONS = (
+    "bar_close_grace_secs",
+    "history_request_timeout_secs",
+    "connect_timeout_secs",
+    "restore_retry_interval_secs",
+)
+_EXEC_DURATIONS = ("connect_timeout_secs", "restore_retry_interval_secs")
+_NOT_POSITIVE = (0.0, -1.0, float("nan"))
+
+
+@pytest.mark.parametrize(
+    ("build", "setting", "value"),
+    [
+        *((config, name, value) for name in _DATA_DURATIONS for value in _NOT_POSITIVE),
+        *((exec_config, name, value) for name in _EXEC_DURATIONS for value in _NOT_POSITIVE),
+        (config, "bar_close_history_retries", -1),
+    ],
+)
+def test_a_config_refuses_a_non_positive_duration(build, setting, value) -> None:
+    with pytest.raises(ValueError, match=setting):
+        build(**{setting: value})

@@ -229,8 +229,8 @@ two groups: historical (the request types listed above, plus tick data and the p
 lists) and everything else. Each group keeps a sliding window of `request_window_secs`, 1.25 s
 by default, and lets at most 5 historical requests or 50 others leave within any such window.
 The window is longer than the venue's 1 s so that jitter cannot push more than the limit into
-one of the venue's seconds. All five pacing values are settings of the client configs, not
-fixed numbers; the 5, 50, 3 and 60 s here are the defaults. See the settings table in
+one of the venue's seconds. All six pacing values are settings of the client configs, not
+fixed numbers; the 5, 50, 3, 60 s and 10 s here are the defaults. See the settings table in
 [execution.md](execution.md).
 
 - **Priorities.** Waiting requests leave in priority order, then in arrival order: execution
@@ -239,6 +239,9 @@ fixed numbers; the 5, 50, 3 and 60 s here are the defaults. See the settings tab
 - **Refusals.** A rate-limit refusal pauses the refused group for `retryAfter` plus 0.25 s, so
   nothing of that group leaves before the venue's block has passed. The other group is not
   affected.
+- **Pause cap.** No pause lasts longer than `rate_limit_max_pause_secs`, 10 s by default. A
+  refusal whose `retryAfter` is above it pauses the group for the cap only and is logged as an
+  ERROR. Every refusal recorded so far asked 1 s.
 - **Retries.** A refused historical request is sent again after the pause, ahead of the other
   requests at its priority, at most 3 times; the next refusal fails it. A refused request of
   the other group fails at once and is never resent: whether to resend an order is the
