@@ -145,15 +145,11 @@ _OPEN = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _ENDED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
 # Activity after which what stands on unloaded symbols may have changed.
 _EXPOSURE_KINDS = (ActivityKind.UNLOADED_SYMBOL, ActivityKind.STOP_OUT)
-# The least time an event not yet applied holds back a report or an activity; the pass floor
-# below can make it longer. Nautilus applies a queued event within a few passes of the loop; an
-# event it refuses never appears.
+# How long an event not yet applied holds back the reports and activity behind it. Nautilus
+# publishes an event its order's state machine refuses, but never applies it.
 _EVENT_WAIT_SECS = 0.1
-# Whole loop passes an event gets before it can expire, however long the loop stalled: in the
-# first, Nautilus puts it on its queue; in the second, its queue task applies it.
-# TODO(verify): measured on the standard asyncio loop only, not on uvloop, and with Nautilus's
-# event queue below capacity; a full queue enqueues through a task, which takes more passes.
-_EVENT_WAIT_PASSES = 2
+# Nautilus publishes order events on `events.order.{strategy_id}`, after applying them.
+_ORDER_EVENTS_TOPIC = "events.order.*"
 
 
 def check_account(trader: om.ProtoOATrader) -> None:
@@ -568,14 +564,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         # `_disconnect` even after a failed `_connect`: only a user this client holds is released.
         self._holds_account = False
         self._checkpoint: BalanceCheckpoint | None = None
-        # The clock the tracking below reads.
-        self._time: Callable[[], float] = loop.time
         # Events sent to Nautilus's queue and not yet seen applied, oldest first:
-        # event id -> (client order id, time sent, loop pass sent).
-        self._unapplied: dict[UUID4, tuple[ClientOrderId, float, int]] = {}
-        # Loop passes, counted only while an event is tracked, and the callback counting them.
-        self._passes = 0
-        self._pass_counter: asyncio.Handle | None = None
+        # event id -> (client order id, the timer that stops waiting for it).
+        self._unapplied: dict[UUID4, tuple[ClientOrderId, asyncio.TimerHandle]] = {}
         # Tracked events that expired while records were held, not yet warned about.
         self._expired_held = 0
         # Records and the client's own events held behind those events, in order, and the task
@@ -583,6 +574,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._outbox: deque[Record | _Resent | _Deferred] = deque()
         self._outbox_task: asyncio.Task | None = None
         self._delivering = False
+        # What that task awaits while events are tracked: set when one is forgotten.
+        self._wake: asyncio.Future | None = None
         # Unknown orders carrying the adapter's record that were logged at ERROR: one line each.
         self._unknown_ours: set[str] = set()
 
@@ -603,6 +596,9 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._hold_buffer()
             self._session = session
             self._msgbus.subscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
+            self._msgbus.subscribe(
+                topic=_ORDER_EVENTS_TOPIC, handler=self._on_order_event_published
+            )
             session.add_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
             session.add_event_handler(oa.ProtoOATrailingSLChangedEvent, self._on_trailing_stop)
             session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
@@ -666,10 +662,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         if self._outbox_task is not None:
             self._outbox_task.cancel()
             self._outbox_task = None
-        if self._pass_counter is not None:
-            self._pass_counter.cancel()
-            self._pass_counter = None
         held, self._outbox = self._outbox, deque()
+        for _, expiry in self._unapplied.values():
+            expiry.cancel()
         self._unapplied.clear()
         self._expired_held = 0
         self._unknown_ours.clear()
@@ -690,6 +685,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         if session is None:
             return
         self._msgbus.unsubscribe(topic=_RECONCILED_TOPIC, handler=self._on_reconciled)
+        self._msgbus.unsubscribe(topic=_ORDER_EVENTS_TOPIC, handler=self._on_order_event_published)
         session.remove_event_handler(oa.ProtoOAExecutionEvent, self._on_execution_event)
         session.remove_event_handler(oa.ProtoOATrailingSLChangedEvent, self._on_trailing_stop)
         session.remove_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
@@ -1795,44 +1791,53 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._outbox.append(_Deferred(event))
             return
         # Nautilus queues an event; a report or an activity after it waits until it is applied.
-        self._expire_unapplied()
-        self._unapplied[event.id] = (event.client_order_id, self._time(), self._passes)
-        self._count_passes()
+        self._track(event.id, event.client_order_id)
         super()._send_order_event(event)
 
-    def _count_passes(self) -> None:
-        """Count loop passes while an event is tracked."""
-        if self._unapplied and self._pass_counter is None:
-            self._pass_counter = self._loop.call_soon(self._count_pass)
+    def _track(self, event_id: UUID4, client_order_id: ClientOrderId) -> None:
+        # Nautilus enqueues the event in the next loop pass and applies it in the one after. A
+        # timer runs behind the callbacks already queued, and the expiry a pass later still: so
+        # however long the loop stalls, Nautilus has had the event first.
+        # TODO(verify): holds on the standard asyncio loop with Nautilus's event queue below
+        # capacity; a full queue enqueues through a task, which takes more passes, and uvloop is
+        # untested.
+        expiry = self._loop.call_later(
+            _EVENT_WAIT_SECS, self._loop.call_soon, self._expire, event_id
+        )
+        self._unapplied[event_id] = (client_order_id, expiry)
 
-    def _count_pass(self) -> None:
-        # Each run schedules the next, which the loop runs in its next pass.
-        self._pass_counter = None
-        self._passes += 1
-        self._check_unapplied()
+    def _on_order_event_published(self, event: NautilusOrderEvent) -> None:
+        tracked = self._unapplied.get(event.id)
+        # A refused event is published too: it waits for its expiry.
+        if tracked is not None and self._settled(event.id, tracked[0]):
+            self._forget(event.id)
 
-    def _expire_unapplied(self) -> None:
-        """Stop waiting for the events past both the time bound and the pass floor."""
-        oldest = self._time() - _EVENT_WAIT_SECS
-        # The count moves somewhere within a pass, so the pass of the send is not a whole one.
-        latest_pass = self._passes - _EVENT_WAIT_PASSES - 1
-        while self._unapplied:
-            event_id, (_, sent, sent_pass) = next(iter(self._unapplied.items()))
-            if sent > oldest or sent_pass > latest_pass:
-                break
-            del self._unapplied[event_id]
-            if self._outbox:
-                self._expired_held += 1
+    def _expire(self, event_id: UUID4) -> None:
+        tracked = self._unapplied.get(event_id)
+        if tracked is None:
+            return
+        if self._outbox and not self._settled(event_id, tracked[0]):
+            self._expired_held += 1
+        self._forget(event_id)
+
+    def _settled(self, event_id: UUID4, client_order_id: ClientOrderId) -> bool:
+        """Whether Nautilus applied the event: it is among its order's events in the cache."""
+        order = self._cache.order(client_order_id)
+        # Without its order the event can never be applied.
+        return order is None or any(e.id == event_id for e in order.events)
+
+    def _forget(self, event_id: UUID4) -> None:
+        """Stop waiting for the event, and wake the delivery waiting for it."""
+        _, expiry = self._unapplied.pop(event_id)
+        expiry.cancel()
+        if self._wake is not None and not self._wake.done():
+            self._wake.set_result(None)
 
     def _check_unapplied(self) -> None:
-        """Forget the events Nautilus applied, and those past the bound."""
-        for event_id, (client_order_id, _, _) in list(self._unapplied.items()):
-            order = self._cache.order(client_order_id)
-            # Without its order the event can never be applied.
-            if order is None or any(e.id == event_id for e in order.events):
-                del self._unapplied[event_id]
-        self._expire_unapplied()
-        self._count_passes()
+        """Forget the events Nautilus applied."""
+        for event_id, (client_order_id, _) in list(self._unapplied.items()):
+            if self._settled(event_id, client_order_id):
+                self._forget(event_id)
 
     def _bookkeep(self, record: Record | _Resent) -> None:
         """What the client itself learns from a record, done as soon as the model makes it."""
@@ -1871,8 +1876,6 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._bookkeep(record)
             at_once = self._applied_at_once(record)
             if at_once:
-                # With nothing held, events past the bound go without a warning: none held a
-                # record back.
                 self._check_unapplied()
             if self._outbox or (at_once and self._unapplied):
                 self._outbox.append(record)
@@ -1884,11 +1887,16 @@ class CTraderExecutionClient(LiveExecutionClient):
     async def _deliver_outbox(self) -> None:
         try:
             while self._outbox:
-                # Polled, not awaited: nothing signals that Nautilus applied an event. Each
-                # tracked event expires within the bound, which ends the loop.
+                # Woken as each tracked event is published applied, or expires.
                 self._check_unapplied()
                 while self._unapplied:
-                    await asyncio.sleep(0)
+                    wake = self._wake = self._loop.create_future()
+                    try:
+                        await wake
+                    finally:
+                        # A detach may have started another delivery already.
+                        if self._wake is wake:
+                            self._wake = None
                     self._check_unapplied()
                 if self._expired_held:
                     self._log.warning(

@@ -70,11 +70,13 @@ def unloaded_order(order_id: int) -> object:
 
 def track_unapplied(h: Harness, client_order_id: str) -> None:
     """An event of `client_order_id` sent now, which Nautilus will never apply."""
-    h.client._unapplied[UUID4()] = (
-        ClientOrderId(client_order_id),
-        h.client._time(),
-        h.client._passes,
-    )
+    h.client._track(UUID4(), ClientOrderId(client_order_id))
+
+
+def all_applied(h: Harness) -> None:
+    """Nautilus applied every tracked event, as its publications would tell the client."""
+    for event_id in list(h.client._unapplied):
+        h.client._forget(event_id)
 
 
 async def never_applied(h: Harness) -> None:
@@ -95,6 +97,79 @@ async def test_an_activity_behind_an_event_never_applied_is_published_after_a_wa
         assert any("did not apply 1 order event" in line for line in h.logger.warnings())
         assert h.client._unapplied == {}
         assert h.logger.errors() == []
+
+
+async def test_the_outbox_does_not_poll_without_a_pending_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
+    async with harness() as h:
+        await never_applied(h)
+        await push(h, unloaded_order(6_900_001))
+        assert len(h.client._outbox) == 1
+
+        # Loop passes while the activity waits and Nautilus publishes nothing.
+        loop = asyncio.get_running_loop()
+        passes = 0
+        run_once = loop._run_once
+
+        def counted() -> None:
+            nonlocal passes
+            passes += 1
+            run_once()
+
+        loop._run_once = counted
+        try:
+            await asyncio.sleep(0.2)
+        finally:
+            del loop._run_once
+
+        assert passes < 20
+        assert h.activity == []
+
+
+async def test_an_activity_waits_for_its_event_to_be_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Past the wait below: only the event being applied can release the activity.
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
+    async with harness() as h:
+        await submitted(h)
+        entry_seen: list[OrderStatus] = []
+        h.client._msgbus.subscribe(
+            topic=ACCOUNT_ACTIVITY_TOPIC,
+            handler=lambda _a: entry_seen.append(status(h, ENTRY)),
+        )
+
+        h.client._on_execution_event(FIRST_EVENTS[0])
+        h.client._handle_records([unloaded_activity()])
+
+        assert h.activity == []
+        await wait_until(lambda: h.activity)
+        assert entry_seen == [OrderStatus.ACCEPTED]
+        assert h.client._unapplied == {}
+        assert not any("did not apply" in line for line in h.logger.warnings())
+
+
+async def test_a_refused_event_releases_the_outbox_after_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 0.3)
+    async with harness() as h:
+        await submitted(h)
+        h.client.generate_order_rejected(STRATEGY_ID, US100_ID, ClientOrderId(ENTRY), "refused", 0)
+        await wait_until(lambda: status(h, ENTRY) == OrderStatus.REJECTED)
+        loop = asyncio.get_running_loop()
+        sent_at = loop.time()
+
+        # Nautilus publishes these, but its state machine refuses them: the entry was rejected.
+        await push(h, *FIRST_EVENTS[:2], unloaded_order(6_900_001))
+
+        assert h.activity == []
+        await wait_until(lambda: h.activity)
+        assert loop.time() - sent_at >= 0.3
+        assert any("did not apply" in line for line in h.logger.warnings())
+        assert h.client._unapplied == {}
 
 
 async def test_records_held_when_the_client_detaches_are_dropped() -> None:
@@ -243,16 +318,15 @@ async def test_a_close_held_behind_an_event_is_matched_at_once(
 async def test_a_stalled_loop_does_not_expire_an_event_still_queued() -> None:
     async with harness() as h:
         await submitted(h)
-        started_at = h.client._time()
         entry_seen: list[OrderStatus] = []
         h.client._msgbus.subscribe(
             topic=ACCOUNT_ACTIVITY_TOPIC,
             handler=lambda _a: entry_seen.append(status(h, ENTRY)),
         )
 
-        # The entry's acceptance goes to Nautilus's queue; then the loop stalls for a second.
+        # The entry's acceptance goes to Nautilus's queue; then the loop stalls past the bound.
         h.client._on_execution_event(FIRST_EVENTS[0])
-        h.client._time = lambda: started_at + 1.0
+        time.sleep(2 * execution._EVENT_WAIT_SECS)  # noqa: ASYNC251
         h.client._handle_records([unloaded_activity()])
 
         assert h.activity == []
@@ -290,7 +364,7 @@ async def test_an_answer_the_client_sends_itself_waits_behind_a_held_event_of_it
                 ts_init=0,
             ),
         )
-        h.client._unapplied.clear()
+        all_applied(h)
 
         def kinds() -> list[str]:
             return [type(e).__name__ for e in h.cache.order(ClientOrderId(STOP)).events]
@@ -337,7 +411,7 @@ async def test_a_leg_update_held_behind_a_partial_close_keeps_the_smaller_quanti
         await push(h, *FIRST_EVENTS[6:9])
 
         h.client._leg_updated(ClientOrderId(STOP), Level.STOP_LOSS, Decimal("85197.20"))
-        h.client._unapplied.clear()
+        all_applied(h)
         await wait_until(lambda: not h.client._outbox)
 
         stop = h.cache.order(ClientOrderId(STOP))
@@ -345,21 +419,21 @@ async def test_a_leg_update_held_behind_a_partial_close_keeps_the_smaller_quanti
         assert stop.quantity == Quantity.from_str("0.99")
 
 
-async def test_the_pass_count_runs_only_while_an_event_is_tracked() -> None:
+async def test_a_detach_stops_the_expiries_and_the_listening() -> None:
     async with harness(execution_venue=bracket_venue()) as h:
+        listener = (execution._ORDER_EVENTS_TOPIC, h.client._on_order_event_published)
         await bracket_opened(h)
-        await wait_until(lambda: h.client._pass_counter is None)
-        assert h.client._unapplied == {}
+        # Each of the bracket's events was forgotten as Nautilus published it applied.
+        await wait_until(lambda: h.client._unapplied == {})
+        assert h.client._msgbus.is_subscribed(*listener)
 
         track_unapplied(h, ENTRY)
-        h.client._count_passes()
-        counting = h.client._pass_counter
-        assert counting is not None
+        ((_, expiry),) = h.client._unapplied.values()
 
         await h.client._disconnect()
 
-        assert counting.cancelled()
-        assert h.client._pass_counter is None
+        assert expiry.cancelled()
+        assert not h.client._msgbus.is_subscribed(*listener)
 
 
 async def test_a_held_event_that_cannot_be_sent_does_not_stop_what_follows(
@@ -372,7 +446,7 @@ async def test_a_held_event_that_cannot_be_sent_does_not_stop_what_follows(
         # Not an event: its send raises.
         h.client._outbox.append(execution._Deferred(None))
         h.client._handle_records([unloaded_activity()])
-        h.client._unapplied.clear()
+        all_applied(h)
 
         await wait_until(lambda: len(h.activity) == 2)
         assert any("could not be sent" in line for line in h.logger.errors())
