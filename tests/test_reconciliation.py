@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 
 from nautilus_ctrader.common import order_record
+from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.common.reconciliation import (
     PositionHistory,
     Reconciliation,
@@ -25,7 +26,6 @@ from nautilus_ctrader.common.venue_records import (
     Level,
     ReportedOrder,
     ReportStatus,
-    units_of,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -140,7 +140,7 @@ def test_foreign_closed_position_reports_its_levels_as_legs() -> None:
     assert stop.trigger_price == Decimal("85206.20")
     assert stop.status == ReportStatus.FILLED
     assert trade_ids(stop) == ("7000003",)
-    assert stop.units == stop.filled_units == units_of(99)
+    assert stop.units == stop.filled_units == volume_to_units(99)
     assert target.order_type == ExternalType.LIMIT
     assert target.price == Decimal("85353.42")
     assert target.status == ReportStatus.CANCELED
@@ -167,7 +167,7 @@ def test_open_position_reports_live_legs() -> None:
     assert stop.status == target.status == ReportStatus.ACCEPTED
     assert stop.trigger_price == levels[Level.STOP_LOSS]
     assert target.price == levels[Level.TAKE_PROFIT]
-    assert stop.units == target.units == units_of(99)
+    assert stop.units == target.units == volume_to_units(99)
     assert stop.contingency == target.contingency == Contingency.OUO
     assert stop.linked_order_ids == (target_id(FIRST),)
     assert target.linked_order_ids == (stop_id(FIRST),)
@@ -176,7 +176,7 @@ def test_open_position_reports_live_legs() -> None:
     assert reports["6000003"].reduce_only
     (position,) = result.positions
     assert position.venue_position_id == str(FIRST)
-    assert position.units == units_of(99)
+    assert position.units == volume_to_units(99)
     assert position.avg_price == Decimal("85287.21")
 
 
@@ -315,7 +315,7 @@ def test_pending_order_is_reported_accepted_without_id() -> None:
     assert report.client_order_id is None
     assert report.order_type == ExternalType.LIMIT
     assert report.price == Decimal("85100.00")
-    assert report.units == units_of(100)
+    assert report.units == volume_to_units(100)
     assert report.filled_units == 0
     assert not report.reduce_only
     assert result.positions == ()
@@ -503,7 +503,7 @@ def test_an_open_position_is_sized_by_its_own_deals() -> None:
     (position,) = run(snapshot, histories, deals).positions
 
     assert snapshot.position[0].tradeData.volume == 100
-    assert position.units == units_of(99)
+    assert position.units == volume_to_units(99)
     assert position.avg_price == Decimal("85287.21")
 
 
@@ -515,7 +515,7 @@ def test_a_deal_list_cut_short_never_closes_what_the_snapshot_holds_open() -> No
     result = run(snapshot, {FIRST: cut_short}, window(FIRST))
 
     (position,) = result.positions
-    assert position.units == units_of(99)
+    assert position.units == volume_to_units(99)
     assert by_id(result)["6000001-TP"].status != ReportStatus.CANCELED
 
 
@@ -586,7 +586,7 @@ def test_an_open_foreign_position_has_a_leg_per_standing_level() -> None:
     assert target.price == Decimal("85353.42")
     assert target.trigger_price is None
     for leg in (stop, target):
-        assert leg.units == units_of(99)
+        assert leg.units == volume_to_units(99)
         assert leg.filled_units == 0
         assert leg.client_order_id is None
         assert leg.contingency is None

@@ -121,11 +121,6 @@ def side_of(trade_side: int) -> str:
     return _SIDES[trade_side]
 
 
-def units_of(volume: int) -> Decimal:
-    """A venue volume, in hundredths of a unit, as units."""
-    return volume_to_units(volume)
-
-
 def money_of(amount: int, money_digits: int) -> Decimal:
     """A venue money amount, scaled by its own message's `moneyDigits`.
 
@@ -186,7 +181,7 @@ def fill_of(
         trade_id=str(deal.dealId),
         venue_position_id=str(deal.positionId),
         side=side_of(deal.tradeSide),
-        units=units_of(deal.filledVolume),
+        units=volume_to_units(deal.filledVolume),
         price=price_of(deal.executionPrice, precision),
         commission=money_in(deal.commission, deal, account_money_digits),
         ts_ms=deal.executionTimestamp,

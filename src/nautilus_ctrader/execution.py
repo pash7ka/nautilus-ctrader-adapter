@@ -86,7 +86,7 @@ from nautilus_ctrader.common.errors import (
 from nautilus_ctrader.common.operations import OperationsInFlight, PendingBracket, PendingBrackets
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.order_translation import Unsupported
-from nautilus_ctrader.common.parsing import PRICE_SCALE
+from nautilus_ctrader.common.parsing import PRICE_SCALE, volume_to_units
 from nautilus_ctrader.common.rate_limit import RequestPriority
 from nautilus_ctrader.common.reconciliation import (
     PositionHistory,
@@ -114,7 +114,6 @@ from nautilus_ctrader.common.venue_records import (
     ReportedOrder,
     money_in,
     parse_leg_venue_order_id,
-    units_of,
 )
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
@@ -2503,7 +2502,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 "need a check by hand",
             )
             return
-        filled = units_of(sum(event.deal.filledVolume for event in events))
+        filled = volume_to_units(sum(event.deal.filledVolume for event in events))
         if filled != view.units:
             # A deal missed or taken twice: the legs' fills do not add up to the position.
             self._log.error(

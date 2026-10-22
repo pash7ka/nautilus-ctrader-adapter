@@ -106,9 +106,10 @@ from nautilus_ctrader.common.errors import (
 )
 from nautilus_ctrader.common.order_record import parse_label
 from nautilus_ctrader.common.order_translation import Unsupported, volume_from_quantity
+from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.common.session import CTraderSession
 from nautilus_ctrader.common.venue_book import entry_of, remaining_of
-from nautilus_ctrader.common.venue_records import Level, parse_leg_venue_order_id, units_of
+from nautilus_ctrader.common.venue_records import Level, parse_leg_venue_order_id
 from nautilus_ctrader.config import CTraderExecClientConfig
 from nautilus_ctrader.constants import (
     DEMO_HOST,
@@ -513,7 +514,7 @@ def choose(
     """The owner's pending order and position on the symbol, from the broker's snapshot."""
     pending = _pending_on(snapshot, symbol_id)
     positions = _positions_on(snapshot, symbol_id)
-    minimum = units_of(min_volume)
+    minimum = volume_to_units(min_volume)
     reasons: list[str] = []
     if len(pending) != 1:
         reasons.append(f"{len(pending)} pending orders on the symbol, not exactly one")
@@ -525,11 +526,11 @@ def choose(
         if parse_label(order.tradeData.label) is not None:
             reasons.append("the pending order was placed by the node: it carries its label")
         if order.tradeData.volume != min_volume:
-            volume = units_of(order.tradeData.volume)
+            volume = volume_to_units(order.tradeData.volume)
             reasons.append(f"the pending order's volume is {volume}, not the minimum {minimum}")
     reasons += _protected_position_reasons(positions)
     if len(positions) == 1 and positions[0].tradeData.volume != min_volume:
-        volume = units_of(positions[0].tradeData.volume)
+        volume = volume_to_units(positions[0].tradeData.volume)
         reasons.append(f"the position's volume is {volume}, not the minimum {minimum}")
     if reasons:
         return Refusal(tuple(reasons))
@@ -563,7 +564,10 @@ def choose_watched(
         reasons.append(f"{len(pending)} pending orders on the symbol, not none")
     reasons += _protected_position_reasons(positions)
     if len(positions) == 1 and positions[0].tradeData.volume < 3 * min_volume:
-        volume, least = units_of(positions[0].tradeData.volume), units_of(3 * min_volume)
+        volume, least = (
+            volume_to_units(positions[0].tradeData.volume),
+            volume_to_units(3 * min_volume),
+        )
         reasons.append(f"the position's volume is {volume}, under three times the minimum, {least}")
     if reasons:
         return Refusal(tuple(reasons))
@@ -1023,7 +1027,7 @@ def left_open(
 
 def _still_open(position: om.ProtoOAPosition, symbol: str, *, volume: bool = False) -> str:
     """The line telling the owner to close `position` by hand; with its volume if `volume`."""
-    size = f" at {units_of(position.tradeData.volume)}" if volume else ""
+    size = f" at {volume_to_units(position.tradeData.volume)}" if volume else ""
     if not position.HasField("stopLoss"):
         return (
             f"The position on {symbol} stays open{size} WITHOUT a stop-loss: close it by hand now."
@@ -1262,7 +1266,10 @@ def decide_closing_deal(
         listed = (
             ""
             if remaining is None
-            else f"; the broker lists {units_of(remaining)} of {units_of(start_volume)}"
+            else (
+                f"; the broker lists {volume_to_units(remaining)} "
+                f"of {volume_to_units(start_volume)}"
+            )
         )
         return DIFFERS, (
             f"the position became smaller, but no execution event carried a closing deal{listed}",
@@ -1270,7 +1277,8 @@ def decide_closing_deal(
     event = deal.message
     lines = [
         f"t={deal.t:.2f} s: {_event_text(event)}",
-        f"deal volume {units_of(event.deal.volume)}, filled {units_of(event.deal.filledVolume)}",
+        f"deal volume {volume_to_units(event.deal.volume)}, "
+        f"filled {volume_to_units(event.deal.filledVolume)}",
     ]
     if remaining is None:
         return UNKNOWN, (
@@ -1279,7 +1287,8 @@ def decide_closing_deal(
         )
     if event.deal.filledVolume != start_volume - remaining:
         lines.append(
-            f"but the position went from {units_of(start_volume)} to {units_of(remaining)}"
+            f"but the position went from {volume_to_units(start_volume)} "
+            f"to {volume_to_units(remaining)}"
         )
         return DIFFERS, tuple(lines)
     return OK, tuple(lines)
@@ -1294,7 +1303,9 @@ def decide_deal_carries_position(deal: Inbound | None) -> Decision:
         return DIFFERS, (
             "the event carries no position; the adapter moves the volume it knows by the deal",
         )
-    return OK, (f"the event carries the position, at {units_of(event.position.tradeData.volume)}",)
+    return OK, (
+        f"the event carries the position, at {volume_to_units(event.position.tradeData.volume)}",
+    )
 
 
 def decide_reduction_arrives(
@@ -1317,13 +1328,13 @@ def decide_reduction_arrives(
             "no execution event of the protective order with a smaller volume before the "
             f"{wait_secs:g} s window ended",
             (
-                f"the broker now lists it at {units_of(listed.tradeData.volume)}"
+                f"the broker now lists it at {volume_to_units(listed.tradeData.volume)}"
                 if listed is not None
                 else "the broker now lists no protective order for the position"
             ),
         )
     event = reduced.message
-    volume = units_of(event.order.tradeData.volume)
+    volume = volume_to_units(event.order.tradeData.volume)
     lines = [f"t={reduced.t:.2f} s: {_event_text(event)}, volume {volume}"]
     after = deal is not None and reduced.t >= deal.t
     if deal is None:
@@ -1351,7 +1362,10 @@ def decide_reduced_total(
     if remaining is None:
         return UNKNOWN, ("the position's remaining volume was not read",)
     volume = reduced.message.order.tradeData.volume
-    line = f"tradeData.volume {units_of(volume)}; the position holds {units_of(remaining)}"
+    line = (
+        f"tradeData.volume {volume_to_units(volume)}; "
+        f"the position holds {volume_to_units(remaining)}"
+    )
     if _twins(start_volume, remaining):
         return UNKNOWN, (line, _TWINS)
     if volume == remaining:
@@ -1388,12 +1402,14 @@ def decide_executed_volume(
     lines = []
     for where, order in orders:
         executed = (
-            f"executedVolume {units_of(order.executedVolume)}"
+            f"executedVolume {volume_to_units(order.executedVolume)}"
             if order.HasField("executedVolume")
             else "executedVolume not set"
         )
-        lines.append(f"{where}: {executed}; the adapter reads {units_of(remaining_of(order))} left")
-    lines.append(f"the position holds {units_of(remaining)}")
+        lines.append(
+            f"{where}: {executed}; the adapter reads {volume_to_units(remaining_of(order))} left"
+        )
+    lines.append(f"the position holds {volume_to_units(remaining)}")
     if _twins(start_volume, remaining):
         return UNKNOWN, (*lines, _TWINS)
     agree = all(remaining_of(order) == remaining for _, order in orders)
@@ -1432,7 +1448,7 @@ def decide_legs_follow(
         return UNKNOWN, (_nothing_closed(wait_secs),)
     if remaining is None:
         return UNKNOWN, ("the position's remaining volume was not read",)
-    expected = units_of(remaining)
+    expected = volume_to_units(remaining)
     lines = []
     for leg in legs:
         if leg.quantity is None:
@@ -1470,15 +1486,15 @@ def decide_remaining(
     if remaining is None:
         return UNKNOWN, ("the broker's snapshot was not read at the end",)
     lines = [
-        f"from {units_of(start_volume)}, {units_of(asked)} asked to close",
+        f"from {volume_to_units(start_volume)}, {volume_to_units(asked)} asked to close",
         (
-            f"the broker lists {units_of(remaining)}"
+            f"the broker lists {volume_to_units(remaining)}"
             if remaining
             else "the broker lists the position no more"
         ),
     ]
     if last_event is not None:
-        lines.append(f"the last execution event carried {units_of(last_event)}")
+        lines.append(f"the last execution event carried {volume_to_units(last_event)}")
     if remaining == start_volume:
         if closed:
             return DIFFERS, (*lines, "the broker still lists the whole volume")
@@ -2061,8 +2077,9 @@ class Watch(_Run):
         start_volume = watched.position.tradeData.volume
         logged_from = len(result.logger.lines) if result.logger is not None else 0
         self._status(
-            f"Found the position and its two legs. Now close {units_of(self._min_volume)} of the "
-            "position, the minimum volume, by hand in the terminal. Listening up to "
+            "Found the position and its two legs. Now close "
+            f"{volume_to_units(self._min_volume)} of the position, the minimum volume, by hand "
+            "in the terminal. Listening up to "
             f"{settings.close_wait_secs:g} s.",
         )
         start = self._recorder.now()

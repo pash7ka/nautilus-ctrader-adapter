@@ -20,6 +20,7 @@ from nautilus_ctrader.common import foreign_legs as foreign_leg_rules
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.foreign_legs import ForeignLeg
 from nautilus_ctrader.common.order_record import LegIds
+from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.common.venue_records import (
     Action,
     Activity,
@@ -44,7 +45,6 @@ from nautilus_ctrader.common.venue_records import (
     position_levels,
     price_of,
     side_of,
-    units_of,
 )
 from nautilus_ctrader.constants import PENDING_ORDER_TYPES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -314,7 +314,7 @@ class VenueBook:
             position_id=position.position_id,
             symbol_id=position.symbol_id,
             side=position.side,
-            units=units_of(position.volume),
+            units=volume_to_units(position.volume),
             open=position.open,
             ours=position.ours,
             entry_order_id=position.entry_order_id,
@@ -324,12 +324,12 @@ class VenueBook:
             legs={level: (leg.client_order_id, leg.alive) for level, leg in position.legs.items()},
             leg_units={
                 **{
-                    level: units_of(leg.quantity)
+                    level: volume_to_units(leg.quantity)
                     for level, leg in position.legs.items()
                     if leg.alive and leg.accepted
                 },
                 **{
-                    level: units_of(leg.quantity)
+                    level: volume_to_units(leg.quantity)
                     for level, leg in position.foreign_legs.items()
                     if leg.alive
                 },
@@ -345,7 +345,9 @@ class VenueBook:
     def exposure(self) -> tuple[Exposure, ...]:
         """What stands on symbols the node has not loaded, sorted."""
         positions = (
-            Exposure(position.symbol_id, "position", position.side, units_of(position.volume))
+            Exposure(
+                position.symbol_id, "position", position.side, volume_to_units(position.volume)
+            )
             for position in self._positions.values()
             if position.open and self._precision(position.symbol_id) is None
         )
@@ -876,7 +878,7 @@ class VenueBook:
             position.symbol_id,
             "position",
             position.side,
-            units_of(position.volume) if units is None else units,
+            volume_to_units(position.volume) if units is None else units,
             action,
             ts_ms,
         )
@@ -907,7 +909,7 @@ class VenueBook:
             symbol_id=order.tradeData.symbolId,
             side=side_of(order.tradeData.tradeSide),
             order_type=kind,
-            units=units_of(order.tradeData.volume),
+            units=volume_to_units(order.tradeData.volume),
             reduce_only=reduce_only,
             venue_position_id=str(order.positionId) if order.HasField("positionId") else None,
             ts_ms=order.utcLastUpdateTimestamp,
@@ -1046,7 +1048,7 @@ class VenueBook:
                         position,
                         Action.OPENED,
                         event.deal.executionTimestamp,
-                        units_of(event.deal.filledVolume),
+                        volume_to_units(event.deal.filledVolume),
                     )
                 )
             if learnt and position.levels:
@@ -1062,7 +1064,7 @@ class VenueBook:
                     position,
                     action,
                     event.deal.executionTimestamp,
-                    units_of(event.deal.filledVolume),
+                    volume_to_units(event.deal.filledVolume),
                 )
             )
         if filled and (position.legs or position.foreign_legs) and not position.open:
@@ -1235,7 +1237,7 @@ class VenueBook:
                         position,
                         level,
                         ts,
-                        quantity=units_of(leg.quantity),
+                        quantity=volume_to_units(leg.quantity),
                         price=new,
                     ),
                 )
@@ -1269,7 +1271,7 @@ class VenueBook:
                             position,
                             level,
                             ts,
-                            quantity=units_of(leg.quantity),
+                            quantity=volume_to_units(leg.quantity),
                             price=new,
                         )
                     )
@@ -1285,7 +1287,11 @@ class VenueBook:
                 leg.quantity = quantity
                 records.append(
                     self._leg_event(
-                        OrderEventKind.UPDATED, position, level, ts, quantity=units_of(quantity)
+                        OrderEventKind.UPDATED,
+                        position,
+                        level,
+                        ts,
+                        quantity=volume_to_units(quantity),
                     ),
                 )
         return records
@@ -1425,7 +1431,7 @@ class VenueBook:
     @staticmethod
     def _unnamed_close(position: _Position, deal: om.ProtoOADeal) -> Notice:
         return Notice(
-            f"the broker closed {units_of(deal.filledVolume)} of position "
+            f"the broker closed {volume_to_units(deal.filledVolume)} of position "
             f"{position.position_id} on its own, for a reason the event does not name",
         )
 
@@ -1434,7 +1440,7 @@ class VenueBook:
         event: oa.ProtoOAExecutionEvent,
         position: _Position,
     ) -> list[Record]:
-        units = units_of(event.deal.filledVolume)
+        units = volume_to_units(event.deal.filledVolume)
         ts = event.deal.executionTimestamp
         action = Action.PARTIALLY_CLOSED if position.open else Action.CLOSED
         # TODO(verify): that a stop-out's closing order carries `isStopOut`; none was recorded.
@@ -1466,20 +1472,20 @@ class VenueBook:
             else:
                 action = Action.OPENED
             subject, side = "position", position_side
-            units, ts = units_of(event.deal.filledVolume), event.deal.executionTimestamp
+            units, ts = volume_to_units(event.deal.filledVolume), event.deal.executionTimestamp
         elif order.orderType == om.STOP_LOSS_TAKE_PROFIT:
             if kind not in (om.ORDER_ACCEPTED, om.ORDER_REPLACED, om.ORDER_CANCELLED):
                 return []
             subject, side, action = "position", position_side, Action.CHANGED
             volume = event.position.tradeData.volume if has_position else data.volume
-            units, ts = units_of(volume), order.utcLastUpdateTimestamp
+            units, ts = volume_to_units(volume), order.utcLastUpdateTimestamp
         elif kind in (om.ORDER_ACCEPTED, om.ORDER_REPLACED, om.ORDER_CANCELLED, om.ORDER_EXPIRED):
             action = {
                 om.ORDER_ACCEPTED: Action.OPENED,
                 om.ORDER_REPLACED: Action.CHANGED,
             }.get(kind, Action.CLOSED)
             subject, side = "order", side_of(data.tradeSide)
-            units, ts = units_of(data.volume), order.utcLastUpdateTimestamp
+            units, ts = volume_to_units(data.volume), order.utcLastUpdateTimestamp
         else:
             return []
         kind_of_activity = (
@@ -1493,7 +1499,7 @@ class VenueBook:
             order.tradeData.symbolId,
             "order",
             side_of(order.tradeData.tradeSide),
-            units_of(remaining_of(order)),
+            volume_to_units(remaining_of(order)),
         )
 
     def _track_unloaded(self, event: oa.ProtoOAExecutionEvent) -> None:
@@ -1508,7 +1514,7 @@ class VenueBook:
             self._unloaded_orders[order_id] = self._pending(order)
         elif kind == om.ORDER_PARTIAL_FILL and order_id in self._unloaded_orders:
             held = self._unloaded_orders[order_id]
-            left = held.units - units_of(event.deal.filledVolume)
+            left = held.units - volume_to_units(event.deal.filledVolume)
             if left > 0:
                 self._unloaded_orders[order_id] = replace(held, units=left)
             else:

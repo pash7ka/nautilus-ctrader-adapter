@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pytest
 
+from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.common.venue_records import (
     ExternalOrder,
     ExternalType,
@@ -15,7 +16,6 @@ from nautilus_ctrader.common.venue_records import (
     money_of,
     parse_leg_venue_order_id,
     price_of,
-    units_of,
 )
 
 
@@ -59,7 +59,7 @@ def test_a_price_too_large_for_its_precision_is_refused_as_a_value_error() -> No
     ("volume", "expected"), [(100, Decimal("1")), (99, Decimal("0.99")), (1, Decimal("0.01"))]
 )
 def test_a_volume_in_hundredths_is_units(volume, expected) -> None:
-    assert units_of(volume) == expected
+    assert volume_to_units(volume) == expected
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import Protocol
 
 from nautilus_ctrader.common import order_record
+from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.common.venue_book import (
     EXTERNAL_TYPE,
     created_of,
@@ -40,7 +41,6 @@ from nautilus_ctrader.common.venue_records import (
     position_levels,
     price_of,
     side_of,
-    units_of,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -272,7 +272,7 @@ def reconcile(
             for index, report in enumerate(reports)
         ]
         if venue_position is not None:
-            units = units_of(volume) if found.complete and still_open else None
+            units = volume_to_units(volume) if found.complete and still_open else None
             positions.append(_position_report(venue_position, digits, units))
     reported = {report.venue_order_id for _, report in keyed}
     for order in snapshot.order:
@@ -711,10 +711,10 @@ class _Position:
         source, levels = found
         if venue_position is not None:
             if live_protective is not None:
-                rest = units_of(remaining_of(live_protective))
+                rest = volume_to_units(remaining_of(live_protective))
                 ts_ms = live_protective.utcLastUpdateTimestamp
             else:
-                rest = units_of(venue_position.tradeData.volume)
+                rest = volume_to_units(venue_position.tradeData.volume)
                 ts_ms = venue_position.utcLastUpdateTimestamp
             if level in levels:
                 status = ReportStatus.PARTIALLY_FILLED if fills else ReportStatus.ACCEPTED
@@ -724,7 +724,7 @@ class _Position:
         else:
             opened = [*self.entry_fills, *(f for o in self.raises for f in self.fills[o.orderId])]
             leg_units = (
-                units_of(source.tradeData.volume)
+                volume_to_units(source.tradeData.volume)
                 if source is not None
                 else sum((fill.units for fill in opened), Decimal(0))
             )
@@ -805,7 +805,7 @@ def _order_report(
         side=side_of(data.tradeSide),
         order_type=kind,
         status=_status(order, fills),
-        units=units_of(data.volume),
+        units=volume_to_units(data.volume),
         filled_units=sum((fill.units for fill in fills), Decimal(0)),
         reduce_only=reduce_only,
         venue_position_id=str(order.positionId) if order.HasField("positionId") else None,
@@ -830,7 +830,7 @@ def _position_report(
         venue_position_id=str(position.positionId),
         symbol_id=position.tradeData.symbolId,
         side=side_of(position.tradeData.tradeSide),
-        units=units_of(position.tradeData.volume) if units is None else units,
+        units=volume_to_units(position.tradeData.volume) if units is None else units,
         avg_price=price_of(position.price, precision),
         ts_ms=position.utcLastUpdateTimestamp,
     )

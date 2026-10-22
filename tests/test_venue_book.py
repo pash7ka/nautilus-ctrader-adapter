@@ -12,6 +12,7 @@ import pytest
 
 from nautilus_ctrader.common.operations import OperationsInFlight
 from nautilus_ctrader.common.order_record import LegIds, encode_comment, encode_label
+from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.common.venue_book import VenueBook, entry_of
 from nautilus_ctrader.common.venue_records import (
     Action,
@@ -30,7 +31,6 @@ from nautilus_ctrader.common.venue_records import (
     OrderEventKind,
     ProtectionMissing,
     leg_venue_order_id,
-    units_of,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -2432,8 +2432,8 @@ def test_exposure_lists_unloaded_positions_and_orders_sorted() -> None:
     b.load(response, {})
 
     assert b.exposure() == (
-        Exposure(near, "order", "BUY", units_of(40)),
-        Exposure(far, "position", "SELL", units_of(250)),
+        Exposure(near, "order", "BUY", volume_to_units(40)),
+        Exposure(far, "position", "SELL", volume_to_units(250)),
     )
 
 

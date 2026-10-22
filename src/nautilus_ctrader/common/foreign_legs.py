@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
+from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.common.venue_records import (
     EntryUnknown,
     ExternalOrder,
@@ -25,7 +26,6 @@ from nautilus_ctrader.common.venue_records import (
     Record,
     leg_prices,
     leg_venue_order_id,
-    units_of,
 )
 
 _LEVELS = (Level.STOP_LOSS, Level.TAKE_PROFIT)
@@ -87,7 +87,7 @@ def foreign_leg(
         symbol_id=symbol_id,
         side="SELL" if position_side == "BUY" else "BUY",
         order_type=ExternalType.STOP_MARKET if level == Level.STOP_LOSS else ExternalType.LIMIT,
-        units=units_of(volume),
+        units=volume_to_units(volume),
         reduce_only=True,
         venue_position_id=str(position_id),
         ts_ms=ts_ms,
@@ -248,7 +248,7 @@ def _accepted_ms(position: ForeignPosition, ts: int) -> int:
 def _resized(leg: ForeignLeg, ts: int) -> OrderEvent:
     """The leg updated to its quantity, its price unchanged."""
     return OrderEvent(
-        OrderEventKind.UPDATED, leg.venue_order_id, None, ts, quantity=units_of(leg.quantity)
+        OrderEventKind.UPDATED, leg.venue_order_id, None, ts, quantity=volume_to_units(leg.quantity)
     )
 
 
@@ -260,7 +260,7 @@ def _moved(leg: ForeignLeg, level: Level, price: Decimal, ts: int) -> OrderEvent
         leg.venue_order_id,
         None,
         ts,
-        quantity=units_of(leg.quantity),
+        quantity=volume_to_units(leg.quantity),
         price=limit,
         trigger_price=trigger,
     )
