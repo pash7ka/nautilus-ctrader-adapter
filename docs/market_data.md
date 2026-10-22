@@ -211,9 +211,14 @@ guarantee against a shortened warm-up does not hold for such a request.
 ## Quotes, and the conversion symbols nobody asked for
 
 A quote subscription publishes a `QuoteTick` per spot event, once both sides are known. Spot
-events are one-sided — an event carries only the side that moved — so the last bid and the last
-ask are kept per symbol and a tick is published as soon as a pair exists. After a reconnect both
-sides are forgotten, so a price from before an outage is never paired with one from after it.
+events are one-sided — an event carries only the side that moved — so the account keeps each
+symbol's last bid and last ask, once for all its clients, and a tick pairs them as soon as both
+exist. Both sides are forgotten only when the venue subscription breaks: at a reconnect, or when
+every holder has released the symbol's spots. So a price from before an outage is never paired
+with one from after it. A quote subscription that ends and starts again while another hold kept
+the spots live, such as another client's or this client's own bars, pairs with the side kept
+meanwhile. Spots that arrive after the venue ends the account's authentication, before the
+connection is brought up again, publish no ticks.
 
 A spot subscription is shared by every client of the account, and a client joining one that is
 already live sends the venue nothing, so whatever the venue sent when the subscription opened is

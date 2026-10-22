@@ -111,7 +111,9 @@ class SubscriptionRegistry:
     - It outlives sessions: the account client `attach`es each new session before starting it
       and `detach`es it when dropping it.
     - It keeps each symbol's last spot for `last_spot()`. A consumer joining a live subscription
-      sends the venue nothing, so it would otherwise have no price until the next spot.
+      sends the venue nothing, so it would otherwise have no price until the next spot. The data
+      client builds every quote from it, so its keeping and clearing decide which bid and ask
+      a quote may pair.
     - It tells each trendbar recovery listener when the venue confirms live trendbars whose
       restore had failed or whose first subscribe got no answer, on the retry that confirms them.
     """

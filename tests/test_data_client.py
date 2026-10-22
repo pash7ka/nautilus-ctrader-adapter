@@ -52,6 +52,7 @@ from nautilus_ctrader.common.errors import (
     CTraderRequestError,
     CTraderTimeoutError,
 )
+from nautilus_ctrader.common.parsing import price_from_raw
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.data import CTraderDataClient, _conversion_message, _raw_bar
@@ -834,6 +835,43 @@ async def test_a_last_spot_from_before_a_reconnect_is_not_published(
         await subscribe_quotes(h, GER40_ID)
 
         assert ger40_quotes(h) == []
+
+
+async def test_quotes_never_carry_a_bid_or_ask_from_before_a_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
+    bid_after = GER40_SPOT.bid + 100_000
+    ask_after = GER40_SPOT.ask + 100_000
+    async with harness() as h:
+        await h.client._connect()
+        await held_elsewhere(h)
+        connections = h.server.connection_count
+        await h.server.drop_connections()
+        await wait_until(
+            lambda: h.server.connection_count > connections and h.account.session.is_ready,
+            description="session ready again",
+        )
+        await push_spot(
+            h,
+            oa.ProtoOASpotEvent(
+                ctidTraderAccountId=ACCOUNT_ID, symbolId=GER40_SYMBOL_ID, bid=bid_after
+            ),
+        )
+
+        await subscribe_quotes(h, GER40_ID)
+        assert ger40_quotes(h) == []
+        await push_spot(
+            h,
+            oa.ProtoOASpotEvent(
+                ctidTraderAccountId=ACCOUNT_ID, symbolId=GER40_SYMBOL_ID, ask=ask_after
+            ),
+        )
+
+        (quote,) = ger40_quotes(h)
+        precision = h.provider.find(GER40_ID).price_precision
+        assert quote.bid_price == price_from_raw(bid_after, precision)
+        assert quote.ask_price == price_from_raw(ask_after, precision)
 
 
 async def test_no_last_spot_is_published_while_the_connection_is_down() -> None:
@@ -1997,6 +2035,20 @@ async def test_a_bid_from_before_a_reconnect_is_not_paired_while_the_restores_ru
         await h.client._disconnect()
 
 
+async def test_spots_after_the_venue_ends_the_account_authentication_make_no_quotes() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await subscribe_quotes(h, EURUSD_ID)
+        await push_spot(h, BID_ONLY)
+        session = h.account.session
+
+        # In one go, as frames already read behind the event are dispatched.
+        session._on_event(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
+        session._on_event(ASK_ONLY)
+
+        assert not h.quotes()
+
+
 # -- Live bars ------------------------------------------------------------------------------
 
 
@@ -2074,7 +2126,7 @@ async def test_an_intraday_open_time_off_the_grid_is_published_not_rounded() -> 
         assert [b.ts_event for b in h.bars()] == [close_ns(opened, 900)]
 
 
-async def test_a_quote_unsubscribe_forgets_the_book_although_the_bars_go_on() -> None:
+async def test_a_quote_resubscribe_pairs_a_side_kept_while_the_bars_held_the_spots() -> None:
     # No conversion, so the quote subscription is the symbol's only spot hold.
     client_config = config(
         subscribe_conversion_quotes=False,
@@ -2092,8 +2144,11 @@ async def test_a_quote_unsubscribe_forgets_the_book_although_the_bars_go_on() ->
         await subscribe_quotes(h, EURUSD_ID)
         await push_spot(h, ASK_ONLY)
 
-        # The bid is from before the gap in the subscription, so it may not be paired.
-        assert not h.quotes()
+        # The bars kept the venue subscription, so the bid is still current.
+        (quote,) = h.quotes()
+        assert str(quote.bid_price) == "1.14813"
+        assert str(quote.ask_price) == "1.14814"
+        assert quote.ts_event == ASK_ONLY.timestamp * 1_000_000
 
 
 async def test_subscribing_bars_holds_the_trendbar_subscription() -> None:

@@ -58,6 +58,7 @@ from nautilus_ctrader.common.parsing import (
 )
 from nautilus_ctrader.common.rate_limit import RequestPriority
 from nautilus_ctrader.common.session import CTraderSession
+from nautilus_ctrader.common.subscriptions import LastSpot
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.enums import PERIOD_SECS, trendbar_period_for
@@ -149,17 +150,6 @@ def _answer_data_type(request: RequestData) -> DataType:
     if type(request) is RequestData:
         return request.data_type
     return DataType(request.data_type.type, metadata={"instrument_id": request.instrument_id})
-
-
-@dataclass
-class _Book:
-    """The last bid and ask seen for one symbol.
-
-    A spot event carries only the side that moved, so both are kept until a tick can be built.
-    """
-
-    bid: int | None = None
-    ask: int | None = None
 
 
 @dataclass(frozen=True)
@@ -310,10 +300,6 @@ class CTraderDataClient(LiveMarketDataClient):
         # releases what an earlier instance left behind.
         self._owner = f"data:{self.id}"
         self._session: CTraderSession | None = None
-        self._books: dict[int, _Book] = {}
-        # The session and its `bring_up_generation` that `_books` were filled under. A session
-        # is part of it because each one counts its bring-ups from zero.
-        self._books_generation: tuple[CTraderSession, int] | None = None
         # One listener per symbol however many holds it has: a symbol that is both subscribed
         # and a conversion leg would otherwise emit every quote once per listener.
         self._spot_listeners: dict[int, SpotListener] = {}
@@ -458,7 +444,6 @@ class CTraderDataClient(LiveMarketDataClient):
         for symbol_id, listener in self._spot_listeners.items():
             self._account.subscriptions.remove_spot_listener(symbol_id, listener)
         self._spot_listeners.clear()
-        self._books.clear()
         self._preparing.clear()
 
     # -- Instruments ------------------------------------------------------------------------
@@ -1007,6 +992,13 @@ class CTraderDataClient(LiveMarketDataClient):
             await self._release_spots(symbol_id, consumer)
 
     def _on_quote_spot(self, symbol_id: int, event: oa.ProtoOASpotEvent) -> None:
+        self._publish_quote(symbol_id, event.timestamp if event.HasField("timestamp") else None)
+
+    def _publish_quote(self, symbol_id: int, timestamp: int | None) -> None:
+        """Publish the account's last spot of `symbol_id`, stamped `timestamp` (broker ms) if any.
+
+        Nothing while that spot lacks a side.
+        """
         # Looked up per event rather than captured, so a reloaded instrument's precisions apply.
         instrument = self._instrument_provider.instrument_for_symbol_id(symbol_id)
         if instrument is None:
@@ -1020,23 +1012,19 @@ class CTraderDataClient(LiveMarketDataClient):
             )
             return
         instrument_id = instrument.id
-        book = self._book(event.symbolId)
-        if event.HasField("bid"):
-            book.bid = event.bid
-        if event.HasField("ask"):
-            book.ask = event.ask
-        if book.bid is None or book.ask is None:
+        spot = self._account.subscriptions.last_spot(symbol_id)
+        if spot is None or spot.bid is None or spot.ask is None:
             return
         ts_init = self._clock.timestamp_ns()
         try:
             quote = quote_from_prices(
                 instrument_id,
-                book.bid,
-                book.ask,
+                spot.bid,
+                spot.ask,
                 instrument.price_precision,
                 self._quote_size,
                 instrument.size_precision,
-                event.timestamp * 1_000_000 if event.HasField("timestamp") else ts_init,
+                ts_init if timestamp is None else timestamp * 1_000_000,
                 ts_init,
             )
         except CTraderProtocolError as e:
@@ -1067,20 +1055,6 @@ class CTraderDataClient(LiveMarketDataClient):
             return
         seen.add(key)
         first(message)
-
-    def _book(self, symbol_id: int) -> _Book:
-        """`symbol_id`'s book, every book emptied first if the session has been brought up since.
-
-        After a reconnect a side from before the outage must never be paired with one from
-        after it. Decided by generation rather than by a restore, because restores run in the
-        order their keys were first registered, and another client's may run first.
-        """
-        session = self._account.session
-        generation = None if session is None else (session, session.bring_up_generation)
-        if generation != self._books_generation:
-            self._books.clear()
-            self._books_generation = generation
-        return self._books.setdefault(symbol_id, _Book())
 
     # -- Bars -------------------------------------------------------------------------------
 
@@ -1622,6 +1596,8 @@ class CTraderDataClient(LiveMarketDataClient):
         subscriptions = self._account.subscriptions
         if consumer in subscriptions.active_consumers(symbol_id, self._owner):
             return False
+        quoted = self._quoting(symbol_id)
+        before = subscriptions.last_spot(symbol_id)
         # Attached first: the registry makes the consumer active as the call starts, so a spot
         # arriving before the answer is published.
         self._attach_listener(symbol_id)
@@ -1630,39 +1606,23 @@ class CTraderDataClient(LiveMarketDataClient):
         finally:
             # Detaches it again if the registry did not count the subscribe.
             self._sync_listener(symbol_id)
-        self._publish_last_spot(symbol_id)
+        if not quoted:
+            self._publish_last_spot(symbol_id, before)
         return True
 
-    def _publish_last_spot(self, symbol_id: int) -> None:
-        """Publish the account's last spot of a symbol this client has no quote of yet.
+    def _publish_last_spot(self, symbol_id: int, before: LastSpot | None) -> None:
+        """Publish the account's last spot unless it changed from `before` during the subscribe.
 
         Joining a live subscription sends the venue nothing, so without it the first quote
-        would wait for the price to move. The quote carries the spot's own broker time.
+        would wait for the price to move. A spot that came during the subscribe was quoted as
+        it came. The quote carries the spot's own broker time.
         """
-        if not self._quoting(symbol_id):
-            return
-        book = self._book(symbol_id)
         spot = self._account.subscriptions.last_spot(symbol_id)
-        if (book.bid is not None and book.ask is not None) or spot is None:
-            return
-        if spot.bid is None or spot.ask is None:
-            return
-        event = oa.ProtoOASpotEvent(
-            ctidTraderAccountId=self._account.account_id,
-            symbolId=symbol_id,
-            bid=spot.bid,
-            ask=spot.ask,
-        )
-        if spot.timestamp is not None:
-            event.timestamp = spot.timestamp
-        self._on_quote_spot(symbol_id, event)
+        if self._quoting(symbol_id) and spot is not None and spot is before:
+            self._publish_quote(symbol_id, spot.timestamp)
 
     async def _release_spots(self, symbol_id: int, consumer: str) -> None:
         subscriptions = self._account.subscriptions
-        if subscriptions.active_consumers(symbol_id, self._owner) <= {consumer}:
-            # The last quote hold goes as the release starts, and nothing updates the book
-            # after that, so it is dropped now rather than when the release returns.
-            self._books.pop(symbol_id, None)
         try:
             # The registry makes `consumer` inactive as the call starts, so nothing is published
             # for it while the request is in flight; a cancelled release stays held for the next
@@ -1676,12 +1636,8 @@ class CTraderDataClient(LiveMarketDataClient):
 
     def _sync_listener(self, symbol_id: int) -> None:
         """Keep exactly one listener on `symbol_id` while a quote hold or a bar needs it."""
-        quoting = self._quoting(symbol_id)
-        if not quoting:
-            # Tied to the quote holds, not to the listener a bar subscription also keeps alive:
-            # a side from before a gap in the subscription must never be paired with one after.
-            self._books.pop(symbol_id, None)
-        if quoting or any(sub.symbol_id == symbol_id for sub in self._bars.values()):
+        has_bars = any(sub.symbol_id == symbol_id for sub in self._bars.values())
+        if self._quoting(symbol_id) or has_bars:
             self._attach_listener(symbol_id)
             return
         listener = self._spot_listeners.pop(symbol_id, None)
