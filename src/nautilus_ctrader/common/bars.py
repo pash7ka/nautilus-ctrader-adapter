@@ -409,8 +409,6 @@ class BarCloser:
         caller to leave the entry queued: see the class docstring.
         """
         boundary = pending.boundary
-        # Bounded by one period, so a bar history cannot serve holds the bars behind it no
-        # longer than that.
         deadline = self._clock.now() + self._period
         error: Exception | None = None
         for attempt in range(1 + self._retries):

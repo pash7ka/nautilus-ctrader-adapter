@@ -30,10 +30,10 @@ later, with no connection:
 
 Type `q` to end the run properly: it asks the closing lists, then writes both files. The first
 Ctrl+C also writes both files, but cancels the run, so the closing lists are skipped and the
-outcome says so. If the process ends before either
-can - a second Ctrl+C, a crash - what was seen is still in the journal it appended to as it
-went, `tests/recordings/<name>.raw.jsonl`; the next run with the same output finishes that
-recording before anything else, and only a later run records a new session.
+outcome says so. If the process ends before either can - a second Ctrl+C, a crash - what was
+seen is still in the journal it appended to as it went, `tests/recordings/<name>.raw.jsonl`;
+the next run with the same output finishes that recording before anything else, and only a
+later run records a new session.
 
 The unscrubbed files are never printed, by `--describe` or otherwise. Neither file is replaced
 without `--overwrite`, which never discards a journal, and a run that recorded nothing writes

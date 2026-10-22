@@ -1065,32 +1065,7 @@ async def test_a_refresh_response_with_an_unusable_token_is_not_kept(
     assert v.get_tokens.load_env(env_file)["CTRADER_CLIENT_ID"] == CLIENT_ID
 
 
-async def test_an_env_write_refused_by_windows_is_retried(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    env_file = tmp_path / ".env"
-    write_env(env_file, "tok-access-SECRET-old", "tok-refresh-SECRET-old")
-    real_update = v.get_tokens.update_env_file
-    failures = iter([PermissionError(13, "in use"), PermissionError(13, "in use")])
-
-    def flaky_update(path, updates):
-        error = next(failures, None)
-        if error is not None:
-            raise error
-        real_update(path, updates)
-
-    monkeypatch.setattr(v.get_tokens, "update_env_file", flaky_update)
-    monkeypatch.setattr(v, "_WRITE_RETRY_DELAY_SECS", 0.0)
-    runner = _offline_runner(env_file)
-    new = v.TokenPair("A'", "tok-access-SECRET-new", "tok-refresh-SECRET-new", None, parent="A")
-
-    assert await runner._write(new)
-    assert v.get_tokens.load_env(env_file)["CTRADER_ACCESS_TOKEN"] == "tok-access-SECRET-new"
-    assert not runner.write_failed
-
-
-async def test_an_env_write_that_keeps_failing_tells_the_owner_what_is_lost(
+def test_an_env_write_that_fails_tells_the_owner_what_is_lost(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1099,11 +1074,10 @@ async def test_an_env_write_that_keeps_failing_tells_the_owner_what_is_lost(
         raise PermissionError(13, "in use")
 
     monkeypatch.setattr(v.get_tokens, "update_env_file", always_in_use)
-    monkeypatch.setattr(v, "_WRITE_RETRY_DELAY_SECS", 0.0)
     runner = _offline_runner(tmp_path / ".env")
     new = v.TokenPair("A'", "tok-access-SECRET-new", "tok-refresh-SECRET-new", None, parent="A")
 
-    assert not await runner._write(new)
+    assert not runner._write(new)
 
     assert runner.write_failed
     err = capsys.readouterr().err

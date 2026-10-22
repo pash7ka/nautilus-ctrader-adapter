@@ -1514,11 +1514,12 @@ class CTraderDataClient(LiveMarketDataClient):
             elif not page:
                 # Without a lower bound, an empty page is the only sign history has run out.
                 break
-            if history_start - reached > max_gap_days * 86_400:
-                starts_at = datetime.fromtimestamp(history_start, UTC).isoformat()
+            # A bar opening just below `reached` may close above it.
+            if history_start - (reached + period_secs) > max_gap_days * 86_400:
+                stopped_at = datetime.fromtimestamp(history_start, UTC).isoformat()
                 self._log.info(
-                    f"{symbol_name} {om.ProtoOATrendbarPeriod.Name(period)} history starts at "
-                    f"{starts_at}: no bar in the {max_gap_days:g} days before it",
+                    f"Paging back {symbol_name} {om.ProtoOATrendbarPeriod.Name(period)} history "
+                    f"stopped at {stopped_at}: no bar in the {max_gap_days:g} days before it",
                 )
                 break
             to_secs = reached

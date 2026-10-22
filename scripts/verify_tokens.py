@@ -135,10 +135,6 @@ _REQUIRED_KEYS = (
 
 _OPERATION_TIMEOUT_SECS = 60.0
 
-# `os.replace` on Windows fails with PermissionError while another process holds the file open.
-_WRITE_ATTEMPTS = 4
-_WRITE_RETRY_DELAY_SECS = 0.5
-
 # Events that tell a connection it lost the account. An uncorrelated error is not one: it is
 # most likely the late answer to a request that already timed out.
 _LOSS_SIGNALS = frozenset(
@@ -846,13 +842,13 @@ class Runner:
         held = self.held
         self.pairs.append(pair)
         if held is not None and pair.parent == held.label:
-            await self._write(pair)
+            self._write(pair)
             await self._check(pair, f"{step}  pair {pair.label}")
             return
         await self._check(pair, f"{step}  pair {pair.label}")
         best = keep_order(self.pairs)
         if best and best[0] is pair:
-            await self._write(pair)
+            self._write(pair)
 
     @property
     def held(self) -> TokenPair | None:
@@ -861,7 +857,7 @@ class Runner:
             return self.written
         return self.pairs[0] if self.pairs else None
 
-    async def _write(self, pair: TokenPair) -> bool:
+    def _write(self, pair: TokenPair) -> bool:
         """Write `pair` to the env file; on failure tell the owner what is lost, naming no token."""
         expires = "" if pair.expires_at_secs is None else str(int(pair.expires_at_secs))
         updates = {
@@ -869,40 +865,30 @@ class Runner:
             get_tokens.REFRESH_TOKEN_KEY: pair.refresh_token,
             get_tokens.TOKEN_EXPIRES_AT_KEY: expires,
         }
-        error: OSError | None = None
-        for attempt in range(_WRITE_ATTEMPTS):
-            try:
-                get_tokens.update_env_file(self._env_file, updates)
-            except PermissionError as e:
-                error = e
-                if attempt + 1 < _WRITE_ATTEMPTS:
-                    await asyncio.sleep(_WRITE_RETRY_DELAY_SECS)
-                continue
-            except OSError as e:
-                error = e
-                break
-            self.written = pair
-            self._say(f"        pair {pair.label} written to {self._env_file.name}")
-            return True
-
-        message = (
-            f"pair {pair.label} could NOT be written to {self._env_file.name} "
-            f"({type(error).__name__}): it exists only in this run's memory and is lost when the "
-            "run ends"
-        )
-        if pair.parent is not None:
-            message += f"; pair {pair.parent}'s refresh token, which produced it, is spent"
-        print(f"warning: {message}.", file=sys.stderr, flush=True)
-        self.notes.append(f"Warning: {message}.")
-        self.write_failed = True
-        return False
+        try:
+            get_tokens.update_env_file(self._env_file, updates)
+        except OSError as e:
+            message = (
+                f"pair {pair.label} could NOT be written to {self._env_file.name} "
+                f"({type(e).__name__}): it exists only in this run's memory and is lost when the "
+                "run ends"
+            )
+            if pair.parent is not None:
+                message += f"; pair {pair.parent}'s refresh token, which produced it, is spent"
+            print(f"warning: {message}.", file=sys.stderr, flush=True)
+            self.notes.append(f"Warning: {message}.")
+            self.write_failed = True
+            return False
+        self.written = pair
+        self._say(f"        pair {pair.label} written to {self._env_file.name}")
+        return True
 
     async def _keep(self, step: str) -> TokenPair | None:
         """The best working pair by `keep_order`, checked right now and put in the env file."""
         for pair in keep_order(self.pairs):
             if not (await self._check(pair, f"{step}  pair {pair.label}, to keep it")).ok:
                 continue
-            if pair is not self.held and not await self._write(pair):
+            if pair is not self.held and not self._write(pair):
                 continue
             self._say(f"{step}  keeping pair {pair.label}")
             return pair

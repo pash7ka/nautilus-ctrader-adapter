@@ -306,9 +306,10 @@ class CTraderAccountClient:
         """Register `callback(access_token, refresh_token, expires_at_secs)` for every refresh.
 
         The new pair exists nowhere else: the application must persist it, because the old
-        refresh token may no longer work.
+        refresh token may no longer work. Adding a registered listener again changes nothing.
         """
-        self._token_listeners.append(callback)
+        if callback not in self._token_listeners:
+            self._token_listeners.append(callback)
 
     def add_reload_listener(self, callback: ReloadListener) -> None:
         """Register `callback(instrument)` for every instrument reloaded after a symbol change.
@@ -336,9 +337,9 @@ class CTraderAccountClient:
         stops what it started and leaves the user count unchanged.
 
         Raises `CTraderConnectionError` if this client was replaced, or if its last bring-up
-        ran on another event loop that is still open or left a session behind: one node per
-        account is supported, and a node rebuilt after its loop closed gets a new client from
-        `get_cached_ctrader_account_client()`.
+        ran on another event loop that is still open or left a session or a connect behind:
+        one node per account is supported, and a node rebuilt after its loop closed gets a new
+        client from `get_cached_ctrader_account_client()`.
         """
         # Before the lock, which another loop may hold or have bound.
         error = self._other_loop_error()
@@ -372,7 +373,7 @@ class CTraderAccountClient:
         loop = self._session_loop
         if loop is None or loop is asyncio.get_running_loop():
             return None
-        if loop.is_closed() and self.session is None:
+        if loop.is_closed() and not self._left_unclean:
             return None
         return CTraderConnectionError(
             "the account session belongs to another event loop; one node per account is "

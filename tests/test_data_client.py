@@ -2980,6 +2980,29 @@ async def test_a_per_instrument_override_extends_the_max_gap(
         assert [b.ts_event for b in bars] == [close_ns(minute, 3600) for minute in expected]
 
 
+async def test_a_gap_just_under_the_max_behind_an_end_off_the_bar_grid_is_paged_through() -> None:
+    """An empty page proves no bar opens in it, but the bar opening just below it may close
+    inside it: the stretch without bars is shorter than the page reached, by up to one period.
+    """
+    # Half an hour past a boundary, so every page edge is too.
+    end_minute = LAST_H1_MINUTE + 90
+    # Seven pages of 24 hours reach 168 hours back, past the 167.76-hour maximum; the newest
+    # bar closes 167.5 hours before the end.
+    served = hours_back(end_minute - 30 - 168 * 60, 3)
+    client_config = config(history_page_size=24, history_max_gap_overrides={"EURUSD": 6.99})
+    async with harness(client_config=client_config, server=h1_history_venue(served)) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(end_minute - 20 * DAY_MINUTES),
+            end=at_minute(end_minute),
+        )
+
+        assert [b.ts_event for b in bars] == [close_ns(minute, 3600) for minute in served]
+
+
 async def test_a_bar_the_stream_did_not_close_is_fetched_from_history() -> None:
     client_config = config(bar_close_grace_secs=0.05, bar_close_history_retries=0)
     async with harness(client_config=client_config, server=trendbar_venue()) as h:

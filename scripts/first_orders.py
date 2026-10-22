@@ -30,15 +30,14 @@ stops it.
 
     uv run python scripts/first_orders.py --symbol EURUSD --distance 0.00100 --send-live-orders
 
-Credentials and the trader login come from `.env` in the repository root. The host shown is read
-from the account list the access token grants, as the adapter reads it. The script does no
-token refresh, so it refuses to start with an access token whose `CTRADER_TOKEN_EXPIRES_AT` has
-passed. Every order event, position event and account activity is appended to a `*.raw.jsonl` file
-under `--log-dir` (by default `tests/recordings/`); git ignores that name in any directory. A
-line carries only the fixed list of the event's fields, which includes the account id, never
-the whole event. Run
-`scripts/record_execution.py` alongside it: the checklist printed at the end says what to
-compare between the two.
+Credentials and the trader login come from `.env` in the repository root. The host shown is
+read from the account list the access token grants, as the adapter reads it. The script does
+no token refresh, so it refuses to start with an access token whose `CTRADER_TOKEN_EXPIRES_AT`
+has passed. Every order event, position event and account activity is appended to a
+`*.raw.jsonl` file under `--log-dir` (by default `tests/recordings/`); git ignores that name in
+any directory. A line carries only the fixed list of the event's fields, which includes the
+account id, never the whole event. Run `scripts/record_execution.py` alongside it: the
+checklist printed at the end says what to compare between the two.
 """
 
 from __future__ import annotations

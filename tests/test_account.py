@@ -906,6 +906,44 @@ def test_a_client_cleanly_stopped_on_a_closed_loop_is_replaced_without_a_warning
         asyncio.run(connect_the_old_instance())
 
 
+def test_a_token_listener_registered_again_on_the_replacement_is_called_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented pattern registers the listener before every node build."""
+    servers: dict[str, FakeCTraderServer] = {}
+    route_hosts(monkeypatch, servers)
+    logger = RecordingLogger()
+    pinned = credentials(token_expires_at=time.time() + 3600.0)
+    notified = []
+
+    def persist(access: str, refresh: str, expires_at_secs: float) -> None:
+        notified.append((access, refresh))
+
+    first_client = cached_account_client(pinned, logger)
+    first_client.add_token_listener(persist)
+
+    async def connect_and_disconnect() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = venue()
+        await servers[LIVE_HOST_NAME].start()
+        await first_client.connect()
+        await first_client.disconnect()
+        await servers[LIVE_HOST_NAME].stop()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(connect_and_disconnect())
+    finally:
+        loop.close()
+
+    client = cached_account_client(pinned, logger)
+    assert client is not first_client
+    client.add_token_listener(persist)
+
+    client._on_tokens_refreshed("new-access", "new-refresh", time.time() + 3600.0)
+
+    assert notified == [("new-access", "new-refresh")]
+
+
 def test_a_replacement_starts_from_the_tokens_refreshed_before_the_loop_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -999,6 +1037,45 @@ def test_a_client_whose_loop_closed_mid_connect_is_replaced_with_a_warning(
     connecting.clear()
     # Inside this test, so the filter above applies.
     gc.collect()
+
+
+# The connect cut off on the closed loop fails to close once it is collected.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_a_directly_built_client_whose_loop_closed_mid_connect_refuses_the_next_connect() -> None:
+    """Not cached, so nothing replaces it; the dead connect still holds the lifecycle lock."""
+    server = venue()
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda _r: account_list(is_live=True),
+    )
+    connecting: list[asyncio.Task] = []
+    clients = []
+
+    async def start_connecting() -> None:
+        await server.start()
+        clients.append(account_client(server))
+        connecting.append(asyncio.get_running_loop().create_task(clients[0].connect()))
+        await held.arrived.wait()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(start_connecting())
+    finally:
+        loop.close()
+    client = clients[0]
+    assert client._lifecycle_lock.locked()
+
+    async def connect_again() -> None:
+        await asyncio.wait_for(client.connect(), 2.0)
+
+    try:
+        with pytest.raises(CTraderConnectionError, match="another event loop"):
+            asyncio.run(connect_again())
+    finally:
+        connecting.clear()
+        # Inside this test, so the filter above applies.
+        gc.collect()
 
 
 def test_a_connect_from_another_loop_during_a_bring_up_is_refused() -> None:

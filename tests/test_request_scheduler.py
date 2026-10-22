@@ -445,7 +445,7 @@ async def test_a_pause_longer_than_the_cap_is_cut_to_the_cap_and_logged_as_error
     assert sends.times("next") == [pytest.approx(10.0)]
     (error,) = logger.errors()
     assert "retryAfter 60 s" in error
-    assert "10 s" in error
+    assert "above the 10 s cap" in error
     assert logger.warnings() == []
 
 
