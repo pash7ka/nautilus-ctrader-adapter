@@ -112,7 +112,7 @@ from nautilus_ctrader.common.venue_records import (
     ProtectionMissing,
     Record,
     ReportedOrder,
-    money_of,
+    money_in,
     parse_leg_venue_order_id,
     units_of,
 )
@@ -142,7 +142,7 @@ _MINUTE_MS = 60_000
 # How far a history window runs past now (`_window_end_ms`).
 _WINDOW_MARGIN_MS = 1440 * _MINUTE_MS
 _OPEN = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
-_ENDED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
+_CLOSED_NOT_FILLED = (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
 # Activity after which what stands on unloaded symbols may have changed.
 _EXPOSURE_KINDS = (ActivityKind.UNLOADED_SYMBOL, ActivityKind.STOP_OUT)
 # How long an event not yet applied holds back the reports and activity behind it. Nautilus
@@ -521,7 +521,11 @@ class CTraderExecutionClient(LiveExecutionClient):
         # Scopes this client's spot holds in the registry every client of the account shares.
         self._owner = f"exec:{self.id}"
         self._session: CTraderSession | None = None
-        self._book = VenueBook(self._price_precision, held_closed=self._held_closed)
+        self._book = VenueBook(
+            self._price_precision,
+            held_closed=self._held_closed,
+            money_digits=self._account_money_digits,
+        )
         self._currency: Currency | None = None
         self._balance = Decimal(0)
         self._balance_version = -1
@@ -981,6 +985,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                         self._book.known_closes(),
                         self._operations,
                         self._held_legs(),
+                        money_digits=self._account_money_digits,
                     )
                     record = next(filter(wanted, built.orders), None)
                     if record is not None and closing is not None:
@@ -1116,7 +1121,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 report.order_status in _OPEN
                 or (
                     not command.open_only
-                    and report.order_status in _ENDED
+                    and report.order_status in _CLOSED_NOT_FILLED
                     and report.filled_qty.as_decimal() == 0
                 )
             )
@@ -1179,6 +1184,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._book.known_closes(),
             self._operations,
             self._held_legs(),
+            money_digits=self._account_money_digits,
         )
         for notice in found.notices:
             self._log.warning(notice.text)
@@ -1617,12 +1623,11 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     # -- Account state --------------------------------------------------------------------------
 
+    def _account_money_digits(self) -> int:
+        return self._account.money_digits
+
     def _money(self, amount: int, message: Message) -> Decimal:
-        """An amount `message` carries, at its own `moneyDigits` when it has them."""
-        digits = (
-            message.moneyDigits if message.HasField("moneyDigits") else self._account.money_digits
-        )
-        return money_of(amount, digits)
+        return money_in(amount, message, self._account_money_digits)
 
     def _set_margin(self, position: om.ProtoOAPosition) -> bool:
         """Keep one position's margin; returns whether it changed.

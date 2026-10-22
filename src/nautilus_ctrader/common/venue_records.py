@@ -16,12 +16,18 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
+from google.protobuf.message import Message
+
 from nautilus_ctrader.common.parsing import volume_to_units
+from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
+
+_SIDES = {om.BUY: "BUY", om.SELL: "SELL"}
 
 
 class Level(Enum):
@@ -100,6 +106,21 @@ def price_of(value: float, precision: int) -> Decimal:
     return exponent * 0 if price == 0 else price
 
 
+def position_levels(position: om.ProtoOAPosition, precision: int) -> dict[Level, Decimal]:
+    """The stop-loss and take-profit levels `position` carries, at `precision` decimals."""
+    levels: dict[Level, Decimal] = {}
+    if position.HasField("stopLoss"):
+        levels[Level.STOP_LOSS] = price_of(position.stopLoss, precision)
+    if position.HasField("takeProfit"):
+        levels[Level.TAKE_PROFIT] = price_of(position.takeProfit, precision)
+    return levels
+
+
+def side_of(trade_side: int) -> str:
+    """A `ProtoOATradeSide` as `"BUY"` or `"SELL"`."""
+    return _SIDES[trade_side]
+
+
 def units_of(volume: int) -> Decimal:
     """A venue volume, in hundredths of a unit, as units."""
     return volume_to_units(volume)
@@ -111,6 +132,24 @@ def money_of(amount: int, money_digits: int) -> Decimal:
     Keep the `Decimal`, not its `str`: a small amount prints in exponent form.
     """
     return Decimal(amount).scaleb(-money_digits)
+
+
+def money_in(
+    amount: int, message: Message, account_money_digits: Callable[[], int] | None
+) -> Decimal:
+    """An amount `message` carries, at its `moneyDigits`, else at `account_money_digits()`.
+
+    The field is optional: read as 0, the amount would be 10^digits too large.
+
+    Raises `ValueError` if `message` has no `moneyDigits` and `account_money_digits` is `None`.
+    """
+    if message.HasField("moneyDigits"):
+        digits = message.moneyDigits
+    elif account_money_digits is None:
+        raise ValueError(f"a {type(message).__name__} without moneyDigits, and no account digits")
+    else:
+        digits = account_money_digits()
+    return money_of(amount, digits)
 
 
 class OrderEventKind(Enum):
@@ -137,6 +176,30 @@ class Fill:
     price: Decimal
     commission: Decimal
     ts_ms: int
+
+
+def fill_of(
+    deal: om.ProtoOADeal, precision: int, account_money_digits: Callable[[], int] | None
+) -> Fill:
+    """`deal` as a `Fill`, its price at `precision`; the commission is scaled by `money_in()`."""
+    return Fill(
+        trade_id=str(deal.dealId),
+        venue_position_id=str(deal.positionId),
+        side=side_of(deal.tradeSide),
+        units=units_of(deal.filledVolume),
+        price=price_of(deal.executionPrice, precision),
+        commission=money_in(deal.commission, deal, account_money_digits),
+        ts_ms=deal.executionTimestamp,
+    )
+
+
+def average_price(fills: Sequence[Fill], precision: int) -> Decimal | None:
+    """The volume-weighted price of `fills`, half-even at `precision`; `None` without units."""
+    units = sum((fill.units for fill in fills), Decimal(0))
+    if not units:
+        return None
+    total = sum((fill.price * fill.units for fill in fills), Decimal(0))
+    return (total / units).quantize(Decimal(1).scaleb(-precision), rounding=ROUND_HALF_EVEN)
 
 
 @dataclass(frozen=True)

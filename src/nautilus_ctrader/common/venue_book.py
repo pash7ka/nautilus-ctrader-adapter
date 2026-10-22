@@ -37,18 +37,19 @@ from nautilus_ctrader.common.venue_records import (
     OrderEventKind,
     ProtectionMissing,
     Record,
+    fill_of,
     leg_prices,
     leg_venue_order_id,
-    money_of,
     parse_leg_venue_order_id,
+    position_levels,
     price_of,
+    side_of,
     units_of,
 )
 from nautilus_ctrader.constants import PENDING_ORDER_TYPES
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
-_SIDE = {om.BUY: "BUY", om.SELL: "SELL"}
 EXTERNAL_TYPE = {
     om.MARKET: ExternalType.MARKET,
     om.MARKET_RANGE: ExternalType.MARKET,
@@ -57,7 +58,8 @@ EXTERNAL_TYPE = {
     om.STOP_LIMIT: ExternalType.STOP_LIMIT,
 }
 _FILLS = (om.ORDER_FILLED, om.ORDER_PARTIAL_FILL)
-_ENDED = {
+# The event of each execution that ends an order without filling it.
+_ENDED_EVENT_KIND = {
     om.ORDER_CANCELLED: OrderEventKind.CANCELED,
     om.ORDER_EXPIRED: OrderEventKind.EXPIRED,
     om.ORDER_REJECTED: OrderEventKind.REJECTED,
@@ -264,15 +266,18 @@ class VenueBook:
     - `held_closed` says whether Nautilus holds a venue order id as a closed order. A leg of a
       position the node did not open takes the first generation of its id that Nautilus does not
       hold closed, and that this model has not ended since it was last loaded.
+    - `money_digits` gives the account's money digits, for a deal without its own (`money_in()`).
     """
 
     def __init__(
         self,
         price_precision: Callable[[int], int | None],
         held_closed: Callable[[str], bool] = lambda _venue_order_id: False,
+        money_digits: Callable[[], int] | None = None,
     ) -> None:
         self._precision = price_precision
         self._held_closed = held_closed
+        self._money_digits = money_digits
         self._positions: dict[int, _Position] = {}
         # Broker orders Nautilus knows besides the node's entries: its closes, by broker id, and
         # external orders reported once.
@@ -424,12 +429,7 @@ class VenueBook:
             position.terms = terms_of(venue_position)
             precision = self._precision(position.symbol_id)
             if precision is not None:
-                if venue_position.HasField("stopLoss"):
-                    position.levels[Level.STOP_LOSS] = price_of(venue_position.stopLoss, precision)
-                if venue_position.HasField("takeProfit"):
-                    position.levels[Level.TAKE_PROFIT] = price_of(
-                        venue_position.takeProfit, precision
-                    )
+                position.levels.update(position_levels(venue_position, precision))
             entry = entry_of(position_orders.get(position.position_id, ()))
             if entry is not None:
                 notices += self._adopt(position, entry, restored=True)
@@ -705,7 +705,7 @@ class VenueBook:
     # Positions
 
     def _new_position(self, position_id: int, symbol_id: int, side: int) -> _Position:
-        position = _Position(position_id, symbol_id, _SIDE[side])
+        position = _Position(position_id, symbol_id, side_of(side))
         self._positions[position_id] = position
         return position
 
@@ -728,7 +728,7 @@ class VenueBook:
                 side = _opposite(side)
         if kept:
             return self._new_position(order.positionId, symbol_id, side)
-        return _Position(order.positionId, symbol_id, _SIDE[side])
+        return _Position(order.positionId, symbol_id, side_of(side))
 
     def _sync(self, position: _Position, event: oa.ProtoOAExecutionEvent) -> None:
         if event.HasField("position"):
@@ -795,15 +795,7 @@ class VenueBook:
     # Records
 
     def _fill(self, deal: om.ProtoOADeal, precision: int) -> Fill:
-        return Fill(
-            trade_id=str(deal.dealId),
-            venue_position_id=str(deal.positionId),
-            side=_SIDE[deal.tradeSide],
-            units=units_of(deal.filledVolume),
-            price=price_of(deal.executionPrice, precision),
-            commission=money_of(deal.commission, deal.moneyDigits),
-            ts_ms=deal.executionTimestamp,
-        )
+        return fill_of(deal, precision, self._money_digits)
 
     @staticmethod
     def _leg_id(position: _Position, level: Level) -> str | None:
@@ -894,7 +886,7 @@ class VenueBook:
         return ExternalOrder(
             venue_order_id=str(order.orderId),
             symbol_id=order.tradeData.symbolId,
-            side=_SIDE[order.tradeData.tradeSide],
+            side=side_of(order.tradeData.tradeSide),
             order_type=kind,
             units=units_of(order.tradeData.volume),
             reduce_only=reduce_only,
@@ -947,9 +939,15 @@ class VenueBook:
             if order.orderType in PENDING_ORDER_TYPES and not taken:
                 return []
             return [self._order_updated(order, precision, ts)]
-        if kind in _ENDED:
+        if kind in _ENDED_EVENT_KIND:
             return [
-                OrderEvent(_ENDED[kind], venue_order_id, None, ts, reason=event.errorCode or None),
+                OrderEvent(
+                    _ENDED_EVENT_KIND[kind],
+                    venue_order_id,
+                    None,
+                    ts,
+                    reason=event.errorCode or None,
+                ),
             ]
         return []
 
@@ -973,7 +971,7 @@ class VenueBook:
         order, kind = event.order, event.executionType
         if order.orderType not in PENDING_ORDER_TYPES:
             return False
-        if kind == om.ORDER_FILLED or kind in _ENDED:
+        if kind == om.ORDER_FILLED or kind in _ENDED_EVENT_KIND:
             self._open_orders.pop(order.orderId, None)
             return False
         if kind in (om.ORDER_ACCEPTED, om.ORDER_PARTIAL_FILL) and not known:
@@ -1107,8 +1105,8 @@ class VenueBook:
                 position.awaiting_protection = True
                 records.append(AwaitProtection(position.position_id))
             return records
-        if kind in _ENDED:
-            ended = _ENDED[kind]
+        if kind in _ENDED_EVENT_KIND:
+            ended = _ENDED_EVENT_KIND[kind]
             records = [
                 OrderEvent(ended, venue_order_id, entry_id, ts, reason=event.errorCode or None),
             ]
@@ -1393,10 +1391,14 @@ class VenueBook:
                 OrderEvent(OrderEventKind.FILLED, venue_order_id, close_id, fill.ts_ms, fill=fill)
             )
             return records
-        if kind in _ENDED:
+        if kind in _ENDED_EVENT_KIND:
             return [
                 OrderEvent(
-                    _ENDED[kind], venue_order_id, close_id, ts, reason=event.errorCode or None
+                    _ENDED_EVENT_KIND[kind],
+                    venue_order_id,
+                    close_id,
+                    ts,
+                    reason=event.errorCode or None,
                 )
             ]
         return []
@@ -1430,12 +1432,12 @@ class VenueBook:
         data = order.tradeData
         has_position = event.HasField("position")
         if has_position:
-            position_side = _SIDE[event.position.tradeData.tradeSide]
+            position_side = side_of(event.position.tradeData.tradeSide)
         else:
             # A closing order trades against its position.
-            position_side = _SIDE[
+            position_side = side_of(
                 _opposite(data.tradeSide) if order.closingOrder else data.tradeSide
-            ]
+            )
         if kind in _FILLS:
             if order.closingOrder:
                 open_after = (
@@ -1457,7 +1459,7 @@ class VenueBook:
                 om.ORDER_ACCEPTED: Action.OPENED,
                 om.ORDER_REPLACED: Action.CHANGED,
             }.get(kind, Action.CLOSED)
-            subject, side = "order", _SIDE[data.tradeSide]
+            subject, side = "order", side_of(data.tradeSide)
             units, ts = units_of(data.volume), order.utcLastUpdateTimestamp
         else:
             return []
@@ -1471,7 +1473,7 @@ class VenueBook:
         return Exposure(
             order.tradeData.symbolId,
             "order",
-            _SIDE[order.tradeData.tradeSide],
+            side_of(order.tradeData.tradeSide),
             units_of(remaining_of(order)),
         )
 
@@ -1492,5 +1494,5 @@ class VenueBook:
                 self._unloaded_orders[order_id] = replace(held, units=left)
             else:
                 del self._unloaded_orders[order_id]
-        elif kind == om.ORDER_FILLED or kind in _ENDED:
+        elif kind == om.ORDER_FILLED or kind in _ENDED_EVENT_KIND:
             self._unloaded_orders.pop(order_id, None)

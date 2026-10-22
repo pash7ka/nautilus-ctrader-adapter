@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
 from typing import Protocol
 
 from nautilus_ctrader.common import order_record
@@ -32,20 +32,23 @@ from nautilus_ctrader.common.venue_records import (
     ReportedOrder,
     ReportedPosition,
     ReportStatus,
+    average_price,
+    fill_of,
     leg_prices,
     leg_venue_order_id,
-    money_of,
     parse_leg_venue_order_id,
+    position_levels,
     price_of,
+    side_of,
     units_of,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 
-_SIDE = {om.BUY: "BUY", om.SELL: "SELL"}
 _OPPOSITE = {"BUY": "SELL", "SELL": "BUY"}
 _LEVELS = (Level.STOP_LOSS, Level.TAKE_PROFIT)
-_ENDED = {
+# The status an order that ended without filling is reported in.
+_ENDED_REPORT_STATUS = {
     om.ORDER_STATUS_CANCELLED: ReportStatus.CANCELED,
     om.ORDER_STATUS_EXPIRED: ReportStatus.EXPIRED,
     om.ORDER_STATUS_REJECTED: ReportStatus.REJECTED,
@@ -114,6 +117,8 @@ def reconcile(
     known_closes: Mapping[int, str],
     operations: Operations,
     held: HeldOrders = NOTHING_HELD,
+    *,
+    money_digits: Callable[[], int] | None = None,
 ) -> Reconciliation:
     """The reports for everything the broker holds now and every position traded in the window.
 
@@ -121,6 +126,7 @@ def reconcile(
     position id. `known_closes` maps a broker order id to the node's close the venue model has
     matched it to. `precision` gives a symbol's price precision, `None` for an unloaded one.
     `held` says what Nautilus holds of the legs of positions the node did not open.
+    `money_digits` gives the account's money digits, for a deal without its own (`money_in()`).
 
     Positions taken: every open one in `snapshot`, every one with a deal in `window_deals`, and
     every one in `histories`.
@@ -225,7 +231,7 @@ def reconcile(
             )
             continue
         venue_position = open_positions.get(position_id)
-        built = _Position(position_id, entry, found, digits)
+        built = _Position(position_id, entry, found, digits, money_digits)
         if not built.entry_fills:
             # Created and never filled: nothing to tell Nautilus, unless the broker holds it open.
             if venue_position is not None:
@@ -297,6 +303,8 @@ def one_position(
     known_closes: Mapping[int, str],
     operations: Operations,
     held: HeldOrders = NOTHING_HELD,
+    *,
+    money_digits: Callable[[], int] | None = None,
 ) -> Reconciliation:
     """`reconcile` of position `position_id` alone, open or closed, from its own lists `found`.
 
@@ -308,7 +316,14 @@ def one_position(
         order=[o for o in snapshot.order if o.positionId == position_id],
     )
     return reconcile(
-        alone, {position_id: found}, found.deals, precision, known_closes, operations, held
+        alone,
+        {position_id: found},
+        found.deals,
+        precision,
+        known_closes,
+        operations,
+        held,
+        money_digits=money_digits,
     )
 
 
@@ -395,15 +410,16 @@ class _Position:
         entry: om.ProtoOAOrder,
         found: PositionHistory,
         precision: int,
+        money_digits: Callable[[], int] | None,
     ) -> None:
         self.position_id = position_id
         self.entry = entry
         self.precision = precision
-        self.side = _SIDE[entry.tradeData.tradeSide]
+        self.side = side_of(entry.tradeData.tradeSide)
         self.deals = sorted(found.deals, key=lambda deal: (deal.executionTimestamp, deal.dealId))
         self.fills: dict[int, list[Fill]] = {}
         for deal in self.deals:
-            self.fills.setdefault(deal.orderId, []).append(_fill(deal, precision))
+            self.fills.setdefault(deal.orderId, []).append(fill_of(deal, precision, money_digits))
         self.entry_fills = self.fills.get(entry.orderId, [])
         self.raises = [
             order
@@ -659,7 +675,7 @@ class _Position:
         are those of `_closing_source`.
         """
         if venue_position is not None:
-            return live_protective, _position_levels(venue_position, self.precision)
+            return live_protective, position_levels(venue_position, self.precision)
         source = self._closing_source(fills)
         return source, {} if source is None else levels_of(source, self.precision)
 
@@ -739,7 +755,7 @@ class _Position:
             venue_position_id=str(self.position_id),
             ts_accepted_ms=accepted,
             ts_ms=max(ts_ms, accepted),
-            avg_price=_average(fills, self.precision),
+            avg_price=average_price(fills, self.precision),
             price=limit,
             trigger_price=trigger,
             time_in_force=_GOOD_TILL_CANCEL,
@@ -754,40 +770,11 @@ class _Position:
         return {deal.orderId for deal in self.deals if str(deal.dealId) in trade_ids}
 
 
-def _fill(deal: om.ProtoOADeal, precision: int) -> Fill:
-    return Fill(
-        trade_id=str(deal.dealId),
-        venue_position_id=str(deal.positionId),
-        side=_SIDE[deal.tradeSide],
-        units=units_of(deal.filledVolume),
-        price=price_of(deal.executionPrice, precision),
-        commission=money_of(deal.commission, deal.moneyDigits),
-        ts_ms=deal.executionTimestamp,
-    )
-
-
-def _average(fills: Sequence[Fill], precision: int) -> Decimal | None:
-    units = sum((fill.units for fill in fills), Decimal(0))
-    if not units:
-        return None
-    total = sum((fill.price * fill.units for fill in fills), Decimal(0))
-    return (total / units).quantize(Decimal(1).scaleb(-precision), rounding=ROUND_HALF_EVEN)
-
-
-def _position_levels(position: om.ProtoOAPosition, precision: int) -> dict[Level, Decimal]:
-    levels: dict[Level, Decimal] = {}
-    if position.HasField("stopLoss"):
-        levels[Level.STOP_LOSS] = price_of(position.stopLoss, precision)
-    if position.HasField("takeProfit"):
-        levels[Level.TAKE_PROFIT] = price_of(position.takeProfit, precision)
-    return levels
-
-
 def _status(order: om.ProtoOAOrder, fills: Sequence[Fill]) -> ReportStatus:
     if order.orderStatus == om.ORDER_STATUS_FILLED:
         return ReportStatus.FILLED
-    if order.orderStatus in _ENDED:
-        return _ENDED[order.orderStatus]
+    if order.orderStatus in _ENDED_REPORT_STATUS:
+        return _ENDED_REPORT_STATUS[order.orderStatus]
     return ReportStatus.PARTIALLY_FILLED if fills else ReportStatus.ACCEPTED
 
 
@@ -815,7 +802,7 @@ def _order_report(
         venue_order_id=str(order.orderId),
         client_order_id=client_order_id,
         symbol_id=data.symbolId,
-        side=_SIDE[data.tradeSide],
+        side=side_of(data.tradeSide),
         order_type=kind,
         status=_status(order, fills),
         units=units_of(data.volume),
@@ -824,7 +811,7 @@ def _order_report(
         venue_position_id=str(order.positionId) if order.HasField("positionId") else None,
         ts_accepted_ms=accepted,
         ts_ms=last,
-        avg_price=_average(fills, precision),
+        avg_price=average_price(fills, precision),
         price=prices.get(Level.TAKE_PROFIT) if priced else None,
         trigger_price=prices.get(Level.STOP_LOSS) if triggered else None,
         time_in_force=(
@@ -842,7 +829,7 @@ def _position_report(
     return ReportedPosition(
         venue_position_id=str(position.positionId),
         symbol_id=position.tradeData.symbolId,
-        side=_SIDE[position.tradeData.tradeSide],
+        side=side_of(position.tradeData.tradeSide),
         units=units_of(position.tradeData.volume) if units is None else units,
         avg_price=price_of(position.price, precision),
         ts_ms=position.utcLastUpdateTimestamp,

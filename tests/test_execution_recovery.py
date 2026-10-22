@@ -540,6 +540,41 @@ async def test_generate_mass_status_reports_the_recorded_state() -> None:
         assert view.legs == {Level.STOP_LOSS: (STOP, True), Level.TAKE_PROFIT: (TARGET, True)}
 
 
+def without_money_digits(message: Message) -> Message:
+    """A copy of `message` whose deal, or itself if a deal, carries no `moneyDigits`."""
+    copy = type(message)()
+    copy.CopyFrom(message)
+    if isinstance(copy, om.ProtoOADeal):
+        copy.ClearField("moneyDigits")
+    elif copy.HasField("deal"):
+        copy.deal.ClearField("moneyDigits")
+    return copy
+
+
+async def test_a_deal_without_money_digits_scales_alike_on_both_paths() -> None:
+    # The account's own digits stand in for the deal's: 2, as the recorded trader states.
+    charged = Money(Decimal("27.72"), USD)
+
+    async with harness() as h:
+        await submitted(h)
+        await push(h, *(without_money_digits(event) for event in FIRST_EVENTS[:3]))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+        (live,) = [e for e in h.events_of(ENTRY) if isinstance(e, OrderFilled)]
+
+    venue = serving()
+    venue.position_deals = {
+        pid: [without_money_digits(deal) for deal in deals]
+        for pid, deals in venue.position_deals.items()
+    }
+    venue.deals = [without_money_digits(deal) for deal in venue.deals]
+    async with harness(execution_venue=venue) as h:
+        built = await h.client.generate_mass_status()
+        (reconciled,) = built.fill_reports[VenueOrderId("6000001")]
+
+    assert live.trade_id == reconciled.trade_id == TradeId("7000001")
+    assert live.commission == reconciled.commission == charged
+
+
 async def test_an_event_during_the_start_pass_is_applied_after_reconciliation() -> None:
     venue = serving()
     async with harness(execution_venue=venue) as h:

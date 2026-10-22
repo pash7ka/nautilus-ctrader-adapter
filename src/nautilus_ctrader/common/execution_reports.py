@@ -10,7 +10,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import (
@@ -65,6 +65,7 @@ from nautilus_ctrader.common.venue_records import (
     OrderEventKind,
     ReportedOrder,
     ReportedPosition,
+    average_price,
 )
 
 _NANOS_PER_MILLI = 1_000_000
@@ -200,7 +201,8 @@ def fill_report(
     )
 
 
-_ENDED_STATUS = {
+# The status Nautilus holds an order in after an event that ends it without a fill.
+_ENDED_ORDER_STATUS = {
     OrderEventKind.CANCELED: OrderStatus.CANCELED,
     OrderEventKind.EXPIRED: OrderStatus.EXPIRED,
     OrderEventKind.REJECTED: OrderStatus.REJECTED,
@@ -222,8 +224,8 @@ def held_order_report(
     if record.kind == OrderEventKind.FILLED:
         raise ValueError("a fill is reported by `fill_report()`")
     filled = order.filled_qty
-    if record.kind in _ENDED_STATUS:
-        status = _ENDED_STATUS[record.kind]
+    if record.kind in _ENDED_ORDER_STATUS:
+        status = _ENDED_ORDER_STATUS[record.kind]
     else:
         status = OrderStatus.PARTIALLY_FILLED if filled.as_decimal() > 0 else OrderStatus.ACCEPTED
     held_price = getattr(order, "price", None)
@@ -494,10 +496,8 @@ def _priced(
         return record
     client_order_id = record.client_order_id or known_id(record.venue_order_id)
     held = None if client_order_id is None else held_price(client_order_id)
-    if held is None and record.fills:
-        units = sum((fill.units for fill in record.fills), Decimal(0))
-        total = sum((fill.price * fill.units for fill in record.fills), Decimal(0))
-        held = (total / units).quantize(Decimal(1).scaleb(-precision), rounding=ROUND_HALF_EVEN)
+    if held is None:
+        held = average_price(record.fills, precision)
     return None if held is None else replace(record, **{field: held})
 
 
