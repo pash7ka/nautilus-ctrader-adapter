@@ -152,8 +152,8 @@ class CTraderAccountClient:
     - `environment="auto"` takes the trading host from that entry's `isLive` flag;
       `"demo"`/`"live"` force it.
     - It belongs to the event loop it was brought up on. Once that loop is closed, the cache
-      replaces it (see `get_cached_ctrader_account_client()`); a `connect()` from another loop
-      while its session exists is refused.
+      replaces it (see `get_cached_ctrader_account_client()`). A `connect()` from another loop
+      is refused while that loop is open or a session is left on it, and on a replaced client.
     - `connect()` returns once the session is ready and the reference data is loaded; bad
       credentials fail it at once rather than after `connect_timeout_secs`.
     - A loaded symbol the venue reports as changed is reloaded here, once for all clients;
@@ -200,6 +200,8 @@ class CTraderAccountClient:
         self._lifecycle_lock = asyncio.Lock()
         # The loop the last bring-up ran on, which the session and its tasks are bound to.
         self._session_loop: asyncio.AbstractEventLoop | None = None
+        # Set once the cache has replaced this client; it never connects again.
+        self._retired = False
         self._retry_task: asyncio.Task | None = None
         # Outlives sessions, so live subscriptions are restored on every later `connect()`.
         self.subscriptions = SubscriptionRegistry(self, logger)
@@ -333,18 +335,16 @@ class CTraderAccountClient:
         and one queued behind a failed attempt tries again. A failed or cancelled attempt
         stops what it started and leaves the user count unchanged.
 
-        Raises `CTraderConnectionError` if the session runs on another event loop: one node
-        per account is supported, and a node rebuilt after its loop closed gets a new client
-        from `get_cached_ctrader_account_client()`.
+        Raises `CTraderConnectionError` if this client was replaced, or if its last bring-up
+        ran on another event loop that is still open or left a session behind: one node per
+        account is supported, and a node rebuilt after its loop closed gets a new client from
+        `get_cached_ctrader_account_client()`.
         """
-        if self.session is not None and self._session_loop is not asyncio.get_running_loop():
-            # Checked before the lock, which the other loop may hold or have bound.
-            self._last_connect_error = CTraderConnectionError(
-                "the account session runs on another event loop; one node per account is "
-                "supported, and a node rebuilt after its loop closed must look the account "
-                "client up again",
-            )
-            raise self._last_connect_error
+        # Before the lock, which another loop may hold or have bound.
+        error = self._other_loop_error()
+        if error is not None:
+            self._last_connect_error = error
+            raise error
         async with self._lifecycle_lock:
             try:
                 if self._users > 0:
@@ -361,6 +361,24 @@ class CTraderAccountClient:
                 self._last_connect_error = e
                 raise
             self._last_connect_error = None
+
+    def _other_loop_error(self) -> CTraderConnectionError | None:
+        if self._retired:
+            return CTraderConnectionError(
+                "this account client was replaced after its event loop closed; look the "
+                "account client up again",
+            )
+        # Set at the start of a bring-up, so a bring-up still resolving the account counts.
+        loop = self._session_loop
+        if loop is None or loop is asyncio.get_running_loop():
+            return None
+        if loop.is_closed() and self.session is None:
+            return None
+        return CTraderConnectionError(
+            "the account session belongs to another event loop; one node per account is "
+            "supported, and a node rebuilt after its loop closed must look the account client "
+            "up again",
+        )
 
     @property
     def _loop_closed(self) -> bool:
@@ -814,10 +832,11 @@ def get_cached_ctrader_account_client(
     - carried over: the application's token listeners, and the client's settings and newest
       tokens;
     - new: the session, the subscriptions, the instrument provider and every listener a
-      Nautilus client registered. A holder of the old instance keeps an instance that no
-      longer serves the account, and must look the client up again.
+      Nautilus client registered. The old instance's `connect()` raises from then on, so a
+      holder of it must look the client up again.
 
-    The old instance is left as it is: whatever its old loop left unfinished acts on it alone.
+    The old instance is otherwise left as it is: whatever its old loop left unfinished acts on
+    it alone.
     A replacement of a client still connected or connecting when its loop closed is logged at
     WARNING, any other at INFO.
     """
@@ -843,6 +862,7 @@ def get_cached_ctrader_account_client(
             )
         else:
             logger.info("The account client's event loop closed; a new account client replaces it")
+        client._retired = True
         client = client._successor()
         _ACCOUNT_CLIENTS[key] = (client, cached)
     differences: list[str] = []

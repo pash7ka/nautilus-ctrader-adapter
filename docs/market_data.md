@@ -366,9 +366,11 @@ process after that loop was closed gets a new client: the registered token liste
 settings and the newest tokens carry over, and everything else — session, subscriptions,
 instrument provider — is new. The replacement is logged at WARNING if the old node's loop
 closed without a disconnect, and at INFO otherwise. A reference kept to the old instance no
-longer serves the account, so look the client up again after rebuilding a node. One node per
-account is supported: a `connect()` from a second loop while the session runs on another raises
-`CTraderConnectionError`.
+longer serves the account: its `connect()` raises `CTraderConnectionError`, so look the client
+up again after rebuilding a node. One node per account is supported: a `connect()` from another
+loop while the loop of the last bring-up is still open, or left a session behind, raises
+`CTraderConnectionError` too. A node stopped without closing its loop therefore keeps the
+account client to itself.
 
 When the config leaves the tokens to the environment (`CTRADER_ACCESS_TOKEN` and the others;
 see [execution.md](execution.md#3-configuration)), the adapter only reads them there. The

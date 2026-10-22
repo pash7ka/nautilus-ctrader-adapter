@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import gc
+import threading
 import time
 from collections.abc import AsyncIterator
 
@@ -897,6 +898,155 @@ def test_a_client_cleanly_stopped_on_a_closed_loop_is_replaced_without_a_warning
     assert cached_account_client(pinned, logger) is not first_client
     assert logger.warnings() == []
     assert any("a new account client replaces it" in m for _, m in logger.lines)
+
+    async def connect_the_old_instance() -> None:
+        await first_client.connect()
+
+    with pytest.raises(CTraderConnectionError, match="replaced"):
+        asyncio.run(connect_the_old_instance())
+
+
+def test_a_replacement_starts_from_the_tokens_refreshed_before_the_loop_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The original refresh token is spent once the old client has refreshed."""
+    servers: dict[str, FakeCTraderServer] = {}
+    route_hosts(monkeypatch, servers)
+    logger = RecordingLogger()
+    pinned = credentials(token_expires_at=time.time() + 3600.0)
+    first_client = cached_account_client(pinned, logger)
+
+    async def connect_refresh_and_disconnect() -> None:
+        server = venue()
+        server.on(
+            oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+            lambda _r: oa.ProtoOARefreshTokenRes(
+                accessToken="new-access",
+                tokenType="bearer",
+                expiresIn=3600,
+                refreshToken="new-refresh",
+            ),
+        )
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = server
+        await server.start()
+        await first_client.connect()
+        await first_client.session.refresh_tokens()
+        await first_client.disconnect()
+        await server.stop()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(connect_refresh_and_disconnect())
+    finally:
+        loop.close()
+
+    second_server = venue()
+    client = cached_account_client(pinned, logger)
+
+    async def connect_the_replacement() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = second_server
+        await second_server.start()
+        try:
+            await client.connect()
+        finally:
+            await client.disconnect()
+            await second_server.stop()
+
+    asyncio.run(connect_the_replacement())
+
+    assert client is not first_client
+    assert [m.accessToken for m in received(second_server, oa.ProtoOAAccountAuthReq)] == [
+        "new-access",
+    ]
+    assert client._credentials.refresh_token == "new-refresh"
+
+
+# The connect cut off on the closed loop fails to close once it is collected.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_a_client_whose_loop_closed_mid_connect_is_replaced_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    servers: dict[str, FakeCTraderServer] = {}
+    route_hosts(monkeypatch, servers)
+    logger = RecordingLogger()
+    pinned = credentials(token_expires_at=time.time() + 3600.0)
+    first_client = cached_account_client(pinned, logger)
+    server = venue()
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda _r: account_list(is_live=True),
+    )
+
+    connecting: list[asyncio.Task] = []
+
+    async def start_connecting() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = server
+        await server.start()
+        connecting.append(asyncio.get_running_loop().create_task(first_client.connect()))
+        await held.arrived.wait()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(start_connecting())
+    finally:
+        loop.close()
+
+    # Still resolving the account: no session yet, only the lifecycle lock held.
+    assert first_client.session is None
+    assert cached_account_client(pinned, logger) is not first_client
+    assert any("closed without a disconnect" in m for m in logger.warnings())
+    connecting.clear()
+    # Inside this test, so the filter above applies.
+    gc.collect()
+
+
+def test_a_connect_from_another_loop_during_a_bring_up_is_refused() -> None:
+    """Two nodes on one account, each on its own loop and thread, connecting at once."""
+    first_loop = asyncio.new_event_loop()
+    first_thread = threading.Thread(target=first_loop.run_forever)
+    first_thread.start()
+
+    def on_the_first_loop(coroutine):
+        return asyncio.run_coroutine_threadsafe(coroutine, first_loop)
+
+    server = venue()
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda _r: account_list(is_live=True),
+    )
+
+    async def connect_from_the_second_loop() -> None:
+        async with asyncio.timeout(5.0):
+            await client.connect()
+
+    try:
+        on_the_first_loop(server.start()).result(5.0)
+        # After the start, which picks the port.
+        client = account_client(server)
+        first_connect = on_the_first_loop(client.connect())
+        on_the_first_loop(held.arrived.wait()).result(5.0)
+        assert client.session is None
+        # Answered while the second loop's connect may be waiting for the first one's.
+        first_loop.call_soon_threadsafe(
+            first_loop.call_later,
+            0.3,
+            lambda: first_loop.create_task(held.release()),
+        )
+
+        with pytest.raises(CTraderConnectionError, match="another event loop"):
+            asyncio.run(connect_from_the_second_loop())
+
+        first_connect.result(5.0)
+        assert client._users == 1
+        assert client.session.is_ready
+        on_the_first_loop(client.disconnect()).result(5.0)
+        on_the_first_loop(server.stop()).result(5.0)
+    finally:
+        first_loop.call_soon_threadsafe(first_loop.stop)
+        first_thread.join(5.0)
+        first_loop.close()
 
 
 def test_a_connect_while_the_session_runs_on_another_open_loop_is_refused(
