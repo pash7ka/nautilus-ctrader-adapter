@@ -546,8 +546,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         # Brackets settled while their position was kept, by position id: their carried commands
         # go out if the position proves open.
         self._kept_brackets: dict[int, list[_KeptBracket]] = {}
-        # Brackets `_detach` handed back, with their position ids, until the next connect.
-        self._handed_back: list[tuple[int, PendingBracket]] = []
+        # Brackets pending at a detach whose position the model held, by entry id, with that
+        # position's id; the next connect ends those whose position is gone.
+        self._detached: dict[str, tuple[int, PendingBracket]] = {}
         # Events held while the model is rebuilt, or `None` when it stands.
         self._buffer: list[_ModelEvent] | None = None
         # Set whenever no buffer is held, so an amend whose answer was held can wait for it.
@@ -615,7 +616,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             self._currency = Currency.from_str(self._account.deposit_asset.name)
             self._take_trader(trader)
             await self._load()
-            self._end_handed_back()
+            self._end_detached()
             self._emit_account_state(self._clock.timestamp_ns())
             await self._hold_reference_spots()
             self._check_attached()
@@ -661,11 +662,14 @@ class CTraderExecutionClient(LiveExecutionClient):
         for timer in self._protection_timers:
             timer.cancel()
         self._protection_timers.clear()
-        self._handed_back += self._unstash()
+        self._unstash()
         # The reconnect's rebuild settles them again.
         for bracket in self._brackets:
             bracket.stop_retry()
             bracket.rebuild_failures = 0
+            view = self._bracket_position(bracket)
+            if view is not None:
+                self._detached[bracket.entry_id] = (view.position_id, bracket)
         if self._outbox_task is not None:
             self._outbox_task.cancel()
             self._outbox_task = None
@@ -700,39 +704,46 @@ class CTraderExecutionClient(LiveExecutionClient):
         session.remove_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
         session.remove_restore(self._restore_key)
 
-    def _unstash(self) -> list[tuple[int, PendingBracket]]:
+    def _unstash(self) -> None:
         """Stop the kept positions' waits and hand their stashed brackets back to `_brackets`.
 
         A rebuild that keeps nothing answers their legs through its own reports; left stashed,
-        they would be answered a second time. Returns each bracket handed back, with its
-        position id.
+        they would be answered a second time.
         """
         for timer in self._close_timers.values():
             timer.cancel()
         self._close_timers.clear()
-        handed_back = []
-        for position_id, held in self._kept_brackets.items():
+        for held in self._kept_brackets.values():
             for kept in held:
                 # Its next rebuild failure waits the shortest time again.
                 kept.bracket.rebuild_failures = 0
                 self._brackets.add(kept.bracket)
-                handed_back.append((position_id, kept.bracket))
         self._kept_brackets.clear()
-        return handed_back
 
-    def _end_handed_back(self) -> None:
-        """End each bracket `_detach` handed back whose position is gone or closed at the connect.
+    def _end_detached(self) -> None:
+        """End each bracket pending at the detach whose position is gone or closed at the connect.
 
-        Its legs' queries are then answered as the broker holds them. Its carried commands are
-        not refused: their answers were lost.
+        No reconciliation follows a reconnect of the client alone, so its legs are then answered
+        by their queries, as the broker holds them (`_end_closed_bracket()`).
         """
-        handed_back, self._handed_back = self._handed_back, []
-        for position_id, bracket in handed_back:
+        detached, self._detached = self._detached, {}
+        for position_id, bracket in detached.values():
             if self._brackets.by_entry(bracket.entry_id) is not bracket:
                 continue
             view = self._book.view(position_id)
             if view is None or not view.open:
-                self._brackets.remove(bracket.entry_id)
+                self._end_closed_bracket(bracket)
+
+    def _end_closed_bracket(self, bracket: PendingBracket) -> None:
+        """End `bracket`, whose position closed before its levels were set.
+
+        A carried modify is refused unless the bracket's last amend lost its answer: that amend
+        may have carried it, so it is left to its leg's end, reported or queried.
+        """
+        if bracket.answer_lost:
+            self._brackets.remove(bracket.entry_id)
+        else:
+            self._end_bracket(bracket.entry_id, "the position closed before its levels were set")
 
     async def _reload(self) -> None:
         """Reconcile again on a reconnect: the broker may have changed meanwhile.
@@ -803,9 +814,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 continue
             view = self._bracket_position(bracket)
             if view is None or not view.open:
-                self._end_bracket(
-                    bracket.entry_id, "the position closed before its levels were set"
-                )
+                self._end_closed_bracket(bracket)
 
     def _end_lost_closes(self) -> None:
         for client_order_id in self._lost_closes:
@@ -2418,7 +2427,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._handle_records(self._book.protection_timed_out(position_id))
 
     def _await_close(self, position_id: int, *, retried: bool) -> None:
-        """Read kept position `position_id`'s deals after a wait, if it still `awaits_close()`.
+        """Read position `position_id`'s deals after a wait, if it still `awaits_close()` then.
+
+        Armed for a kept position; a non-closing event that ends the keep leaves it armed.
 
         Nothing is armed while a wait for it is pending.
         """
@@ -2437,11 +2448,12 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._close_timers[position_id] = timer
 
     async def _close_from_deals(self, position_id: int, *, retried: bool) -> None:
-        """Apply a kept position's closing deals as their execution events would have been applied.
+        """Apply a position's closing deals as their execution events would have been applied.
 
-        A rebuild's snapshot lacked the position and no event closed it since. A failed read is
-        tried once more after `protective_order_timeout_secs`. After an ERROR the position stays
-        kept, so a later event or rebuild still answers its brackets.
+        A rebuild's snapshot lacked the position and no event closed it since, though a
+        non-closing one may have ended its keep (`VenueBook.awaits_close()`). A failed read is
+        tried once more after `protective_order_timeout_secs`. After an ERROR nothing changes,
+        so a later event or rebuild still answers its legs and brackets.
         """
         wait_secs = self._config.protective_order_timeout_secs
         unanswered = (

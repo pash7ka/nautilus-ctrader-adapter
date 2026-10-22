@@ -4148,13 +4148,25 @@ async def test_a_reconnect_answers_a_stashed_brackets_legs_once(
         assert len(h.client._brackets) == 0
 
 
+async def test_a_reconnect_ending_a_stashed_bracket_refuses_none_of_its_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await reconnect_after_a_stashed_close(h, held, monkeypatch, execution_venue)
+
+        # The stop's modify rode amends whose answers were lost: the stop's fill answers it.
+        assert refusals(h, h.cache.order(ClientOrderId(STOP))) == []
+        assert len(h.client._brackets) == 0
+
+
 async def test_a_stashed_leg_nautilus_holds_closed_is_not_cancelled_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     execution_venue, held = entry_held()
     async with harness(execution_venue=execution_venue, config=LOSING) as h:
         # The bracket stays stashed across the reconnect: only the guard stands.
-        monkeypatch.setattr(h.client, "_unstash", lambda: [])
+        monkeypatch.setattr(h.client, "_unstash", lambda: None)
         await reconnect_after_a_stashed_close(h, held, monkeypatch, execution_venue)
 
         assert_each_leg_ended_once(h)
@@ -4547,6 +4559,50 @@ async def test_a_connect_ends_a_handed_back_bracket_whose_position_is_gone(
         assert report.order_status == OrderStatus.CANCELED
         _, sent = await h.client._answer(stop.client_order_id, None)
         assert sent
+
+
+async def test_a_connect_keeps_a_handed_back_bracket_whose_position_is_listed_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(lambda: any("name no close" in e for e in h.logger.errors()))
+        assert h.client._kept_brackets
+
+        await h.client._disconnect()
+        broker_holds(execution_venue, stop=85197.2, target=85387.22)
+        await h.client._connect()
+        stop = h.cache.order(ClientOrderId(STOP))
+        # Still pending, so its carried modify goes out.
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+
+        (amend,) = amends
+        assert amend.stopLoss == 85150.0
+        assert refusals(h, stop) == []
+
+
+async def test_a_connect_ends_a_pending_bracket_whose_position_closed_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held, _ = refusing_amends(first_only=False)
+    async with harness(execution_venue=execution_venue, config=HOLDING) as h:
+        await lost_correction(h, held, monkeypatch)
+        assert len(h.client._brackets) == 1
+
+        await h.client._disconnect()
+        # Closed by its stop while the client was away.
+        closed_by_stop(execution_venue)
+        await h.client._connect()
+        await sync(h)
+
+        assert len(h.client._brackets) == 0
+        stop = h.cache.order(ClientOrderId(STOP))
+        # The correction carrying the stop's modify lost its answer: the modify is not refused.
+        assert refusals(h, stop) == []
+        report, _ = await h.client._answer(ClientOrderId(TARGET), None)
+        assert report.order_status == OrderStatus.CANCELED
 
 
 async def test_answering_as_held_sends_no_cancel_for_a_leg_nautilus_holds_closed() -> None:
