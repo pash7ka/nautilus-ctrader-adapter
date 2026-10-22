@@ -21,8 +21,7 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
-
-ACCOUNT_ID = 1234567
+from tests.session_venue import ACCOUNT_ID, authenticating_server, session_for
 
 FAST = Pacing(requests_per_window=1000, historical_requests_per_window=1000)
 
@@ -61,41 +60,10 @@ def _owned_tasks(name: str) -> list[asyncio.Task]:
     ]
 
 
-def _authenticating_server() -> FakeCTraderServer:
-    server = FakeCTraderServer()
-    server.on(
-        oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
-        lambda _r: oa.ProtoOAApplicationAuthRes(),
-    )
-    server.on(
-        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
-        lambda _r: oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID),
-    )
-    return server
-
-
-def _session(
-    server: FakeCTraderServer,
-    logger: Logger | RecordingLogger | None = None,
-    **kwargs,
-) -> CTraderSession:
-    return CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="access-token",
-        logger=Logger("test") if logger is None else logger,
-        tls=False,
-        **kwargs,
-    )
-
-
 async def test_start_authenticates_application_then_account() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
@@ -117,7 +85,7 @@ async def test_a_rejected_application_auth_never_becomes_ready() -> None:
         lambda _r: oa.ProtoOAErrorRes(errorCode="INVALID_REQUEST", description="bad client"),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05, failure_threshold=1)
+    session = session_for(server, backoff_base_secs=0.05, failure_threshold=1)
     try:
         await session.start()
         with pytest.raises(TimeoutError):
@@ -129,13 +97,13 @@ async def test_a_rejected_application_auth_never_becomes_ready() -> None:
 
 
 async def test_restore_actions_run_after_authentication() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
     )
     await server.start()
-    session = _session(server)
+    session = session_for(server)
 
     async def subscribe() -> None:
         await session.request(
@@ -154,13 +122,13 @@ async def test_restore_actions_run_after_authentication() -> None:
 
 
 async def test_a_dropped_connection_reauthenticates_and_replays_restores() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
 
     async def subscribe() -> None:
         await session.request(
@@ -193,10 +161,10 @@ async def test_a_silent_venue_makes_the_session_reconnect() -> None:
     # The fake server answers only auth requests; after authentication it goes silent, which is
     # exactly the half-open-connection case. Our own heartbeats get no answer either, but that
     # does not matter here - the inbound-silence watchdog is what must notice and reconnect.
-    server = _authenticating_server()
+    server = authenticating_server()
     server.answer_heartbeats = False
     await server.start()
-    session = _session(
+    session = session_for(
         server,
         heartbeat_idle_secs=0.05,
         inbound_silence_secs=0.3,
@@ -214,13 +182,13 @@ async def test_a_silent_venue_makes_the_session_reconnect() -> None:
 
 
 async def test_a_removed_restore_is_not_replayed() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
 
     async def subscribe() -> None:
         await session.request(
@@ -245,9 +213,9 @@ async def test_a_removed_restore_is_not_replayed() -> None:
 
 
 async def test_a_request_while_not_ready_fails_fast() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     try:
         with pytest.raises(CTraderConnectionError, match="not ready"):
             await session.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
@@ -257,9 +225,9 @@ async def test_a_request_while_not_ready_fails_fast() -> None:
 
 
 async def test_unsolicited_events_reach_the_event_handler() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     seen: list[object] = []
     try:
         session.add_event_handler(oa.ProtoOASpotEvent, seen.append)
@@ -285,7 +253,7 @@ async def test_a_rejected_auth_is_recorded_as_last_error() -> None:
         lambda _r: oa.ProtoOAErrorRes(errorCode="INVALID_REQUEST"),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     try:
         await session.start()
         await wait_until(lambda: isinstance(session.last_error, CTraderAuthError))
@@ -296,13 +264,13 @@ async def test_a_rejected_auth_is_recorded_as_last_error() -> None:
 
 
 async def test_a_failing_restore_does_not_keep_the_session_down() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone"),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     attempts: list[int] = []
 
     async def subscribe() -> None:
@@ -331,9 +299,9 @@ async def test_a_failing_restore_does_not_keep_the_session_down() -> None:
 
 async def test_a_restore_raising_a_connection_error_is_a_bring_up_failure() -> None:
     # The exception clause: a connection error from a restore must not be contained.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     attempts: list[int] = []
 
     async def restore() -> None:
@@ -353,9 +321,9 @@ async def test_a_restore_raising_a_connection_error_is_a_bring_up_failure() -> N
 
 
 async def test_starting_twice_runs_a_single_supervisor() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     try:
         await session.start()
         await session.start()
@@ -370,9 +338,9 @@ async def test_starting_twice_runs_a_single_supervisor() -> None:
 
 async def test_a_session_lost_soon_after_ready_backs_off() -> None:
     # A peer that drops every new session must not be hammered with immediate reconnects.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=1.0)
+    session = session_for(server, backoff_base_secs=1.0)
     try:
         await session.start()
         loop = asyncio.get_running_loop()
@@ -398,10 +366,10 @@ async def test_a_protocol_error_during_a_restore_is_a_bring_up_failure() -> None
     # A malformed frame rejects pending requests with the protocol error itself, not a
     # connection error. Bring-up must still fail - and back off - rather than mark a dead
     # socket ready and reconnect immediately.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
     logger = RecordingLogger()
-    session = _session(server, logger=logger, backoff_base_secs=0.5)
+    session = session_for(server, logger=logger, backoff_base_secs=0.5)
     attempts: list[int] = []
 
     async def restore() -> None:
@@ -449,20 +417,10 @@ async def test_a_loss_after_a_stable_session_reconnects_at_once(
     # A session that had been ready for a while is recovering, not failing: the attempt
     # counter resets and the next connection is not made to wait out a backoff.
     monkeypatch.setattr("nautilus_ctrader.common.session.STABLE_SESSION_SECS", 0.0)
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
     logger = RecordingLogger()
-    session = CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="access-token",
-        logger=logger,
-        tls=False,
-        backoff_base_secs=5.0,
-    )
+    session = session_for(server, logger, backoff_base_secs=5.0)
     loop = asyncio.get_running_loop()
     try:
         await session.start()
@@ -495,9 +453,9 @@ async def test_a_loss_right_after_authenticating_skips_restoring(
     # A loss landing the instant authentication finishes must be caught before RESTORING
     # starts, not only after the restore loop runs - or a restore would go out on a socket
     # whose authentication just dropped.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     attempts: list[int] = []
     triggered = False
     original_authenticate = CTraderSession._authenticate
@@ -533,9 +491,9 @@ async def test_a_loss_right_after_authenticating_skips_restoring(
 async def test_a_bring_up_failure_chains_the_real_disconnect_reason() -> None:
     # A protocol error during restore rejects the pending request with itself; the bring-up
     # failure raised from it must still carry that real reason in its exception chain.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=1.0)
+    session = session_for(server, backoff_base_secs=1.0)
     attempts: list[int] = []
 
     async def restore() -> None:
@@ -579,9 +537,9 @@ async def test_a_bring_up_loss_through_an_event_does_not_chain_a_stale_cause() -
     # An auth-loss event (unlike a socket loss) carries no exception of its own. If the bring-up
     # failure it triggers still chains to `last_error`, repeated failures chain to each other and
     # the public `__cause__` ends up pointing at an unrelated, older failure.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
 
     async def restore() -> None:
         session._on_event(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
@@ -640,14 +598,14 @@ async def test_connect_timeout_secs_is_forwarded_to_the_connection() -> None:
 
 
 async def test_failed_restores_reports_the_keys_that_failed_in_the_last_bring_up() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     replies = iter([oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone")])
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: next(replies, oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID)),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
 
     async def subscribe() -> None:
         await session.request(
@@ -675,13 +633,13 @@ async def test_failed_restores_reports_the_keys_that_failed_in_the_last_bring_up
 
 
 async def test_remove_restore_also_clears_it_from_failed_restores() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone"),
     )
     await server.start()
-    session = _session(server)
+    session = session_for(server)
 
     async def subscribe() -> None:
         await session.request(
@@ -704,14 +662,14 @@ async def test_remove_restore_also_clears_it_from_failed_restores() -> None:
 async def test_a_loss_after_the_last_restore_fails_the_bring_up() -> None:
     # The restore's own request succeeded, so only the loss check after the loop stands between
     # this bring-up and a session marked ready on a dead socket.
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
     )
     await server.start()
     logger = RecordingLogger()
-    session = _session(server, logger=logger, backoff_base_secs=0.05)
+    session = session_for(server, logger=logger, backoff_base_secs=0.05)
     attempts: list[int] = []
 
     async def subscribe_then_lose() -> None:
@@ -747,7 +705,7 @@ async def test_bring_up_failures_escalate_to_error_at_the_threshold() -> None:
     )
     await server.start()
     logger = RecordingLogger()
-    session = _session(server, logger=logger, backoff_base_secs=0.05, failure_threshold=2)
+    session = session_for(server, logger=logger, backoff_base_secs=0.05, failure_threshold=2)
     try:
         await session.start()
         await wait_until(lambda: bool(logger.errors()), description="an ERROR line")
@@ -766,7 +724,7 @@ async def test_stop_during_bring_up_returns_promptly() -> None:
     # No handler: the application auth request is never answered.
     server = FakeCTraderServer()
     await server.start()
-    session = _session(server, request_timeout_secs=30.0)
+    session = session_for(server, request_timeout_secs=30.0)
     try:
         await session.start()
         await wait_until(
@@ -796,9 +754,9 @@ async def test_stop_during_bring_up_returns_promptly() -> None:
 async def test_stop_can_be_cancelled_by_its_own_caller() -> None:
     # If `stop()` swallowed cancellation aimed at it, `wait_for(session.stop(), ...)` could never
     # time out and a cancelled caller would see a normal return instead of `CancelledError`.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
@@ -843,9 +801,9 @@ async def test_stop_survives_repeated_cancellation(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(CTraderConnection, "_heartbeat_loop", slow_to_cancel_heartbeat_loop)
 
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
@@ -893,9 +851,9 @@ async def test_a_server_drop_during_stop_changes_nothing(
 
     monkeypatch.setattr(CTraderConnection, "_heartbeat_loop", slow_to_cancel_heartbeat_loop)
 
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
@@ -918,14 +876,14 @@ async def test_a_server_drop_during_stop_changes_nothing(
 async def test_start_during_stop_ends_healthy() -> None:
     # A restore slow to honour cancellation keeps `stop()` waiting while `start()` is called,
     # as when Nautilus schedules disconnect and connect as separate tasks.
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
     )
     await server.start()
     # Fast pacing, so the new bring-up finishes well inside the restore's cancellation delay.
-    session = _session(server, backoff_base_secs=0.01, pacing=FAST)
+    session = session_for(server, backoff_base_secs=0.01, pacing=FAST)
     slow_restore = _SlowRestore()
 
     def subscribe_request() -> oa.ProtoOASubscribeSpotsReq:
@@ -988,9 +946,9 @@ async def test_a_stop_after_a_waiting_start_wins() -> None:
     # A; stop() C lands while the supervisor is already captured by A, so C returns almost at
     # once, decrementing the in-progress count without reaching zero. When A finally finishes
     # and wakes S, C - not S - must be the call the session ends up reflecting.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=0.01, pacing=FAST)
+    session = session_for(server, backoff_base_secs=0.01, pacing=FAST)
     slow_restore = _SlowRestore()
     try:
         session.add_restore("slow", slow_restore)
@@ -1014,9 +972,9 @@ async def test_a_stop_after_a_waiting_start_wins_as_separate_tasks() -> None:
     # Same race as above, as separate tasks with a yield between each call - the shape Nautilus
     # uses when disconnect/connect/disconnect are scheduled from unrelated call sites rather
     # than awaited together in one coroutine.
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=0.01, pacing=FAST)
+    session = session_for(server, backoff_base_secs=0.01, pacing=FAST)
     slow_restore = _SlowRestore()
     try:
         session.add_restore("slow", slow_restore)
@@ -1064,9 +1022,9 @@ async def test_stop_returns_promptly_after_the_server_drops_the_connection(
 
     monkeypatch.setattr(CTraderConnection, "_heartbeat_loop", slow_to_cancel_heartbeat_loop)
 
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=5.0)
+    session = session_for(server, backoff_base_secs=5.0)
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
@@ -1087,13 +1045,13 @@ async def test_stop_returns_promptly_after_the_server_drops_the_connection(
 
 
 async def test_session_request_passes_its_priority() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_GET_TRENDBARS_REQ,
         lambda _r: oa.ProtoOAGetTrendbarsRes(ctidTraderAccountId=ACCOUNT_ID, period=oa_model.M1),
     )
     await server.start()
-    session = _session(server)
+    session = session_for(server)
 
     def trendbars(symbol_id: int) -> oa.ProtoOAGetTrendbarsReq:
         return oa.ProtoOAGetTrendbarsReq(

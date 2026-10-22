@@ -4,55 +4,20 @@ from __future__ import annotations
 
 import asyncio
 
-from nautilus_trader.common.component import Logger
-
 from nautilus_ctrader.common.errors import CTraderConnectionError
 from nautilus_ctrader.common.session import CTraderSession, SessionState
 from nautilus_ctrader.constants import GROUP_HISTORICAL, GROUP_OTHER
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
-from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
-
-ACCOUNT_ID = 1234567
-
-
-def _authenticating_server() -> FakeCTraderServer:
-    server = FakeCTraderServer()
-    server.on(
-        oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
-        lambda _r: oa.ProtoOAApplicationAuthRes(),
-    )
-    server.on(
-        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
-        lambda _r: oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID),
-    )
-    return server
-
-
-def _session(
-    server: FakeCTraderServer,
-    logger: Logger | RecordingLogger | None = None,
-    **kwargs,
-) -> CTraderSession:
-    return CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="access-token",
-        logger=Logger("test") if logger is None else logger,
-        tls=False,
-        **kwargs,
-    )
+from tests.session_venue import ACCOUNT_ID, authenticating_server, session_for
 
 
 async def test_two_handlers_for_the_same_type_both_receive_the_event() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     first: list[object] = []
     second: list[object] = []
     executions: list[object] = []
@@ -77,9 +42,9 @@ async def test_two_handlers_for_the_same_type_both_receive_the_event() -> None:
 
 
 async def test_remove_event_handler_stops_delivery() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     seen: list[object] = []
     try:
         session.add_event_handler(oa.ProtoOASpotEvent, seen.append)
@@ -99,10 +64,10 @@ async def test_remove_event_handler_stops_delivery() -> None:
 
 
 async def test_a_raising_handler_does_not_stop_the_next_one() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
     logger = RecordingLogger()
-    session = _session(server, logger=logger)
+    session = session_for(server, logger=logger)
     seen: list[object] = []
 
     def explode(_payload: object) -> None:
@@ -127,9 +92,9 @@ async def test_a_raising_handler_does_not_stop_the_next_one() -> None:
 
 
 async def test_a_handler_removing_itself_during_dispatch_does_not_skip_the_next_one() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     second: list[object] = []
 
     def remove_self(_payload: object) -> None:
@@ -153,9 +118,9 @@ async def test_a_handler_removing_itself_during_dispatch_does_not_skip_the_next_
 
 
 async def test_remove_event_handler_on_a_live_session_stops_delivery() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     seen: list[object] = []
     try:
         session.add_event_handler(oa.ProtoOASpotEvent, seen.append)
@@ -176,10 +141,10 @@ async def test_remove_event_handler_on_a_live_session_stops_delivery() -> None:
 
 
 async def test_an_event_with_no_handler_logs_a_debug_line_naming_the_type() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
     logger = RecordingLogger()
-    session = _session(server, logger=logger)
+    session = session_for(server, logger=logger)
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
@@ -222,13 +187,13 @@ def _trendbars_req() -> oa.ProtoOAGetTrendbarsReq:
 
 
 async def test_a_historical_request_uses_the_historical_group_and_auth_the_other() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_GET_TRENDBARS_REQ,
         lambda _r: oa.ProtoOAGetTrendbarsRes(ctidTraderAccountId=ACCOUNT_ID, period=oa_model.M1),
     )
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     groups = _record_groups(session)
     try:
         await session.start()
@@ -245,14 +210,14 @@ async def test_a_historical_request_uses_the_historical_group_and_auth_the_other
 
 
 async def test_retry_failed_restores_reruns_and_clears_a_succeeding_key() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     replies = iter([oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone")])
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: next(replies, oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID)),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     attempts: list[int] = []
 
     async def subscribe() -> None:
@@ -278,14 +243,14 @@ async def test_retry_failed_restores_reruns_and_clears_a_succeeding_key() -> Non
 
 
 async def test_retry_keeps_a_key_that_fails_again_and_logs_a_warning() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone"),
     )
     await server.start()
     logger = RecordingLogger()
-    session = _session(server, logger=logger, backoff_base_secs=0.05)
+    session = session_for(server, logger=logger, backoff_base_secs=0.05)
     attempts: list[int] = []
 
     async def subscribe() -> None:
@@ -312,13 +277,13 @@ async def test_retry_keeps_a_key_that_fails_again_and_logs_a_warning() -> None:
 
 
 async def test_retry_returns_immediately_when_not_ready() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone"),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     attempts: list[int] = []
 
     async def subscribe() -> None:
@@ -346,9 +311,9 @@ async def test_retry_returns_immediately_when_not_ready() -> None:
 
 
 async def test_retry_stops_when_the_connection_is_lost_mid_retry() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     calls: list[int] = []
 
     async def flaky() -> None:
@@ -373,13 +338,13 @@ async def test_retry_stops_when_the_connection_is_lost_mid_retry() -> None:
 
 
 async def test_overlapping_retries_do_not_rerun_a_factory_twice() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOAErrorRes(errorCode="ENTITY_NOT_FOUND", description="gone"),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     attempts: list[int] = []
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -421,13 +386,13 @@ async def test_a_retry_spanning_a_reconnect_does_not_clear_a_newly_failed_key() 
     # next bring-up clears `_failed_restores` and marks the same key failed again on its own
     # attempt; the original retry's call then succeeds only because `RESTORING` accepts
     # requests. Its stale result must not overwrite what the newer bring-up decided.
-    server = _authenticating_server()
+    server = authenticating_server()
     server.on(
         oa_model.PROTO_OA_SUBSCRIBE_SPOTS_REQ,
         lambda _r: oa.ProtoOASubscribeSpotsRes(ctidTraderAccountId=ACCOUNT_ID),
     )
     await server.start()
-    session = _session(server, backoff_base_secs=0.05)
+    session = session_for(server, backoff_base_secs=0.05)
     calls: list[int] = []
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -477,9 +442,9 @@ async def test_a_retry_spanning_a_reconnect_does_not_clear_a_newly_failed_key() 
 
 
 async def test_mark_restore_failed_marks_only_a_registered_key() -> None:
-    server = _authenticating_server()
+    server = authenticating_server()
     await server.start()
-    session = _session(server)
+    session = session_for(server)
     runs = []
 
     async def restore() -> None:

@@ -1,12 +1,12 @@
 """Token refresh, and recovery when the venue drops authentication on a live socket."""
 
 import asyncio
+import functools
 import struct
 import time
 from collections.abc import Callable
 
 import pytest
-from nautilus_trader.common.component import Logger
 
 from nautilus_ctrader.common.errors import (
     CTraderAuthError,
@@ -23,8 +23,8 @@ from tests.account_venue import HeldReplies
 from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
+from tests.session_venue import ACCOUNT_ID, authenticating_server, session_for
 
-ACCOUNT_ID = 1234567
 OTHER_ACCOUNT_ID = 7654321
 
 
@@ -38,36 +38,13 @@ def _refresh_response(_request: object) -> oa.ProtoOARefreshTokenRes:
 
 
 def _server() -> FakeCTraderServer:
-    server = FakeCTraderServer()
-    server.on(
-        oa_model.PROTO_OA_APPLICATION_AUTH_REQ,
-        lambda _r: oa.ProtoOAApplicationAuthRes(),
-    )
-    server.on(
-        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
-        lambda _r: oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID),
-    )
+    server = authenticating_server()
     server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, _refresh_response)
     return server
 
 
-def _session(
-    server: FakeCTraderServer,
-    logger: Logger | RecordingLogger | None = None,
-    **kwargs,
-) -> CTraderSession:
-    return CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="old-access",
-        refresh_token="old-refresh",
-        logger=Logger("test") if logger is None else logger,
-        tls=False,
-        **kwargs,
-    )
+# A session that holds a refresh token, unlike the shared builder's default.
+_session = functools.partial(session_for, access_token="old-access", refresh_token="old-refresh")
 
 
 def _account_auths(server: FakeCTraderServer) -> list[oa.ProtoOAAccountAuthReq]:
@@ -152,16 +129,7 @@ async def test_a_rejected_refresh_raises_an_auth_error() -> None:
 async def test_refresh_without_a_refresh_token_raises() -> None:
     server = _server()
     await server.start()
-    session = CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="only-access",
-        logger=Logger("test"),
-        tls=False,
-    )
+    session = _session(server, access_token="only-access", refresh_token=None)
     try:
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
@@ -929,18 +897,11 @@ async def test_a_raising_persistence_callback_is_logged_and_the_session_carries_
     def explode(_access: str, _refresh: str, _expires_at: float) -> None:
         raise RuntimeError("storage unavailable")
 
-    session = CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="old-access",
-        refresh_token="old-refresh",
+    session = _session(
+        server,
+        logger,
         expires_at_secs=_due_after_ready(monkeypatch),
         on_tokens_refreshed=explode,
-        logger=logger,
-        tls=False,
     )
     try:
         await session.start()
@@ -964,17 +925,10 @@ async def test_a_proactive_refresh_that_fails_unexpectedly_is_logged(
     server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
     await server.start()
     logger = RecordingLogger()
-    session = CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="old-access",
-        refresh_token="old-refresh",
+    session = _session(
+        server,
+        logger,
         expires_at_secs=_due_after_ready(monkeypatch),
-        logger=logger,
-        tls=False,
         backoff_base_secs=0.05,
     )
     try:
@@ -1003,17 +957,10 @@ async def test_a_proactive_refresh_that_will_be_retried_before_expiry_is_a_warni
     server.on(oa_model.PROTO_OA_REFRESH_TOKEN_REQ, lambda _r: None)
     await server.start()
     logger = RecordingLogger()
-    session = CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="old-access",
-        refresh_token="old-refresh",
+    session = _session(
+        server,
+        logger,
         expires_at_secs=_due_after_ready(monkeypatch),
-        logger=logger,
-        tls=False,
         backoff_base_secs=0.05,
     )
     try:
@@ -1106,17 +1053,10 @@ async def test_a_loss_during_a_proactive_refresh_keeps_its_backoff(
     server = _server()
     await server.start()
     logger = RecordingLogger()
-    session = CTraderSession(
-        host=server.host,
-        port=server.port,
-        client_id="client-id",
-        client_secret="client-secret",
-        account_id=ACCOUNT_ID,
-        access_token="old-access",
-        refresh_token="old-refresh",
+    session = _session(
+        server,
+        logger,
         expires_at_secs=_due_after_ready(monkeypatch),
-        logger=logger,
-        tls=False,
         backoff_base_secs=0.05,
     )
     original_refresh = CTraderSession.refresh_tokens
