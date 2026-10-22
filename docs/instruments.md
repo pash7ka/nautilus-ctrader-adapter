@@ -178,6 +178,9 @@ for failure in provider.failures:
     print(failure.symbol, failure.reason)
 ```
 
+The list holds one entry per symbol, the latest failure, and a later successful load of the
+symbol removes its entry.
+
 An instrument that loads but is not tradable right now (`tradingMode` other than `ENABLED`) is
 a WARNING, not a failure: it is still a correct instrument.
 

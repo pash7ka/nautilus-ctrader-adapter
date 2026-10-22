@@ -60,8 +60,10 @@ once, in ascending order, whichever of them got there first:
   bar replaces the streamed state. History can lag a just-closed bar, so it is asked up to
   `1 + bar_close_history_retries` times, a grace period apart. If it still has nothing, the last
   streamed state is emitted with a WARNING, and a repeat of the same condition drops to DEBUG
-  rather than flooding the log. A request that finds no connection is not one of those
-  attempts: the bar keeps waiting, and the backfill below closes it.
+  rather than flooding the log. All of the asking takes one bar period at most, a request
+  still unanswered then included, so a bar history cannot serve holds the bars behind it no
+  longer than that. A request that finds no connection is not one of those attempts: the bar
+  keeps waiting, and the backfill below closes it.
 - **A backfill after a reconnect.** Bars that closed while the connection was down are fetched
   from history and emitted before the stream resumes. The range is fetched once; bars that close
   while that fetch runs are then asked from history one by one. The backfill runs in the
@@ -138,6 +140,14 @@ bar opening before it, although the venue's pages reach back past it, and one wi
 delivers the newest `limit` closed bars. With neither a `start` nor a `limit` exactly one page
 is fetched: that call is asking for "the most recent bars", not for the whole history the venue
 holds.
+
+Paging back stops at a stretch without bars longer than `history_max_gap_days` (7 days by
+default), set per broker symbol name in `history_max_gap_overrides`, such as
+`{"US100.cash": 14.0}`, for a symbol whose market can close for longer. History is then taken to start
+at the oldest bar served: the request is answered with the bars served so far, not failed, and
+one INFO line names the symbol and where its history starts. Without this, a `start` before the
+symbol's history would cost one request per empty page all the way back to it. The same applies
+to the backfill after a reconnect.
 
 Historical requests are rate-limited separately from everything else and much more tightly, so
 a large warm-up cannot starve the subscriptions running beside it.

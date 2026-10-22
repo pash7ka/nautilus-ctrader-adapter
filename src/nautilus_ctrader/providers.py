@@ -1,8 +1,9 @@
 """`CTraderInstrumentProvider`: builds Nautilus instruments from broker symbol specs.
 
-Requires `account` to already be connected; every method raises `CTraderConnectionError`
-otherwise. Load failures (unknown symbols, protocol errors from `instrument_from_symbol`) are
-recorded rather than raised, unless `fail_on_instrument_error` is set.
+Loading and reloading raise `CTraderConnectionError` when the account is not connected. Load
+failures (unknown symbols, protocol errors from `instrument_from_symbol`) are recorded rather
+than raised, unless `fail_on_instrument_error` is set; a later successful load of the symbol
+removes its entry.
 """
 
 from __future__ import annotations
@@ -353,6 +354,7 @@ class CTraderInstrumentProvider(InstrumentProvider):
         self.add(instrument)
         self._by_symbol_id[instrument.info["symbol_id"]] = instrument
         self._quote_asset_id[instrument.id] = light.quoteAssetId
+        self._failures.pop(name, None)
 
     def _record_failure(self, symbol: str, reason: str) -> InstrumentLoadFailure:
         failure = InstrumentLoadFailure(symbol=symbol, reason=reason)

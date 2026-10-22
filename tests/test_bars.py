@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 
 from nautilus_ctrader.common.bars import BarCloser, RawBar
-from nautilus_ctrader.common.errors import CTraderConnectionError
+from nautilus_ctrader.common.errors import CTraderConnectionError, CTraderTimeoutError
 from tests.recording_logger import RecordingLogger
 
 PERIOD = 60
@@ -397,6 +397,41 @@ async def test_close_stops_a_resolver_that_is_retrying() -> None:
     assert fetch.calls == [T0]
     assert emitted == []
     assert logger.lines == []
+
+
+async def test_an_unresolvable_bar_does_not_hold_the_next_bars_longer_than_one_period() -> None:
+    clock = FakeClock(T0)
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+    asked_at: list[float] = []
+
+    async def fetch(boundary_secs: int) -> RawBar | None:
+        # Every request ends only in its own 30 s timeout.
+        asked_at.append(clock.now())
+        answered = asyncio.get_running_loop().create_future()
+        clock.call_later(30, lambda: answered.done() or answered.set_result(None))
+        await answered
+        raise CTraderTimeoutError("no response")
+
+    closer = make_closer(clock, fetch, emitted, logger)
+    closer.on_update(s(0))
+    await clock.advance(61)  # T0+61: the timer asks history for T0
+    await clock.advance(9)
+    closer.on_update(s(60))
+    await clock.advance(30)  # the first request times out; the retry waits `grace`
+    await clock.advance(1)  # T0+101: the second request goes out
+    await clock.advance(19)
+    closer.on_update(s(120))  # T0+120: the stream closes T0+60, queued behind T0
+    assert emitted == []
+
+    # One period after T0's history was first asked, the second request is still out.
+    await clock.advance(1)
+
+    assert asked_at == [T0 + 61, T0 + 101]
+    assert emitted == [s(0), s(60)]
+    assert len(warnings_of(logger)) == 1
+    assert "emitting the streamed state" in warnings_of(logger)[0]
+    closer.close()
 
 
 async def test_an_emit_callback_exception_from_the_history_path_is_caught_and_logged() -> None:
@@ -1029,14 +1064,17 @@ async def test_backfill_gives_up_waiting_on_a_fetch_that_never_returns() -> None
         return None
 
     closer = make_closer(clock, fetch, emitted, logger)
+    clock.t = T0 + 115
+    # A baseline already closed queues T0; its history request never returns, and its one-period
+    # budget runs until T0+175.
     closer.on_update(s(0))
-    await clock.advance(61)  # the timer queues T0; its history request never returns
+    await settle()
     assert calls == [T0]
 
     async def fetch_range(start: int, end: int) -> list[RawBar]:
         return [h(60)]
 
-    clock.t = T0 + 180
+    clock.t = T0 + 125
     task = asyncio.create_task(closer.backfill(fetch_range))
     await settle()
     assert emitted == []  # h60 is queued behind the stuck T0 entry

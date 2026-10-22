@@ -402,6 +402,44 @@ def with_trendbars(
     return server
 
 
+def h1_history_venue(minutes: list[int]) -> FakeCTraderServer:
+    """The trendbar venue, serving EURUSD H1 history only at `minutes`, each a recorded bar.
+
+    Unlike `trendbar_venue` it bounds an answer by `fromTimestamp` too, so a window inside a gap
+    of history comes back empty.
+    """
+    template = RECORDED["trendbars_h1"][0].trendbar[0]
+    bars = {}
+    for minute in minutes:
+        trendbar = om.ProtoOATrendbar()
+        trendbar.CopyFrom(template)
+        trendbar.utcTimestampInMinutes = minute
+        bars[minute] = trendbar
+
+    def serve(request: oa.ProtoOAGetTrendbarsReq) -> oa.ProtoOAGetTrendbarsRes:
+        window = [
+            bars[minute]
+            for minute in sorted(bars)
+            if request.fromTimestamp <= minute * 60_000 <= request.toTimestamp
+        ]
+        return oa.ProtoOAGetTrendbarsRes(
+            ctidTraderAccountId=request.ctidTraderAccountId,
+            symbolId=request.symbolId,
+            period=request.period,
+            trendbar=window[-request.count :],
+            hasMore=len(window) > request.count,
+        )
+
+    server = trendbar_venue()
+    server.on(om.PROTO_OA_GET_TRENDBARS_REQ, serve)
+    return server
+
+
+def hours_back(newest_minute: int, count: int) -> list[int]:
+    """`count` H1 open minutes, ascending, the newest at `newest_minute`."""
+    return [newest_minute - 60 * offset for offset in reversed(range(count))]
+
+
 class PinnedClock:
     """A `Clock` for the client's bar closers whose `now()` the test sets.
 
@@ -2749,6 +2787,79 @@ async def test_a_one_bar_page_on_an_inclusive_edge_still_walks_backwards() -> No
         assert [b.ts_event for b in bars] == [
             close_ns(LAST_H1_MINUTE - 60 * offset, 3600) for offset in reversed(range(3))
         ]
+
+
+DAY_MINUTES = 1_440
+
+
+def cut_offs(h: Harness) -> list[str]:
+    return [line for level, line in h.logger.lines if level == "info" and "history" in line]
+
+
+async def test_paging_back_stops_after_an_empty_stretch_longer_than_the_max_gap() -> None:
+    served = hours_back(LAST_H1_MINUTE, 24)
+    server = h1_history_venue(served)
+    async with harness(client_config=config(history_page_size=20), server=server, logged=True) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(LAST_H1_MINUTE - 60 * DAY_MINUTES),
+            end=at_minute(LAST_H1_MINUTE + 60),
+        )
+
+        assert [b.ts_event for b in bars] == [close_ns(minute, 3600) for minute in served]
+        # Pages of 20 hours: ten cover the served day and the seven empty days behind it, and
+        # two more allow for the page that repeats the oldest bar and the one crossing the gap.
+        # Paging the whole 60 days would take 72.
+        assert len(received(h.server, oa.ProtoOAGetTrendbarsReq)) <= 12
+        assert len(cut_offs(h)) == 1
+        assert "EURUSD" in cut_offs(h)[0]
+        assert at_minute(served[0]).isoformat() in cut_offs(h)[0]
+
+
+async def test_a_gap_shorter_than_the_max_is_paged_through() -> None:
+    newer = hours_back(LAST_H1_MINUTE, 24)
+    older = hours_back(newer[0] - 5 * DAY_MINUTES, 24)
+    server = h1_history_venue(older + newer)
+    async with harness(client_config=config(history_page_size=20), server=server, logged=True) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(LAST_H1_MINUTE - 20 * DAY_MINUTES),
+            end=at_minute(LAST_H1_MINUTE + 60),
+        )
+
+        assert [b.ts_event for b in bars] == [close_ns(minute, 3600) for minute in older + newer]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "older_returned"),
+    [({}, False), ({"EURUSD": 14.0}, True), ({"GBPUSD": 14.0}, False)],
+    ids=["no override", "this symbol", "another symbol"],
+)
+async def test_a_per_instrument_override_extends_the_max_gap(
+    overrides: dict[str, float],
+    older_returned: bool,
+) -> None:
+    newer = hours_back(LAST_H1_MINUTE, 24)
+    older = hours_back(newer[0] - 10 * DAY_MINUTES, 24)
+    client_config = config(history_page_size=20, history_max_gap_overrides=overrides)
+    async with harness(client_config=client_config, server=h1_history_venue(older + newer)) as h:
+        await h.client._connect()
+
+        bars = await request_bars(
+            h,
+            EURUSD_H1,
+            start=at_minute(LAST_H1_MINUTE - 20 * DAY_MINUTES),
+            end=at_minute(LAST_H1_MINUTE + 60),
+        )
+
+        expected = older + newer if older_returned else newer
+        assert [b.ts_event for b in bars] == [close_ns(minute, 3600) for minute in expected]
 
 
 async def test_a_bar_the_stream_did_not_close_is_fetched_from_history() -> None:

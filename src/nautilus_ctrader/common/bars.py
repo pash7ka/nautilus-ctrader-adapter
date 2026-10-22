@@ -71,8 +71,9 @@ class BarCloser:
 
     - A stream update for a newer boundary closes the previous one with its last streamed state.
     - Otherwise a timer at `boundary + period + grace` queues it for history, which is asked up
-      to `1 + history_retries` times, `grace` apart; if it never has the bar, the last streamed
-      state is emitted instead.
+      to `1 + history_retries` times, `grace` apart, and for one period at most from the first
+      ask, a request still out then included; if it never has the bar, the last streamed state
+      is emitted instead.
     - While there is no connection there is no history to ask, so that is not a spent attempt:
       the entry stays queued until `backfill` or a later closed bar resumes it. A bar that
       closed during an outage is therefore never emitted from its partial streamed state.
@@ -402,20 +403,25 @@ class BarCloser:
                 self._drained.set()
 
     async def _from_history(self, pending: _Pending) -> RawBar | None:
-        """Ask history for `pending`'s bar; fall back to its streamed state.
+        """Ask history for `pending`'s bar, for one period at most; fall back to its streamed state.
 
         Return `None` if nothing should be emitted. Raises `CTraderConnectionError` for the
         caller to leave the entry queued: see the class docstring.
         """
         boundary = pending.boundary
+        # Bounded by one period, so a bar history cannot serve holds the bars behind it no
+        # longer than that.
+        deadline = self._clock.now() + self._period
         error: Exception | None = None
         for attempt in range(1 + self._retries):
             if attempt:
+                if self._clock.now() + self._grace >= deadline:
+                    break
                 await self._sleep(self._grace)
             if not self._wanted(pending):
                 return None
             try:
-                result = await self._fetch(boundary)
+                result = await self._fetch_by(boundary, deadline)
             except CTraderConnectionError:
                 # Kept ahead of the catch-all below, which would count it as an attempt.
                 raise
@@ -458,6 +464,36 @@ class BarCloser:
                 f"{self._label}: closed bar from streamed state",
             )
         return fallback
+
+    async def _fetch_by(self, boundary: int, deadline: float) -> RawBar | None:
+        """`fetch(boundary)`, cancelled at `deadline`; raises `TimeoutError` then."""
+        # Eager, so an answer at hand costs no extra turn of the loop.
+        fetch = asyncio.Task(
+            self._fetch(boundary),
+            loop=asyncio.get_running_loop(),
+            eager_start=True,
+        )
+        if fetch.done():
+            return fetch.result()
+        expired = False
+
+        def expire() -> None:
+            nonlocal expired
+            expired = True
+            fetch.cancel()
+
+        handle = self._clock.call_later(deadline - self._clock.now(), expire)
+        try:
+            return await fetch
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if expired and current is not None and not current.cancelling():
+                raise TimeoutError(
+                    f"history did not answer within one bar period ({self._period} s)"
+                ) from None
+            raise
+        finally:
+            handle.cancel()
 
     def _wanted(self, pending: _Pending) -> bool:
         return (

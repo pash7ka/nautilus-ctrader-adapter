@@ -272,6 +272,7 @@ _DATA_DURATIONS = (
     "history_request_timeout_secs",
     "connect_timeout_secs",
     "restore_retry_interval_secs",
+    "history_max_gap_days",
 )
 _EXEC_DURATIONS = ("connect_timeout_secs", "restore_retry_interval_secs")
 _NOT_POSITIVE = (0.0, -1.0, float("nan"))
@@ -288,3 +289,9 @@ _NOT_POSITIVE = (0.0, -1.0, float("nan"))
 def test_a_config_refuses_a_non_positive_duration(build, setting, value) -> None:
     with pytest.raises(ValueError, match=setting):
         build(**{setting: value})
+
+
+@pytest.mark.parametrize("value", _NOT_POSITIVE)
+def test_a_config_refuses_a_non_positive_max_gap_override(value) -> None:
+    with pytest.raises(ValueError, match=r"history_max_gap_overrides\['EURUSD'\]"):
+        config(history_max_gap_overrides={"GBPUSD": 14.0, "EURUSD": value})

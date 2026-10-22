@@ -13,6 +13,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum, auto
 
@@ -1395,6 +1396,7 @@ class CTraderDataClient(LiveMarketDataClient):
         now_secs = int(self._bar_clock.now())
         served = await self._page_trendbars(
             instrument.info["symbol_id"],
+            instrument.id.symbol.value,
             period,
             # Rounded up, so a fractional start never lets in the bar opening just before it.
             start_secs=None if request.start is None else math.ceil(request.start.timestamp()),
@@ -1428,6 +1430,7 @@ class CTraderDataClient(LiveMarketDataClient):
     async def _page_trendbars(
         self,
         symbol_id: int,
+        symbol_name: str,
         period: int,
         *,
         start_secs: int | None,
@@ -1451,11 +1454,20 @@ class CTraderDataClient(LiveMarketDataClient):
         window asked for. A venue that cut the page short - whether it says so through
         `hasMore` or not - therefore skips nothing, and a full page changes nothing, since it
         reaches back to the window's own start.
+
+        Paging back stops, with one INFO line, once the stretch without a bar below the oldest
+        one served (or below `end_secs`, before any) is longer than the symbol's maximum gap:
+        history is taken to start at that bar, and what was served is the answer.
         """
         period_secs = PERIOD_SECS[period]
         span = self._config.history_page_size * period_secs
+        max_gap_days = self._config.history_max_gap_overrides.get(
+            symbol_name,
+            self._config.history_max_gap_days,
+        )
         bars: dict[int, RawBar] = {}
         to_secs = end_secs
+        history_start = end_secs
         while True:
             from_secs = to_secs - span
             if start_secs is not None:
@@ -1482,6 +1494,7 @@ class CTraderDataClient(LiveMarketDataClient):
             if oldest is None:
                 reached = from_secs
             else:
+                history_start = min(history_start, oldest)
                 # Never above the window's own last boundary, so every page makes progress.
                 reached = min(oldest, to_secs - period_secs)
                 if reached > from_secs:
@@ -1500,6 +1513,13 @@ class CTraderDataClient(LiveMarketDataClient):
                     break
             elif not page:
                 # Without a lower bound, an empty page is the only sign history has run out.
+                break
+            if history_start - reached > max_gap_days * 86_400:
+                starts_at = datetime.fromtimestamp(history_start, UTC).isoformat()
+                self._log.info(
+                    f"{symbol_name} {om.ProtoOATrendbarPeriod.Name(period)} history starts at "
+                    f"{starts_at}: no bar in the {max_gap_days:g} days before it",
+                )
                 break
             to_secs = reached
         return [bars[boundary] for boundary in sorted(bars)]
@@ -1530,6 +1550,7 @@ class CTraderDataClient(LiveMarketDataClient):
         # venue counts `count` from.
         return await self._page_trendbars(
             sub.symbol_id,
+            sub.bar_type.instrument_id.symbol.value,
             sub.period,
             start_secs=start_secs,
             end_secs=end_secs + period_secs,

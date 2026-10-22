@@ -570,6 +570,40 @@ async def test_a_later_failure_for_the_same_symbol_replaces_the_earlier_one() ->
         await server.stop()
 
 
+async def test_a_symbol_that_loads_later_leaves_the_failures() -> None:
+    server = venue()
+    ger40_symbol_id = LIGHT["GER40.cash"].symbolId
+    asked: list[list[int]] = []
+
+    def symbol_by_id(request: oa.ProtoOASymbolByIdReq) -> oa.ProtoOASymbolByIdRes:
+        asked.append(list(request.symbolId))
+        wanted = set(request.symbolId)
+        if len(asked) == 1:
+            # The first answer leaves the symbol out.
+            wanted.discard(ger40_symbol_id)
+        return oa.ProtoOASymbolByIdRes(
+            ctidTraderAccountId=request.ctidTraderAccountId,
+            symbol=[s for s in RECORDED["symbol_specs"][0].symbol if s.symbolId in wanted],
+        )
+
+    server.on(om.PROTO_OA_SYMBOL_BY_ID_REQ, symbol_by_id)
+    await server.start()
+    client = account_client(server)
+    try:
+        await client.connect()
+        provider = _provider(client)
+        await provider.load_ids_async([GER40_ID])
+        assert [f.symbol for f in provider.failures] == ["GER40.cash"]
+
+        await provider.load_ids_async([GER40_ID])
+
+        assert provider.find(GER40_ID) is not None
+        assert provider.failures == ()
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_a_dropped_instrument_is_not_rebuilt_as_a_conversion_leg() -> None:
     server = venue()
     await server.start()

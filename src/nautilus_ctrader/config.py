@@ -166,6 +166,11 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
         covers.
     history_request_timeout_secs : float, default 30.0
         Response timeout for a historical request.
+    history_max_gap_days : float, default 7.0
+        The longest stretch without a bar that paging back through history crosses. History
+        is taken to start before a longer one.
+    history_max_gap_overrides : dict[str, float], default {}
+        `history_max_gap_days` per broker symbol name, e.g. `{"US100.cash": 14.0}`.
     connect_timeout_secs : float, default 60.0
         Bound on the whole account bring-up.
     restore_retry_interval_secs : float, default 30.0
@@ -221,6 +226,8 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     # TODO(verify): the venue's maximum bars per historical request.
     history_page_size: int = 500
     history_request_timeout_secs: float = 30.0
+    history_max_gap_days: float = 7.0
+    history_max_gap_overrides: dict[str, float] = {}  # noqa: RUF012
     connect_timeout_secs: float = 60.0
     restore_retry_interval_secs: float = 30.0
     request_window_secs: float = REQUEST_WINDOW_SECS
@@ -240,9 +247,15 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
             self,
             "bar_close_grace_secs",
             "history_request_timeout_secs",
+            "history_max_gap_days",
             "connect_timeout_secs",
             "restore_retry_interval_secs",
         )
+        for symbol, days in self.history_max_gap_overrides.items():
+            if not (days > 0):
+                raise ValueError(
+                    f"history_max_gap_overrides[{symbol!r}] must be positive, got {days}",
+                )
         if self.bar_close_history_retries < 0:
             raise ValueError(
                 "bar_close_history_retries must not be negative, "
