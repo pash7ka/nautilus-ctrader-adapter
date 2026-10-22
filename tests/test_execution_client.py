@@ -2007,6 +2007,79 @@ async def test_a_client_reconnected_before_the_protective_order_waits_for_it_aga
         assert levels(amend) == (85197.2, 85387.22)
 
 
+async def test_a_rebuild_ending_after_a_detach_arms_no_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])
+    config = exec_config(protective_order_timeout_secs=30.0)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await filled_bracket(h)
+        unprotected_position(execution_venue)
+        read_broker = h.client._read_broker
+
+        async def read_then_disconnect(*args, **kwargs):
+            monkeypatch.setattr(h.client, "_read_broker", read_broker)
+            state = await read_broker(*args, **kwargs)
+            # The client is stopped while the read's answer is on its way.
+            await h.client._disconnect()
+            return state
+
+        monkeypatch.setattr(h.client, "_read_broker", read_then_disconnect)
+        await h.client._load()
+        assert h.client._protection_waits == {}
+
+        await h.client._connect()
+        assert FIRST in h.client._protection_waits
+
+
+async def test_a_rebuild_during_the_wait_for_protection_arms_no_second_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])
+    config = exec_config(protective_order_timeout_secs=0.3)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        steps = ["lost"] * (2 * _AMEND_ATTEMPTS)
+        lose_amends(h, monkeypatch, steps)
+        await filled_bracket(h)
+        unprotected_position(execution_venue)
+        await h.client._load()
+        await wait_until(
+            lambda: any("whether its levels were set is unknown" in e for e in h.logger.errors()),
+        )
+        # Past the deadline a wait armed by the rebuild would have.
+        await asyncio.sleep(0.6)
+
+        assert len(steps) == _AMEND_ATTEMPTS
+        warned = [line for line in h.logger.warnings() if "No protective order followed" in line]
+        assert len(warned) == 1
+
+
+async def test_a_reconnect_before_the_protective_order_leaves_its_levels_uncorrected() -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])
+    amends = echo_amends(execution_venue)
+    config = exec_config(protective_order_timeout_secs=30.0)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await filled_bracket(h, stop_price="85190.00", target_price="85400.00")
+        unprotected_position(execution_venue)
+        execution_venue.position_deals[FIRST] = [FIRST_EVENTS[1].deal]
+        await h.server.drop_connections()
+        # The reconnect's mass status reports the legs whose level has not come as cancelled.
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.CANCELED
+                and status(h, TARGET) == OrderStatus.CANCELED
+            ),
+            timeout_secs=10,
+        )
+
+        await push(h, FIRST_EVENTS[2])
+
+        # Settled on the event itself: the broker's levels stand, with no leg.
+        assert len(h.client._brackets) == 0
+        await sync(h)
+        assert amends == []
+
+
 async def test_a_wait_ending_with_nothing_to_set_leaves_the_bracket_to_its_correction() -> None:
     execution_venue = ExecutionVenue()
     held = HeldReplies(

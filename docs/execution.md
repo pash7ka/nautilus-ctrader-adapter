@@ -140,9 +140,10 @@ exists, the adapter amends the position's levels to the exact prices requested.
   the position stands without its levels. If it gets no answer, an ERROR says that whether the
   levels were set is unknown; the legs wait for the broker's late answer or the next rebuild.
   A rebuild of the model during the wait leaves the legs waiting and the wait running; a
-  reconnect of the client alone starts the wait again. A reconnect's mass status instead reports
-  a leg whose level has not come as cancelled, and the levels the protective order then brings
-  stay at the broker without legs.
+  reconnect of the client alone starts the wait again. Once the wait has ended and its amend got
+  no answer, a later rebuild that still finds no levels starts a new wait, after which the amend
+  may be sent again. A reconnect's mass status instead reports a leg whose level has not come as
+  cancelled, and the levels the protective order then brings stay at the broker without legs.
 - A cancel or a modify of a leg that arrives while its entry is still in flight is recorded and
   carried by this amend. A rejected entry rejects the pending modify.
 

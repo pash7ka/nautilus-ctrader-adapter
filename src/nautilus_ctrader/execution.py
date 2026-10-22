@@ -2434,8 +2434,9 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _on_protection(self, record: AwaitProtection | ProtectionMissing) -> None:
         if isinstance(record, AwaitProtection):
             position_id = record.position_id
-            # A rebuild asks again for a wait its fill armed already.
-            if position_id in self._protection_waits:
+            # A rebuild asks again for a wait its fill armed already. A rebuild that ends after a
+            # detach must arm nothing: the next connect's rebuild asks again.
+            if position_id in self._protection_waits or self._session is None:
                 return
 
             def waited() -> None:
