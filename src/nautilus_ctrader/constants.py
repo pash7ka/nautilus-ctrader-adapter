@@ -30,8 +30,8 @@ HEARTBEAT_IDLE_SECS: float = 10.0
 
 # No inbound frame for this long means the connection is lost, even if writes still succeed
 # (a half-open TCP connection). Three missed server heartbeats at the 30 s tolerance.
-# TODO(verify): that the server really sends heartbeats when it has nothing else to send; if
-# it stays silent on an idle connection, this reconnects an idle session every interval.
+# TODO(verify): that the idle frames are heartbeats. That some frame arrives on an idle
+# connection is confirmed: a recorded idle session never tripped this.
 INBOUND_SILENCE_SECS: float = 90.0
 
 # Client.send in their SDK defaults to a 5 s response timeout.

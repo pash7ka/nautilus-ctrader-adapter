@@ -8,7 +8,7 @@ execution against any broker that exposes cTrader Open API.
 > market data client and the execution client are in place and tested offline against recorded
 > fixtures and a fake server. The execution client has sent minimum-size brackets, cancels and
 > amends on a live account; what that confirmed, and what is still open, is in
-> [Execution, section 10](docs/execution.md#10-not-yet-confirmed-against-a-live-endpoint).
+> [Execution, section 10](docs/execution.md#10-confirmed-live-and-still-open).
 > The public API is not stable and there is no PyPI release yet. See [Roadmap](#roadmap).
 
 ## Why this exists
@@ -164,7 +164,8 @@ tokens the adapter refreshes while it runs, see [docs/market_data.md](docs/marke
 
 ## Protocol notes
 
-- Endpoints: `demo.ctraderapi.com:5035` and `live.ctraderapi.com:5035`, TLS.
+- Endpoints: `demo.ctraderapi.com:5035` and `live.ctraderapi.com:5035`, TLS with the venue's
+  certificate verified.
 - Each frame is a 4-byte big-endian length prefix followed by a serialised `ProtoMessage`
   envelope (`payloadType`, `payload`, `clientMsgId`), capped at 15 MB. Responses are
   correlated to requests by `clientMsgId`.
@@ -212,12 +213,12 @@ real broker connection are opt-in and never run in CI.
 
 ## Roadmap
 
-| Milestone | Contents |
-|---|---|
-| M1 | Transport: connection, framing, both authentication levels, token refresh, fake server, tests |
-| M2 | Data: instrument provider, trendbar and spot subscriptions, historical warm-up |
-| M3 | Execution: order submission and modification, Nautilus/cTrader order model translation, execution reports, reconciliation and recovery after a restart or a reconnect, order queries, account activity and the balance checkpoint |
-| M4 | Confirmation with live orders, hardening, first tagged release |
+| Milestone | Contents | Status |
+|---|---|---|
+| M1 | Transport: connection, framing, both authentication levels, token refresh, fake server, tests | Delivered |
+| M2 | Data: instrument provider, trendbar and spot subscriptions, historical warm-up | Delivered |
+| M3 | Execution: order submission and modification, Nautilus/cTrader order model translation, execution reports, reconciliation and recovery after a restart or a reconnect, order queries, account activity and the balance checkpoint | Delivered |
+| M4 | Confirmation with live orders, hardening, first tagged release | In progress |
 
 ## Disclaimer
 

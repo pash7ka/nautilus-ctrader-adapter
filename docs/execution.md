@@ -9,7 +9,7 @@ places where an application has to design around a difference.
 Read [Instruments](instruments.md) first for how a symbol becomes a Nautilus instrument, and
 [Protocol notes](protocol.md) (section 10) for what was observed on the wire. Brackets, and cancels
 and amends of orders placed by hand, have been sent through the adapter on a live account; see
-[Not yet confirmed](#10-not-yet-confirmed-against-a-live-endpoint) for what they confirmed and
+[Confirmed live, and still open](#10-confirmed-live-and-still-open) for what they confirmed and
 what is still open.
 
 ## 1. What it trades
@@ -68,7 +68,8 @@ repeated, up to three times. Once one of its attempts got no answer, the broker 
 it, so the amend ends as unknown unless a later attempt is answered: a later refusal or failure
 is not reported as a refusal. A WARNING says so, and the order the command was about stays
 pending for Nautilus's in-flight check. A cancel or an amend of a pending order is not repeated
-either. A frame from the venue that the adapter cannot read drops the connection; a request
+either. A frame whose length or envelope cannot be read drops the connection; a message of an
+unknown type, or one that does not parse, is logged at WARNING and skipped. Either way a request
 waiting on it counts as unanswered.
 
 Only a request that was sent can end as unknown. A command whose request never left is refused,
@@ -153,7 +154,7 @@ exists, the adapter amends the position's levels to the exact prices requested.
 |---|---|---|
 | Order accepted | `OrderAccepted`, with the broker's order id | none |
 | Fill (or partial fill) | `OrderFilled`, with the deal's commission | none |
-| The protective order appears | none | `OrderAccepted` for each level present, at the broker's price, after the entry's fill: the levels exist only from then on |
+| The protective order appears | none | `OrderAccepted` for each level present, at the requested price, after the entry's fill: the levels exist only from then on. The correcting amend moves the broker's level to that price; if it fails, an `OrderUpdated` gives the broker's price |
 | Entry cancelled or expired without a fill | `OrderCanceled` / `OrderExpired` | `OrderCanceled` |
 | Entry refused | `OrderRejected` | `OrderCanceled` |
 | A trailing stop-loss moves | none | the stop-loss leg `OrderUpdated`, for each move |
@@ -383,13 +384,13 @@ Nautilus writes the whole node config to `config.json`, so leave the secrets out
 and set the environment instead.
 
 The config refuses, with a `ValueError`: an `instrument_provider`, an `environment` other than
-the three above, a value that is not positive in `reference_price_max_age_secs`,
-`protective_order_timeout_secs`, `order_request_timeout_secs` or
-`reconciliation_default_lookback_mins`, an hour outside 0 to 23, an unknown time zone, and an
-impossible request pacing (a count below 1, a window or queue timeout that is not positive,
-negative retries).
+the three above, a value that is not positive in `connect_timeout_secs`,
+`restore_retry_interval_secs`, `reference_price_max_age_secs`, `protective_order_timeout_secs`,
+`order_request_timeout_secs` or `reconciliation_default_lookback_mins`, an hour outside 0 to 23,
+an unknown time zone, and an impossible request pacing (a count below 1, a window, queue timeout
+or pause cap that is not positive, negative retries).
 
-The five request pacing fields are on `CTraderDataClientConfig` too, with the same names and
+The six request pacing fields are on `CTraderDataClientConfig` too, with the same names and
 defaults. The defaults come from the limits measured live and recorded in
 [`protocol.md` section 6](protocol.md#6-rate-limiting); the first config built for an account
 sets the pacing every client of that account uses.
@@ -939,8 +940,14 @@ sign flipped to Nautilus's convention (a charge is positive).
   answer. If a query named its broker order meanwhile, that order's later events stay the node's
   close's. Without one, an event of it after the timeout is reported as an external reduce-only
   order and a `manual_change`.
+- **A bracket whose entry filled, and whose position closed entirely, while the execution client
+  was disconnected is not ended when the client alone connects again.** No reconciliation follows
+  that connect, and the bracket had no position when the client disconnected, so nothing ties it
+  to the closed one. Its legs are settled by their own queries and by Nautilus's open-order check.
 
-## 10. Not yet confirmed against a live endpoint
+## 10. Confirmed live, and still open
+
+### Confirmed live
 
 Brackets have been sent through the adapter on a live account, on an index, a metal and a
 crypto CFD, each at the instrument's minimum volume. They confirmed:
@@ -964,8 +971,12 @@ carrying the position; after the fill comes an `ORDER_REPLACED` of the protectiv
 same id, its `tradeData.volume` the reduced total and its `executedVolume` 0. Those events
 carried a `clientMsgId` the listening connection had not sent (observed once, and inferred from a
 recorder's mislabel: whose id it was is not recorded), so only an id the adapter is waiting for
-marks an answer. Each point still open is marked in the source with a `TODO(verify):` comment
-saying what would settle it. The main groups:
+marks an answer.
+
+### Still open
+
+Each point still open is marked in the source with a `TODO(verify):` comment saying what would
+settle it. The main groups:
 
 - **Amends**: that leaving the stop-loss out of an amend removes it, as leaving the take-profit
   out does; what the venue does with an optional field an amend leaves out, a position's trailing

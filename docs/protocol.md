@@ -20,12 +20,19 @@ until a connection settles it.
 The API is reached over TLS at `demo.ctraderapi.com:5035` or `live.ctraderapi.com:5035` — the
 same port for both.
 
+TLS is on by default and verifies the venue's certificate. `CTraderAccountClient`,
+`list_accounts()` and `list_symbols()` take a `tls` argument for tests against a local fake
+server. Used anywhere else, `tls=False` sends the client secret and the tokens in clear, and a
+context that does not verify the certificate sends them to whoever answers.
+
 Each frame on the wire is a 4-byte big-endian length prefix followed by a serialised
 `ProtoMessage` envelope, capped at 15,000,000 bytes. This is exactly the framing Twisted's
 `Int32StringReceiver` implements (`structFormat = "!I"`, a 4-byte prefix, `MAX_LENGTH =
-15_000_000`), which is what Spotware's own reference SDK is built on. A length prefix
-declaring more than the cap is treated as a protocol violation and the connection is dropped
-rather than read further.
+15_000_000`), which is what Spotware's own reference SDK is built on. A frame whose length
+prefix declares more than the cap, or whose envelope cannot be parsed, is a protocol violation:
+it is logged at ERROR and the connection is dropped rather than read further. A payload of an
+unknown type, or one that does not parse as its type, is logged at WARNING and skipped, and the
+connection carries on; a request waiting for it times out.
 
 ### Which host an account belongs to
 
@@ -64,7 +71,7 @@ event, delivered as one.
 
 The venue requires a heartbeat if the connection would otherwise be idle for more than 30
 seconds, per the schema's own comment on the heartbeat message. The server also sends its own
-heartbeats when it has been idle.
+heartbeats when it has been idle (inferred; see the end of this section).
 
 This adapter sends a heartbeat after 10 seconds of outbound silence — a full missed beat of
 headroom inside the server's 30-second tolerance — and deliberately does **not** answer the
@@ -81,8 +88,8 @@ checked periodically, so the loss is detected within a few seconds after the 90 
 exactly 90 seconds.
 The server does send frames on an otherwise idle authenticated connection (confirmed): in a
 recorded session with no market-data subscription, stretches of up to two minutes with no
-other message passed without the 90-second detector firing. Heartbeats themselves were not
-recorded, so this is inferred from the detector staying silent.
+other message passed without the 90-second detector firing. The frames themselves were not
+recorded, so that they are heartbeats is inferred.
 
 ## 4. Authentication
 
@@ -93,6 +100,25 @@ Authentication has two independent levels, each its own request:
 
 Both levels must be re-established after any reconnect, along with every subscription that
 was active before the disconnect — the venue does not remember either across a new socket.
+
+### Reconnecting
+
+A running session reconnects on its own and never stops retrying; only stopping the session
+ends it. The values are constants in `constants.py`:
+
+- A session lost after staying ready for `STABLE_SESSION_SECS` (30 s) reconnects at once, with
+  the WARNING `Connection lost, reconnecting`, and the count of failed attempts starts again.
+- A failed bring-up, or a session lost sooner, is a failed attempt and waits before the next:
+  `BACKOFF_BASE_SECS` (1 s), doubled for each failed attempt in a row up to `BACKOFF_MAX_SECS`
+  (60 s), then lengthened by a random part of up to `BACKOFF_JITTER` (25 %).
+- Each wait is logged as `Session bring-up failed (attempt N): <reason>; retrying in Xs` or
+  `Connection lost soon after becoming ready (attempt N); retrying in Xs`: at WARNING, and at
+  ERROR from attempt `RECONNECT_FAILURE_THRESHOLD` (5) on. Only the level changes; the
+  retries go on.
+
+An account client's first `connect()` runs the same loop, bounded by `connect_timeout_secs`; it
+raises a `CTraderAuthError` as soon as authentication is refused, and otherwise a
+`CTraderTimeoutError` caused by the last bring-up's error.
 
 ## 5. Tokens and losing authentication
 
@@ -410,11 +436,13 @@ it.
 ## 10. Execution events
 
 Everything in this section up to [Commands on orders placed by hand](#commands-on-orders-placed-by-hand)
-was observed in one recorded session on a hedging account, in which a person traded one symbol
-priced near 85,000 with 2-decimal prices by hand in the broker's terminal while a read-only
-connection listened; the history lists also hold one earlier trade on another symbol. The
-scrubbed recording is the fixture `tests/fixtures/m3_execution_recorded.json`. What it did not
-exercise is marked **unconfirmed**.
+was observed in two recorded sessions. In the first, on a hedging account, a person traded one
+symbol priced near 85,000 with 2-decimal prices by hand in the broker's terminal while a
+read-only connection listened; the history lists also hold one earlier trade on another symbol.
+Its scrubbed recording is the fixture `tests/fixtures/m3_execution_recorded.json`. The second
+watched a partial close by hand, and is described under
+[Closing part of a position](#closing-part-of-a-position); its fixture is
+`tests/fixtures/partial_close_live.json`. What neither exercised is marked **unconfirmed**.
 
 ### Delivery
 
@@ -493,7 +521,7 @@ volume. The position's `price` stays the original entry price.
 
 `closingOrder` is `true` on a partial close and on the protective order (confirmed).
 **Unconfirmed**: a full manual close of a position from the terminal, and a stop-out; neither
-happened in the session.
+happened in either session.
 
 A later recording on EURUSD watched a person close part of a position with a stop-loss and a
 take-profit by hand, while a read-only connection listened. The scrubbed recording is the fixture
