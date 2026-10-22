@@ -335,17 +335,19 @@ class Guard:
             ):
                 return f"{name} moving the limit price toward the market"
             return None
-        if payload.positionId != targets.position_id:
-            return f"{name} of a position other than the owner's"
-        if not payload.HasField("stopLoss"):
-            return f"{name} removing the stop-loss"
-        if _toward(payload.stopLoss, self._reported_stop(targets), up=targets.position_is_long):
-            return f"{name} moving the stop-loss toward the market"
-        if payload.HasField("takeProfit") and not _same(
-            payload.takeProfit, targets.start_take_profit
-        ):
-            return f"{name} changing the take-profit"
-        return None
+        if isinstance(payload, oa.ProtoOAAmendPositionSLTPReq):
+            if payload.positionId != targets.position_id:
+                return f"{name} of a position other than the owner's"
+            if not payload.HasField("stopLoss"):
+                return f"{name} removing the stop-loss"
+            if _toward(payload.stopLoss, self._reported_stop(targets), up=targets.position_is_long):
+                return f"{name} moving the stop-loss toward the market"
+            if payload.HasField("takeProfit") and not _same(
+                payload.takeProfit, targets.start_take_profit
+            ):
+                return f"{name} changing the take-profit"
+            return None
+        return f"{name} is not a command this guard checks"
 
     def _reported_stop(self, targets: Targets) -> float:
         """The position's stop-loss as the broker last reported it: a trailing stop moves."""
@@ -1088,7 +1090,7 @@ SETTLES_CARRIES = "venue_book.py `_sync` TODO(verify): whether a fill always car
 SETTLES_ARRIVAL = (
     "foreign_legs.py `filled`: whether, and when, the protective order's smaller volume "
     "arrives after a partial close; venue_book.py `_protective` TODO(verify): whether the broker "
-    "replaces the protective order's id"
+    "replaces the protective order's id in any case other than a level change or a partial close"
 )
 SETTLES_REMAINING = (
     "venue_book.py `remaining_of` TODO(verify), and its twin in reconciliation.py: whether a "
@@ -1100,7 +1102,8 @@ SETTLES_LEGS = (
     "Nautilus took every fill (no overfill)"
 )
 SETTLES_POSITION = (
-    "venue_book.py `_sync` TODO(verify): the event's position against the broker's own list"
+    "venue_book.py `_sync` TODO(verify): the order of a position's `utcLastUpdateTimestamp` "
+    "across events; the event's position is compared here with the broker's own list"
 )
 
 _RESTORED = "the connection was restored during the window; events may be missing"

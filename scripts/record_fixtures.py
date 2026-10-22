@@ -79,10 +79,11 @@ _GET_TOKENS_SPEC.loader.exec_module(get_tokens)
 FAKE_ACCOUNT_ID = 1_000_001
 FAKE_TOKEN = "scrubbed-token"
 
-# Reached only by the by-type sweep at the end of `_scrub_in_place`, for a real trader login
-# found in an int64/uint64 field this script does not know by name. `traderLogin` itself is
-# cleared, so nothing is expected to use this; it exists because such an unknown field may be
-# `required`, and the sweep therefore cannot clear what it finds.
+# What a real trader login becomes: in the by-type sweep at the end of `_scrub_in_place`, for an
+# int64/uint64 field this script does not know by name (such a field may be `required`, so the
+# sweep cannot clear it); in the free text, via `scrub`'s default `clean_text`; and in the
+# forbidden-number checks of `_run`, `rescrub_bytes` and `record_execution.py`. `traderLogin`
+# itself is cleared outright.
 FAKE_TRADER_LOGIN = 2_000_002
 
 SYMBOLS = ("EURUSD", "XAUUSD", "GER40.cash", "US100.cash")
@@ -195,7 +196,8 @@ def scrub(
 ) -> Message:
     """Return a scrubbed copy of `message`.
 
-    Recursively walks every field of a `CopyFrom` copy: any int64/uint64 field named
+    Drops the fields these bindings do not know from a `CopyFrom` copy, then recursively walks
+    every field of it: any int64/uint64 field named
     `ctidTraderAccountId` becomes `FAKE_ACCOUNT_ID`, `accessToken`/`refreshToken` become
     `FAKE_TOKEN`, and `_CLEARED_FIELDS` are cleared - wherever any of these occur, at any
     nesting depth, and whether the cleared field is a scalar or a whole submessage. A
@@ -222,6 +224,8 @@ def scrub(
 
     result = type(message)()
     result.CopyFrom(message)
+    # A field newer than these bindings is scrubbed by nothing here, and may hold anything.
+    result.DiscardUnknownFields()
     _scrub_in_place(result, real_account_id, real_login, clean_text)
     return result
 

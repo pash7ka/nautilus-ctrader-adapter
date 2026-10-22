@@ -28,7 +28,9 @@ later, with no connection:
 
     uv run python scripts/record_execution.py --rescrub tests/recordings/<name>.raw.json
 
-The first Ctrl+C, like `q`, ends the run and writes both files. If the process ends before it
+Type `q` to end the run properly: it asks the closing lists, then writes both files. The first
+Ctrl+C also writes both files, but cancels the run, so the closing lists are skipped and the
+outcome says so. If the process ends before either
 can - a second Ctrl+C, a crash - what was seen is still in the journal it appended to as it
 went, `tests/recordings/<name>.raw.jsonl`; the next run with the same output finishes that
 recording before anything else, and only a later run records a new session.
@@ -174,6 +176,9 @@ JOURNAL_OTHER_ACCOUNT = (
 # How the recorder's own markers begin when the owner has to read them before trusting the
 # recording: a list it lacks, in whole or in part, or a recording finished from its journal.
 _PROBLEM_MARKERS = ("closing ", "recording ")
+# Told by the outcome lines, not recorded: a cancelled run's timeline already ends in its own
+# "run failed" marker.
+CANCELLED_LISTS = "closing lists skipped or cut short: the run was cancelled"
 # The whole of a fixture's shape. A file with any other key is not one; an unscrubbed
 # recording carries more at both levels.
 _FIXTURE_KEYS = frozenset({"format", "timeline", "closing"})
@@ -2106,7 +2111,8 @@ def _outcome_lines(outcome: Outcome, output: pathlib.Path, *, rescrub: bool = Fa
         lines.append(f"Unscrubbed copy, never to be committed: {outcome.raw}")
         if not outcome.fixture:
             lines.append(f"Rebuild the fixture from it with: --rescrub {outcome.raw}")
-    return [*lines, *kept, *summary(outcome.recording)]
+    cancelled = isinstance(outcome.run_error, asyncio.CancelledError | KeyboardInterrupt)
+    return [*lines, *kept, *([CANCELLED_LISTS] if cancelled else []), *summary(outcome.recording)]
 
 
 def _read_journal_file(

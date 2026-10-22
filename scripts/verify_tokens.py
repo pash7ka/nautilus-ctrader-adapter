@@ -527,7 +527,7 @@ async def _outcome_of(operation: Callable[[], Awaitable[object]]) -> Outcome:
 
 @dataclass
 class _Watch:
-    """One of the two connections in step 6, and what it has seen so far."""
+    """One of the two connections in step 7, and what it has seen so far."""
 
     name: str
     connection: CTraderConnection

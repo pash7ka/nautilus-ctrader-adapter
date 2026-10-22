@@ -33,9 +33,10 @@ stops it.
 Credentials and the trader login come from `.env` in the repository root. The host shown is read
 from the account list the access token grants, as the adapter reads it. The script does no
 token refresh, so it refuses to start with an access token whose `CTRADER_TOKEN_EXPIRES_AT` has
-passed. Every order event, position event and account activity is appended to a JSONL file under
-`--log-dir` (by default `tests/recordings/`, which git ignores). A line carries only the fixed
-list of the event's fields, which includes the account id, never the whole event. Run
+passed. Every order event, position event and account activity is appended to a `*.raw.jsonl` file
+under `--log-dir` (by default `tests/recordings/`); git ignores that name in any directory. A
+line carries only the fixed list of the event's fields, which includes the account id, never
+the whole event. Run
 `scripts/record_execution.py` alongside it: the checklist printed at the end says what to
 compare between the two.
 """
@@ -807,7 +808,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--log-dir",
         type=pathlib.Path,
         default=_REPO_ROOT / "tests" / "recordings",
-        help="where the JSONL event log goes (default: tests/recordings/, ignored by git)",
+        help="where the JSONL event log goes (default: tests/recordings/)",
     )
     return parser
 
@@ -868,7 +869,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args.log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
-    log_path = args.log_dir / f"first_orders-{stamp}.jsonl"
+    log_path = args.log_dir / f"first_orders-{stamp}.raw.jsonl"
     with EventLog(log_path) as log:
         driver = _Driver(
             instrument_id_of(args.symbol),

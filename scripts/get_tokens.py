@@ -1,7 +1,8 @@
-"""One-time helper that performs the interactive cTrader Open API OAuth flow.
+"""Helper that performs the interactive cTrader Open API OAuth flow.
 
-Run once per application, after registering it and filling `CTRADER_CLIENT_ID` /
-`CTRADER_CLIENT_SECRET` into a `.env` file:
+Run it after registering the application and filling `CTRADER_CLIENT_ID` /
+`CTRADER_CLIENT_SECRET` into a `.env` file, and again whenever a token pair must be
+issued anew:
 
     uv run python scripts/get_tokens.py
 
@@ -22,6 +23,7 @@ import secrets
 import ssl
 import sys
 import tempfile
+import time
 import webbrowser
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,6 +56,10 @@ ACCESS_TOKEN_KEY = "CTRADER_ACCESS_TOKEN"
 REFRESH_TOKEN_KEY = "CTRADER_REFRESH_TOKEN"
 TOKEN_EXPIRES_AT_KEY = "CTRADER_TOKEN_EXPIRES_AT"
 
+# `os.replace` on Windows fails with PermissionError while another process holds the file open.
+_REPLACE_ATTEMPTS = 4
+_REPLACE_RETRY_DELAY_SECS = 0.5
+
 
 class _PrintLogger:
     """Enough of the Nautilus `Logger` interface for `CTraderConnection`, printed to stderr.
@@ -74,7 +80,7 @@ class _PrintLogger:
         print(f"error: {message}", file=sys.stderr)
 
     def exception(self, message: str, ex: BaseException) -> None:
-        print(f"error: {message}: {ex!r}", file=sys.stderr)
+        print(f"error: {message}: {type(ex).__name__}", file=sys.stderr)
 
 
 def _strip_matching_quotes(value: str) -> str:
@@ -148,7 +154,17 @@ def _write_atomically(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
-        os.replace(tmp_name, path)
+            # On disk before it replaces the file that holds the only copy of the tokens.
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp_name, path)
+                break
+            except PermissionError:
+                if attempt + 1 == _REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(_REPLACE_RETRY_DELAY_SECS)
     except BaseException:
         with contextlib.suppress(OSError):
             os.remove(tmp_name)
@@ -233,7 +249,7 @@ def parse_redirect_uri(redirect_uri: str) -> tuple[int, str]:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Perform the one-time cTrader OAuth flow and list the granted accounts.",
+        description="Perform the interactive cTrader OAuth flow and list the granted accounts.",
     )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--redirect-uri", default="http://localhost:8080/callback")
