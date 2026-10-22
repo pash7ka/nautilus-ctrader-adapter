@@ -18,10 +18,13 @@ class OperationsInFlight:
     """The node's level amends and closes the broker has not answered yet.
 
     An entry lives until its answer, its refusal or its timeout, so a lost answer never leaves one
-    behind to take a trader's later change for the node's own. The one exception is the levels
-    of the amends whose answers were lost: they are kept for those answers, coming late and in
-    order, only until a protective event the broker did not originate fails to match them, or the
-    next rebuild.
+    behind to take a trader's later change for the node's own. Two exceptions:
+
+    - the levels of the amends whose answers were lost are kept for those answers, coming late
+      and in order, only until a protective event the broker did not originate fails to match
+      them, or the next rebuild;
+    - a close whose answer went with the connection stays until the reconnect's pass, which may
+      find its broker order, or a detach.
     """
 
     def __init__(self) -> None:

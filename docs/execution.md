@@ -139,6 +139,10 @@ exists, the adapter amends the position's levels to the exact prices requested.
   set by an amend instead. If that is refused too, the legs are rejected and an ERROR is logged:
   the position stands without its levels. If it gets no answer, an ERROR says that whether the
   levels were set is unknown; the legs wait for the broker's late answer or the next rebuild.
+  A rebuild of the model during the wait leaves the legs waiting and the wait running; a
+  reconnect of the client alone starts the wait again. A reconnect's mass status instead reports
+  a leg whose level has not come as cancelled, and the levels the protective order then brings
+  stay at the broker without legs.
 - A cancel or a modify of a leg that arrives while its entry is still in flight is recorded and
   carried by this amend. A rejected entry rejects the pending modify.
 
@@ -568,9 +572,10 @@ pass: the pass reports it under the node's client order id if it reached the bro
 The three report generators answer from the same read, without rebuilding the model:
 
 - order reports: every open order and every live leg, foreign legs included; with `open_only`
-  false, also orders that ended without a fill. A filled order is never returned here, because
-  without its fills Nautilus would infer one with no commission. It arrives through a mass status
-  or a query;
+  false, also the legs that ended without a fill. A pending order that ended without a fill is
+  not returned, as the read lists no ended order; Nautilus queries an order it misses itself. A
+  filled order is never returned here, because without its fills Nautilus would infer one with
+  no commission. It arrives through a mass status or a query;
 - fill reports: the fills of the window;
 - position reports: the open positions.
 

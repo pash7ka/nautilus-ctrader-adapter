@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import partial
@@ -541,6 +541,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         # Likewise for a pending order, by broker order id.
         self._order_locks: dict[int, asyncio.Lock] = {}
         self._protection_timers: set[asyncio.TimerHandle] = set()
+        # Each filled position's wait for its protective order, by position id.
+        self._protection_waits: dict[int, asyncio.TimerHandle] = {}
         # Each kept position's wait for an event of its own, by position id.
         self._close_timers: dict[int, asyncio.TimerHandle] = {}
         # Brackets settled while their position was kept, by position id: their carried commands
@@ -659,9 +661,10 @@ class CTraderExecutionClient(LiveExecutionClient):
                 await self._account.disconnect()
 
     def _detach(self) -> None:
-        for timer in self._protection_timers:
+        for timer in (*self._protection_timers, *self._protection_waits.values()):
             timer.cancel()
         self._protection_timers.clear()
+        self._protection_waits.clear()
         self._unstash()
         # The reconnect's rebuild settles them again.
         for bracket in self._brackets:
@@ -1110,15 +1113,16 @@ class CTraderExecutionClient(LiveExecutionClient):
         """Rebuild the model after a query found bracket `entry_id`'s entry filled.
 
         No event told the model of the position, so its legs would stay "in flight" and its
-        levels uncorrected; the rebuild settles the bracket from the broker's levels.
+        levels uncorrected; the rebuild settles the bracket from the broker's levels, or keeps
+        its legs waiting for the protective order if that has not come.
 
-        - Only for a position the model does not know: a rebuild before the protective order
-          has come would end legs still alive.
+        - Only for a position the model does not know.
         - Not while a rebuild holds the buffer: releasing it here would apply the held events
           before Nautilus has reconciled the start.
 
-        The rebuild also resets the in-flight state of other brackets (rare; their own queries
-        heal it).
+        The other brackets come through it as they stood: a leg still waiting for its protective
+        order keeps waiting (`_load()`), and a lost amend is forgotten, so a later correction may
+        send its levels again.
         """
         if self._buffer is not None:
             self._log.debug(f"Bracket {entry_id}: its entry filled; left to the rebuild under way")
@@ -1134,11 +1138,12 @@ class CTraderExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
-        """Every open order and live leg; with `open_only` false, also those that ended unfilled.
+        """Every open order and live leg; with `open_only` false, also the legs that ended unfilled.
 
-        A filled order reaches Nautilus only inside a mass status: without its fills Nautilus
-        would infer one with no commission. An external order Nautilus holds is reported under
-        the client order id it gave it.
+        A pending order that ended unfilled is not reported: the read lists no ended order, and
+        Nautilus queries an order it misses itself. A filled order reaches Nautilus only inside a
+        mass status: without its fills Nautilus would infer one with no commission. An external
+        order Nautilus holds is reported under the client order id it gave it.
 
         Raises the `CTraderError` of a failed read, and `ValueError` for a record that does not
         fit its instrument.
@@ -1461,11 +1466,16 @@ class CTraderExecutionClient(LiveExecutionClient):
 
         `keep_gone`: a position with a live leg that the snapshot lacks is kept, for its close
         event; if none comes, its deals answer it (`_close_from_deals()`).
+
+        The legs of a pending bracket whose protective order has not come stay alive and wait
+        for it, as without the rebuild. A reconnect's pass does not keep them: its reports tell
+        Nautilus the legs whose level is missing are cancelled.
         """
         self._hold_buffer()
         rebuilt = False
         try:
-            self._stand(await self._read_broker(since_ms=None, deals=False), keep_gone=keep_gone)
+            state = await self._read_broker(since_ms=None, deals=False)
+            self._stand(state, keep_gone=keep_gone, waiting=self._waiting_legs())
             rebuilt = True
             for position_id in self._book.kept():
                 self._await_close(position_id, retried=False)
@@ -1589,8 +1599,19 @@ class CTraderExecutionClient(LiveExecutionClient):
             snapshot = _with_positions(snapshot, await read_snapshot(), lacking)
         return BrokerState(snapshot, histories, tuple(window.values()), requests)
 
-    def _stand(self, state: BrokerState, *, keep_gone: bool = False) -> None:
-        """Rebuild the venue model and the margins from `state`'s snapshot."""
+    def _waiting_legs(self) -> set[str]:
+        """The legs of the pending brackets whose protective order has not come."""
+        legs: set[str] = set()
+        for bracket in self._brackets:
+            view = self._bracket_position(bracket)
+            if view is None or view.protective_order_id is None:
+                legs.update(bracket.legs.values())
+        return legs
+
+    def _stand(
+        self, state: BrokerState, *, keep_gone: bool = False, waiting: Collection[str] = ()
+    ) -> None:
+        """Rebuild the venue model and the margins from `state`'s snapshot (`VenueBook.load()`)."""
         orders = {position_id: found.orders for position_id, found in state.histories.items()}
         snapshot = state.snapshot
         # The snapshot carries no time of its own: the newest the node knows bounds it.
@@ -1606,7 +1627,9 @@ class CTraderExecutionClient(LiveExecutionClient):
         )
         stashed = [kept for held in self._kept_brackets.values() for kept in held]
         alive = [self._alive_legs(kept.bracket) for kept in stashed]
-        records = self._book.load(snapshot, orders, keep_gone=keep_gone, read_ms=read_ms)
+        records = self._book.load(
+            snapshot, orders, keep_gone=keep_gone, read_ms=read_ms, waiting=waiting
+        )
         # A leg of a stashed bracket that this rebuild ended had no event to report it.
         for kept, before in zip(stashed, alive, strict=True):
             kept.ended |= before - self._alive_legs(kept.bracket)
@@ -2410,13 +2433,18 @@ class CTraderExecutionClient(LiveExecutionClient):
 
     def _on_protection(self, record: AwaitProtection | ProtectionMissing) -> None:
         if isinstance(record, AwaitProtection):
+            position_id = record.position_id
+            # A rebuild asks again for a wait its fill armed already.
+            if position_id in self._protection_waits:
+                return
 
             def waited() -> None:
-                self._protection_timers.discard(timer)
-                self._protection_waited(record.position_id)
+                self._protection_waits.pop(position_id, None)
+                self._protection_waited(position_id)
 
-            timer = self._loop.call_later(self._config.protective_order_timeout_secs, waited)
-            self._protection_timers.add(timer)
+            self._protection_waits[position_id] = self._loop.call_later(
+                self._config.protective_order_timeout_secs, waited
+            )
         else:
             self.create_task(
                 self._set_missing_levels(record),
@@ -2682,10 +2710,11 @@ class CTraderExecutionClient(LiveExecutionClient):
     ) -> None:
         """Remove the levels of the node's legs `cancels` and move those of `moves`, in one amend.
 
-        `moves` holds each leg with the price its level is to move to.
+        `moves` holds each leg with the price its level is to move to. A move whose leg ended
+        while it waited for the amend lock is left out and refused.
         """
         cancels = cancels or {}
-        moves = moves or {}
+        moves = dict(moves or {})
         what = "; ".join(
             _command(verb, client_order_ids)
             for verb, client_order_ids in (
@@ -2694,13 +2723,20 @@ class CTraderExecutionClient(LiveExecutionClient):
             )
             if client_order_ids
         )
+        ended: set[Level] = set()
 
         def levels_of(view: PositionView) -> dict[Level, Decimal]:
             levels = {lv: p for lv, p in view.levels.items() if lv not in cancels}
-            levels.update((lv, wanted) for lv, (_, wanted) in moves.items())
+            for lv, (client_order_id, wanted) in moves.items():
+                if view.legs.get(lv, (client_order_id.value, False))[1]:
+                    levels[lv] = wanted
+                else:
+                    ended.add(lv)
             return levels
 
         outcome = await self._amend(position_id, levels_of, what=what)
+        for level in ended:
+            self._modify_rejected(moves.pop(level)[0], "the leg is already closed")
         if outcome is None:
             return
         if isinstance(outcome, _Refused):
@@ -3388,8 +3424,8 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _wanted_levels(bracket: PendingBracket, view: PositionView) -> dict[Level, Decimal]:
         """The broker's levels, with each live leg's at its asked price and a cancelled one gone.
 
-        The level of a leg the model holds dead stays as the broker holds it: a rebuild marks a
-        leg dead whose level had not come yet.
+        The level of a leg the model holds dead stays as the broker holds it: a reconnect's pass
+        reports a leg whose level had not come yet cancelled, and the model holds it dead.
         """
         levels = dict(view.levels)
         for level, leg_id in bracket.legs.items():
@@ -3419,6 +3455,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         bracket.unanswered = sent if outcome is None else None
         # Checked again: a cancel or modify may have come while the amend was out.
         self._settle_brackets()
+        # `is`, not `==`: an older lost amend with equal levels must not release a newer one's
+        # hold, which would resend an amend the broker may have applied.
         if (
             bracket.unanswered is sent
             and not bracket.correcting

@@ -1207,6 +1207,40 @@ def test_load_revives_a_leg_only_where_its_level_stands() -> None:
     }
 
 
+def test_load_keeps_a_waiting_leg_alive_until_its_level_comes() -> None:
+    b = book()
+    waiting = {stop_id(P), target_id(P)}
+
+    records = b.load(snapshot(stop=85000.0), {P: [our_entry(P, ENTRY)]}, waiting=waiting)
+    target_set = b.apply(
+        make_event(om.ORDER_REPLACED, protective(6, stop=85000.0, limit=85500.0), server=True),
+        NOTHING,
+    )
+
+    assert records == [AwaitProtection(P)]
+    assert target_set == [
+        leg(
+            OrderEventKind.ACCEPTED,
+            Level.TAKE_PROFIT,
+            6,
+            quantity=Decimal("1"),
+            price=Decimal("85500.00"),
+        )
+    ]
+
+
+def test_load_never_revives_a_waiting_leg_the_model_ended() -> None:
+    b = book()
+    waiting = {stop_id(P), target_id(P)}
+    b.load(snapshot(stop=85000.0), {P: [our_entry(P, ENTRY)]}, waiting=waiting)
+    b.cancel_leg(P, Level.TAKE_PROFIT, 5)
+
+    records = b.load(snapshot(stop=85000.0), {P: [our_entry(P, ENTRY)]}, waiting=waiting)
+
+    assert records == []
+    assert b.view(P).legs[Level.TAKE_PROFIT] == (target_id(P), False)
+
+
 def test_load_holds_the_protective_orders_volume() -> None:
     b = book()
     b.load(snapshot(stop=85000.0, target=85500.0), {P: [our_entry(P, ENTRY)]})

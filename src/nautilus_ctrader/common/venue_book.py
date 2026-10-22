@@ -5,14 +5,14 @@ broker by a command. For each event it returns records saying what Nautilus must
 does no I/O and holds no Nautilus object. What it relies on, from a recorded session:
 
 - a position's stop-loss and take-profit live in one protective order (`STOP_LOSS_TAKE_PROFIT`)
-  that the broker creates after the fill, replaces on every level change and fills when a level
-  triggers;
+  that the broker creates after the fill, changes in place (`ORDER_REPLACED`, same id) on every
+  level change and fills when a level triggers;
 - `isServerEvent` separates what the broker did on its own from what a client asked for.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
@@ -389,18 +389,30 @@ class VenueBook:
         *,
         keep_gone: bool = False,
         read_ms: int = -1,
+        waiting: Collection[str] = (),
     ) -> list[Record]:
         """Rebuild the model from a snapshot asked with protection orders.
 
         `position_orders` holds each open position's own order list. Reporting the rebuilt state
-        to Nautilus is reconciliation's job; this returns only notices, and an `EntryUnknown` for
-        each foreign position with a level whose order list names no entry.
+        to Nautilus is reconciliation's job; this returns only notices, an `EntryUnknown` for
+        each foreign position with a level whose order list names no entry, and an
+        `AwaitProtection` for each position with a leg kept waiting.
 
-        `keep_gone`: a position with a live leg that the snapshot lacks is kept as it stood, so
-        its close event, held or late, still ends its legs. It stays in `kept()` until an event
-        of it dated at or after `read_ms`, a lower bound of the broker's time of the snapshot,
-        or one that closes it, is applied.
+        - `keep_gone`: a position with a live leg that the snapshot lacks is kept as it stood, so
+          its close event, held or late, still ends its legs. It stays in `kept()` until an event
+          of it dated at or after `read_ms`, a lower bound of the broker's time of the snapshot,
+          or one that closes it, is applied.
+        - `waiting`: the node's legs whose protective order has not come. One whose level the
+          snapshot lacks stays alive and unaccepted, as its fill left it, unless this model held
+          it ended or accepted.
         """
+        settled = {
+            leg.client_order_id
+            for position in self._positions.values()
+            for leg in position.legs.values()
+            if not leg.alive or leg.accepted
+        }
+        waiting = set(waiting) - settled
         self._kept_ms = read_ms
         listed = {position.positionId for position in snapshot.position}
         gone = {
@@ -437,7 +449,10 @@ class VenueBook:
                 position.levels.update(position_levels(venue_position, precision))
             entry = entry_of(position_orders.get(position.position_id, ()))
             if entry is not None:
-                notices += self._adopt(position, entry, restored=True)
+                notices += self._adopt(position, entry, restored=True, waiting=waiting)
+            if any(leg.alive and not leg.accepted for leg in position.legs.values()):
+                position.awaiting_protection = True
+                notices.append(AwaitProtection(position.position_id))
         for order in snapshot.order:
             if order.orderType == om.STOP_LOSS_TAKE_PROFIT:
                 position = self._positions.get(order.positionId)
@@ -784,9 +799,17 @@ class VenueBook:
                 position.open = position.volume > 0
 
     def _adopt(
-        self, position: _Position, entry: om.ProtoOAOrder, *, restored: bool
+        self,
+        position: _Position,
+        entry: om.ProtoOAOrder,
+        *,
+        restored: bool,
+        waiting: Collection[str] = (),
     ) -> list[Record]:
-        """Take `entry` as `position`'s; the position is the node's if `entry` has its record."""
+        """Take `entry` as `position`'s; the position is the node's if `entry` has its record.
+
+        `waiting`: with `restored`, the legs that wait for their level (`load()`).
+        """
         position.entry_order_id = entry.orderId
         entry_id = order_record.parse_label(entry.tradeData.label)
         if entry_id is None:
@@ -802,15 +825,17 @@ class VenueBook:
                 ),
             ]
         for level, client_order_id in zip(_LEVELS, (legs.stop_loss, legs.take_profit), strict=True):
-            if client_order_id is not None:
-                # After a restart a leg lives exactly while its level does.
-                alive = level in position.levels if restored else True
+            if client_order_id is None:
+                continue
+            if not restored:
+                position.legs[level] = _Leg(client_order_id)
+            elif level in position.levels:
                 position.legs[level] = _Leg(
-                    client_order_id,
-                    alive=alive,
-                    accepted=restored and alive,
-                    quantity=position.volume if restored and alive else 0,
+                    client_order_id, accepted=True, quantity=position.volume
                 )
+            else:
+                # After a restart a leg lives while its level does, or while it waits for it.
+                position.legs[level] = _Leg(client_order_id, alive=client_order_id in waiting)
         return []
 
     # Records

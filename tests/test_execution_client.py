@@ -1842,7 +1842,7 @@ async def test_missing_protection_is_set_by_an_amend_once_the_wait_ends() -> Non
         assert amend.stopLoss == 85197.2
         assert amend.takeProfit == 85387.22
         assert any("No protective order followed" in line for line in h.logger.warnings())
-        assert h.client._protection_timers == set()
+        assert h.client._protection_waits == {}
 
 
 async def test_a_positions_amend_lock_goes_once_the_position_has_closed() -> None:
@@ -1911,28 +1911,100 @@ async def test_a_bracket_settles_once_the_model_is_rebuilt_with_its_protective_o
         assert len(h.client._brackets) == 0
 
 
-async def test_a_correction_leaves_the_level_of_a_leg_no_longer_alive() -> None:
+def unprotected_position(execution_venue: ExecutionVenue) -> None:
+    """The node's position open at the broker before its protective order has come."""
+    our_open_position(execution_venue)
+    snapshot = execution_venue.snapshot
+    snapshot.position[0].ClearField("stopLoss")
+    snapshot.position[0].ClearField("takeProfit")
+    del snapshot.order[:]
+
+
+async def filled_bracket(h, **levels) -> None:
+    await push_spot(h, BID, ASK)
+    await submit_bracket(h, bracket(h, **levels))
+    await wait_until(lambda: status(h, ENTRY) == OrderStatus.FILLED)
+
+
+async def test_a_rebuild_before_the_protective_order_keeps_the_legs_pending() -> None:
     execution_venue = answered(FIRST_EVENTS[:2])
     amends = echo_amends(execution_venue)
     config = exec_config(protective_order_timeout_secs=30.0)
     async with harness(execution_venue=execution_venue, config=config) as h:
-        await push_spot(h, BID, ASK)
-        await submit_bracket(h, bracket(h))
-        await wait_until(lambda: status(h, ENTRY) == OrderStatus.FILLED)
-        # Rebuilt before the protective order came: the position has no level, so no live leg.
-        our_open_position(execution_venue)
-        snapshot = execution_venue.snapshot
-        snapshot.position[0].ClearField("stopLoss")
-        snapshot.position[0].ClearField("takeProfit")
-        del snapshot.order[:]
+        await filled_bracket(h, stop_price="85190.00", target_price="85400.00")
+        unprotected_position(execution_venue)
         await h.client._load()
-        assert not any(alive for _, alive in h.client._book.view(FIRST).legs.values())
 
         await push(h, FIRST_EVENTS[2])
+        await wait_until(lambda: last_kind(h, TARGET) == "OrderUpdated")
 
-        # Settled on the event itself: no correction was started.
+        for leg in (STOP, TARGET):
+            assert h.kinds_of(leg) == ["OrderSubmitted", "OrderAccepted", "OrderUpdated"]
+        (amend,) = amends
+        assert levels(amend) == (85190.0, 85400.0)
         assert len(h.client._brackets) == 0
-        assert amends == []
+
+
+async def test_a_rebuild_before_a_refused_protective_order_rejects_the_legs() -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+    config = exec_config(protective_order_timeout_secs=0.5)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await filled_bracket(h)
+        unprotected_position(execution_venue)
+        await h.client._load()
+
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.REJECTED
+                and status(h, TARGET) == OrderStatus.REJECTED
+            ),
+        )
+
+        assert any("stands without its levels" in line for line in h.logger.errors())
+
+
+async def test_a_rebuild_before_a_lost_protective_order_times_out_as_missing_protection() -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])
+    amends = echo_amends(execution_venue, kind=om.ORDER_ACCEPTED)
+    config = exec_config(protective_order_timeout_secs=0.5)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await filled_bracket(h)
+        unprotected_position(execution_venue)
+        await h.client._load()
+
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.ACCEPTED
+                and status(h, TARGET) == OrderStatus.ACCEPTED
+            ),
+        )
+
+        (amend,) = amends
+        assert levels(amend) == (85197.2, 85387.22)
+        assert any("No protective order followed" in line for line in h.logger.warnings())
+
+
+async def test_a_client_reconnected_before_the_protective_order_waits_for_it_again() -> None:
+    execution_venue = answered(FIRST_EVENTS[:2])
+    amends = echo_amends(execution_venue, kind=om.ORDER_ACCEPTED)
+    config = exec_config(protective_order_timeout_secs=0.5)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await filled_bracket(h)
+        # The disconnect drops the wait the fill armed.
+        await h.client._disconnect()
+        unprotected_position(execution_venue)
+        await h.client._connect()
+
+        await wait_until(
+            lambda: (
+                status(h, STOP) == OrderStatus.ACCEPTED
+                and status(h, TARGET) == OrderStatus.ACCEPTED
+            ),
+        )
+
+        (amend,) = amends
+        assert levels(amend) == (85197.2, 85387.22)
 
 
 async def test_a_wait_ending_with_nothing_to_set_leaves_the_bracket_to_its_correction() -> None:
@@ -2813,6 +2885,28 @@ async def test_a_leg_modified_by_the_wrong_price_is_refused(level, change, reaso
         (rejected,) = [e for e in h.events_of(leg) if isinstance(e, OrderModifyRejected)]
         assert rejected.reason == reason
         assert amends == []
+
+
+async def test_a_modify_of_a_leg_that_closed_while_waiting_for_the_amend_is_refused() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        lock = h.client._amend_locks.setdefault(FIRST, asyncio.Lock())
+        async with lock:
+            modifying = asyncio.create_task(
+                h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+            )
+            await asyncio.sleep(0)
+            # A trader removes the stop-loss while the modify waits for the lock.
+            await push(h, protective(None, 85387.22, utc=AMEND_FROM))
+            await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
+        await modifying
+
+        assert all(not amend.HasField("stopLoss") for amend in amends)
+        (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]
+        assert rejected.reason == "the leg is already closed"
+        assert "OrderUpdated" not in h.kinds_of(STOP)
 
 
 def trailed_at(stop: float, *, utc: int = AMEND_FROM + 100) -> oa.ProtoOATrailingSLChangedEvent:
