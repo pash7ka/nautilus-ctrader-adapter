@@ -1035,6 +1035,8 @@ def test_a_client_whose_loop_closed_mid_connect_is_replaced_with_a_warning(
     assert cached_account_client(pinned, logger) is not first_client
     assert any("closed without a disconnect" in m for m in logger.warnings())
     connecting.clear()
+    servers.clear()
+    server = held = None  # frees the abandoned server before the collection below
     # Inside this test, so the filter above applies.
     gc.collect()
 
@@ -1074,6 +1076,7 @@ def test_a_directly_built_client_whose_loop_closed_mid_connect_refuses_the_next_
             asyncio.run(connect_again())
     finally:
         connecting.clear()
+        server = held = None  # frees the abandoned server before the collection below
         # Inside this test, so the filter above applies.
         gc.collect()
 

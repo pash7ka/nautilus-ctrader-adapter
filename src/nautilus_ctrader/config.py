@@ -168,8 +168,8 @@ class CTraderDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
         Response timeout for a historical request.
     history_max_gap_days : float, default 7.0
         The longest stretch without a bar that paging back through history crosses. History
-        is taken to start before a longer one. A live page reaches back past its window's
-        start, so this most likely only cuts at a page with no bars at all.
+        is taken to start before a longer one. Only a page with no bars cuts, and a live page
+        reaches back past its window's start, so most likely only where history really starts.
     history_max_gap_overrides : dict[str, float], default {}
         `history_max_gap_days` per broker symbol name, e.g. `{"US100.cash": 14.0}`.
     connect_timeout_secs : float, default 60.0
