@@ -56,6 +56,7 @@ from nautilus_ctrader.common.errors import (
     CTraderProtocolError,
     CTraderRequestError,
 )
+from nautilus_ctrader.common.operations import PendingBracket
 from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.venue_book import terms_of
@@ -3895,14 +3896,16 @@ async def test_a_position_the_settling_rebuild_misses_but_an_event_states_is_not
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     execution_venue, held = entry_held()
+    open_at_broker(execution_venue)
     async with harness(execution_venue=execution_venue, config=LOSING) as h:
         read_broker = h.client._read_broker
 
         async def missed(**kwargs):
             state = await read_broker(**kwargs)
-            # The protective order as it stands, behind a snapshot that lacked its position.
-            await h.server.push(protective(85197.2, 85387.22, utc=AMEND_FROM))
-            await wait_until(lambda: bool(h.client._buffer))
+            if kwargs.get("positions") is None:
+                # The protective order as it stands, behind a snapshot that lacked its position.
+                await h.server.push(protective(85197.2, 85387.22, utc=AMEND_FROM))
+                await wait_until(lambda: bool(h.client._buffer))
             return state
 
         monkeypatch.setattr(h.client, "_read_broker", missed)
@@ -3918,7 +3921,9 @@ async def test_a_position_the_settling_rebuild_misses_but_an_event_states_is_not
 
         assert h.client._book.view(FIRST).open
         assert h.client._book.kept() == frozenset()
-        assert h.received(oa.ProtoOADealListByPositionIdReq) == []
+        # The event may be older than the snapshot: the deals confirm the position open.
+        assert len(deal_reads(h)) == 1
+        assert not any("check by hand" in e for e in h.logger.errors())
         for leg in (STOP, TARGET):
             assert status(h, leg) == OrderStatus.ACCEPTED
         assert h.activity == []
@@ -3970,6 +3975,7 @@ async def test_a_kept_position_an_event_shows_open_gets_its_carried_modify(
 ) -> None:
     execution_venue, held = entry_held()
     amends = echo_amends(execution_venue)
+    open_at_broker(execution_venue)
     async with harness(execution_venue=execution_venue, config=LOSING) as h:
         read_broker = h.client._read_broker
         pushed: list = []
@@ -3986,13 +3992,15 @@ async def test_a_kept_position_an_event_shows_open_gets_its_carried_modify(
         await stop_modify_lost(h, held, monkeypatch)
         stop = h.cache.order(ClientOrderId(STOP))
         await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+        # The event may be older than the snapshot: the deals confirm the position open.
+        await wait_until(lambda: len(deal_reads(h)) == 1)
         await sync(h)
 
         (amend,) = amends
         assert amend.stopLoss == 85150.0
         assert amend.takeProfit == 85387.22
         assert refusals(h, stop) == []
-        assert deal_reads(h) == []
+        assert not any("check by hand" in e for e in h.logger.errors())
         assert len(h.client._brackets) == 0
 
 
@@ -4146,7 +4154,7 @@ async def test_a_stashed_leg_nautilus_holds_closed_is_not_cancelled_again(
     execution_venue, held = entry_held()
     async with harness(execution_venue=execution_venue, config=LOSING) as h:
         # The bracket stays stashed across the reconnect: only the guard stands.
-        monkeypatch.setattr(h.client, "_unstash", lambda: None)
+        monkeypatch.setattr(h.client, "_unstash", lambda: [])
         await reconnect_after_a_stashed_close(h, held, monkeypatch, execution_venue)
 
         assert_each_leg_ended_once(h)
@@ -4493,6 +4501,104 @@ async def test_a_detach_forgets_the_failed_settling_rebuilds(
         # The next connect's first failure waits the shortest time again.
         assert bracket.rebuild_failures == 0
         assert bracket.retry is None
+
+
+async def test_a_reconnect_hands_back_a_stashed_bracket_without_its_failed_rebuilds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        failing_reads(h, monkeypatch, failures=1)
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(lambda: any("name no close" in e for e in h.logger.errors()))
+        ((kept,),) = h.client._kept_brackets.values()
+        assert kept.bracket.rebuild_failures == 1
+
+        # The pass fails after the bracket is handed back, so it stays pending.
+        execution_venue.fail.add(om.PROTO_OA_TRADER_REQ)
+        with pytest.raises(CTraderRequestError):
+            await h.client._reload()
+
+        (bracket,) = h.client._brackets
+        assert bracket is kept.bracket
+        assert bracket.rebuild_failures == 0
+
+
+async def test_a_connect_ends_a_handed_back_bracket_whose_position_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(lambda: any("name no close" in e for e in h.logger.errors()))
+        assert h.client._kept_brackets
+
+        await h.client._disconnect()
+        # Closed by its stop while the client was away.
+        closed_by_stop(execution_venue)
+        await h.client._connect()
+        await sync(h)
+
+        assert len(h.client._brackets) == 0
+        stop = h.cache.order(ClientOrderId(STOP))
+        # The carried modify's answer was lost: it is left to the query, never refused.
+        assert refusals(h, stop) == []
+        report, _ = await h.client._answer(ClientOrderId(TARGET), None)
+        assert report.order_status == OrderStatus.CANCELED
+        _, sent = await h.client._answer(stop.client_order_id, None)
+        assert sent
+
+
+async def test_answering_as_held_sends_no_cancel_for_a_leg_nautilus_holds_closed() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await opened_bracket(h)
+        # The broker removed the take-profit: its leg is cancelled.
+        await push(h, protective(85197.2, None, utc=AMEND_FROM))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        pending = PendingBracket(ENTRY, {Level.STOP_LOSS: STOP, Level.TAKE_PROFIT: TARGET}, {})
+        both = {Level.STOP_LOSS, Level.TAKE_PROFIT}
+
+        await h.client._answer_as_held(pending, ended={Level.TAKE_PROFIT}, alive_before=both)
+        await sync(h)
+
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+
+
+async def test_a_keep_ended_by_an_event_older_than_the_snapshot_is_still_read_from_its_deals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await opened_bracket(h)
+        closed_by_stop(execution_venue)
+        read_broker = h.client._read_broker
+        pushed: list = []
+
+        async def missed(**kwargs):
+            state = await read_broker(**kwargs)
+            if not pushed:
+                pushed.append(True)
+                # Made before the stop filled, so before the snapshot that lacks the position,
+                # but past every time the node knew: it ends the keep.
+                await h.server.push(protective(85197.2, 85387.22, utc=AMEND_FROM))
+                await wait_until(lambda: bool(h.client._buffer))
+            return state
+
+        monkeypatch.setattr(h.client, "_read_broker", missed)
+        await h.client._learn_position("O-E-5000002")
+        assert h.client._book.kept() == frozenset()
+
+        # The stop's own event is lost.
+        await wait_until(
+            lambda: status(h, STOP) == OrderStatus.FILLED, description="the stop leg filled"
+        )
+        await sync(h)
+
+        assert len(deal_reads(h)) == 1
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
+        assert h.reports == []
 
 
 async def test_a_failed_rebuild_leaves_a_held_correction_and_its_lost_amend(

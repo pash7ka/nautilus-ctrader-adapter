@@ -301,6 +301,8 @@ class VenueBook:
         # and the broker's time of that snapshot.
         self._kept: set[int] = set()
         self._kept_ms = -1
+        # Kept positions whose keep a non-closing event ended: see `awaits_close()`.
+        self._unconfirmed: set[int] = set()
         # See `closed_in_reconciliation()`.
         self._closed_in_reconciliation: set[int] = set()
 
@@ -394,8 +396,8 @@ class VenueBook:
 
         `keep_gone`: a position with a live leg that the snapshot lacks is kept as it stood, so
         its close event, held or late, still ends its legs. It stays in `kept()` until an event
-        of it dated at or after `read_ms`, the broker's time of the snapshot, or one that closes
-        it, is applied.
+        of it dated at or after `read_ms`, a lower bound of the broker's time of the snapshot,
+        or one that closes it, is applied.
         """
         self._kept_ms = read_ms
         listed = {position.positionId for position in snapshot.position}
@@ -411,6 +413,7 @@ class VenueBook:
             )
         }
         self._kept = set(gone)
+        self._unconfirmed = set()
         self._positions = {}
         self._unloaded_orders = {}
         self._reported = set()
@@ -462,9 +465,22 @@ class VenueBook:
         """The positions the last load kept that no event has named since."""
         return frozenset(self._kept)
 
+    def awaits_close(self, position_id: int) -> bool:
+        """Whether position `position_id` still waits for its deals to tell whether it closed.
+
+        It does while kept, and while it stays open after a non-closing event ended its keep:
+        `read_ms` only bounds the snapshot's time from below, so that event may be older than
+        the snapshot that lacked the position.
+        """
+        if position_id in self._kept:
+            return True
+        position = self._positions.get(position_id)
+        return position_id in self._unconfirmed and position is not None and position.open
+
     def end_keep(self, position_id: int) -> None:
         """Position `position_id` is known open after all: it stays as held, kept no longer."""
         self._kept.discard(position_id)
+        self._unconfirmed.discard(position_id)
 
     def deal_applied(self, deal_id: int) -> bool:
         """Whether a fill event carrying deal `deal_id` was applied."""
@@ -503,10 +519,13 @@ class VenueBook:
         position_id = event.order.positionId
         if position_id in self._kept:
             position = self._positions.get(position_id)
-            # The broker states the position since the snapshot: its events, not a deal read,
-            # answer its legs. An older event says nothing the snapshot did not.
-            if _event_ms(event) >= self._kept_ms or position is None or not position.open:
+            # The broker states the position since the snapshot: its events answer its legs.
+            # An older event says nothing the snapshot did not.
+            if position is None or not position.open:
                 self._kept.discard(position_id)
+            elif _event_ms(event) >= self._kept_ms:
+                self._kept.discard(position_id)
+                self._unconfirmed.add(position_id)
         return records
 
     def trailing_stop_moved(self, event: oa.ProtoOATrailingSLChangedEvent) -> list[Record]:
