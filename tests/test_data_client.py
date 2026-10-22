@@ -899,6 +899,60 @@ async def test_quotes_already_published_are_not_published_again_on_a_second_hold
         assert len(h.quotes()) == published
 
 
+async def joining_while_another_subscribe_is_held(
+    h: Harness,
+    *,
+    before: oa.ProtoOASpotEvent | None = None,
+    during: oa.ProtoOASpotEvent,
+) -> None:
+    """Join GER40.cash's spots behind another owner's held subscribe; `during` arrives meanwhile.
+
+    `before` arrives under the other owner's subscribe, before this client joins.
+    """
+    held = HeldReplies(h.server, om.PROTO_OA_SUBSCRIBE_SPOTS_REQ, spots_reply)
+    subscriptions = h.account.subscriptions
+    other = asyncio.create_task(
+        subscriptions.subscribe_spots(GER40_SYMBOL_ID, "reference", "execution")
+    )
+    await held.arrived.wait()
+    if before is not None:
+        await push_spot(h, before)
+    joining = asyncio.create_task(h.client._hold_spots(GER40_SYMBOL_ID, f"quotes:{GER40_ID}"))
+    await wait_until(lambda: h.client._quoting(GER40_SYMBOL_ID), description="quote hold active")
+
+    await push_spot(h, during)
+    await held.stop_holding()
+    await other
+    await joining
+
+
+def assert_quotes_spot(quote: QuoteTick, h: Harness, spot: oa.ProtoOASpotEvent) -> None:
+    precision = h.provider.find(GER40_ID).price_precision
+    assert quote.bid_price == price_from_raw(spot.bid, precision)
+    assert quote.ask_price == price_from_raw(spot.ask, precision)
+
+
+async def test_a_spot_arriving_during_the_subscribe_is_quoted_once() -> None:
+    async with harness() as h:
+        await h.client._connect()
+
+        await joining_while_another_subscribe_is_held(h, during=GER40_SPOT)
+
+        (quote,) = ger40_quotes(h)
+        assert_quotes_spot(quote, h, GER40_SPOT)
+
+
+async def test_a_spot_without_prices_during_the_subscribe_adds_no_second_quote() -> None:
+    no_prices = oa.ProtoOASpotEvent(ctidTraderAccountId=ACCOUNT_ID, symbolId=GER40_SYMBOL_ID)
+    async with harness() as h:
+        await h.client._connect()
+
+        await joining_while_another_subscribe_is_held(h, before=GER40_SPOT, during=no_prices)
+
+        (quote,) = ger40_quotes(h)
+        assert_quotes_spot(quote, h, GER40_SPOT)
+
+
 async def test_subscribing_quotes_holds_the_spot_subscription_for_that_instrument() -> None:
     async with harness() as h:
         await h.client._connect()
@@ -2127,7 +2181,7 @@ async def test_an_intraday_open_time_off_the_grid_is_published_not_rounded() -> 
 
 
 async def test_a_quote_resubscribe_pairs_a_side_kept_while_the_bars_held_the_spots() -> None:
-    # No conversion, so the quote subscription is the symbol's only spot hold.
+    # No conversion, so the bars are the only other hold on the symbol's spots.
     client_config = config(
         subscribe_conversion_quotes=False,
         instrument_provider=InstrumentProviderConfig(load_ids=frozenset({EURUSD_ID})),
@@ -2135,7 +2189,7 @@ async def test_a_quote_resubscribe_pairs_a_side_kept_while_the_bars_held_the_spo
     async with harness(client_config=client_config, server=trendbar_venue()) as h:
         await h.client._connect()
         pin_clock(h, FIRST_M1_MINUTE)
-        # The bar subscription keeps the symbol's listener attached throughout.
+        # The bars keep the venue subscription, and so the registry's last spot, throughout.
         await subscribe_bars(h, EURUSD_M1)
         await subscribe_quotes(h, EURUSD_ID)
         await push_spot(h, BID_ONLY)

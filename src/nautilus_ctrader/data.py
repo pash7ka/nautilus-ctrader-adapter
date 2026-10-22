@@ -58,7 +58,6 @@ from nautilus_ctrader.common.parsing import (
 )
 from nautilus_ctrader.common.rate_limit import RequestPriority
 from nautilus_ctrader.common.session import CTraderSession
-from nautilus_ctrader.common.subscriptions import LastSpot
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.enums import PERIOD_SECS, trendbar_period_for
@@ -303,6 +302,9 @@ class CTraderDataClient(LiveMarketDataClient):
         # One listener per symbol however many holds it has: a symbol that is both subscribed
         # and a conversion leg would otherwise emit every quote once per listener.
         self._spot_listeners: dict[int, SpotListener] = {}
+        # Per symbol, so a first hold can tell whether a spot arriving during its subscribe was
+        # already quoted and its last spot need not be published again.
+        self._quotes_published: dict[int, int] = {}
         self._converted: set[InstrumentId] = set()
         # The provider's `conversion_generation` that `_converted` is valid for. The provider is
         # the account's, which resets it on a bring-up and on a symbol change.
@@ -1037,6 +1039,7 @@ class CTraderDataClient(LiveMarketDataClient):
                 self._log.error,
             )
             return
+        self._quotes_published[symbol_id] = self._quotes_published.get(symbol_id, 0) + 1
         self._handle_data(quote)
 
     def _log_once(
@@ -1597,7 +1600,7 @@ class CTraderDataClient(LiveMarketDataClient):
         if consumer in subscriptions.active_consumers(symbol_id, self._owner):
             return False
         quoted = self._quoting(symbol_id)
-        before = subscriptions.last_spot(symbol_id)
+        published = self._quotes_published.get(symbol_id, 0)
         # Attached first: the registry makes the consumer active as the call starts, so a spot
         # arriving before the answer is published.
         self._attach_listener(symbol_id)
@@ -1606,19 +1609,18 @@ class CTraderDataClient(LiveMarketDataClient):
         finally:
             # Detaches it again if the registry did not count the subscribe.
             self._sync_listener(symbol_id)
-        if not quoted:
-            self._publish_last_spot(symbol_id, before)
+        if not quoted and self._quotes_published.get(symbol_id, 0) == published:
+            self._publish_last_spot(symbol_id)
         return True
 
-    def _publish_last_spot(self, symbol_id: int, before: LastSpot | None) -> None:
-        """Publish the account's last spot unless it changed from `before` during the subscribe.
+    def _publish_last_spot(self, symbol_id: int) -> None:
+        """Publish the account's last spot of a symbol this client has no quote of yet.
 
         Joining a live subscription sends the venue nothing, so without it the first quote
-        would wait for the price to move. A spot that came during the subscribe was quoted as
-        it came. The quote carries the spot's own broker time.
+        would wait for the price to move. The quote carries the spot's own broker time.
         """
         spot = self._account.subscriptions.last_spot(symbol_id)
-        if self._quoting(symbol_id) and spot is not None and spot is before:
+        if self._quoting(symbol_id) and spot is not None:
             self._publish_quote(symbol_id, spot.timestamp)
 
     async def _release_spots(self, symbol_id: int, consumer: str) -> None:
