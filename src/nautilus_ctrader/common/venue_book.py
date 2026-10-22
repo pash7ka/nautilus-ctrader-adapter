@@ -468,6 +468,10 @@ class VenueBook:
         """Whether a fill event carrying deal `deal_id` was applied."""
         return deal_id in self._applied_deals
 
+    def deals_reported(self, deal_ids: Iterable[int]) -> None:
+        """Deals a mass status carried as fills: their events, held or late, are not applied."""
+        self._applied_deals.update(deal_ids)
+
     def apply(self, event: oa.ProtoOAExecutionEvent, operations: Operations) -> list[Record]:
         """What `event` means to Nautilus; an event seen before means nothing new.
 

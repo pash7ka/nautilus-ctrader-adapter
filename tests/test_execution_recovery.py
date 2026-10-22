@@ -1613,6 +1613,79 @@ async def test_a_position_closed_after_the_snapshot_is_reported_closed() -> None
         assert reconciliation_orders(h) == []
 
 
+def stop_filled_once(h: Harness) -> None:
+    """The node's stop leg filled by the stop's deal alone, its take-profit cancelled once."""
+    assert status(h, STOP) == OrderStatus.FILLED
+    assert h.cache.order(ClientOrderId(STOP)).trade_ids == [TradeId("7000003")]
+    assert kinds(h, STOP).count("OrderFilled") == 1
+    assert status(h, TARGET) == OrderStatus.CANCELED
+    assert kinds(h, TARGET).count("OrderCanceled") == 1
+    stops = [o.client_order_id for o in h.cache.orders() if o.order_type == OrderType.STOP_MARKET]
+    assert stops == [ClientOrderId(STOP)]
+    assert h.cache.position(PositionId(str(FIRST))).is_closed
+    assert h.cache.positions_open() == []
+    assert reconciliation_orders(h) == []
+
+
+async def test_a_stop_filled_during_the_start_reconciliation_is_the_nodes_leg() -> None:
+    cache = await legs_accepted()
+    # The stop filled before the snapshot, which lacks the position; its event comes during the
+    # pass and is held.
+    venue = serving(CLOSED_AT)
+    async with harness(execution_venue=venue, cache=cache) as h:
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+        )
+        passing = asyncio.create_task(h.client.generate_mass_status())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        await push(h, FIRST_EVENTS[-1])
+        await held.stop_holding()
+        built = await asyncio.wait_for(passing, timeout=10)
+
+        h.engine.reconcile_execution_mass_status(built)
+        await wait_until(lambda: h.client._buffer is None)
+        await sync(h)
+
+        stop_filled_once(h)
+        for leg in (STOP, TARGET):
+            assert h.events_of(leg) == []
+        assert h.reports == []
+        assert h.activity == []
+
+
+async def test_a_stop_filled_during_the_reconnect_pass_is_the_nodes_leg() -> None:
+    venue = serving(OPEN_AT)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        # The stop-loss moved by hand while connected: Nautilus holds the level it fills at.
+        await push(h, FIRST_EVENTS[-2])
+        await wait_until(lambda: kinds(h, STOP)[-1] == "OrderUpdated")
+        events, reported, activity = len(h.events), len(h.reports), len(h.activity)
+        # The stop filled during the outage, before the snapshot; its event comes during the pass.
+        serve(venue, CLOSED_AT)
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_DEAL_LIST_BY_POSITION_ID_REQ],
+        )
+
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+        await h.server.push(FIRST_EVENTS[-1])
+        await wait_until(lambda: bool(h.client._buffer))
+        await held.stop_holding()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        await wait_until(lambda: h.client._buffer is None)
+        await sync(h)
+
+        stop_filled_once(h)
+        assert h.events[events:] == []
+        assert h.reports[reported:] == []
+        assert h.activity[activity:] == []
+
+
 async def test_a_partial_close_after_the_snapshot_sizes_the_position_by_the_lists() -> None:
     # The snapshot holds the whole position; the lists, read later, a trader's partial close.
     venue = serving(TP_BACK_AT)

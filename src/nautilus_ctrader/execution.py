@@ -832,6 +832,16 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._stand(state)
         # One record left out beats a reconciliation that fails every time.
         status = self._mass_status(state, misfit=self._log.error)
+        # A closed position the snapshot lacked: its fill event, applied to a model without it,
+        # would make up a foreign order for a fill this mass status carries.
+        reported = {fill.trade_id.value for found in status.fill_reports.values() for fill in found}
+        self._book.deals_reported(
+            deal.dealId
+            for position_id, found in state.histories.items()
+            if self._book.view(position_id) is None and open_volume(found) == 0
+            for deal in found.deals
+            if str(deal.dealId) in reported
+        )
         self._write_exposure()
         fills = sum(len(found) for found in status.fill_reports.values())
         positions = sum(len(found) for found in status.position_reports.values())
