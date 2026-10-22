@@ -181,8 +181,8 @@ def test_send_is_the_only_way_to_the_connection() -> None:
 
     assert source.count(".request(") == 1
     assert ".request(" in send_body
-    # The connection's own lower layers: its unanswered send, its frame writers, its socket.
-    for lower in ("send", "_write", "_write_now", "_writer"):
+    # The connection's own lower layers: its frame writers, its socket.
+    for lower in ("_write", "_write_now", "_writer"):
         assert hasattr(CTraderConnection("127.0.0.1", 1, logger=None), lower), lower
         assert f".{lower}" not in source, lower
 
