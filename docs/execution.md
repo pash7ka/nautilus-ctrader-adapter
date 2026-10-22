@@ -391,8 +391,9 @@ an unknown time zone, and an impossible request pacing (a count below 1, a windo
 or pause cap that is not positive, negative retries).
 
 The six request pacing fields are on `CTraderDataClientConfig` too, with the same names and
-defaults. The defaults come from the limits measured live and recorded in
-[`protocol.md` section 6](protocol.md#6-rate-limiting); the first config built for an account
+defaults. Only the two request counts are limits measured live, recorded in
+[`protocol.md` section 6](protocol.md#6-rate-limiting); the window, the retries, the queue
+timeout and the pause cap are margins chosen around them. The first config built for an account
 sets the pacing every client of that account uses.
 
 The in-flight check belongs to Nautilus's `LiveExecEngineConfig`, not to this config; see
@@ -973,6 +974,9 @@ carried a `clientMsgId` the listening connection had not sent (observed once, an
 recorder's mislabel: whose id it was is not recorded), so only an id the adapter is waiting for
 marks an answer.
 
+The deal and order lists answer a window ending in the future, so the history windows end a day
+past now ([Protocol notes](protocol.md), section 10).
+
 ### Still open
 
 Each point still open is marked in the source with a `TODO(verify):` comment saying what would
@@ -1005,8 +1009,7 @@ settle it. The main groups:
   newest first; nothing relies on it), which of an order's times the order list filters by,
   paging of the order and deal lists past one page, whether the list holds a rejected order,
   whether the edges of a window are inclusive, and whether the cash-flow list has no pages and
-  takes at most a week. That the deal and order lists answer a window ending in the future is
-  confirmed.
+  takes at most a week.
 - **The balance checkpoint**: that an account's first funding is a balance deposit, and the sign
   of a withdrawal's amount.
 

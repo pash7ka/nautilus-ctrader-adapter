@@ -108,6 +108,9 @@ ends it. The values are constants in `constants.py`:
 
 - A session lost after staying ready for `STABLE_SESSION_SECS` (30 s) reconnects at once, with
   the WARNING `Connection lost, reconnecting`, and the count of failed attempts starts again.
+- A session that took a refreshed token while ready ends itself, however long it was ready, and
+  reconnects at once to authenticate with the new token (section 5), with the INFO
+  `Re-authenticating with the refreshed token`; the count of failed attempts starts again too.
 - A failed bring-up, or a session lost sooner, is a failed attempt and waits before the next:
   `BACKOFF_BASE_SECS` (1 s), doubled for each failed attempt in a row up to `BACKOFF_MAX_SECS`
   (60 s), then lengthened by a random part of up to `BACKOFF_JITTER` (25 %).

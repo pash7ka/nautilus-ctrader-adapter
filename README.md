@@ -171,8 +171,10 @@ tokens the adapter refreshes while it runs, see [docs/market_data.md](docs/marke
   correlated to requests by `clientMsgId`.
 - A heartbeat must be sent if the connection would otherwise be idle for more than 30
   seconds. This adapter sends one after 10 seconds of outbound silence and does not answer
-  the server's own heartbeats. 90 seconds without any data from the server is treated as a
-  lost connection, detected within a few seconds after the 90 seconds.
+  the server's own heartbeats (that the server sends them is inferred; see
+  [docs/protocol.md](docs/protocol.md#3-heartbeat)).
+  90 seconds without any data from the server is treated as a lost connection, detected within
+  a few seconds after the 90 seconds.
 - After any reconnect, both authentication levels and all subscriptions must be
   re-established.
 - Outbound requests are rate-limited, with a separate and much tighter budget for historical
