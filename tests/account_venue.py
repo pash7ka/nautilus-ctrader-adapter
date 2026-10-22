@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
+import pytest
 from google.protobuf.message import Message
 
+from nautilus_ctrader.common import account as account_module
+from nautilus_ctrader.common import connection as connection_module
+from nautilus_ctrader.common import session as session_module
 from nautilus_ctrader.common.account import AccountCredentials, CTraderAccountClient
+from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from tests.fake_server import FakeCTraderServer
@@ -126,6 +131,50 @@ def account_client(
         demo_host=server.host,
         live_host=server.host,
         port=server.port,
+        tls=False,
+        **kwargs,
+    )
+
+
+DEMO_HOST_NAME = "demo.invalid"
+LIVE_HOST_NAME = "live.invalid"
+
+
+def route_hosts(monkeypatch: pytest.MonkeyPatch, servers: Mapping[str, FakeCTraderServer]) -> None:
+    """Send every connection to the fake server `servers` holds under its host name.
+
+    The demo and live hosts share one port, so a fake server cannot stand for one of them by
+    address alone. The server is looked up when the connection is built: a test may replace
+    one in between.
+    """
+    real_connection = connection_module.CTraderConnection
+
+    def routed(host: str, port: int, **options) -> CTraderConnection:
+        server = servers[host]
+        return real_connection(server.host, server.port, **options)
+
+    monkeypatch.setattr(account_module, "CTraderConnection", routed)
+    monkeypatch.setattr(session_module, "CTraderConnection", routed)
+
+
+def two_host_account_client(
+    monkeypatch: pytest.MonkeyPatch,
+    servers: Mapping[str, FakeCTraderServer],
+    *,
+    environment: str = "auto",
+    **kwargs,
+) -> CTraderAccountClient:
+    """An account client whose demo and live hosts are `servers[DEMO_HOST_NAME]` and
+    `servers[LIVE_HOST_NAME]`."""
+    route_hosts(monkeypatch, servers)
+    kwargs.setdefault("credentials", credentials())
+    kwargs.setdefault("logger", RecordingLogger())
+    return CTraderAccountClient(
+        trader_login=TRADER_LOGIN,
+        environment=environment,
+        demo_host=DEMO_HOST_NAME,
+        live_host=LIVE_HOST_NAME,
+        port=0,
         tls=False,
         **kwargs,
     )

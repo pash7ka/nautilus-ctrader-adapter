@@ -146,10 +146,13 @@ class CTraderAccountClient:
     One trading account's connection, shared by reference count.
 
     - The account is named by its `trader_login`. Every bring-up lists the accounts the token
-      grants over a short pre-connection to `demo_host` - the list is served on either host -
-      and reads the `ctidTraderAccountId` the protocol needs off the matching entry.
-    - `environment="auto"` takes the host from that entry's `isLive` flag; `"demo"`/`"live"`
-      force it.
+      grants over a short pre-connection to the configured host - `live_host` for `"auto"`;
+      the list is served on either host - and reads the `ctidTraderAccountId` the protocol
+      needs off the matching entry.
+    - `environment="auto"` takes the trading host from that entry's `isLive` flag;
+      `"demo"`/`"live"` force it.
+    - A cached client whose session was brought up on another event loop, one closed without
+      `disconnect()`, forgets that session at the next `connect()` and brings up a new one.
     - `connect()` returns once the session is ready and the reference data is loaded; bad
       credentials fail it at once rather than after `connect_timeout_secs`.
     - A loaded symbol the venue reports as changed is reloaded here, once for all clients;
@@ -194,6 +197,8 @@ class CTraderAccountClient:
         self._users = 0
         # Serialises `connect()` and `disconnect()`, so at most one session is ever brought up.
         self._lifecycle_lock = asyncio.Lock()
+        # The loop the last bring-up ran on, which the session and its tasks are bound to.
+        self._session_loop: asyncio.AbstractEventLoop | None = None
         self._retry_task: asyncio.Task | None = None
         # Outlives sessions, so live subscriptions are restored on every later `connect()`.
         self.subscriptions = SubscriptionRegistry(self, logger)
@@ -326,7 +331,12 @@ class CTraderAccountClient:
         Calls are serialised: a caller queued behind a successful attempt only counts itself,
         and one queued behind a failed attempt tries again. A failed or cancelled attempt
         stops what it started and leaves the user count unchanged.
+
+        A session brought up on another event loop is forgotten with a WARNING, together with
+        its users, and a new one is brought up: nothing on a closed loop can be stopped or
+        reused.
         """
+        self._forget_session_on_another_loop()
         async with self._lifecycle_lock:
             try:
                 if self._users > 0:
@@ -343,6 +353,27 @@ class CTraderAccountClient:
                 self._last_connect_error = e
                 raise
             self._last_connect_error = None
+
+    def _forget_session_on_another_loop(self) -> None:
+        loop = self._session_loop
+        if loop is None or loop is asyncio.get_running_loop():
+            return
+        self._session_loop = None
+        # A lock is bound to the loop it was first contended on, and one held when that loop
+        # closed is never released.
+        self._lifecycle_lock = asyncio.Lock()
+        if self.session is None and self._users == 0:
+            return
+        self._log.warning(
+            "Account session was brought up on another event loop; forgetting it and "
+            "bringing up a new one",
+        )
+        # Dropped, not stopped or cancelled: both would schedule work on the old loop.
+        self.session = None
+        self._users = 0
+        self._retry_task = None
+        self._reload_tasks = set()
+        self.subscriptions.detach()
 
     async def disconnect(self) -> None:
         """Release one user; the last one stops the session."""
@@ -405,6 +436,7 @@ class CTraderAccountClient:
         # `connect()` waits no longer than `connect_timeout_secs`.
         deadline = asyncio.timeout(self._connect_timeout_secs)
         session: CTraderSession | None = None
+        self._session_loop = asyncio.get_running_loop()
         try:
             async with deadline:
                 host = await self._resolve_account()
@@ -476,8 +508,10 @@ class CTraderAccountClient:
         The list is fetched whatever `environment` says, because it is the only thing that
         maps a trader login to the `ctidTraderAccountId` the protocol addresses.
         """
+        # "auto" reads it from the live host; both hosts serve the same list.
+        list_host = self._demo_host if self._environment == "demo" else self._live_host
         connection = CTraderConnection(
-            self._demo_host,
+            list_host,
             self._port,
             logger=self._log,
             tls=self._tls,
@@ -536,16 +570,24 @@ class CTraderAccountClient:
             raise CTraderAuthError(f"account list rejected after refresh: {e.error_code}") from e
 
     async def _refresh_over(self, connection: CTraderConnection) -> None:
-        # TODO(verify): ProtoOARefreshTokenReq over an app-only-authenticated pre-connection on
-        # the demo host works for a live account's token.
-        late: asyncio.Future[oa.ProtoOARefreshTokenRes] = asyncio.get_running_loop().create_future()
+        # TODO(verify): ProtoOARefreshTokenReq over an app-only-authenticated pre-connection
+        # works on a host other than the account's own, as with "auto" for a demo account.
+        # `None` once the connection is lost: no reply can come on it then.
+        late: asyncio.Future[oa.ProtoOARefreshTokenRes | None] = (
+            asyncio.get_running_loop().create_future()
+        )
 
         def catch_late_reply(payload: Message) -> None:
             if isinstance(payload, oa.ProtoOARefreshTokenRes) and not late.done():
                 late.set_result(payload)
 
+        def end_late_wait(_error: Exception) -> None:
+            if not late.done():
+                late.set_result(None)
+
         # Set before the request, so a reply that misses its timeout is still caught.
         connection.set_event_handler(catch_late_reply)
+        connection.set_disconnect_handler(end_late_wait)
         try:
             response = await connection.request(
                 oa.ProtoOARefreshTokenReq(refreshToken=self._credentials.refresh_token),
@@ -561,6 +603,8 @@ class CTraderAccountClient:
                 response = await asyncio.wait_for(late, LATE_REFRESH_WAIT_SECS)
             except TimeoutError:
                 raise timeout from None
+            if response is None:
+                raise timeout
             self._log.warning("Adopted a late token refresh reply")
         else:
             self._log.info("Access token refreshed")
@@ -741,6 +785,8 @@ def get_cached_ctrader_account_client(
     duplicate check in `_resolve_account()` enforces at connect time.
 
     Later calls with the same key return the first instance; their other arguments are ignored.
+    That holds across event loops too: a node rebuilt in the same process gets the same client,
+    its listeners included, and its `connect()` replaces a session left on the old loop.
     A differing `environment` or credential is reported in one WARNING: the first client's
     host and tokens win, and the second config would otherwise be ignored in silence. The
     comparison is against the credentials the client was built from, so a token the client

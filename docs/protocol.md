@@ -35,9 +35,11 @@ token was issued makes no difference — a token obtained through a sandbox auth
 still routes by the account's flag.
 
 The account list (`ProtoOAGetAccountListByAccessTokenReq`) is served on **either** host
-(confirmed), which is what makes host selection automatic: this adapter opens a short
-connection to one host, reads the flag for the configured account, and connects to the host
-that flag names. Naming the environment explicitly skips that step.
+(confirmed), the same list on both. This adapter always reads it first, over a short connection
+to the configured host (the live host for `auto`), because the list is what maps the configured
+trader login to the account id the protocol addresses. With `auto` the flag of the matching
+entry then picks the host the session connects to; an explicit environment keeps the host it
+names.
 
 ## 2. Envelope and correlation
 
@@ -138,7 +140,7 @@ How tokens behave was checked on a live connection, on the account's own (live) 
   refresh request reaches the venue, the old refresh token stops working, and its reply must
   not be lost. This adapter adopts a reply that arrives after its request timed out, unless a
   newer pair has been taken since that request was sent. A refresh made while a connection is
-  being brought up — on the short pre-connection that resolves the account's host, or after
+  being brought up — on the short pre-connection that reads the account list, or after
   account authentication was rejected — keeps that connection open up to ten seconds more for
   the reply, and gives up at once if the connection is lost. Within the first `connect()`, or a
   later user's wait to join, that time counts against the account's `connect_timeout_secs`; a
@@ -164,10 +166,10 @@ How tokens behave was checked on a live connection, on the account's own (live) 
   own, so only one node per account is supported
   ([Execution](execution.md#1-what-it-trades)).
 
-**Unconfirmed**: a refresh for a live account's token over the short pre-connection to the
-demo host that resolves the account's host (Section 1). This adapter refreshes there at
-start-up when the account list rejects the access token it was given; every refresh confirmed
-so far went through the account's own host.
+**Unconfirmed**: a refresh over the short pre-connection that reads the account list (Section 1)
+when that is not the account's own host, as with `auto` for a demo account. This adapter
+refreshes there at start-up when the account list rejects the access token it was given; every
+refresh confirmed so far went through the account's own host.
 
 **Authentication lost on a live socket.** The venue can drop authentication without closing
 the connection, through three events:

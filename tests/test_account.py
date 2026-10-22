@@ -2,7 +2,9 @@
 
 import asyncio
 import contextlib
+import gc
 import time
+from collections.abc import AsyncIterator
 
 import pytest
 from google.protobuf.message import Message
@@ -30,6 +32,8 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
 from nautilus_ctrader.providers import CTraderInstrumentProvider
 from tests.account_venue import (
     ACCOUNT_ID,
+    DEMO_HOST_NAME,
+    LIVE_HOST_NAME,
     RECORDED,
     TRADER_LOGIN,
     HeldReplies,
@@ -38,8 +42,11 @@ from tests.account_venue import (
     credentials,
     hold_account_auth,
     received,
+    route_hosts,
+    two_host_account_client,
     venue,
 )
+from tests.fake_server import FakeCTraderServer
 from tests.polling import wait_until
 from tests.recording_logger import RecordingLogger
 
@@ -70,52 +77,88 @@ async def test_auto_connects_to_the_listed_account_and_closes_the_pre_connection
         await server.stop()
 
 
+@contextlib.asynccontextmanager
+async def _two_hosts(*, is_live: bool) -> AsyncIterator[dict[str, FakeCTraderServer]]:
+    """A started demo and live host, each serving the same account list, as the venue does."""
+    servers = {DEMO_HOST_NAME: venue(is_live=is_live), LIVE_HOST_NAME: venue(is_live=is_live)}
+    for server in servers.values():
+        await server.start()
+    try:
+        yield servers
+    finally:
+        for server in servers.values():
+            await server.stop()
+
+
+def _hosts_that_received(servers: dict[str, FakeCTraderServer], cls: type[Message]) -> set[str]:
+    return {name for name, server in servers.items() if received(server, cls)}
+
+
 @pytest.mark.parametrize(
-    ("environment", "is_live", "expected"),
+    ("environment", "is_live", "trading_host"),
     [
-        ("auto", True, "live.invalid"),
-        ("auto", False, "127.0.0.1"),
+        ("auto", True, LIVE_HOST_NAME),
+        ("auto", False, DEMO_HOST_NAME),
         # An explicit environment still resolves the login, but keeps the host it names.
-        ("demo", True, "127.0.0.1"),
-        ("live", False, "live.invalid"),
+        ("demo", True, DEMO_HOST_NAME),
+        ("live", False, LIVE_HOST_NAME),
     ],
 )
 async def test_the_host_follows_the_is_live_flag_unless_the_environment_names_one(
     monkeypatch: pytest.MonkeyPatch,
     environment: str,
     is_live: bool,
-    expected: str,
+    trading_host: str,
 ) -> None:
-    hosts = []
-    real_session = account_module.CTraderSession
+    async with _two_hosts(is_live=is_live) as servers:
+        client = two_host_account_client(monkeypatch, servers, environment=environment)
+        try:
+            await client.connect()
 
-    server = venue(is_live=is_live)
+            assert _hosts_that_received(servers, oa.ProtoOAAccountAuthReq) == {trading_host}
+            assert client.account_id == ACCOUNT_ID
+        finally:
+            await client.disconnect()
 
-    # The live name does not resolve; the session is pointed back at the one fake server.
-    def recording_session(**kwargs):
-        hosts.append(kwargs["host"])
-        return real_session(**{**kwargs, "host": server.host})
 
-    monkeypatch.setattr(account_module, "CTraderSession", recording_session)
-    await server.start()
-    client = CTraderAccountClient(
-        trader_login=TRADER_LOGIN,
-        credentials=credentials(),
-        environment=environment,
-        logger=RecordingLogger(),
-        demo_host=server.host,
-        live_host="live.invalid",
-        port=server.port,
-        tls=False,
-    )
-    try:
-        await client.connect()
+@pytest.mark.parametrize(
+    ("environment", "host"),
+    [("demo", DEMO_HOST_NAME), ("live", LIVE_HOST_NAME)],
+)
+async def test_the_account_list_is_read_from_the_configured_host(
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+    host: str,
+) -> None:
+    async with _two_hosts(is_live=environment == "live") as servers:
+        client = two_host_account_client(monkeypatch, servers, environment=environment)
+        try:
+            await client.connect()
 
-        assert hosts == [expected]
-        assert client.account_id == ACCOUNT_ID
-    finally:
-        await client.disconnect()
-        await server.stop()
+            assert len(received(servers[host], oa.ProtoOAGetAccountListByAccessTokenReq)) == 1
+            # No short connection to the other host either.
+            assert {name for name, server in servers.items() if server.connection_count} == {
+                host,
+            }
+        finally:
+            await client.disconnect()
+
+
+async def test_auto_reads_the_list_from_live_and_trades_a_demo_account_on_demo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _two_hosts(is_live=False) as servers:
+        client = two_host_account_client(monkeypatch, servers, environment="auto")
+        try:
+            await client.connect()
+
+            assert _hosts_that_received(servers, oa.ProtoOAGetAccountListByAccessTokenReq) == {
+                LIVE_HOST_NAME,
+            }
+            assert _hosts_that_received(servers, oa.ProtoOAAccountAuthReq) == {DEMO_HOST_NAME}
+            assert client.session.is_ready
+        finally:
+            await client.disconnect()
 
 
 async def test_a_login_the_token_does_not_grant_is_refused() -> None:
@@ -349,6 +392,43 @@ async def test_a_start_up_refresh_that_is_never_answered_times_out(
         with pytest.raises(CTraderTimeoutError):
             await client.connect()
     finally:
+        await server.stop()
+
+
+async def test_a_lost_pre_connection_ends_the_late_refresh_wait_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No reply can arrive on a closed connection, so waiting on only delays the failure.
+    monkeypatch.setattr(account_module, "DEFAULT_REQUEST_TIMEOUT_SECS", 0.1)
+    monkeypatch.setattr(account_module, "LATE_REFRESH_WAIT_SECS", 30.0)
+    server = venue()
+    server.on(
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID"),
+    )
+    held = HeldReplies(
+        server,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOARefreshTokenRes(),
+    )
+    await server.start()
+    client = account_client(server)
+    connecting = asyncio.create_task(client.connect())
+    try:
+        await held.arrived.wait()
+        # Past the request's own timeout, so the late wait has begun.
+        await asyncio.sleep(0.3)
+        dropped_at = time.monotonic()
+        await server.drop_connections()
+
+        with pytest.raises(CTraderTimeoutError, match="no response to payloadType"):
+            async with asyncio.timeout(5.0):
+                await connecting
+
+        assert time.monotonic() - dropped_at < 2.0
+        assert client.session is None
+    finally:
+        connecting.cancel()
         await server.stop()
 
 
@@ -718,6 +798,86 @@ def test_a_cached_client_for_the_same_environment_and_credentials_logs_nothing()
     )
 
     assert logger.lines == []
+
+
+# What the first loop leaves behind fails to close once it is collected, which is the scenario.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_a_client_cached_on_a_closed_loop_brings_up_a_new_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A node rebuilt in the same process after an unclean stop gets the cached client back."""
+    servers: dict[str, FakeCTraderServer] = {}
+    route_hosts(monkeypatch, servers)
+    logger = RecordingLogger()
+    pinned = credentials(token_expires_at=time.time() + 3600.0)
+
+    def cached() -> CTraderAccountClient:
+        return get_cached_ctrader_account_client(
+            trader_login=TRADER_LOGIN,
+            credentials=pinned,
+            environment="auto",
+            logger=logger,
+            demo_host=DEMO_HOST_NAME,
+            live_host=LIVE_HOST_NAME,
+            port=0,
+            tls=False,
+        )
+
+    first_client = cached()
+    notified = []
+    first_client.add_token_listener(lambda a, r, e: notified.append((a, r)))
+
+    async def connect_on_the_first_loop() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = venue()
+        await servers[LIVE_HOST_NAME].start()
+        await first_client.connect()
+
+    first_loop = asyncio.new_event_loop()
+    try:
+        first_loop.run_until_complete(connect_on_the_first_loop())
+    finally:
+        # Without `disconnect()`: the session is left behind, still looking ready.
+        first_loop.close()
+
+    second_server = venue()
+    second_server.on(
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOARefreshTokenRes(
+            accessToken="new-access",
+            tokenType="bearer",
+            expiresIn=3600,
+            refreshToken="new-refresh",
+        ),
+    )
+
+    async def connect_on_the_second_loop() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = second_server
+        await second_server.start()
+        client = cached()
+        try:
+            async with asyncio.timeout(10.0):
+                await client.connect()
+
+                assert client is first_client
+                assert client.session.is_ready
+                assert received(second_server, oa.ProtoOAAccountAuthReq)
+                assert any("another event loop" in m for m in logger.warnings())
+
+                await client.session.refresh_tokens()
+
+                assert notified == [("new-access", "new-refresh")]
+        finally:
+            async with asyncio.timeout(5.0):
+                await client.disconnect()
+            await second_server.stop()
+
+    second_loop = asyncio.new_event_loop()
+    try:
+        second_loop.run_until_complete(connect_on_the_second_loop())
+    finally:
+        second_loop.close()
+        # Inside this test, so the filter above applies.
+        gc.collect()
 
 
 def test_unknown_environment_is_rejected() -> None:

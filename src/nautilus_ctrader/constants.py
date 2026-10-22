@@ -99,9 +99,10 @@ TOKEN_ERROR_CODES: frozenset[str] = frozenset({"OA_AUTH_TOKEN_EXPIRED", "CH_ACCE
 MIN_TOKEN_REFRESH_INTERVAL_SECS: float = 300.0
 
 # How long a refresh that timed out still waits for its reply before its connection is closed.
-# A refresh token is single-use, so a reply lost that way leaves no working token pair. Inside
+# A refresh token is single-use, so a reply lost that way leaves no working token pair. A
+# connection lost meanwhile ends the wait at once, since no reply can come on it. Inside
 # `connect()` the wait counts against the client config's `connect_timeout_secs` (the whole
-# bring-up, default 60 s), and only a setting under about 15 s cuts it short; a bring-up the
+# bring-up, default 60 s), and a setting under about 15 s cuts it short; a bring-up the
 # session runs after a connection loss has no such bound, so there it delays the reconnect
 # backoff.
 LATE_REFRESH_WAIT_SECS: float = 10.0
