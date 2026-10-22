@@ -381,7 +381,7 @@ def mass_status(
     ts_init: int,
     *,
     held_price: Callable[[str], Decimal | None],
-    known_id: Callable[[str], str | None] = lambda _venue_order_id: None,
+    known_id: Callable[[str], str | None],
     misfit: Callable[[str], None] = refuse,
 ) -> tuple[ExecutionMassStatus, tuple[ReportedOrder, ...]]:
     """The reconciliation records as one mass status, orders in record order.

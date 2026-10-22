@@ -129,22 +129,13 @@ def money_of(amount: int, money_digits: int) -> Decimal:
     return Decimal(amount).scaleb(-money_digits)
 
 
-def money_in(
-    amount: int, message: Message, account_money_digits: Callable[[], int] | None
-) -> Decimal:
+def money_in(amount: int, message: Message, account_money_digits: Callable[[], int]) -> Decimal:
     """An amount `message` carries, at its `moneyDigits`, else at `account_money_digits()`.
 
     The field is optional: read as 0, the amount would be 10^digits too large.
-
-    Raises `ValueError` if `message` has no `moneyDigits` and `account_money_digits` is `None`.
     """
-    if message.HasField("moneyDigits"):
-        digits = message.moneyDigits
-    elif account_money_digits is None:
-        raise ValueError(f"a {type(message).__name__} without moneyDigits, and no account digits")
-    else:
-        digits = account_money_digits()
-    return money_of(amount, digits)
+    has_own = message.HasField("moneyDigits")
+    return money_of(amount, message.moneyDigits if has_own else account_money_digits())
 
 
 class OrderEventKind(Enum):
@@ -173,9 +164,7 @@ class Fill:
     ts_ms: int
 
 
-def fill_of(
-    deal: om.ProtoOADeal, precision: int, account_money_digits: Callable[[], int] | None
-) -> Fill:
+def fill_of(deal: om.ProtoOADeal, precision: int, account_money_digits: Callable[[], int]) -> Fill:
     """`deal` as a `Fill`, its price at `precision`; the commission is scaled by `money_in()`."""
     return Fill(
         trade_id=str(deal.dealId),

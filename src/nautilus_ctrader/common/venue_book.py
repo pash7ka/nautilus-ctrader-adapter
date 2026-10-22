@@ -272,8 +272,8 @@ class VenueBook:
     def __init__(
         self,
         price_precision: Callable[[int], int | None],
-        held_closed: Callable[[str], bool] = lambda _venue_order_id: False,
-        money_digits: Callable[[], int] | None = None,
+        held_closed: Callable[[str], bool],
+        money_digits: Callable[[], int],
     ) -> None:
         self._precision = price_precision
         self._held_closed = held_closed

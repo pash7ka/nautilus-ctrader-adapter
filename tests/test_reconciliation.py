@@ -31,9 +31,11 @@ from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.execution_replay import (
     FIRST,
+    NOTHING_HELD,
     RECORDING,
     SECOND,
     NoOperations,
+    account_money_digits,
     as_ours,
     entry_id,
     events,
@@ -71,7 +73,16 @@ def ours(found: PositionHistory, position_id: int) -> PositionHistory:
 
 
 def run(snapshot, histories, deals, *, known_closes=None, operations=NOTHING) -> Reconciliation:
-    return reconcile(snapshot, histories, deals, precision, known_closes or {}, operations)
+    return reconcile(
+        snapshot,
+        histories,
+        deals,
+        precision,
+        known_closes or {},
+        operations,
+        NOTHING_HELD,
+        money_digits=account_money_digits,
+    )
 
 
 def by_id(result: Reconciliation) -> dict[str, ReportedOrder]:
@@ -283,7 +294,16 @@ def test_unloaded_symbols_are_not_reported() -> None:
     assert {r.venue_position_id for r in result.orders} == {str(FIRST), str(SECOND)}
 
     snapshot, histories, deals = open_first(mine=True)
-    nothing = reconcile(snapshot, histories, deals, lambda symbol_id: None, {}, NOTHING)
+    nothing = reconcile(
+        snapshot,
+        histories,
+        deals,
+        lambda symbol_id: None,
+        {},
+        NOTHING,
+        NOTHING_HELD,
+        money_digits=account_money_digits,
+    )
     assert nothing == Reconciliation((), (), ())
 
 
@@ -425,7 +445,16 @@ def test_one_position_is_reported_from_its_own_lists_alone() -> None:
     snapshot.position.append(make_position(SECOND))
     found = ours(history(FIRST, until_ms=snapshot.position[0].utcLastUpdateTimestamp), FIRST)
 
-    result = one_position(snapshot, FIRST, found, precision, {}, NOTHING)
+    result = one_position(
+        snapshot,
+        FIRST,
+        found,
+        precision,
+        {},
+        NOTHING,
+        NOTHING_HELD,
+        money_digits=account_money_digits,
+    )
 
     assert result.notices == ()
     assert {r.venue_position_id for r in result.orders} == {str(FIRST)}
@@ -435,7 +464,16 @@ def test_one_position_is_reported_from_its_own_lists_alone() -> None:
 def test_one_position_takes_a_closed_position_with_no_window() -> None:
     found = ours(history(FIRST), FIRST)
 
-    result = one_position(snapshot_at(CLOSED_AT), FIRST, found, precision, {}, NOTHING)
+    result = one_position(
+        snapshot_at(CLOSED_AT),
+        FIRST,
+        found,
+        precision,
+        {},
+        NOTHING,
+        NOTHING_HELD,
+        money_digits=account_money_digits,
+    )
 
     assert [r.venue_order_id for r in result.orders] == [
         r.venue_order_id for r in closed_first(mine=True).orders
@@ -563,7 +601,9 @@ def foreign_legs(result: Reconciliation) -> dict[str, ReportedOrder]:
 
 
 def held_run(snapshot, histories, deals, held: Held) -> Reconciliation:
-    return reconcile(snapshot, histories, deals, precision, {}, NOTHING, held)
+    return reconcile(
+        snapshot, histories, deals, precision, {}, NOTHING, held, money_digits=account_money_digits
+    )
 
 
 def closed_held(held: Held) -> Reconciliation:
@@ -611,7 +651,7 @@ def test_a_foreign_leg_takes_the_first_generation_nautilus_does_not_hold_closed(
 def test_the_legs_reported_are_the_ones_the_venue_model_holds() -> None:
     snapshot, histories, deals = open_first(mine=False)
     for closed in ((), ("6000001-SL",), ("6000001-TP", "6000001-TP-2")):
-        book = VenueBook(precision, held_closed=Held(closed=closed).closed)
+        book = VenueBook(precision, Held(closed=closed).closed, account_money_digits)
         book.load(snapshot, {FIRST: histories[FIRST].orders})
 
         legs = foreign_legs(held_run(snapshot, histories, deals, Held(closed=closed)))
@@ -631,7 +671,7 @@ def test_a_level_put_back_after_a_partial_trigger_takes_a_new_leg() -> None:
     histories = {FIRST: PositionHistory((*found.orders, protective), (*found.deals, partial))}
     # Nautilus holds the first leg closed, with the partial fill.
     held = Held(closed=("6000001-TP",), trades={"6000001-TP": ("7000050",)})
-    book = VenueBook(precision, held_closed=held.closed)
+    book = VenueBook(precision, held.closed, account_money_digits)
     book.load(snapshot, {FIRST: histories[FIRST].orders})
 
     legs = foreign_legs(held_run(snapshot, histories, (*deals, partial), held))
@@ -750,7 +790,7 @@ def _creation_unstated(order: om.ProtoOAOrder) -> None:
     ids=["as-recorded", "created-before-the-fill", "creation-unstated"],
 )
 def test_a_foreign_leg_is_accepted_at_the_same_time_live_and_reconciled(change) -> None:
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     live = [
         record
         for event in live_events_changed(change)

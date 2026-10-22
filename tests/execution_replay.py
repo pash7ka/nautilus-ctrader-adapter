@@ -51,6 +51,26 @@ class NoOperations:
         return None
 
 
+class NothingHeld:
+    """Nautilus holds no order: a start without a persistent cache."""
+
+    def closed(self, venue_order_id: str) -> bool:
+        return False
+
+    def trade_ids(self, venue_order_id: str) -> tuple[str, ...]:
+        return ()
+
+    def open_legs(self, entry_order_id: int) -> tuple[str, ...]:
+        return ()
+
+
+NOTHING_HELD = NothingHeld()
+
+
+def account_money_digits() -> int:
+    return 2
+
+
 def events() -> list[oa.ProtoOAExecutionEvent]:
     return [
         item["message"]

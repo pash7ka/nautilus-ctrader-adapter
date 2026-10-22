@@ -29,7 +29,7 @@ from nautilus_ctrader.common.venue_book import VenueBook
 from nautilus_ctrader.common.venue_records import Level
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.execution_replay import NoOperations
+from tests.execution_replay import NOTHING_HELD, NoOperations, account_money_digits
 from tests.execution_venue import (
     EURUSD_ID,
     EURUSD_SYMBOL_ID,
@@ -367,7 +367,11 @@ async def test_a_recorded_trailing_move_ahead_of_the_amends_answer_is_kept() -> 
 
 
 def test_the_model_keeps_a_trailing_move_newer_than_the_answer_applied_after_it() -> None:
-    book = VenueBook(lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None)
+    book = VenueBook(
+        lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None,
+        NOTHING_HELD.closed,
+        account_money_digits,
+    )
     book.load(SNAPSHOTS[0], {})
     book.apply(LEVEL_AMENDS[0], NoOperations())
     removal, move = LEVEL_AMENDS[1], TRAILED[0]
@@ -397,7 +401,11 @@ def at(move: oa.ProtoOATrailingSLChangedEvent, *, utc: int, stop: float):
 
 
 def test_the_model_drops_a_trailing_move_older_than_the_answer_applied_before_it() -> None:
-    book = VenueBook(lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None)
+    book = VenueBook(
+        lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None,
+        NOTHING_HELD.closed,
+        account_money_digits,
+    )
     book.load(SNAPSHOTS[0], {})
     answer = LEVEL_AMENDS[0]
     book.apply(answer, NoOperations())
@@ -412,7 +420,11 @@ def test_the_model_drops_a_trailing_move_older_than_the_answer_applied_before_it
 
 
 def test_an_answer_without_its_time_sets_its_stop_loss_on_a_trailed_position() -> None:
-    book = VenueBook(lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None)
+    book = VenueBook(
+        lambda symbol_id: 5 if symbol_id == EURUSD_SYMBOL_ID else None,
+        NOTHING_HELD.closed,
+        account_money_digits,
+    )
     book.load(SNAPSHOTS[0], {})
     book.trailing_stop_moved(TRAILED[0])
     unstamped = type(LEVEL_AMENDS[1])()

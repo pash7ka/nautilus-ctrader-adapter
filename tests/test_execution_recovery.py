@@ -59,7 +59,9 @@ from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.account_venue import ACCOUNT_ID, HeldReplies, _symbol_by_id
 from tests.execution_replay import (
     FIRST,
+    NOTHING_HELD,
     NoOperations,
+    account_money_digits,
     history,
     make_deal,
     make_event,
@@ -113,7 +115,16 @@ def precision(symbol_id: int) -> int | None:
 
 
 def records(snapshot, histories, deals) -> Reconciliation:
-    return reconcile(snapshot, histories, deals, precision, {}, NoOperations())
+    return reconcile(
+        snapshot,
+        histories,
+        deals,
+        precision,
+        {},
+        NoOperations(),
+        NOTHING_HELD,
+        money_digits=account_money_digits,
+    )
 
 
 def records_at(at: float, *, mine: bool = True) -> Reconciliation:
@@ -148,6 +159,7 @@ def convert(
         USD,
         ts_init=0,
         held_price=held_price(h),
+        known_id=lambda _venue_order_id: None,
     )
 
 

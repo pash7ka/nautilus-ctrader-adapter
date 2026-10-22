@@ -84,22 +84,6 @@ class HeldOrders(Protocol):
         ...
 
 
-class NothingHeld:
-    """Nautilus holds no order: a start without a persistent cache."""
-
-    def closed(self, venue_order_id: str) -> bool:
-        return False
-
-    def trade_ids(self, venue_order_id: str) -> Collection[str]:
-        return ()
-
-    def open_legs(self, entry_order_id: int) -> Collection[str]:
-        return ()
-
-
-NOTHING_HELD = NothingHeld()
-
-
 @dataclass(frozen=True)
 class Reconciliation:
     """`orders` is chronological, as `reconcile` describes."""
@@ -116,9 +100,9 @@ def reconcile(
     precision: Callable[[int], int | None],
     known_closes: Mapping[int, str],
     operations: Operations,
-    held: HeldOrders = NOTHING_HELD,
+    held: HeldOrders,
     *,
-    money_digits: Callable[[], int] | None = None,
+    money_digits: Callable[[], int],
 ) -> Reconciliation:
     """The reports for everything the broker holds now and every position traded in the window.
 
@@ -302,9 +286,9 @@ def one_position(
     precision: Callable[[int], int | None],
     known_closes: Mapping[int, str],
     operations: Operations,
-    held: HeldOrders = NOTHING_HELD,
+    held: HeldOrders,
     *,
-    money_digits: Callable[[], int] | None = None,
+    money_digits: Callable[[], int],
 ) -> Reconciliation:
     """`reconcile` of position `position_id` alone, open or closed, from its own lists `found`.
 
@@ -410,7 +394,7 @@ class _Position:
         entry: om.ProtoOAOrder,
         found: PositionHistory,
         precision: int,
-        money_digits: Callable[[], int] | None,
+        money_digits: Callable[[], int],
     ) -> None:
         self.position_id = position_id
         self.entry = entry

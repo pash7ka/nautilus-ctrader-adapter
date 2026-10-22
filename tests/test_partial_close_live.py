@@ -41,7 +41,9 @@ from nautilus_ctrader.common.venue_records import (
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.execution_replay import (
+    NOTHING_HELD,
     NoOperations,
+    account_money_digits,
     as_ours,
     entry_id,
     make_event,
@@ -267,7 +269,7 @@ def test_the_entry_of_a_grown_position_is_its_earliest_opening_order() -> None:
 
 
 def test_a_grown_position_loaded_at_start_holds_its_earliest_opening_order() -> None:
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     book.load(SNAPSHOTS[0], {POSITION: LISTED})
 
     assert book.view(POSITION).entry_order_id == OPENING
@@ -277,7 +279,16 @@ def test_a_grown_position_loaded_at_start_holds_its_earliest_opening_order() -> 
 
 
 def test_reconciliation_reports_every_opening_order_of_a_grown_position() -> None:
-    built = reconcile(SNAPSHOTS[0], grown(), (), precision, {}, NOTHING)
+    built = reconcile(
+        SNAPSHOTS[0],
+        grown(),
+        (),
+        precision,
+        {},
+        NOTHING,
+        NOTHING_HELD,
+        money_digits=account_money_digits,
+    )
 
     filled, accepted_ = ReportStatus.FILLED, ReportStatus.ACCEPTED
     assert rows(built.orders) == [
@@ -297,14 +308,23 @@ def test_a_raise_filled_in_its_entrys_millisecond_is_reported_after_it() -> None
         deal.executionTimestamp = OPENED_MS
     history = {POSITION: PositionHistory(tuple(LISTED), tuple(deals))}
 
-    built = reconcile(SNAPSHOTS[0], history, (), precision, {}, NOTHING)
+    built = reconcile(
+        SNAPSHOTS[0],
+        history,
+        (),
+        precision,
+        {},
+        NOTHING,
+        NOTHING_HELD,
+        money_digits=account_money_digits,
+    )
 
     assert ADD_ON < OPENING
     assert [o.venue_order_id for o in built.orders][:2] == [str(OPENING), str(ADD_ON)]
 
 
 def test_live_and_reconciliation_name_a_grown_positions_legs_alike() -> None:
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     records = applied(book, opening_events() + add_on_events())
 
     reported = [r for r in records if isinstance(r, ExternalOrder)]
@@ -321,13 +341,22 @@ def test_live_and_reconciliation_name_a_grown_positions_legs_alike() -> None:
     assert view.entry_order_id == OPENING
     assert view.leg_units == {Level.STOP_LOSS: 3000, Level.TAKE_PROFIT: 3000}
 
-    built = reconcile(SNAPSHOTS[0], grown(), (), precision, {}, NOTHING)
+    built = reconcile(
+        SNAPSHOTS[0],
+        grown(),
+        (),
+        precision,
+        {},
+        NOTHING,
+        NOTHING_HELD,
+        money_digits=account_money_digits,
+    )
     legs = {r.venue_order_id for r in built.orders if r.reduce_only}
     assert legs == set(view.foreign_legs.values()) == {STOP, TARGET}
 
 
 def test_a_later_opening_order_seen_first_is_never_taken_for_the_entry() -> None:
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     # Loaded at 2000 with an order list that names no opening order.
     book.load(before_the_raise(), {})
 
@@ -345,7 +374,7 @@ def test_a_later_opening_order_seen_first_is_never_taken_for_the_entry() -> None
     assert all(r.units == 3000 for r in found if isinstance(r, ExternalOrder))
 
     # Never seen before, a position first met through its raise is no different.
-    fresh = VenueBook(precision)
+    fresh = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     applied(fresh, add_on_events()[:2])
     assert fresh.view(POSITION).entry_order_id is None
 
@@ -354,7 +383,7 @@ def test_a_hand_raise_of_the_nodes_position_is_never_its_entry() -> None:
     orders = own(LISTED)
     assert entry_of(orders).orderId == OPENING
 
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     (snapshot,) = own([SNAPSHOTS[0]])
     book.load(snapshot, {POSITION: orders})
     view = book.view(POSITION)
@@ -371,6 +400,8 @@ def test_a_hand_raise_of_the_nodes_position_is_never_its_entry() -> None:
         precision,
         {},
         NOTHING,
+        NOTHING_HELD,
+        money_digits=account_money_digits,
     )
     filled, accepted_ = ReportStatus.FILLED, ReportStatus.ACCEPTED
     assert rows(built.orders) == [
@@ -382,7 +413,7 @@ def test_a_hand_raise_of_the_nodes_position_is_never_its_entry() -> None:
 
 
 def test_a_hand_raise_of_the_nodes_position_is_an_external_fill_and_a_manual_change() -> None:
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     (snapshot,) = own([before_the_raise()])
     book.load(snapshot, {POSITION: own([listed(OPENING)])})
 

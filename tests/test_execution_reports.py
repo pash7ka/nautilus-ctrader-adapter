@@ -434,6 +434,7 @@ def build(reconciliation: Reconciliation, held=lambda client_order_id: None, **o
         USD,
         ts_init=1,
         held_price=held,
+        known_id=lambda _venue_order_id: None,
         **options,
     )
 

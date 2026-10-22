@@ -35,8 +35,10 @@ from nautilus_ctrader.common.venue_records import (
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.execution_replay import (
+    NOTHING_HELD,
     SYMBOL,
     NoOperations,
+    account_money_digits,
     entry_id,
     make_deal,
     make_event,
@@ -135,7 +137,7 @@ def manual(action, ts, units="1") -> Activity:
 
 
 def book() -> VenueBook:
-    return VenueBook(precision)
+    return VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
 
 
 def test_an_entry_is_accepted_filled_and_its_legs_accepted_on_the_protective_order() -> None:
@@ -2792,7 +2794,7 @@ def test_a_foreign_legs_later_news_is_order_events_on_its_venue_order_id(event, 
 def test_a_foreign_level_put_back_after_its_leg_closed_is_a_new_generation(
     held_closed, generation
 ) -> None:
-    b = VenueBook(precision, held_closed=held_closed.__contains__)
+    b = VenueBook(precision, held_closed.__contains__, account_money_digits)
     foreign_opened(b)
     b.apply(make_event(om.ORDER_REPLACED, foreign_protective(25, stop=85000.0)), NOTHING)
 
@@ -2814,7 +2816,7 @@ def test_a_foreign_level_put_back_after_its_leg_closed_is_a_new_generation(
 def test_a_foreign_leg_takes_the_first_generation_nautilus_does_not_hold_closed(
     held_closed, generation
 ) -> None:
-    b = VenueBook(precision, held_closed=held_closed.__contains__)
+    b = VenueBook(precision, held_closed.__contains__, account_money_digits)
 
     assert foreign_opened(b) == [
         first_seen(Level.STOP_LOSS, PROTECTED_AT, "85000.00", generation=generation),

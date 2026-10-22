@@ -24,10 +24,12 @@ from nautilus_ctrader.common.venue_records import (
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
 from tests.execution_replay import (
     FIRST,
+    NOTHING_HELD,
     PENDING,
     SECOND,
     SYMBOL,
     NoOperations,
+    account_money_digits,
     as_ours,
     entry_id,
     events,
@@ -49,7 +51,7 @@ A, F, U, C = (
 
 
 def run(messages) -> list:
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     records = []
     for message in messages:
         records += book.apply(message, NOTHING)
@@ -311,7 +313,7 @@ def foreign_first(take_profit_again: str) -> list:
     ],
 )
 def test_the_first_position_as_recorded_has_foreign_legs(held_closed, take_profit_again) -> None:
-    book = VenueBook(precision, held_closed=held_closed.__contains__)
+    book = VenueBook(precision, held_closed.__contains__, account_money_digits)
     records = []
     for message in first_n(events(), FIRST):
         records += book.apply(message, NOTHING)
@@ -372,7 +374,7 @@ def test_the_pending_order_as_recorded() -> None:
 
 def test_every_event_twice_changes_nothing_the_second_time() -> None:
     once = run(as_ours(events(), [FIRST, SECOND]))
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     twice = []
     for message in as_ours(events(), [FIRST, SECOND]):
         twice += book.apply(message, NOTHING)
@@ -382,7 +384,7 @@ def test_every_event_twice_changes_nothing_the_second_time() -> None:
 
 
 def test_a_model_loaded_mid_session_continues_like_one_that_saw_it_all() -> None:
-    book = VenueBook(precision)
+    book = VenueBook(precision, NOTHING_HELD.closed, account_money_digits)
     (snapshot,) = as_ours([snapshot_with_protection(127.187)], [FIRST])
     orders = {
         position_id: as_ours(listed, [FIRST]) for position_id, listed in position_orders().items()
@@ -431,7 +433,7 @@ def test_a_model_loaded_mid_session_continues_like_one_that_saw_it_all() -> None
 def test_a_foreign_position_loaded_mid_session_continues_with_its_legs(
     held_closed, stop_loss
 ) -> None:
-    book = VenueBook(precision, held_closed=held_closed.__contains__)
+    book = VenueBook(precision, held_closed.__contains__, account_money_digits)
 
     assert book.load(snapshot_with_protection(127.187), position_orders()) == []
     view = book.view(FIRST)
