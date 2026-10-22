@@ -591,7 +591,6 @@ class CTraderExecutionClient(LiveExecutionClient):
         return self._instrument_provider
 
     async def _connect(self) -> None:
-        self._account.forget_another_loop()
         await self._account.connect()
         self._holds_account = True
         try:

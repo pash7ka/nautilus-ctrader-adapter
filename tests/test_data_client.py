@@ -15,6 +15,7 @@ import asyncio
 import functools
 import gc
 import time
+import weakref
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -69,9 +70,10 @@ from tests.account_venue import (
     TRADER_LOGIN,
     HeldReplies,
     account_client,
+    cached_account_client,
     for_account,
     received,
-    two_host_account_client,
+    route_hosts,
     venue,
 )
 from tests.execution_venue import STRATEGY_ID, TRADER_ID, ExecutionVenue
@@ -753,37 +755,31 @@ def _node_data_client(
 
 # What the first loop leaves behind fails to close once it is collected, which is the scenario.
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_a_data_client_rebuilt_after_its_loop_closed_drops_what_the_old_node_held(
+def test_a_node_rebuilt_after_its_loop_closed_gets_an_account_client_the_old_node_cannot_reach(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    other_symbol_id = 2
     servers: dict[str, FakeCTraderServer] = {}
+    route_hosts(monkeypatch, servers)
     client_config = config()
-    account = two_host_account_client(
-        monkeypatch,
-        servers,
-        credentials=client_config.credentials(),
-    )
-    old_node: dict[str, list] = {}
+    logger = RecordingLogger()
+    # Only weakly referenced here, so nothing but its own leftovers keeps the old node alive.
+    old_node: dict[str, object] = {}
 
     async def run_the_old_node() -> None:
-        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = data_venue()
-        await servers[LIVE_HOST_NAME].start()
+        server = data_venue()
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = server
+        await server.start()
+        account = cached_account_client(client_config.credentials(), logger)
+        old_node["account"] = weakref.ref(account)
         client, old_node["published"] = _node_data_client(account, client_config)
         # Holds EURUSD for its GER40 conversion, under the owner the new node reuses.
         await client._connect()
-        # Two holds of one key at once: the second waits on the key's lock, binding it here.
-        await asyncio.gather(
-            account.subscriptions.subscribe_spots(other_symbol_id, "first", "data:OTHER"),
-            account.subscriptions.subscribe_spots(other_symbol_id, "second", "data:OTHER"),
-        )
-
-    first_loop = asyncio.new_event_loop()
-    try:
-        first_loop.run_until_complete(run_the_old_node())
-    finally:
-        # Without `_disconnect()`, as an unclean stop leaves it.
-        first_loop.close()
+        await account.subscriptions.subscribe_spots(2, "quotes", "data:OTHER")
+        # Its disconnect is in flight when the loop closes: the release is never answered.
+        # Unreferenced, so the collection below finalizes it.
+        server.on(om.PROTO_OA_UNSUBSCRIBE_SPOTS_REQ, lambda _r: None)
+        asyncio.ensure_future(client._disconnect())  # noqa: RUF006
+        await asyncio.sleep(0.2)
 
     second_server = data_venue()
 
@@ -793,35 +789,53 @@ def test_a_data_client_rebuilt_after_its_loop_closed_drops_what_the_old_node_hel
     async def run_the_new_node() -> None:
         servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = second_server
         await second_server.start()
+        account = cached_account_client(client_config.credentials(), logger)
+        assert account is not old_node["account"]()
         client, published = _node_data_client(account, client_config)
         try:
-            started = time.monotonic()
             async with asyncio.timeout(10.0):
                 await client._connect()
-            assert time.monotonic() - started < 2.0
+                # A second user, as the node's execution client is.
+                await account.connect()
+            session = account.session
             assert subscribed() == [EURUSD_SYMBOL_ID]
 
-            old_published = len(old_node["published"])
+            # The old node's suspended coroutines are finalized now, on this loop's thread.
+            gc.enable()
+            gc.collect()
+            await asyncio.sleep(0.3)
+            assert old_node["account"]() is None
+
+            assert account._users == 2
+            assert account.session is session and session.is_ready
+            assert not account._lifecycle_lock.locked()
+            old_count = len(old_node["published"])
             await second_server.push(TWO_SIDED)
             await account.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
             assert any(isinstance(d, QuoteTick) for d in published)
-            assert len(old_node["published"]) == old_published
-
-            await asyncio.gather(
-                account.subscriptions.subscribe_spots(other_symbol_id, "first", "data:THIRD"),
-                account.subscriptions.subscribe_spots(other_symbol_id, "second", "data:THIRD"),
-            )
-            assert subscribed() == [EURUSD_SYMBOL_ID, other_symbol_id]
+            assert len(old_node["published"]) == old_count
         finally:
             async with asyncio.timeout(5.0):
                 await client._disconnect()
+                await account.disconnect()
             await second_server.stop()
+        assert account._users == 0 and account.session is None
 
-    second_loop = asyncio.new_event_loop()
+    gc.disable()
     try:
-        second_loop.run_until_complete(run_the_new_node())
+        first_loop = asyncio.new_event_loop()
+        try:
+            first_loop.run_until_complete(run_the_old_node())
+        finally:
+            first_loop.close()
+            del first_loop
+        second_loop = asyncio.new_event_loop()
+        try:
+            second_loop.run_until_complete(run_the_new_node())
+        finally:
+            second_loop.close()
     finally:
-        second_loop.close()
+        gc.enable()
         # Inside this test, so the filter above applies.
         gc.collect()
 

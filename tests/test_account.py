@@ -39,6 +39,7 @@ from tests.account_venue import (
     HeldReplies,
     account_client,
     account_list,
+    cached_account_client,
     credentials,
     hold_account_auth,
     received,
@@ -802,28 +803,15 @@ def test_a_cached_client_for_the_same_environment_and_credentials_logs_nothing()
 
 # What the first loop leaves behind fails to close once it is collected, which is the scenario.
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_a_client_cached_on_a_closed_loop_brings_up_a_new_session(
+def test_a_client_cached_on_a_closed_loop_is_replaced_keeping_the_token_listeners(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A node rebuilt in the same process after an unclean stop gets the cached client back."""
+    """A node rebuilt in the same process after an unclean stop gets a new client."""
     servers: dict[str, FakeCTraderServer] = {}
     route_hosts(monkeypatch, servers)
     logger = RecordingLogger()
     pinned = credentials(token_expires_at=time.time() + 3600.0)
-
-    def cached() -> CTraderAccountClient:
-        return get_cached_ctrader_account_client(
-            trader_login=TRADER_LOGIN,
-            credentials=pinned,
-            environment="auto",
-            logger=logger,
-            demo_host=DEMO_HOST_NAME,
-            live_host=LIVE_HOST_NAME,
-            port=0,
-            tls=False,
-        )
-
-    first_client = cached()
+    first_client = cached_account_client(pinned, logger)
     notified = []
     first_client.add_token_listener(lambda a, r, e: notified.append((a, r)))
 
@@ -853,15 +841,19 @@ def test_a_client_cached_on_a_closed_loop_brings_up_a_new_session(
     async def connect_on_the_second_loop() -> None:
         servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = second_server
         await second_server.start()
-        client = cached()
+        old_session = first_client.session
+        client = cached_account_client(pinned, logger)
         try:
             async with asyncio.timeout(10.0):
                 await client.connect()
 
-                assert client is first_client
+                assert client is not first_client
+                assert cached_account_client(pinned, logger) is client
+                assert any("closed without a disconnect" in m for m in logger.warnings())
                 assert client.session.is_ready
                 assert received(second_server, oa.ProtoOAAccountAuthReq)
-                assert any("another event loop" in m for m in logger.warnings())
+                # The old instance is left alone.
+                assert first_client.session is old_session
 
                 await client.session.refresh_tokens()
 
@@ -880,48 +872,69 @@ def test_a_client_cached_on_a_closed_loop_brings_up_a_new_session(
         gc.collect()
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_a_disconnect_on_a_new_loop_after_an_unclean_stop_returns_and_leaves_it_connectable(
+def test_a_client_cleanly_stopped_on_a_closed_loop_is_replaced_without_a_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     servers: dict[str, FakeCTraderServer] = {}
-    client = two_host_account_client(monkeypatch, servers)
+    route_hosts(monkeypatch, servers)
+    logger = RecordingLogger()
+    pinned = credentials(token_expires_at=time.time() + 3600.0)
+    first_client = cached_account_client(pinned, logger)
 
-    async def connect_on_the_first_loop() -> None:
+    async def connect_and_disconnect() -> None:
+        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = venue()
+        await servers[LIVE_HOST_NAME].start()
+        await first_client.connect()
+        await first_client.disconnect()
+        await servers[LIVE_HOST_NAME].stop()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(connect_and_disconnect())
+    finally:
+        loop.close()
+
+    assert cached_account_client(pinned, logger) is not first_client
+    assert logger.warnings() == []
+    assert any("a new account client replaces it" in m for _, m in logger.lines)
+
+
+def test_a_connect_while_the_session_runs_on_another_open_loop_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One node per account: a second loop must not share the session or take it over."""
+    servers: dict[str, FakeCTraderServer] = {}
+    client = two_host_account_client(monkeypatch, servers)
+    first_loop = asyncio.new_event_loop()
+    second_loop = asyncio.new_event_loop()
+
+    async def start_on_the_first_loop() -> None:
         servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = venue()
         await servers[LIVE_HOST_NAME].start()
         await client.connect()
 
-    first_loop = asyncio.new_event_loop()
+    async def connect_on_the_second_loop() -> None:
+        async with asyncio.timeout(5.0):
+            await client.connect()
+
+    async def stop_on_the_first_loop() -> None:
+        await client.disconnect()
+        await servers[LIVE_HOST_NAME].stop()
+
     try:
-        first_loop.run_until_complete(connect_on_the_first_loop())
+        first_loop.run_until_complete(start_on_the_first_loop())
+        session = client.session
+
+        with pytest.raises(CTraderConnectionError, match="another event loop"):
+            second_loop.run_until_complete(connect_on_the_second_loop())
+
+        assert client.session is session
+        assert client.last_connect_error is not None
+        first_loop.run_until_complete(stop_on_the_first_loop())
+        assert client.session is None
     finally:
         first_loop.close()
-
-    second_server = venue()
-
-    async def disconnect_then_connect_on_the_second_loop() -> None:
-        servers[DEMO_HOST_NAME] = servers[LIVE_HOST_NAME] = second_server
-        await second_server.start()
-        try:
-            async with asyncio.timeout(1.0):
-                await client.disconnect()
-
-            async with asyncio.timeout(10.0):
-                await client.connect()
-            assert client.session.is_ready
-            assert received(second_server, oa.ProtoOAAccountAuthReq)
-        finally:
-            async with asyncio.timeout(5.0):
-                await client.disconnect()
-            await second_server.stop()
-
-    second_loop = asyncio.new_event_loop()
-    try:
-        second_loop.run_until_complete(disconnect_then_connect_on_the_second_loop())
-    finally:
         second_loop.close()
-        gc.collect()
 
 
 def test_unknown_environment_is_rejected() -> None:

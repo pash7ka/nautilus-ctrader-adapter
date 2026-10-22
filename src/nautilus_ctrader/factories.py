@@ -7,7 +7,8 @@ account shares one connection and one provider.
 
 An application that persists refreshed tokens must call `account_client_from_config` itself
 and register its listener **before** building the node; the factory then finds that same
-instance.
+instance, or, once an earlier node's event loop is closed, a new one carrying its token
+listeners.
 """
 
 from __future__ import annotations

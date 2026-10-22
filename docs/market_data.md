@@ -361,6 +361,15 @@ second config for the same account gets that same client, and its connection set
 timeouts, retry intervals — are ignored; an `environment` that differs from the first one is
 ignored too and logged at WARNING, because it would have chosen a different host.
 
+The client belongs to the event loop its session was brought up on. A node rebuilt in the same
+process after that loop was closed gets a new client: the registered token listeners, the
+settings and the newest tokens carry over, and everything else — session, subscriptions,
+instrument provider — is new. The replacement is logged at WARNING if the old node's loop
+closed without a disconnect, and at INFO otherwise. A reference kept to the old instance no
+longer serves the account, so look the client up again after rebuilding a node. One node per
+account is supported: a `connect()` from a second loop while the session runs on another raises
+`CTraderConnectionError`.
+
 When the config leaves the tokens to the environment (`CTRADER_ACCESS_TOKEN` and the others;
 see [execution.md](execution.md#3-configuration)), the adapter only reads them there. The
 listener must store the new pair wherever the next process start will find it in its

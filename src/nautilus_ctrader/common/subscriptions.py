@@ -153,21 +153,6 @@ class SubscriptionRegistry:
         if session is not None:
             session.remove_event_handler(oa.ProtoOASpotEvent, self._on_spot)
 
-    def reset(self) -> None:
-        """Detach, and forget every hold, intent, lock and listener: start as built.
-
-        For the clients of a node whose event loop closed without their `disconnect()`. What
-        they held and registered was theirs, and the clients that replace them subscribe again.
-        """
-        self.detach()
-        self._consumers.clear()
-        self._intents.clear()
-        self._maybe_unsubscribed.clear()
-        self._locks.clear()
-        self._spot_listeners.clear()
-        self._failing_listeners.clear()
-        self._recovery_listeners.clear()
-
     async def subscribe_spots(self, symbol_id: int, consumer: str, owner: str) -> None:
         """Hold `symbol_id`'s spot subscription for `consumer`.
 

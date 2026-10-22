@@ -12,7 +12,11 @@ from google.protobuf.message import Message
 from nautilus_ctrader.common import account as account_module
 from nautilus_ctrader.common import connection as connection_module
 from nautilus_ctrader.common import session as session_module
-from nautilus_ctrader.common.account import AccountCredentials, CTraderAccountClient
+from nautilus_ctrader.common.account import (
+    AccountCredentials,
+    CTraderAccountClient,
+    get_cached_ctrader_account_client,
+)
 from nautilus_ctrader.common.connection import CTraderConnection
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as oa_model
@@ -177,6 +181,23 @@ def two_host_account_client(
         port=0,
         tls=False,
         **kwargs,
+    )
+
+
+def cached_account_client(
+    account_credentials: AccountCredentials,
+    logger: RecordingLogger,
+) -> CTraderAccountClient:
+    """The cached client for `TRADER_LOGIN` on the two host names `route_hosts()` routes."""
+    return get_cached_ctrader_account_client(
+        trader_login=TRADER_LOGIN,
+        credentials=account_credentials,
+        environment="auto",
+        logger=logger,
+        demo_host=DEMO_HOST_NAME,
+        live_host=LIVE_HOST_NAME,
+        port=0,
+        tls=False,
     )
 
 

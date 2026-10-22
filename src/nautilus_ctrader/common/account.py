@@ -151,10 +151,9 @@ class CTraderAccountClient:
       needs off the matching entry.
     - `environment="auto"` takes the trading host from that entry's `isLive` flag;
       `"demo"`/`"live"` force it.
-    - A cached client whose session was brought up on another event loop, one closed without
-      `disconnect()`, forgets that session and everything the old node's clients held or
-      registered, and brings up a new session at the next `connect()`; see
-      `forget_another_loop()`.
+    - It belongs to the event loop it was brought up on. Once that loop is closed, the cache
+      replaces it (see `get_cached_ctrader_account_client()`); a `connect()` from another loop
+      while its session exists is refused.
     - `connect()` returns once the session is ready and the reference data is loaded; bad
       credentials fail it at once rather than after `connect_timeout_secs`.
     - A loaded symbol the venue reports as changed is reloaded here, once for all clients;
@@ -334,11 +333,18 @@ class CTraderAccountClient:
         and one queued behind a failed attempt tries again. A failed or cancelled attempt
         stops what it started and leaves the user count unchanged.
 
-        A session brought up on another event loop is forgotten first, as `forget_another_loop()`
-        describes, and a new one is brought up: nothing on a closed loop can be stopped or
-        reused.
+        Raises `CTraderConnectionError` if the session runs on another event loop: one node
+        per account is supported, and a node rebuilt after its loop closed gets a new client
+        from `get_cached_ctrader_account_client()`.
         """
-        self.forget_another_loop()
+        if self.session is not None and self._session_loop is not asyncio.get_running_loop():
+            # Checked before the lock, which the other loop may hold or have bound.
+            self._last_connect_error = CTraderConnectionError(
+                "the account session runs on another event loop; one node per account is "
+                "supported, and a node rebuilt after its loop closed must look the account "
+                "client up again",
+            )
+            raise self._last_connect_error
         async with self._lifecycle_lock:
             try:
                 if self._users > 0:
@@ -356,48 +362,39 @@ class CTraderAccountClient:
                 raise
             self._last_connect_error = None
 
-    def forget_another_loop(self) -> None:
-        """Drop what an earlier node left on an event loop other than the running one.
+    @property
+    def _loop_closed(self) -> bool:
+        """Whether the last bring-up ran on an event loop that is now closed."""
+        return self._session_loop is not None and self._session_loop.is_closed()
 
-        For a node rebuilt in the same process after its loop closed without `disconnect()`.
-        Does nothing while the last bring-up's loop is the running one. Every client calls it
-        first in its own connect, before it touches the subscription registry; `connect()` and
-        `disconnect()` call it too.
+    @property
+    def _left_unclean(self) -> bool:
+        """Whether anything was still connected, or connecting, when this client was dropped."""
+        return self.session is not None or self._users > 0 or self._lifecycle_lock.locked()
 
-        - Dropped: the session and its user count, every subscription hold, per-key lock and
-          spot or trendbar-recovery listener in the registry, and the reload listeners. All of
-          them belong to the old node's clients, and the new clients register their own.
-        - Kept: this instance, the application's token listeners, the instrument provider and
-          the reference data.
+    def _successor(self) -> CTraderAccountClient:
+        """A new client for this account: these settings, the newest tokens, the token listeners.
 
-        A session or user dropped is reported in one WARNING.
+        Nothing else carries over, since all of it may be bound to this client's event loop.
         """
-        loop = self._session_loop
-        if loop is None or loop is asyncio.get_running_loop():
-            return
-        self._session_loop = None
-        # A lock is bound to the loop it was first contended on, and one held when that loop
-        # closed is never released.
-        self._lifecycle_lock = asyncio.Lock()
-        if self.session is not None or self._users > 0:
-            self._log.warning(
-                "Account session was brought up on another event loop; forgetting it and "
-                "bringing up a new one",
-            )
-        # Dropped, not stopped or cancelled: both would schedule work on the old loop.
-        self.session = None
-        self._users = 0
-        self._retry_task = None
-        self._reload_tasks = set()
-        self._reload_listeners.clear()
-        self.subscriptions.reset()
+        successor = CTraderAccountClient(
+            trader_login=self.trader_login,
+            credentials=self._credentials,
+            environment=self._environment,
+            logger=self._log,
+            connect_timeout_secs=self._connect_timeout_secs,
+            restore_retry_interval_secs=self._restore_retry_interval_secs,
+            pacing=self._pacing,
+            demo_host=self._demo_host,
+            live_host=self._live_host,
+            port=self._port,
+            tls=self._tls,
+        )
+        successor._token_listeners = list(self._token_listeners)
+        return successor
 
     async def disconnect(self) -> None:
-        """Release one user; the last one stops the session.
-
-        A session left on another event loop is forgotten instead, with all its users.
-        """
-        self.forget_another_loop()
+        """Release one user; the last one stops the session."""
         async with self._lifecycle_lock:
             if self._users == 0:
                 return
@@ -806,13 +803,23 @@ def get_cached_ctrader_account_client(
     duplicate check in `_resolve_account()` enforces at connect time.
 
     Later calls with the same key return the first instance; their other arguments are ignored.
-    That holds across event loops too: a node rebuilt in the same process gets the same client,
-    with the application's token listeners, and its clients' connect drops what the old node
-    left on the old loop (`CTraderAccountClient.forget_another_loop()`).
     A differing `environment` or credential is reported in one WARNING: the first client's
     host and tokens win, and the second config would otherwise be ignored in silence. The
     comparison is against the credentials the client was built from, so a token the client
     refreshed on its own is not reported as the caller's disagreement.
+
+    Once the event loop the cached client was brought up on is closed, a new node in the same
+    process gets a new client in its place:
+
+    - carried over: the application's token listeners, and the client's settings and newest
+      tokens;
+    - new: the session, the subscriptions, the instrument provider and every listener a
+      Nautilus client registered. A holder of the old instance keeps an instance that no
+      longer serves the account, and must look the client up again.
+
+    The old instance is left as it is: whatever its old loop left unfinished acts on it alone.
+    A replacement of a client still connected or connecting when its loop closed is logged at
+    WARNING, any other at INFO.
     """
     key = (trader_login, credentials.client_id)
     entry = _ACCOUNT_CLIENTS.get(key)
@@ -828,6 +835,16 @@ def get_cached_ctrader_account_client(
         return client
 
     client, cached = entry
+    if client._loop_closed:
+        if client._left_unclean:
+            logger.warning(
+                "The account client's event loop closed without a disconnect; a new account "
+                "client replaces it",
+            )
+        else:
+            logger.info("The account client's event loop closed; a new account client replaces it")
+        client = client._successor()
+        _ACCOUNT_CLIENTS[key] = (client, cached)
     differences: list[str] = []
     if environment != client._environment:
         differences.append(
