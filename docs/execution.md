@@ -553,6 +553,13 @@ Commands are refused from the moment the connection drops until this reload (rec
 balance checkpoint, held events) is done. They do not wait for the bar backfills of a data client
 on the same account, which run afterwards at a lower request priority.
 
+A modify whose answer arrives while the venue model is being rebuilt, at a reconnect or any
+other time, is held with the other events. The command waits for the rebuild and is answered by
+what its held answer did when applied, so the leg or order it changed is updated once. One limit
+remains: if the rebuild takes longer than `connect_timeout_secs`, the command does not wait any
+longer and is answered from the model as it stands. That can be an `OrderUpdated` at the old
+level, followed by a second `OrderUpdated` at the new level when the held answer is applied.
+
 Nautilus skips a mass status's order report whose status and filled quantity match the order it
 holds, without comparing its quantity or prices. So once a mass status is reconciled, at start
 and on a reconnect, and before the held events are applied, the adapter compares each open order

@@ -379,11 +379,15 @@ class _HeldLegs:
 _ModelEvent = oa.ProtoOAExecutionEvent | oa.ProtoOATrailingSLChangedEvent
 
 
+@dataclass(eq=False)
 class _Buffered:
-    """An execution event held while the venue model is rebuilt; it is applied later."""
+    """An event held while the venue model is rebuilt; it is applied later.
 
+    `records` are what applying it produced, set when the buffer is released; `None` until
+    then, and for good if a detach drops the buffer.
+    """
 
-_BUFFERED = _Buffered()
+    records: list[Record] | None = None
 
 
 @dataclass(frozen=True)
@@ -551,8 +555,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         # Brackets pending at a detach whose position the model held, by entry id, with that
         # position's id; the next connect ends those whose position is gone.
         self._detached: dict[str, tuple[int, PendingBracket]] = {}
-        # Events held while the model is rebuilt, or `None` when it stands.
-        self._buffer: list[_ModelEvent] | None = None
+        # Events held while the model is rebuilt, each with its marker, or `None` when it stands.
+        self._buffer: list[tuple[_ModelEvent, _Buffered]] | None = None
         # Set whenever no buffer is held, so an amend whose answer was held can wait for it.
         self._model_standing = asyncio.Event()
         self._model_standing.set()
@@ -1409,11 +1413,11 @@ class CTraderExecutionClient(LiveExecutionClient):
             # A client detached meanwhile must start nothing; its next connect rebuilds anew.
             if held is None or self._session is None:
                 return
-            for event in held:
+            for event, marker in held:
                 if isinstance(event, oa.ProtoOATrailingSLChangedEvent):
                     self._on_trailing_stop(event)
                 else:
-                    self._on_execution_event(event)
+                    marker.records = self._apply_execution_event(event)
             if rebuilt:
                 # The rebuilt model shows what the broker holds, so an unanswered amend may be
                 # resent.
@@ -1796,12 +1800,16 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _on_execution_event(self, event: oa.ProtoOAExecutionEvent) -> list[Record] | _Buffered:
         """The one way an execution event reaches the model, pushed or as a request's response.
 
-        Returns the records it produced, so a command can tell what its response meant, or
-        `_BUFFERED` while a rebuild holds it.
+        Returns the records it produced, so a command can tell what its response meant, or,
+        while a rebuild holds it, the marker that gets them when it is applied.
         """
         if self._buffer is not None:
-            self._buffer.append(event)
-            return _BUFFERED
+            marker = _Buffered()
+            self._buffer.append((event, marker))
+            return marker
+        return self._apply_execution_event(event)
+
+    def _apply_execution_event(self, event: oa.ProtoOAExecutionEvent) -> list[Record]:
         try:
             records = self._book.apply(event, self._operations)
         except Exception as e:
@@ -1825,7 +1833,7 @@ class CTraderExecutionClient(LiveExecutionClient):
     def _on_trailing_stop(self, event: oa.ProtoOATrailingSLChangedEvent) -> None:
         """A trailing stop-loss the broker moved: its leg follows."""
         if self._buffer is not None:
-            self._buffer.append(event)
+            self._buffer.append((event, _Buffered()))
             return
         try:
             records = self._book.trailing_stop_moved(event)
@@ -2883,10 +2891,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             if outcome.executionType in (om.ORDER_REJECTED, om.ORDER_CANCEL_REJECTED):
                 code = outcome.errorCode or om.ProtoOAExecutionType.Name(outcome.executionType)
                 return _Refused(code)
-            records = self._on_execution_event(outcome)
-            if isinstance(records, _Buffered):
-                await self._wait_for_model()
-                records = []
+            records = await self._apply_answer(outcome)
             replaced = outcome.executionType == om.ORDER_REPLACED and outcome.HasField("order")
             return _Answered(records, outcome.order if replaced else None)
         return None
@@ -3273,15 +3278,25 @@ class CTraderExecutionClient(LiveExecutionClient):
                     if not isinstance(outcome, oa.ProtoOAExecutionEvent):
                         return _Amended([], None)
                     answered = _answered_levels(outcome, instrument.price_precision)
-                    records = self._on_execution_event(outcome)
-                    if isinstance(records, _Buffered):
-                        # Still in flight while it waits, so the answer is read as the node's.
-                        await self._wait_for_model()
-                        records = []
+                    # Still in flight while a held answer waits, so it is read as the node's.
+                    records = await self._apply_answer(outcome)
                     return _Amended(records, answered)
                 return None
             finally:
                 self._operations.end_amend(position_id)
+
+    async def _apply_answer(self, answer: oa.ProtoOAExecutionEvent) -> list[Record]:
+        """Apply a command's answer and return its records; one a rebuild holds is waited for.
+
+        The records of a held answer are those its release produced. There are none when the
+        wait timed out or a detach dropped the buffer: the command is then answered from the
+        model as it stands.
+        """
+        records = self._on_execution_event(answer)
+        if not isinstance(records, _Buffered):
+            return records
+        await self._wait_for_model()
+        return records.records or []
 
     async def _wait_for_model(self) -> None:
         """Wait for the rebuilt model, with the events it held applied."""

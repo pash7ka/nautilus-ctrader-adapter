@@ -2554,6 +2554,32 @@ async def test_a_foreign_leg_is_moved_by_an_amend_keeping_the_other_level(
         assert h.logger.errors() == []
 
 
+async def answered_during_a_rebuild(h, command: ModifyOrder) -> None:
+    """Run `command` while a rebuild holds the events, its answer among them."""
+    h.client._hold_buffer()
+    commanding = asyncio.create_task(h.client._modify_order(command))
+    await wait_until(lambda: len(h.client._buffer) == 1)
+    h.client._release_buffer()
+    await asyncio.wait_for(commanding, timeout=5)
+    await sync(h)
+
+
+async def test_a_foreign_leg_modify_answered_during_a_rebuild_is_reported_once() -> None:
+    execution_venue = ExecutionVenue()
+    echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue) as h:
+        _, order = await foreign_legs(h)
+        before = len(reports_of(h, FOREIGN_TP))
+        await answered_during_a_rebuild(h, modify(order.client_order_id.value, price="85400.00"))
+
+        (moved,) = reports_of(h, FOREIGN_TP)[before:]
+        assert moved.order_status == OrderStatus.ACCEPTED
+        assert moved.price == Price.from_str("85400.00")
+        assert foreign_leg(h, FOREIGN_TP).price == Price.from_str("85400.00")
+        assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+
 async def test_a_modify_of_a_trailing_stop_loss_keeps_it_trailing() -> None:
     execution_venue = ExecutionVenue()
     amends = echo_amends(execution_venue)
@@ -2794,6 +2820,20 @@ async def test_a_pending_order_cancel_answered_during_a_rebuild_is_not_rejected(
         await asyncio.wait_for(cancelling, timeout=5)
         await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.CANCELED)
 
+        assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+
+async def test_a_pending_order_amend_answered_during_a_rebuild_is_reported_once() -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+        before = len(reports_of(h, str(RESTING)))
+        await answered_during_a_rebuild(h, modify(order.client_order_id.value, price="84100.00"))
+
+        (amended,) = reports_of(h, str(RESTING))[before:]
+        assert amended.order_status == OrderStatus.ACCEPTED
+        assert amended.price == Price.from_str("84100.00")
+        assert foreign_leg(h, str(RESTING)).price == Price.from_str("84100.00")
         assert sent_about(h, order) == []
         assert h.logger.errors() == []
 

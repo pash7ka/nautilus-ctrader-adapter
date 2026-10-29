@@ -1252,10 +1252,20 @@ def target_moved_to(price: float | None) -> oa.ProtoOAExecutionEvent:
 
 
 async def answered_during_a_rebuild(
-    h: Harness, venue: ExecutionVenue, command: Callable[[], object]
+    h: Harness,
+    venue: ExecutionVenue,
+    command: Callable[[], object],
+    *,
+    read_after: oa.ProtoOAExecutionEvent | None = None,
 ) -> None:
-    """Run `command` while a reconnect's rebuild holds the events, its answer among them."""
+    """Run `command` while a reconnect's rebuild holds the events, its answer among them.
+
+    `read_after`: an answer the broker applied before the rebuild reads it, so the rebuilt
+    model holds its levels already.
+    """
     await started(h)
+    if read_after is not None:
+        venue.snapshot.position[0].CopyFrom(read_after.position)
     held = HeldReplies(
         h.server,
         om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
@@ -1271,34 +1281,60 @@ async def answered_during_a_rebuild(
     await asyncio.wait_for(commanding, timeout=10)
 
 
+def target_modify(price: str) -> ModifyOrder:
+    return ModifyOrder(
+        trader_id=TRADER_ID,
+        strategy_id=STRATEGY_ID,
+        instrument_id=US100_ID,
+        client_order_id=ClientOrderId(TARGET),
+        venue_order_id=None,
+        quantity=None,
+        price=Price.from_str(price),
+        trigger_price=None,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def target_updates(h: Harness) -> list[Price]:
+    return [e.price for e in h.events_of(TARGET) if isinstance(e, OrderUpdated)]
+
+
 async def test_an_amend_answered_during_a_rebuild_reads_the_rebuilt_view() -> None:
+    venue = serving()
+    venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: target_moved_to(85400.0))
+    async with harness(execution_venue=venue) as h:
+        await answered_during_a_rebuild(
+            h, venue, lambda: h.client._modify_order(target_modify("85400.00"))
+        )
+
+        await wait_until(
+            lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
+        )
+        await sync(h)
+        assert "OrderModifyRejected" not in h.kinds_of(TARGET)
+        assert h.kinds_of(TARGET)[-1] == "OrderUpdated"
+        assert target_updates(h) == [Price.from_str("85400.00")]
+        assert h.logger.errors() == []
+
+
+async def test_an_amend_the_rebuild_read_already_is_still_answered() -> None:
+    # The answer changes nothing once released, so no update of the model's answers the modify.
     venue = serving()
     venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: target_moved_to(85400.0))
     async with harness(execution_venue=venue) as h:
         await answered_during_a_rebuild(
             h,
             venue,
-            lambda: h.client._modify_order(
-                ModifyOrder(
-                    trader_id=TRADER_ID,
-                    strategy_id=STRATEGY_ID,
-                    instrument_id=US100_ID,
-                    client_order_id=ClientOrderId(TARGET),
-                    venue_order_id=None,
-                    quantity=None,
-                    price=Price.from_str("85400.00"),
-                    trigger_price=None,
-                    command_id=UUID4(),
-                    ts_init=0,
-                ),
-            ),
+            lambda: h.client._modify_order(target_modify("85400.00")),
+            read_after=target_moved_to(85400.0),
         )
 
-        await wait_until(
-            lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
-        )
+        await wait_until(lambda: Price.from_str("85400.00") in target_updates(h))
+        await sync(h)
         assert "OrderModifyRejected" not in h.kinds_of(TARGET)
-        assert h.kinds_of(TARGET)[-1] == "OrderUpdated"
+        assert target_updates(h) == [Price.from_str("85400.00")]
+        assert h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00")
         assert h.logger.errors() == []
 
 
