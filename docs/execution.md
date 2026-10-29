@@ -835,7 +835,10 @@ Nautilus's while the node runs.
   connection is lost, also during a reconnect, when the client disconnects, and while a rebuild
   of the model runs. It stays `false`, with the last positions kept, until the next rebuild has
   stood. A rebuild that fails without a loss turns it back to `true`, because the earlier model
-  still stands. `true` does not prove the model exact. With `false`, skip the comparison.
+  still stands. `true` means no known outage and no rebuild in progress, not proof that the model
+  is exact. If the rebuild that should add a position the model lacked fails, the key stays
+  `complete: true` without that position until its next event or the next reconnect, so Nautilus
+  may hold a position the key lacks. With `false`, skip the comparison.
 - `updated_ms` is the newest broker time the client had seen when the key was written, in ms, or
   `null` before any; an empty, quiet account can have `null` with `complete: true`. Snapshots,
   execution events and spots all advance it, so it can be later than the last change to a
