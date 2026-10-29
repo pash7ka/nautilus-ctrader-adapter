@@ -41,7 +41,7 @@ from nautilus_trader.model.identifiers import (
     Venue,
     VenueOrderId,
 )
-from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.model.instruments import CurrencyPair, Instrument
 from nautilus_trader.model.objects import (
     AccountBalance,
     Currency,
@@ -111,12 +111,18 @@ def quantity(units: Decimal, instrument: Instrument) -> Quantity:
     return Quantity.from_str(_text_at(units, instrument.size_precision, "quantity"))
 
 
-def commission(fill: Fill, currency: Currency) -> Money:
+def commission(fill: Fill, currency: Currency, instrument: Instrument) -> Money:
     """The deal's commission as Nautilus counts it, a charge positive.
 
-    Rounded to the currency's precision where the venue reports finer amounts.
+    Rounded to the currency's precision where the venue reports finer amounts. A commission in a
+    currency pair's base currency is given in its quote currency at the deal's price: Nautilus
+    takes it as paid in the pair's own units and shrinks the position by it, while the venue
+    charges it to the account.
     """
-    return Money(-fill.commission, currency)
+    charge = -fill.commission
+    if isinstance(instrument, CurrencyPair) and currency == instrument.base_currency:
+        return Money(charge * fill.price, instrument.quote_currency)
+    return Money(charge, currency)
 
 
 def _time_in_force(
@@ -190,7 +196,7 @@ def fill_report(
         order_side=order_side(fill.side),
         last_qty=quantity(fill.units, instrument),
         last_px=price(fill.price, instrument),
-        commission=commission(fill, currency),
+        commission=commission(fill, currency, instrument),
         # The venue does not say which side of the book a deal took.
         liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
         report_id=UUID4(),

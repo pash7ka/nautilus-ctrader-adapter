@@ -12,7 +12,7 @@ from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import OrderStatusReport
-from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.currencies import CAD, CHF, JPY, USD
 from nautilus_trader.model.enums import (
     AccountType,
     ContingencyType,
@@ -24,6 +24,7 @@ from nautilus_trader.model.enums import (
     TimeInForce,
     TriggerType,
 )
+from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import (
     AccountId,
     ClientId,
@@ -35,6 +36,8 @@ from nautilus_trader.model.identifiers import (
     VenueOrderId,
 )
 from nautilus_trader.model.objects import Money, Price, Quantity
+from nautilus_trader.model.position import Position
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 from nautilus_ctrader.activity import ACCOUNT_ACTIVITY_TOPIC, CTraderAccountActivity
 from nautilus_ctrader.common import execution_reports as reports
@@ -106,8 +109,94 @@ def test_a_quantity_takes_the_instruments_size_precision() -> None:
 
 
 def test_a_charged_commission_is_positive_in_the_deposit_currency() -> None:
-    assert reports.commission(fill(), USD) == Money(Decimal("27.41"), USD)
-    assert reports.commission(fill(commission=Decimal("1.50")), USD) == Money(Decimal("-1.50"), USD)
+    assert reports.commission(fill(), USD, US100) == Money(Decimal("27.41"), USD)
+    assert reports.commission(fill(commission=Decimal("1.50")), USD, US100) == Money(
+        Decimal("-1.50"), USD
+    )
+
+
+# The recordings hold no pair whose base is the deposit currency; Nautilus's test pairs stand in.
+USDJPY = TestInstrumentProvider.default_fx_ccy("USD/JPY")
+USDCHF = TestInstrumentProvider.default_fx_ccy("USD/CHF")
+USDCAD = TestInstrumentProvider.default_fx_ccy("USD/CAD")
+
+
+def fx_deal(price: str, side: str = "BUY", commission: str = "-24.98") -> Fill:
+    return fill(
+        side=side, units=Decimal(999_000), price=Decimal(price), commission=Decimal(commission)
+    )
+
+
+@pytest.mark.parametrize(
+    ("pair", "price", "expected"),
+    [
+        (USDJPY, "157.734", Money(3940, JPY)),  # 24.98 x 157.734 = 3940.19
+        (USDCHF, "0.79312", Money(Decimal("19.81"), CHF)),  # 19.8121
+        (USDCAD, "1.38655", Money(Decimal("34.64"), CAD)),  # 34.6360
+    ],
+)
+def test_a_commission_in_a_pairs_base_currency_is_given_in_its_quote_currency(
+    pair, price: str, expected: Money
+) -> None:
+    assert reports.commission(fx_deal(price), USD, pair) == expected
+
+
+def test_a_commission_not_in_the_base_currency_stays_in_the_deposit_currency() -> None:
+    assert reports.commission(fx_deal("1.16420"), USD, EURUSD) == Money(Decimal("24.98"), USD)
+    assert reports.commission(fill(), USD, US100) == Money(Decimal("27.41"), USD)
+    assert reports.commission(fx_deal("157.734", commission="0"), USD, USDJPY) == Money(0, JPY)
+
+
+@pytest.mark.parametrize(
+    ("pair", "entry_price", "exit_price"),
+    [
+        (USDJPY, "157.734", "157.975"),
+        (USDCHF, "0.79312", "0.79401"),
+        (USDCAD, "1.38655", "1.38702"),
+    ],
+)
+def test_a_base_currency_pair_closed_at_the_venue_ends_flat_in_nautilus(
+    pair, entry_price: str, exit_price: str
+) -> None:
+    """Nautilus takes a base-currency commission on a `CurrencyPair` off the position's size."""
+
+    def order_filled(side: str, price: str, order_id: str) -> OrderFilled:
+        return OrderFilled(
+            TraderId("T-001"),
+            StrategyId("S-001"),
+            pair.id,
+            ClientOrderId(order_id),
+            VenueOrderId(order_id),
+            ACCOUNT,
+            TradeId(order_id),
+            PositionId("P-1"),
+            reports.order_side(side),
+            OrderType.MARKET,
+            Quantity.from_int(999_000),
+            Price.from_str(price),
+            pair.quote_currency,
+            reports.commission(fx_deal(price, side), USD, pair),
+            LiquiditySide.TAKER,
+            UUID4(),
+            0,
+            0,
+        )
+
+    position = Position(pair, order_filled("BUY", entry_price, "O-1"))
+    assert position.signed_qty == 999_000
+
+    position.apply(order_filled("SELL", exit_price, "O-2"))
+
+    assert position.is_closed
+    assert position.signed_qty == 0
+
+
+def test_a_fill_report_carries_the_same_commission_as_the_live_fill() -> None:
+    deal = fx_deal("157.734")
+
+    report = reports.fill_report(deal, "6000001", USDJPY, ACCOUNT, USD, ts_init=0)
+
+    assert report.commission == reports.commission(deal, USD, USDJPY) == Money(3940, JPY)
 
 
 def test_an_external_order_is_reported_accepted_with_nothing_filled() -> None:

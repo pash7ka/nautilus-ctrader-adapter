@@ -880,6 +880,14 @@ The broker's balance changes only when volume closes: an opening deal shows its 
 fill, and the balance stays as it was. Every `OrderFilled` carries the deal's commission, with the
 sign flipped to Nautilus's convention (a charge is positive).
 
+The commission is in the deposit currency, except on a currency pair whose base currency is the
+deposit currency (USDJPY on a USD account, for example). There it is given in the pair's quote
+currency, converted at the deal's price: Nautilus takes a base-currency commission on a
+`CurrencyPair` as paid in units of the pair and takes it off the position's size, so a position
+the broker closed in full would be left open by the commissions. Fill reports in reconciliation
+carry the same converted figure. On such pairs Nautilus's realised profit, kept in the quote
+currency, then includes the commission.
+
 **Known differences from Nautilus's own figures.**
 
 - **Swap** accrues on the position at the broker, not on the balance. It is not in Nautilus's

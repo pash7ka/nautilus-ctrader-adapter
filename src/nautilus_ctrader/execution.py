@@ -2100,7 +2100,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 reports.quantity(fill.units, instrument),
                 reports.price(fill.price, instrument),
                 instrument.quote_currency,
-                reports.commission(fill, self._currency),
+                reports.commission(fill, self._currency, instrument),
                 LiquiditySide.NO_LIQUIDITY_SIDE,
                 ts,
             )
