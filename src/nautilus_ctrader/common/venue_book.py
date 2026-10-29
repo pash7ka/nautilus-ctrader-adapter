@@ -33,6 +33,7 @@ from nautilus_ctrader.common.venue_records import (
     Level,
     LevelTerms,
     Notice,
+    OpenPosition,
     Operations,
     OrderEvent,
     OrderEventKind,
@@ -352,6 +353,21 @@ class VenueBook:
             if position.open and self._precision(position.symbol_id) is None
         )
         return tuple(sorted((*positions, *self._unloaded_orders.values())))
+
+    def open_positions(self) -> tuple[OpenPosition, ...]:
+        """Every open position, loaded symbols or not, sorted by position id."""
+        return tuple(
+            sorted(
+                OpenPosition(
+                    position.position_id,
+                    position.symbol_id,
+                    position.side,
+                    volume_to_units(position.volume),
+                )
+                for position in self._positions.values()
+                if position.open
+            )
+        )
 
     def updated_ms(self, position_id: int) -> int:
         """The broker's time of the last position state applied, or -1 for none."""

@@ -212,6 +212,75 @@ async def test_a_removed_restore_is_not_replayed() -> None:
         await server.stop()
 
 
+@pytest.mark.parametrize(
+    "lose",
+    [
+        pytest.param(lambda server: server.drop_connections(), id="dropped-socket"),
+        pytest.param(
+            lambda server: server.push(
+                oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID)
+            ),
+            id="ended-by-the-venue",
+        ),
+    ],
+)
+async def test_a_loss_is_told_to_every_loss_listener(lose) -> None:
+    server = authenticating_server()
+    await server.start()
+    logger = RecordingLogger()
+    session = session_for(server, logger, backoff_base_secs=0.05)
+    told: list[SessionState] = []
+
+    def failing() -> None:
+        raise RuntimeError("listener failed")
+
+    try:
+        session.add_loss_listener(failing)
+        session.add_loss_listener(lambda: told.append(session.state))
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        await lose(server)
+        await wait_until(lambda: told, description="loss told")
+        await wait_until(lambda: server.connection_count >= 2, description="reconnect")
+        await session.wait_ready(timeout_secs=3.0)
+
+        # Told once, before the reconnect, despite the listener before it raising.
+        assert told == [SessionState.CONNECTING]
+        assert any("listener" in line for line in logger.errors())
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_stop_or_a_removed_listener_tells_no_loss() -> None:
+    server = authenticating_server()
+    await server.start()
+    session = session_for(server, backoff_base_secs=0.05)
+    told: list[str] = []
+
+    def removed() -> None:
+        told.append("removed")
+
+    try:
+        session.add_loss_listener(lambda: told.append("kept"))
+        session.add_loss_listener(removed)
+        session.remove_loss_listener(removed)
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        await server.drop_connections()
+        await wait_until(lambda: server.connection_count >= 2, description="reconnect")
+        await session.wait_ready(timeout_secs=3.0)
+
+        await session.stop()
+        await asyncio.sleep(0.1)
+
+        assert told == ["kept"]
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_a_request_while_not_ready_fails_fast() -> None:
     server = authenticating_server()
     await server.start()

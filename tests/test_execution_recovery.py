@@ -55,10 +55,14 @@ from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.reconciliation import PositionHistory, Reconciliation, reconcile
 from nautilus_ctrader.common.session import SessionState
 from nautilus_ctrader.common.venue_records import Fill, Level, ReportedOrder, money_of
-from nautilus_ctrader.constants import CTRADER_VENUE, UNLOADED_EXPOSURE_KEY
+from nautilus_ctrader.constants import (
+    CTRADER_VENUE,
+    UNLOADED_EXPOSURE_KEY,
+    VENUE_POSITIONS_KEY,
+)
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
-from tests.account_venue import ACCOUNT_ID, HeldReplies, _symbol_by_id
+from tests.account_venue import ACCOUNT_ID, HeldReplies, _symbol_by_id, hold_account_auth
 from tests.execution_replay import (
     FIRST,
     NOTHING_HELD,
@@ -876,6 +880,144 @@ async def test_the_key_is_fresh_when_the_reconciliation_topic_fires() -> None:
 
         assert seen
         assert [item["subject"] for item in json.loads(seen[0])] == ["position"]
+
+
+def venue_positions(h: Harness) -> dict | None:
+    raw = h.cache.get(VENUE_POSITIONS_KEY)
+    return None if raw is None else json.loads(raw)
+
+
+def units_of(h: Harness) -> list[str]:
+    return [p["units"] for p in venue_positions(h)["positions"]]
+
+
+def two_positions(venue: ExecutionVenue) -> None:
+    """A foreign BUY of 1 on `US100.cash`, and a SELL of 999000 on the unloaded EURUSD, later."""
+    foreign_position(venue, 1, ts=1_600_000_000_000)
+    position = make_position(5_900_005, side=om.SELL, volume=99_900_000, symbol=EURUSD_SYMBOL_ID)
+    position.utcLastUpdateTimestamp = 1_600_000_009_000
+    venue.snapshot.position.append(position)
+
+
+TWO_POSITIONS = [
+    {"position_id": "5100001", "symbol": "US100.cash", "side": "LONG", "units": "1"},
+    {"position_id": "5900005", "symbol": "EURUSD", "side": "SHORT", "units": "999000"},
+]
+
+
+async def test_the_venue_positions_key_lists_every_open_position_at_connect() -> None:
+    venue = ExecutionVenue()
+    two_positions(venue)
+    async with harness(execution_venue=venue) as h:
+        assert venue_positions(h) == {
+            "complete": True,
+            "updated_ms": 1_600_000_009_000,
+            "positions": TWO_POSITIONS,
+        }
+        assert exposure(h) == [
+            {"symbol": "EURUSD", "subject": "position", "side": "SELL", "volume": "999000"},
+        ]
+
+
+async def test_the_venue_positions_key_is_absent_before_the_first_rebuild() -> None:
+    async with harness(connect=False) as h:
+        assert venue_positions(h) is None
+
+        await h.client._connect()
+
+        assert venue_positions(h) == {"complete": True, "updated_ms": None, "positions": []}
+
+
+async def test_the_venue_positions_key_follows_fills_and_closes() -> None:
+    async with harness() as h:
+        await submitted(h)
+        seen: list[list[str]] = []
+
+        for event in FIRST_EVENTS:
+            await push(h, event)
+            if not seen or units_of(h) != seen[-1]:
+                seen.append(units_of(h))
+
+        # Opened by the fill, partly closed by hand, closed by its stop-loss.
+        assert seen == [[], ["1"], ["0.99"], []]
+        assert venue_positions(h) == {
+            "complete": True,
+            "updated_ms": FIRST_EVENTS[-1].deal.executionTimestamp,
+            "positions": [],
+        }
+
+
+async def test_a_lost_connection_marks_the_venue_positions_incomplete() -> None:
+    venue = ExecutionVenue()
+    two_positions(venue)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        held = hold_account_auth(h.server)
+
+        await h.server.drop_connections()
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+
+        # Before the reconnect has rebuilt anything: the last positions, marked incomplete.
+        assert venue_positions(h)["complete"] is False
+        assert venue_positions(h)["positions"] == TWO_POSITIONS
+
+        # The unloaded position closed during the outage.
+        venue.snapshot.position.pop()
+        await held.stop_holding()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+
+        assert venue_positions(h)["complete"] is True
+        assert venue_positions(h)["positions"] == TWO_POSITIONS[:1]
+
+
+async def test_a_detach_marks_the_venue_positions_incomplete() -> None:
+    venue = ExecutionVenue()
+    two_positions(venue)
+    async with harness(execution_venue=venue) as h:
+        await h.client._disconnect()
+
+        assert venue_positions(h)["complete"] is False
+        assert venue_positions(h)["positions"] == TWO_POSITIONS
+
+        venue.snapshot.position.pop()
+        await h.client._connect()
+
+        assert venue_positions(h)["complete"] is True
+        assert venue_positions(h)["positions"] == TWO_POSITIONS[:1]
+
+
+async def test_the_venue_positions_are_incomplete_while_a_rebuild_runs() -> None:
+    venue = ExecutionVenue()
+    two_positions(venue)
+    async with harness(execution_venue=venue) as h:
+        held = HeldReplies(
+            h.server,
+            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+        )
+        passing = asyncio.create_task(h.client.generate_mass_status())
+        await asyncio.wait_for(held.arrived.wait(), timeout=10)
+
+        assert venue_positions(h)["complete"] is False
+        assert venue_positions(h)["positions"] == TWO_POSITIONS
+
+        await held.stop_holding()
+        await asyncio.wait_for(passing, timeout=10)
+
+        assert venue_positions(h)["complete"] is True
+
+
+async def test_a_failed_rebuild_leaves_the_venue_positions_as_they_stood() -> None:
+    # The model of the last rebuild still follows the broker's events.
+    venue = ExecutionVenue()
+    two_positions(venue)
+    async with harness(execution_venue=venue) as h:
+        venue.fail = {om.PROTO_OA_RECONCILE_REQ}
+
+        assert await h.client.generate_mass_status() is None
+
+        assert venue_positions(h)["complete"] is True
+        assert venue_positions(h)["positions"] == TWO_POSITIONS
 
 
 async def test_reports_outside_a_mass_status_never_carry_a_filled_order() -> None:

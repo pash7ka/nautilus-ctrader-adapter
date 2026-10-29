@@ -289,6 +289,16 @@ class Exposure:
     units: Decimal
 
 
+@dataclass(frozen=True, order=True)
+class OpenPosition:
+    """An open position in the venue model, on any symbol; `side` is `"BUY"` or `"SELL"`."""
+
+    position_id: int
+    symbol_id: int
+    side: str
+    units: Decimal
+
+
 class ReportStatus(Enum):
     ACCEPTED = "accepted"
     PARTIALLY_FILLED = "partially_filled"

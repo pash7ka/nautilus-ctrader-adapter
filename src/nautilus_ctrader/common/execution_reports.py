@@ -61,6 +61,7 @@ from nautilus_ctrader.common.venue_records import (
     ExternalOrder,
     ExternalType,
     Fill,
+    OpenPosition,
     OrderEvent,
     OrderEventKind,
     ReportedOrder,
@@ -520,6 +521,38 @@ def exposure_json(items: Sequence[Exposure], symbol_name: Callable[[int], str]) 
             {"symbol": symbol, "subject": subject, "side": side, "volume": format(units, "f")}
             for symbol, subject, side, units in named
         ]
+    ).encode("utf-8")
+
+
+_POSITION_SIDE = {"BUY": "LONG", "SELL": "SHORT"}
+
+
+def venue_positions_json(
+    positions: Sequence[OpenPosition],
+    symbol_name: Callable[[int], str],
+    *,
+    complete: bool,
+    updated_ms: int | None,
+) -> bytes:
+    """The venue model's open positions as UTF-8 JSON, in the order given.
+
+    `{"complete", "updated_ms", "positions"}`; each position is `{"position_id", "symbol",
+    "side", "units"}`, the units as plain decimal text without trailing zeros.
+    """
+    return json.dumps(
+        {
+            "complete": complete,
+            "updated_ms": updated_ms,
+            "positions": [
+                {
+                    "position_id": str(position.position_id),
+                    "symbol": symbol_name(position.symbol_id),
+                    "side": _POSITION_SIDE[position.side],
+                    "units": format(position.units.normalize(), "f"),
+                }
+                for position in positions
+            ],
+        }
     ).encode("utf-8")
 
 

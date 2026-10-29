@@ -121,6 +121,7 @@ from nautilus_ctrader.constants import (
     CTRADER,
     CTRADER_VENUE,
     UNLOADED_EXPOSURE_KEY,
+    VENUE_POSITIONS_KEY,
 )
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -562,6 +563,12 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._model_standing.set()
         # The newest broker timestamp the node has seen, in ms, or -1 before any.
         self._broker_ms = -1
+        # Times the model stopped following the broker (a lost connection or a detach), and that
+        # count when a rebuild last stood; `None` before the first rebuild.
+        self._breaks = 0
+        self._rebuilt_at_break: int | None = None
+        # From a rebuild's start until it stands or ends.
+        self._rebuilding = False
         # Closes whose answer the connection lost: in flight until the next reconnect pass.
         self._lost_closes: set[str] = set()
         # The start's mass status the held events wait on, its open orders, and how long they
@@ -617,6 +624,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             session.add_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
             session.add_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
             session.add_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
+            session.add_loss_listener(self._model_broke)
             trader = await self._trader()
             check_account(trader)
             self._currency = Currency.from_str(self._account.deposit_asset.name)
@@ -695,6 +703,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         # Whatever it held is dropped: its next connect rebuilds anew.
         self._buffer = None
         self._model_standing.set()
+        self._rebuilding = False
+        self._model_broke()
         self._end_lost_closes()
         if self._checkpoint is not None:
             self._checkpoint.stop()
@@ -709,6 +719,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         session.remove_event_handler(oa.ProtoOAOrderErrorEvent, self._on_order_error_event)
         session.remove_event_handler(oa.ProtoOATraderUpdatedEvent, self._on_trader_updated)
         session.remove_event_handler(oa.ProtoOAMarginChangedEvent, self._on_margin_changed)
+        session.remove_loss_listener(self._model_broke)
         session.remove_restore(self._restore_key)
 
     def _unstash(self) -> None:
@@ -861,14 +872,15 @@ class CTraderExecutionClient(LiveExecutionClient):
         return status
 
     async def _reconcile_pass(self, since_ms: int) -> ExecutionMassStatus:
-        """Read the broker once, rebuild the venue model and write the unloaded exposure.
+        """Read the broker once, rebuild the venue model and write the model's cache keys.
 
         Leaves the buffer held: the caller releases it once Nautilus has the returned mass
         status, or when this raises.
         """
         self._hold_buffer()
+        breaks = self._breaks
         state = await self._read_broker(since_ms=since_ms)
-        self._stand(state)
+        self._stand(state, breaks=breaks)
         # One record left out beats a reconciliation that fails every time.
         status = self._mass_status(state, misfit=self._log.error)
         # A closed position the snapshot lacked: its events, applied to a model without it, would
@@ -884,6 +896,7 @@ class CTraderExecutionClient(LiveExecutionClient):
             and any(str(deal.dealId) in reported for deal in found.deals)
         )
         self._write_exposure()
+        self._write_venue_positions()
         fills = sum(len(found) for found in status.fill_reports.values())
         positions = sum(len(found) for found in status.position_reports.values())
         self._log.info(
@@ -1330,6 +1343,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         if self._buffer is None:
             self._buffer = []
         self._model_standing.clear()
+        self._rebuilding = True
+        self._write_venue_positions()
 
     def _await_reconciliation(self, status: ExecutionMassStatus) -> None:
         self._stop_awaiting()
@@ -1409,6 +1424,10 @@ class CTraderExecutionClient(LiveExecutionClient):
         """
         self._stop_awaiting()
         held, self._buffer = self._buffer, None
+        if self._rebuilding:
+            # The rebuild failed: the model it would have replaced stands.
+            self._rebuilding = False
+            self._write_venue_positions()
         try:
             # A client detached meanwhile must start nothing; its next connect rebuilds anew.
             if held is None or self._session is None:
@@ -1440,6 +1459,29 @@ class CTraderExecutionClient(LiveExecutionClient):
             UNLOADED_EXPOSURE_KEY,
             reports.exposure_json(self._book.exposure(), self._symbol_name),
         )
+
+    def _write_venue_positions(self) -> None:
+        """Write the model's open positions to the cache, whole; nothing before the first rebuild.
+
+        Complete while the last rebuild stood with no break since and no rebuild runs.
+        """
+        if self._rebuilt_at_break is None:
+            return
+        self._cache.add(
+            VENUE_POSITIONS_KEY,
+            reports.venue_positions_json(
+                self._book.open_positions(),
+                self._symbol_name,
+                complete=self._rebuilt_at_break == self._breaks and not self._rebuilding,
+                # Unset timestamp fields read as 0, which is no time either.
+                updated_ms=self._broker_ms if self._broker_ms > 0 else None,
+            ),
+        )
+
+    def _model_broke(self) -> None:
+        """The model stopped following the broker; the next rebuild picks it up again."""
+        self._breaks += 1
+        self._write_venue_positions()
 
     # -- Venue data ---------------------------------------------------------------------------
 
@@ -1476,10 +1518,11 @@ class CTraderExecutionClient(LiveExecutionClient):
         Nautilus the legs whose level is missing are cancelled.
         """
         self._hold_buffer()
+        breaks = self._breaks
         rebuilt = False
         try:
             state = await self._read_broker(since_ms=None, deals=False)
-            self._stand(state, keep_gone=keep_gone, waiting=self._waiting_legs())
+            self._stand(state, breaks=breaks, keep_gone=keep_gone, waiting=self._waiting_legs())
             rebuilt = True
             for position_id in self._book.kept():
                 self._await_close(position_id, retried=False)
@@ -1488,6 +1531,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         finally:
             self._release_buffer(rebuilt)
         self._write_exposure()
+        self._write_venue_positions()
 
     async def _read_broker(
         self,
@@ -1613,9 +1657,17 @@ class CTraderExecutionClient(LiveExecutionClient):
         return legs
 
     def _stand(
-        self, state: BrokerState, *, keep_gone: bool = False, waiting: Collection[str] = ()
+        self,
+        state: BrokerState,
+        *,
+        breaks: int,
+        keep_gone: bool = False,
+        waiting: Collection[str] = (),
     ) -> None:
-        """Rebuild the venue model and the margins from `state`'s snapshot (`VenueBook.load()`)."""
+        """Rebuild the venue model and the margins from `state`'s snapshot (`VenueBook.load()`).
+
+        `breaks` is `_breaks` when the read started: a break since leaves the model incomplete.
+        """
         orders = {position_id: found.orders for position_id, found in state.histories.items()}
         snapshot = state.snapshot
         # The snapshot carries no time of its own: the newest the node knows bounds it.
@@ -1629,6 +1681,7 @@ class CTraderExecutionClient(LiveExecutionClient):
                 *(o.utcLastUpdateTimestamp for o in snapshot.order),
             ]
         )
+        self._saw_broker_time(read_ms)
         stashed = [kept for held in self._kept_brackets.values() for kept in held]
         alive = [self._alive_legs(kept.bracket) for kept in stashed]
         records = self._book.load(
@@ -1649,6 +1702,8 @@ class CTraderExecutionClient(LiveExecutionClient):
         self._margin_times = {}
         for position in state.snapshot.position:
             self._set_margin(position)
+        self._rebuilt_at_break = breaks
+        self._rebuilding = False
 
     async def _position_orders(
         self, position_id: int, request: history.Request
@@ -1824,6 +1879,7 @@ class CTraderExecutionClient(LiveExecutionClient):
         )
         if any(isinstance(r, Activity) and r.kind in _EXPOSURE_KINDS for r in records):
             self._write_exposure()
+        self._write_venue_positions()
         self._update_account(event)
         self._release_unkept()
         self._settle_brackets()

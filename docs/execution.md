@@ -687,7 +687,9 @@ unprotected will see this one that way.
 ## 6. Account activity
 
 Two things the node did not start reach an application: a message for each piece of activity seen
-live, and a cache key holding what stands now on instruments the node has not loaded.
+live, and a cache key holding what stands now on instruments the node has not loaded. A second
+key lists every open position the adapter's model of the account holds, for an application that
+compares the broker's positions with Nautilus's.
 
 ### The `ctrader.account_activity` topic
 
@@ -808,6 +810,52 @@ class ExposureWatcher(Actor):
         ...
 
     def _on_activity(self, activity) -> None: ...
+```
+
+### The `ctrader.venue_positions` key
+
+The key (`nautilus_ctrader.constants.VENUE_POSITIONS_KEY`) holds, as UTF-8 JSON in the Nautilus
+cache, every open position in the adapter's model of the account, on loaded instruments and
+unloaded ones alike. The model is built from the broker's snapshot and changed by the broker's
+events, so the key costs no request. It is meant for comparing the broker's positions with
+Nautilus's while the node runs.
+
+```json
+{"complete": true, "updated_ms": 1761710400123,
+ "positions": [{"position_id": "15631725", "symbol": "USDJPY", "side": "LONG", "units": "999000"}]}
+```
+
+- `positions` is sorted by position id. `position_id` is the broker's id, the same value Nautilus
+  holds as the position's `venue_position_id`. `symbol` is the broker's symbol name. `side` is
+  `"LONG"` or `"SHORT"`. `units` is plain decimal text without trailing zeros. An empty account has
+  `"positions": []`.
+- `complete` is `true` while the model follows the broker. It turns `false` when the connection is
+  lost, when the client disconnects, and while a rebuild of the model runs. It stays `false`, with
+  the last positions kept, until the next rebuild has stood. A rebuild that fails without a loss
+  turns it back to `true`, because the earlier model still stands. With `false`, skip the
+  comparison.
+- `updated_ms` is the newest broker time the client had seen when the key was written, in ms, or
+  `null` before any. Snapshots, execution events and spots all advance it, so it can be later than
+  the last change to a position. On a quiet account it can stay the same for hours.
+
+The key is absent until the first rebuild, at connect. It is written whole after every rebuild
+(at connect, and in every reconciliation pass before the mass status is returned or sent), after
+every execution event the model applies, and whenever `complete` changes. Read it as you read
+`ctrader.unloaded_exposure`: in `on_start`, and whenever `reports.execution.CTRADER` fires.
+
+```python
+import json
+
+from nautilus_ctrader.constants import VENUE_POSITIONS_KEY
+
+
+def _check_positions(self) -> None:  # a method of an Actor
+    raw = self.cache.get(VENUE_POSITIONS_KEY)
+    state = None if raw is None else json.loads(raw)
+    if state is None or not state["complete"]:
+        return
+    broker = {p["position_id"]: p for p in state["positions"]}
+    ...
 ```
 
 ## 7. Balance checkpoint

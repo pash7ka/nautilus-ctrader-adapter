@@ -115,6 +115,7 @@ class CTraderSession:
         self._restores: dict[Hashable, Callable[[], Awaitable[None]]] = {}
         self._failed_restores: set[Hashable] = set()
         self._event_handlers: dict[type[Message], list[EventHandler]] = {}
+        self._loss_listeners: list[Callable[[], None]] = []
         self._ready = asyncio.Event()
         self._lost = asyncio.Event()
         self._supervisor: asyncio.Task | None = None
@@ -173,6 +174,18 @@ class CTraderSession:
         handlers.remove(handler)
         if not handlers:
             del self._event_handlers[payload_class]
+
+    def add_loss_listener(self, callback: Callable[[], None]) -> None:
+        """Register `callback()` for every loss of a ready session, before it reconnects.
+
+        A loss is a dropped connection or an authentication the venue ended, including the
+        re-authentication after a token refresh; `stop()` is none.
+        """
+        self._loss_listeners.append(callback)
+
+    def remove_loss_listener(self, callback: Callable[[], None]) -> None:
+        if callback in self._loss_listeners:
+            self._loss_listeners.remove(callback)
 
     def add_restore(self, key: Hashable, factory: Callable[[], Awaitable[None]]) -> None:
         """Register an action to replay after every successful authentication."""
@@ -278,6 +291,7 @@ class CTraderSession:
                 await self._lost.wait()
                 if self._stopping:
                     return
+                self._tell_loss()
                 await self._hold_for_refresh_reply()
                 # The old socket may still be live (the venue dropped our authentication) or
                 # half-dead (a failed read leaves the writer and heartbeat task running). Either
@@ -304,6 +318,13 @@ class CTraderSession:
                 attempt += 1
                 await self._teardown_connection()
                 await self._back_off(attempt, f"Session bring-up failed (attempt {attempt}): {e}")
+
+    def _tell_loss(self) -> None:
+        for listener in tuple(self._loss_listeners):
+            try:
+                listener()
+            except Exception as e:
+                self._log.exception("Loss listener raised", e)
 
     async def _back_off(self, attempt: int, message: str) -> None:
         """Log `message` and sleep an exponential, jittered delay; ERROR from the threshold on."""

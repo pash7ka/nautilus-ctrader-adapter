@@ -118,4 +118,5 @@ STABLE_SESSION_SECS: float = 30.0
 
 # Cache keys the execution client writes for the application, as UTF-8 JSON.
 UNLOADED_EXPOSURE_KEY: str = "ctrader.unloaded_exposure"
+VENUE_POSITIONS_KEY: str = "ctrader.venue_positions"
 BALANCE_CHECKPOINT_KEY: str = "ctrader.balance_checkpoint"
