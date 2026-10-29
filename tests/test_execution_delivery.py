@@ -85,6 +85,17 @@ async def never_applied(h: Harness) -> None:
     track_unapplied(h, ENTRY)
 
 
+async def held_and_delivered(h: Harness) -> None:
+    """One activity held behind an event, then delivered once Nautilus applies the event."""
+    delivered = len(h.activity)
+    track_unapplied(h, ENTRY)
+    h.client._handle_records([unloaded_activity()])
+    assert len(h.activity) == delivered
+    all_applied(h)
+    await wait_until(lambda: len(h.activity) == delivered + 1, timeout_secs=2)
+    await wait_until(lambda: h.client._outbox_task is None or h.client._outbox_task.done())
+
+
 async def test_an_activity_behind_an_event_never_applied_is_published_after_a_warning() -> None:
     async with harness() as h:
         await never_applied(h)
@@ -183,6 +194,11 @@ async def test_records_held_when_the_client_detaches_are_dropped() -> None:
         assert len(h.client._outbox) == 0
         assert h.client._outbox_task is None
         assert h.activity == []
+
+        # The event tracked at the detach holds nothing back after the next connect.
+        await h.client._connect()
+        h.client._handle_records([unloaded_activity()])
+        await wait_until(lambda: len(h.activity) == 1, timeout_secs=2)
 
 
 async def test_records_held_before_a_reconnect_reach_nautilus_before_its_mass_status() -> None:
@@ -345,6 +361,8 @@ async def test_an_answer_the_client_sends_itself_waits_behind_a_held_event_of_it
         await push_spot(h, 8_528_600_000, 8_528_721_000)
         await submit_bracket(h, bracket(h))
         await wait_until(lambda: status(h, STOP) == OrderStatus.ACCEPTED)
+        # A delivery finished before must not let the answer below overtake.
+        await held_and_delivered(h)
         track_unapplied(h, ENTRY)
         await push(h, unloaded_order(6_900_001))
         # The stop moved by hand: its OrderUpdated is held behind the activity above.
@@ -450,3 +468,15 @@ async def test_a_held_event_that_cannot_be_sent_does_not_stop_what_follows(
 
         await wait_until(lambda: len(h.activity) == 2)
         assert any("could not be sent" in line for line in h.logger.errors())
+
+
+async def test_records_held_after_a_finished_delivery_are_delivered_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Past the waits below: only the event being applied can release the activity.
+    monkeypatch.setattr(execution, "_EVENT_WAIT_SECS", 5.0)
+    async with harness() as h:
+        await submitted(h)
+
+        await held_and_delivered(h)
+        await held_and_delivered(h)

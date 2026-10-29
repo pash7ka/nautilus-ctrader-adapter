@@ -45,6 +45,7 @@ from nautilus_trader.model.identifiers import (
 from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
+from nautilus_ctrader import execution
 from nautilus_ctrader.common import order_record
 from nautilus_ctrader.common.errors import CTraderRequestError
 from nautilus_ctrader.common.execution_reports import mass_status
@@ -654,10 +655,16 @@ async def test_a_failed_release_after_the_wait_is_logged(monkeypatch: pytest.Mon
         assert h.client._model_standing.is_set()
 
 
-async def test_a_failed_list_releases_the_buffer() -> None:
+@pytest.mark.parametrize(
+    "failing",
+    # The fill window, or the order list of a position the snapshot lists.
+    [om.PROTO_OA_DEAL_LIST_REQ, om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+    ids=["window", "position-orders"],
+)
+async def test_a_failed_list_releases_the_buffer(failing) -> None:
     venue = serving()
-    venue.fail = {om.PROTO_OA_DEAL_LIST_REQ}
     async with harness(execution_venue=venue) as h:
+        venue.fail = {failing}
         assert await h.client.generate_mass_status() is None
 
         await push(h, *FIRST_EVENTS[-2:])
@@ -668,6 +675,24 @@ async def test_a_failed_list_releases_the_buffer() -> None:
         assert errors
         assert all("No Nautilus order" in line for line in errors)
         assert any("INTERNAL_SERVER_ERROR" in line for line in h.logger.warnings())
+
+
+async def test_a_mass_status_failing_unexpectedly_releases_the_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(execution_venue=serving()) as h:
+
+        async def broken(**_kwargs) -> None:
+            raise RuntimeError("read failed")
+
+        monkeypatch.setattr(h.client, "_read_broker", broken)
+
+        with pytest.raises(RuntimeError, match="read failed"):
+            await asyncio.wait_for(h.client.generate_mass_status(), timeout=10)
+
+        assert h.client._buffer is None
+        await push(h, *FIRST_EVENTS[-2:])
+        assert not h.client._book.view(FIRST).open
 
 
 async def test_the_pass_asks_each_position_once() -> None:
@@ -801,6 +826,35 @@ async def test_exposure_written_at_connect_and_on_change() -> None:
         assert h.cache.get(UNLOADED_EXPOSURE_KEY) == b"[]"
 
 
+async def test_reconciliation_reads_unloaded_symbols_open_positions_only_and_covers_the_rest() -> (
+    None
+):
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    # Ids in the order the pass covers them: closed unloaded, open unloaded, loaded.
+    closed_unloaded, open_unloaded = 5_000_101, 5_000_102
+    order = make_order(6_000_101, closed_unloaded, symbol=EURUSD_SYMBOL_ID)
+    order.orderStatus = om.ORDER_STATUS_FILLED
+    for deal_id, side in ((7_000_101, om.BUY), (7_000_102, om.SELL)):
+        deal = make_deal(
+            deal_id, 6_000_101, closed_unloaded, side=side, volume=100, price=1.1, ts=now - 60_000
+        )
+        deal.symbolId = EURUSD_SYMBOL_ID
+        venue.deals.append(deal)
+    venue.snapshot.position.append(unloaded_position(open_unloaded))
+    foreign_position(venue, 1, ts=now - 30_000)
+    async with harness(execution_venue=venue) as h:
+        before = len(h.received(oa.ProtoOAOrderListByPositionIdReq))
+
+        built = await h.client.generate_mass_status()
+
+        read = [r.positionId for r in h.received(oa.ProtoOAOrderListByPositionIdReq)[before:]]
+        assert open_unloaded in read
+        assert closed_unloaded not in read
+        (report,) = built.position_reports[US100_ID]
+        assert report.venue_position_id == PositionId("5100001")
+
+
 async def test_a_pass_publishes_no_unloaded_activity() -> None:
     venue = ExecutionVenue()
     venue.snapshot.position.append(unloaded_position(5_900_003))
@@ -845,6 +899,51 @@ async def test_reports_outside_a_mass_status_never_carry_a_filled_order() -> Non
             ClientOrderId(STOP),
             ClientOrderId(TARGET),
         }
+
+
+@pytest.mark.parametrize("open_only", [False, True], ids=["all", "open-only"])
+async def test_order_status_reports_add_only_legs_that_ended_unfilled(open_only) -> None:
+    # The first position closed by its stop-loss within the window: its take-profit cancelled.
+    venue = ExecutionVenue()
+    serve(venue, CLOSED_AT, later_ms=later_ms())
+    # A trader's limit order, half filled and then cancelled: its position stays open.
+    ts = int(time.time() * 1000) - 60_000
+    position_id, order_id = 5_200_090, 6_200_090
+    position = make_position(position_id, volume=50, symbol=US100_SYMBOL_ID)
+    position.price = 85000.0
+    position.utcLastUpdateTimestamp = ts
+    venue.snapshot.position.append(position)
+    limit = make_order(
+        order_id, position_id, order_type=om.LIMIT, limit=85000.0, utc=ts, symbol=US100_SYMBOL_ID
+    )
+    limit.orderStatus = om.ORDER_STATUS_CANCELLED
+    limit.executedVolume = 50
+    venue.position_orders[position_id] = [limit]
+    (deal,) = on_us100(
+        [make_deal(7_200_090, order_id, position_id, side=om.BUY, volume=50, price=85000.0, ts=ts)]
+    )
+    venue.position_deals[position_id] = [deal]
+    venue.deals.append(deal)
+    async with harness(execution_venue=venue) as h:
+        deal_lists = len(h.received(oa.ProtoOADealListReq))
+
+        found = await h.client.generate_order_status_reports(
+            GenerateOrderStatusReports(
+                instrument_id=None,
+                start=None,
+                end=None,
+                open_only=open_only,
+                command_id=UUID4(),
+                ts_init=0,
+            ),
+        )
+
+        statuses = {report.venue_order_id.value: report.order_status for report in found}
+        if open_only:
+            assert statuses == {}
+            assert len(h.received(oa.ProtoOADealListReq)) == deal_lists
+        else:
+            assert statuses == {"6000001-TP": OrderStatus.CANCELED}
 
 
 def closed_before_the_window() -> ExecutionVenue:
@@ -989,10 +1088,16 @@ def orders_command() -> GenerateOrderStatusReports:
     ],
     ids=["orders", "fills", "positions"],
 )
-async def test_a_failed_read_raises_instead_of_reporting_nothing_open(generate) -> None:
+@pytest.mark.parametrize(
+    "failing",
+    # The snapshot, or the order list of a position it lists.
+    [om.PROTO_OA_RECONCILE_REQ, om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+    ids=["snapshot", "position-orders"],
+)
+async def test_a_failed_read_raises_instead_of_reporting_nothing_open(generate, failing) -> None:
     venue = serving()
     async with harness(execution_venue=venue) as h:
-        venue.fail = {om.PROTO_OA_RECONCILE_REQ}
+        venue.fail = {failing}
 
         with pytest.raises(CTraderRequestError):
             await generate(h.client)
@@ -1452,15 +1557,17 @@ def bracket_closed_meanwhile(venue: ExecutionVenue, *, opened: int, closed: int)
     venue.deals += deals
 
 
-async def lost_bracket_with_a_waiting_modify(h: Harness) -> None:
+async def lost_bracket_with_a_waiting_modify(
+    h: Harness, entry: str = ENTRY, stop: str = STOP, target: str = TARGET
+) -> None:
     await push_spot(h, 8_528_600_000, 8_528_721_000)
-    await submit_bracket(h, bracket(h))
+    await submit_bracket(h, bracket(h, entry=entry, stop=stop, target=target))
     await h.client._modify_order(
         ModifyOrder(
             trader_id=TRADER_ID,
             strategy_id=STRATEGY_ID,
             instrument_id=US100_ID,
-            client_order_id=ClientOrderId(STOP),
+            client_order_id=ClientOrderId(stop),
             venue_order_id=None,
             quantity=None,
             price=None,
@@ -1469,7 +1576,7 @@ async def lost_bracket_with_a_waiting_modify(h: Harness) -> None:
             ts_init=0,
         ),
     )
-    assert len(h.client._brackets) == 1
+    assert h.client._brackets.by_entry(entry) is not None
 
 
 async def test_a_bracket_whose_position_closed_during_a_disconnect_ends_at_the_reconnect() -> None:
@@ -1500,6 +1607,45 @@ async def test_a_bracket_the_broker_does_not_list_stays_pending_across_a_reconne
         assert len(h.client._brackets) == 1
         assert "OrderModifyRejected" not in h.kinds_of(STOP)
         assert status(h, STOP) == OrderStatus.SUBMITTED
+
+
+RESTING_ENTRY, RESTING_STOP, RESTING_TARGET = "O-E-5400009", "O-SL-5400009", "O-TP-5400009"
+
+
+async def test_a_reconnect_keeps_a_resting_entrys_bracket_and_ends_a_closed_one() -> None:
+    now = int(time.time() * 1000)
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue, config=LOSING) as h:
+        # Pending first, so the pass meets it first.
+        await lost_bracket_with_a_waiting_modify(h, RESTING_ENTRY, RESTING_STOP, RESTING_TARGET)
+        await lost_bracket_with_a_waiting_modify(h)
+        # The broker holds the first entry accepted and unfilled.
+        resting = make_order(
+            6_400_009,
+            5_400_009,
+            utc=now - 30_000,
+            label=order_record.encode_label(RESTING_ENTRY),
+            comment=order_record.encode_comment(LegIds(RESTING_STOP, RESTING_TARGET)),
+            client_order_id=RESTING_ENTRY,
+            symbol=US100_SYMBOL_ID,
+        )
+        venue.snapshot.order.append(resting)
+        bracket_closed_meanwhile(venue, opened=now - 120_000, closed=now - 60_000)
+
+        await h.server.drop_connections()
+        await wait_until(lambda: len(h.mass_statuses) == 1, timeout_secs=10)
+        await wait_until(lambda: "OrderModifyRejected" in h.kinds_of(STOP))
+
+        (built,) = h.mass_statuses
+        (listed,) = [
+            r
+            for r in built.order_reports.values()
+            if r.client_order_id == ClientOrderId(RESTING_ENTRY)
+        ]
+        assert listed.filled_qty == Quantity.from_str("0.00")
+        assert h.client._brackets.by_entry(ENTRY) is None
+        assert h.client._brackets.by_entry(RESTING_ENTRY) is not None
+        assert "OrderModifyRejected" not in h.kinds_of(RESTING_STOP)
 
 
 def moved(event: oa.ProtoOAExecutionEvent, by_ms: int) -> oa.ProtoOAExecutionEvent:
@@ -1805,6 +1951,29 @@ async def test_a_position_missing_from_the_snapshot_is_read_again() -> None:
         assert report.venue_position_id == PositionId(str(OURS))
         assert h.cache.position(PositionId(str(OURS))).is_open
         assert reconciliation_orders(h) == []
+
+
+def test_a_reread_snapshot_adds_only_the_lacking_positions_and_their_orders() -> None:
+    a, b, c = 5_400_001, 5_400_002, 5_400_003
+    first = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
+    first.position.append(make_position(a))
+    first.order.append(make_order(6_400_001, a, order_type=om.STOP_LOSS_TAKE_PROFIT, stop=1.0))
+    again = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
+    again.position.extend([make_position(a), make_position(b), make_position(c)])
+    again.order.extend(
+        [
+            make_order(6_400_001, a, order_type=om.STOP_LOSS_TAKE_PROFIT, stop=1.0),
+            make_order(6_400_002, b, order_type=om.STOP_LOSS_TAKE_PROFIT, stop=1.0),
+            # A new order of a position the first snapshot held: no list was read for it.
+            make_order(6_400_003, a, order_type=om.LIMIT, limit=1.0),
+            make_order(6_400_004, c, order_type=om.LIMIT, limit=1.0),
+        ],
+    )
+
+    merged = execution._with_positions(first, again, {b})
+
+    assert [p.positionId for p in merged.position] == [a, b]
+    assert [o.orderId for o in merged.order] == [6_400_001, 6_400_002]
 
 
 # -- The levels of a position the node did not open, through the engine ----------------------
@@ -2171,6 +2340,27 @@ async def test_a_level_moved_during_a_reconnect_gap_updates_the_nodes_leg() -> N
             ClientOrderId(TARGET),
         }
         assert h.logger.errors() == []
+
+
+async def test_a_reconnect_resends_every_changed_order_past_one_nautilus_holds_closed() -> None:
+    venue = ExecutionVenue()
+    async with harness(execution_venue=venue) as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS[:3])
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+        # Nautilus holds the stop-loss closed, which the venue still lists, ahead of the target.
+        h.client.generate_order_canceled(
+            STRATEGY_ID, US100_ID, ClientOrderId(STOP), VenueOrderId(SL), 0
+        )
+        await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
+
+        changed_at(OPEN_AT, venue)
+        await reconnected(h)
+
+        (target,) = updates(h.cache.order(ClientOrderId(TARGET)))
+        assert target.price == Price.from_str("85353.42")
+        assert [r.client_order_id for r in order_reports(h)] == [ClientOrderId(TARGET)]
+        assert status(h, STOP) == OrderStatus.CANCELED
 
 
 async def test_a_restart_with_cache_updates_a_leg_whose_level_moved() -> None:

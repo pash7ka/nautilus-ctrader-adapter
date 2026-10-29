@@ -62,7 +62,12 @@ from nautilus_ctrader.common.rate_limit import Pacing
 from nautilus_ctrader.common.venue_book import terms_of
 from nautilus_ctrader.common.venue_records import Level, LevelTerms, OrderEvent, OrderEventKind
 from nautilus_ctrader.constants import LENGTH_PREFIX_FORMAT, MAX_FRAME_BYTES
-from nautilus_ctrader.execution import _AMEND_ATTEMPTS, CTraderExecutionClient, _distances
+from nautilus_ctrader.execution import (
+    _AMEND_ATTEMPTS,
+    _RECONCILED_TOPIC,
+    CTraderExecutionClient,
+    _distances,
+)
 from nautilus_ctrader.factories import CTraderLiveExecClientFactory
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -231,14 +236,14 @@ async def test_the_factory_needs_the_accounts_provider_built_first() -> None:
 
 
 async def test_connect_states_the_account_and_holds_the_spots_brackets_are_measured_from() -> None:
-    async with harness() as h:
+    execution_venue = ExecutionVenue()
+    # The recorded trader's balance is scrubbed to 0, which a balance never read also states.
+    execution_venue.trader = trader(balance=1_000_000, balanceVersion=1)
+    async with harness(execution_venue=execution_venue) as h:
         (state,) = h.states
-        recorded = trader().trader
         assert state.account_id == ACCOUNT
         assert state.base_currency == USD
-        assert state.balances[0].total == Money(
-            Decimal(recorded.balance).scaleb(-recorded.moneyDigits), USD
-        )
+        assert state.balances[0].total == Money(Decimal("10000.00"), USD)
         assert state.margins == []
         assert [list(r.symbolId) for r in h.received(oa.ProtoOASubscribeSpotsReq)] == [
             [US100_SYMBOL_ID]
@@ -319,13 +324,27 @@ async def test_disconnect_releases_the_spots_and_the_account() -> None:
         assert h.account.session is None
 
 
-async def test_disconnect_releases_only_the_account_user_this_client_holds() -> None:
+async def test_disconnect_releases_only_the_account_user_this_client_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     execution_venue = ExecutionVenue()
     execution_venue.trader = trader(accountType=om.NETTED)
+
+    async def refused() -> None:
+        raise CTraderConnectionError("authentication refused")
+
     async with harness(execution_venue=execution_venue, connect=False) as h:
         # Another client of the same account, which must keep its session.
         await h.account.connect()
         try:
+            # The client never became a user of the account.
+            with monkeypatch.context() as patched:
+                patched.setattr(h.account, "connect", refused)
+                with pytest.raises(CTraderConnectionError):
+                    await h.client._connect()
+            await h.client._disconnect()
+            assert h.account.session is not None
+
             with pytest.raises(CTraderAccountError):
                 await h.client._connect()
             await h.client._disconnect()
@@ -339,6 +358,61 @@ async def test_disconnect_releases_only_the_account_user_this_client_holds() -> 
         finally:
             await h.account.disconnect()
         assert h.account.session is None
+
+
+async def test_a_detached_client_leaves_nothing_on_a_shared_session() -> None:
+    execution_venue = ExecutionVenue()
+    async with harness(execution_venue=execution_venue) as h:
+        await submitted(h)
+        await push(h, *FIRST_EVENTS[:3])
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+        # Another user of the account keeps the session up.
+        await h.account.connect()
+        try:
+            await h.client._disconnect()
+            assert not h.client._msgbus.is_subscribed(_RECONCILED_TOPIC, h.client._on_reconciled)
+            sent = (len(h.events), len(h.states), len(h.reports), len(h.mass_statuses))
+            snapshots = len(h.received(oa.ProtoOAReconcileReq))
+            auths = len(h.received(oa.ProtoOAAccountAuthReq))
+
+            await push(
+                h,
+                FIRST_EVENTS[3],
+                trailed_at(85210.0),
+                oa.ProtoOAOrderErrorEvent(ctidTraderAccountId=ACCOUNT_ID, errorCode="X"),
+                oa.ProtoOATraderUpdatedEvent(
+                    ctidTraderAccountId=ACCOUNT_ID,
+                    trader=trader(balance=123_456, balanceVersion=50).trader,
+                ),
+                oa.ProtoOAMarginChangedEvent(
+                    ctidTraderAccountId=ACCOUNT_ID,
+                    positionId=FIRST,
+                    usedMargin=1_234,
+                    moneyDigits=2,
+                ),
+            )
+            await h.server.drop_connections()
+            await wait_until(
+                lambda: (
+                    len(h.received(oa.ProtoOAAccountAuthReq)) > auths and h.account.session.is_ready
+                ),
+                timeout_secs=10,
+            )
+            await sync(h)
+
+            assert (len(h.events), len(h.states), len(h.reports), len(h.mass_statuses)) == sent
+            assert len(h.received(oa.ProtoOAReconcileReq)) == snapshots
+            assert not any("Order error" in line for line in h.logger.warnings())
+
+            # Back with the position as it stood at the detach: a later event is applied once.
+            our_open_position(execution_venue)
+            await h.client._connect()
+            await push(h, FIRST_EVENTS[3])
+            await wait_until(lambda: last_kind(h, STOP) == "OrderUpdated")
+            await sync(h)
+            assert h.kinds_of(STOP).count("OrderUpdated") == 1
+        finally:
+            await h.account.disconnect()
 
 
 async def test_the_nodes_entry_and_legs_reach_nautilus_under_their_ids() -> None:
@@ -1619,6 +1693,8 @@ async def test_a_leg_is_moved_by_an_amend_keeping_the_other_level() -> None:
         await wait_until(
             lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
         )
+        await sync(h)
+        assert h.kinds_of(TARGET).count("OrderUpdated") == 1
 
 
 async def test_a_legs_quantity_follows_its_position_and_cannot_be_set() -> None:
@@ -2071,6 +2147,9 @@ async def test_a_reconnect_before_the_protective_order_leaves_its_levels_uncorre
             ),
             timeout_secs=10,
         )
+        await wait_until(lambda: h.client._buffer is None)
+        # The position is open, so its protective order may still come.
+        assert h.client._brackets.by_entry(ENTRY) is not None
 
         await push(h, FIRST_EVENTS[2])
 
@@ -4269,9 +4348,16 @@ async def test_a_kept_position_whose_deals_name_no_close_is_an_error(
 
 
 async def reconnect_after_a_stashed_close(
-    h, held: HeldReplies, monkeypatch: pytest.MonkeyPatch, execution_venue: ExecutionVenue
+    h,
+    held: HeldReplies,
+    monkeypatch: pytest.MonkeyPatch,
+    execution_venue: ExecutionVenue,
+    at_reconnect: Callable[[ExecutionVenue], object] = closed_by_stop,
 ) -> None:
-    """A kept position whose deals cannot be read closes by its stop; the session reconnects."""
+    """A kept position whose deals cannot be read closes by its stop; the session reconnects.
+
+    `at_reconnect` makes the venue what the reconnect finds instead of that close.
+    """
     read_broker = h.client._read_broker
 
     async def deals_dropped(**kwargs):
@@ -4284,7 +4370,7 @@ async def reconnect_after_a_stashed_close(
     await wait_until(lambda: any("check by hand" in e for e in h.logger.errors()))
     assert h.client._kept_brackets
 
-    closed_by_stop(execution_venue)
+    at_reconnect(execution_venue)
     await h.client._reload()
     await asyncio.sleep(LOSING.protective_order_timeout_secs * 4)
     await sync(h)
@@ -4338,6 +4424,36 @@ async def test_a_stashed_leg_nautilus_holds_closed_is_not_cancelled_again(
 
         assert_each_leg_ended_once(h)
         assert h.client._kept_brackets == {}
+
+
+@pytest.mark.parametrize("target", [85387.22, None], ids=["both-levels", "target-removed"])
+async def test_a_reconnect_answers_a_stashed_brackets_carried_command_once(
+    monkeypatch: pytest.MonkeyPatch, target: float | None
+) -> None:
+    execution_venue, held = entry_held()
+    amends = echo_amends(execution_venue)
+
+    def open_with_levels(venue: ExecutionVenue) -> None:
+        broker_holds(venue, stop=85197.2, target=target)
+        venue.position_deals = {FIRST: [FIRST_EVENTS[1].deal]}
+
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        await reconnect_after_a_stashed_close(
+            h, held, monkeypatch, execution_venue, at_reconnect=open_with_levels
+        )
+        stop = h.cache.order(ClientOrderId(STOP))
+        await wait_until(lambda: stop.trigger_price == Price.from_str("85150.00"))
+        await asyncio.sleep(LOSING.protective_order_timeout_secs * 4)
+        await sync(h)
+
+        (amend,) = amends
+        assert amend.stopLoss == 85150.0
+        assert h.kinds_of(STOP).count("OrderUpdated") == 1
+        assert refusals(h, stop) == []
+        canceled = [type(e) for e in h.cache.order(ClientOrderId(TARGET)).events].count(
+            OrderCanceled
+        )
+        assert canceled == (0 if target else 1)
 
 
 SLOW = exec_config(protective_order_timeout_secs=0.2)
@@ -4400,6 +4516,34 @@ async def test_a_learning_rebuild_keeps_a_gone_position_and_reads_its_close() ->
         assert h.kinds_of(TARGET).count("OrderCanceled") == 1
         assert h.reports == []
         assert h.activity == []
+
+
+async def test_a_position_kept_again_after_a_reconnect_is_read_from_its_deals() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    async with harness(execution_venue=execution_venue, config=SLOW) as h:
+        await opened_bracket(h)
+        await h.client._learn_position("O-E-5000002")
+        assert h.client._book.kept() == frozenset({FIRST})
+
+        # The session comes back, within the kept position's wait, with the position open.
+        our_open_position(execution_venue)
+        execution_venue.position_deals = {FIRST: [FIRST_EVENTS[1].deal]}
+        await h.client._reload()
+        assert h.client._book.kept() == frozenset()
+        assert h.client._book.view(FIRST).open
+
+        # Its stop then closes it unseen, and a later rebuild keeps it again.
+        execution_venue.snapshot = oa.ProtoOAReconcileRes(ctidTraderAccountId=ACCOUNT_ID)
+        closed_by_stop(execution_venue)
+        await h.client._learn_position("O-E-5000002")
+        assert h.client._book.kept() == frozenset({FIRST})
+        await wait_until(
+            lambda: status(h, STOP) == OrderStatus.FILLED, description="the stop leg filled"
+        )
+        await sync(h)
+
+        assert status(h, TARGET) == OrderStatus.CANCELED
+        assert h.logger.errors() == []
 
 
 async def test_a_kept_foreign_position_reports_its_legs_from_its_deals() -> None:
