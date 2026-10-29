@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 
 from nautilus_ctrader.common import order_record
+from nautilus_ctrader.common.order_record import LegIds
 from nautilus_ctrader.common.parsing import volume_to_units
 from nautilus_ctrader.common.reconciliation import (
     PositionHistory,
@@ -439,6 +440,228 @@ def test_unfilled_orders_carry_the_node_id_when_they_are_the_node_s() -> None:
     assert result.notices == ()
 
 
+UNLOADED_SYMBOL = 279
+
+
+def round_trip(pid: int, entry_order_id: int, opened_ms: int, closed_ms: int) -> PositionHistory:
+    """A trader's buy of 100 filled at `opened_ms`, closed by hand at `closed_ms`."""
+    entry = make_order(entry_order_id, pid, utc=opened_ms)
+    close = make_order(entry_order_id + 1, pid, side=om.SELL, closing=True, utc=closed_ms)
+    deals = (
+        filled(entry, entry_order_id + 1_000_000, 100, opened_ms),
+        filled(close, entry_order_id + 1_000_001, 100, closed_ms),
+    )
+    return PositionHistory((entry, close), deals)
+
+
+def protective_order(
+    order_id: int, pid: int, utc: int, *, stop: float, limit: float, side: int = om.SELL
+) -> om.ProtoOAOrder:
+    return make_order(
+        order_id,
+        pid,
+        order_type=om.STOP_LOSS_TAKE_PROFIT,
+        side=side,
+        closing=True,
+        utc=utc,
+        stop=stop,
+        limit=limit,
+    )
+
+
+def test_each_skipped_position_or_order_skips_only_itself() -> None:
+    unloaded, no_lists, no_entry, never_filled, unlisted, closed = range(5_000_201, 5_000_207)
+    unloaded_deal = make_deal(
+        7_000_201, 6_000_201, unloaded, side=om.BUY, volume=100, price=1.1, ts=1000
+    )
+    unloaded_deal.symbolId = UNLOADED_SYMBOL
+    no_lists_deal = make_deal(
+        7_000_202, 6_000_202, no_lists, side=om.BUY, volume=100, price=85000.0, ts=1000
+    )
+    lone_deal = make_deal(
+        7_000_203, 6_000_203, no_entry, side=om.BUY, volume=100, price=85000.0, ts=1000
+    )
+    open_entry = make_order(6_000_205, unlisted)
+    ended = round_trip(closed, 6_000_206, 1000, 2000)
+    histories = {
+        no_entry: PositionHistory((), (lone_deal,)),
+        never_filled: PositionHistory((make_order(6_000_204, never_filled),), ()),
+        unlisted: PositionHistory((open_entry,), (filled(open_entry, 7_000_205, 100, 1000),)),
+        closed: ended,
+    }
+    pending_unloaded = make_order(
+        6_000_208, 5_000_208, order_type=om.LIMIT, limit=1.1, symbol=UNLOADED_SYMBOL
+    )
+    pending = make_order(6_000_209, 5_000_209, order_type=om.LIMIT, limit=84000.0, utc=3000)
+    snapshot = reconcile_res(orders=[pending_unloaded, pending])
+
+    result = run(snapshot, histories, (unloaded_deal, no_lists_deal, *ended.deals))
+
+    assert [r.venue_order_id for r in result.orders] == ["6000206", "6000207", "6000209"]
+    assert result.positions == ()
+    expected = [
+        (no_lists, "no order and deal lists"),
+        (no_entry, "lists no entry order"),
+        (unlisted, "not in the snapshot"),
+    ]
+    assert len(result.notices) == len(expected)
+    for notice, (pid, says) in zip(result.notices, expected, strict=True):
+        assert str(pid) in notice.text
+        assert says in notice.text
+
+
+def test_reports_of_two_positions_interleave_by_time() -> None:
+    first, second = 5_000_211, 5_000_212
+    histories = {
+        first: round_trip(first, 6_000_211, 1000, 5000),
+        second: round_trip(second, 6_000_213, 2000, 6000),
+    }
+    deals = tuple(deal for found in histories.values() for deal in found.deals)
+
+    result = run(reconcile_res(), histories, deals)
+
+    assert [r.venue_order_id for r in result.orders] == [
+        "6000211",
+        "6000213",
+        "6000212",
+        "6000214",
+    ]
+
+
+def test_no_report_of_a_position_sorts_before_its_entry() -> None:
+    pid = 5_000_271
+    # Without a creation time, the first order's late last change makes the raise the entry.
+    first = make_order(6_000_271, pid, utc=5000)
+    raised = make_order(6_000_272, pid, utc=3000)
+    raised.tradeData.openTimestamp = 3000
+    close = make_order(6_000_273, pid, side=om.SELL, volume=200, closing=True, utc=6000)
+    deals = (
+        filled(first, 7_000_271, 100, 1000),
+        filled(raised, 7_000_272, 100, 3000),
+        filled(close, 7_000_273, 200, 6000),
+    )
+    found = PositionHistory((first, raised, close), deals)
+
+    result = run(reconcile_res(), {pid: found}, deals)
+
+    assert [r.venue_order_id for r in result.orders] == ["6000272", "6000271", "6000273"]
+
+
+def test_only_the_newest_of_two_closes_takes_the_close_in_flight() -> None:
+    pid = 5_000_221
+    entry = our_entry(pid, 6_000_220, volume=200)
+    older = make_order(6_000_221, pid, side=om.SELL, volume=100, closing=True, utc=2000)
+    newer = make_order(6_000_222, pid, side=om.SELL, volume=100, closing=True, utc=3000)
+    deals = (
+        filled(entry, 7_000_220, 200, 1000),
+        filled(older, 7_000_221, 100, 2000),
+        filled(newer, 7_000_222, 100, 3000),
+    )
+    found = PositionHistory((entry, older, newer), deals)
+
+    reports = by_id(run(reconcile_res(), {pid: found}, deals, operations=OneClose(pid, 100)))
+
+    assert reports["6000222"].client_order_id == "O-C-1"
+    assert reports["6000221"].client_order_id is None
+
+
+@pytest.mark.parametrize("mine", [True, False], ids=["mine", "foreign"])
+def test_a_sell_positions_legs_are_buys(mine: bool) -> None:
+    pid = 5_000_231
+    entry = (
+        our_entry(pid, 6_000_231, side=om.SELL)
+        if mine
+        else make_order(6_000_231, pid, side=om.SELL)
+    )
+    protective = protective_order(6_000_232, pid, 2000, stop=85500.0, limit=84500.0, side=om.BUY)
+    position = make_position(pid, side=om.SELL)
+    position.stopLoss, position.takeProfit = 85500.0, 84500.0
+    deal = filled(entry, 7_000_231, 100, 1000)
+    found = PositionHistory((entry, protective), (deal,))
+
+    result = run(reconcile_res([position], [protective]), {pid: found}, (deal,))
+
+    stop, target = by_id(result)["6000231-SL"], by_id(result)["6000231-TP"]
+    assert stop.side == target.side == "BUY"
+    assert stop.status == target.status == ReportStatus.ACCEPTED
+    assert stop.trigger_price == Decimal("85500.00")
+    assert target.price == Decimal("84500.00")
+
+
+def test_a_trigger_of_a_protective_order_listed_after_an_unfilled_one_fills_its_leg() -> None:
+    pid = 5_000_241
+    entry = our_entry(pid, 6_000_241)
+    replaced = protective_order(6_000_242, pid, 1500, stop=84400.0, limit=85600.0)
+    replaced.orderStatus = om.ORDER_STATUS_CANCELLED
+    protective = protective_order(6_000_243, pid, 2000, stop=84500.0, limit=85500.0)
+    deals = (
+        filled(entry, 7_000_241, 100, 1000),
+        make_deal(7_000_243, 6_000_243, pid, side=om.SELL, volume=100, price=84500.0, ts=2000),
+    )
+    found = PositionHistory((entry, replaced, protective), deals)
+
+    stop = by_id(run(reconcile_res(), {pid: found}, deals))["6000241-SL"]
+
+    assert stop.status == ReportStatus.FILLED
+    assert trade_ids(stop) == ("7000243",)
+
+
+@pytest.mark.parametrize(
+    ("leg", "fill_price", "order_type", "field", "level"),
+    [
+        (Level.STOP_LOSS, 85500.0, ExternalType.LIMIT, "price", "85500.00"),
+        (Level.TAKE_PROFIT, 84500.0, ExternalType.STOP_MARKET, "trigger_price", "84500.00"),
+    ],
+    ids=["only-a-stop-leg", "only-a-take-profit-leg"],
+)
+def test_a_level_without_a_leg_fills_as_an_external_order_of_its_type(
+    leg, fill_price, order_type, field, level
+) -> None:
+    pid = 5_000_251
+    legs = LegIds(stop_id(pid), None) if leg == Level.STOP_LOSS else LegIds(None, target_id(pid))
+    entry = make_order(
+        6_000_251,
+        pid,
+        label=order_record.encode_label(entry_id(pid)),
+        comment=order_record.encode_comment(legs),
+        client_order_id=entry_id(pid),
+    )
+    protective = protective_order(6_000_252, pid, 2000, stop=84500.0, limit=85500.0)
+    deals = (
+        filled(entry, 7_000_251, 100, 1000),
+        make_deal(7_000_252, 6_000_252, pid, side=om.SELL, volume=100, price=fill_price, ts=2000),
+    )
+    found = PositionHistory((entry, protective), deals)
+
+    result = run(reconcile_res(), {pid: found}, deals)
+
+    (external,) = (r for r in result.orders if r.venue_order_id == "6000252")
+    assert external.reduce_only
+    assert external.client_order_id is None
+    assert external.order_type == order_type
+    assert getattr(external, field) == Decimal(level)
+    assert trade_ids(external) == ("7000252",)
+
+
+def test_a_leg_filled_in_part_before_its_position_closed_is_canceled() -> None:
+    pid = 5_000_261
+    entry = our_entry(pid, 6_000_261)
+    protective = protective_order(6_000_262, pid, 2000, stop=84500.0, limit=85500.0)
+    close = make_order(6_000_263, pid, side=om.SELL, volume=60, closing=True, utc=3000)
+    deals = (
+        filled(entry, 7_000_261, 100, 1000),
+        make_deal(7_000_262, 6_000_262, pid, side=om.SELL, volume=40, price=84500.0, ts=2000),
+        filled(close, 7_000_263, 60, 3000),
+    )
+    found = PositionHistory((entry, protective, close), deals)
+
+    stop = by_id(run(reconcile_res(), {pid: found}, deals))["6000261-SL"]
+
+    assert stop.status == ReportStatus.CANCELED
+    assert stop.filled_units == volume_to_units(40)
+    assert stop.units == volume_to_units(100)
+
+
 def test_one_position_is_reported_from_its_own_lists_alone() -> None:
     # Another open position, with no lists given: left out, not reported with a notice.
     snapshot = as_ours([snapshot_at(OPEN_AT)], [FIRST])[0]
@@ -743,18 +966,55 @@ def test_a_closed_foreign_positions_leg_nautilus_holds_open_is_cancelled() -> No
     assert target.ts_ms == legs["6000001-SL"].fills[0].ts_ms
 
 
+def test_a_skipped_stop_generation_leaves_the_take_profit_reported() -> None:
+    # SECOND closed at its take-profit; Nautilus holds its first stop-loss leg closed.
+    held = Held(closed=("6000004-SL",))
+
+    result = held_run(snapshot_at(EMPTY_AT), {SECOND: history(SECOND)}, window(SECOND), held)
+
+    legs = {i: r for i, r in by_id(result).items() if i.startswith("6000004-")}
+    assert legs["6000004-TP"].status == ReportStatus.FILLED
+    assert "6000004-SL-2" not in legs
+
+
+def test_a_foreign_position_with_only_a_take_profit_has_its_leg() -> None:
+    snapshot, histories, deals = open_first(mine=False)
+    snapshot = copy.deepcopy(snapshot)
+    snapshot.position[0].ClearField("stopLoss")
+    changed = protective_changed(snapshot.order, _without_stop)
+    del snapshot.order[:]
+    snapshot.order.extend(changed)
+    found = histories[FIRST]
+    histories = {
+        FIRST: PositionHistory(tuple(protective_changed(found.orders, _without_stop)), found.deals)
+    }
+
+    legs = foreign_legs(run(snapshot, histories, deals))
+
+    assert list(legs) == ["6000001-TP"]
+    assert legs["6000001-TP"].status == ReportStatus.ACCEPTED
+
+
+def _without_stop(order: om.ProtoOAOrder) -> None:
+    order.ClearField("stopPrice")
+
+
 def test_a_foreign_protective_fill_with_no_level_known_keeps_its_own_id() -> None:
     pid = 5_000_160
     entry = make_order(6_000_160, pid, utc=1000)
     protective = make_order(6_000_161, pid, order_type=om.STOP_LOSS_TAKE_PROFIT, utc=2000)
-    closing = make_deal(7_000_161, 6_000_161, pid, side=om.SELL, volume=100, price=85000.0, ts=2000)
-    deals = (filled(entry, 7_000_160, 100, 1000), closing)
+    closing = [
+        make_deal(deal_id, 6_000_161, pid, side=om.SELL, volume=50, price=85000.0, ts=ts)
+        for deal_id, ts in ((7_000_161, 2000), (7_000_162, 2001))
+    ]
+    deals = (filled(entry, 7_000_160, 100, 1000), *closing)
 
     result = run(reconcile_res(), {pid: PositionHistory((entry, protective), deals)}, deals)
 
     assert [r.venue_order_id for r in result.orders] == ["6000160", "6000161"]
     assert result.orders[1].order_type == ExternalType.MARKET
     assert result.orders[1].reduce_only
+    assert trade_ids(result.orders[1]) == ("7000161", "7000162")
 
 
 def protective_changed(orders, change) -> list[om.ProtoOAOrder]:

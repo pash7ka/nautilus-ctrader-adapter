@@ -138,6 +138,16 @@ def test_two_closes_of_one_volume_are_matched_one_at_a_time() -> None:
     assert table.closing(1, 100, LATER, ORDER) == "O-C-2"
 
 
+def test_a_close_in_flight_is_found_behind_closes_it_does_not_match() -> None:
+    table = OperationsInFlight()
+    table.begin_close("O-C-A", 1, 100, ANCHOR)
+    table.answered("O-C-A", ORDER)
+    table.begin_close("O-C-C", 3, 100, ANCHOR)
+    table.begin_close("O-C-B", 2, 100, ANCHOR)
+
+    assert table.closing(2, 100, LATER, ORDER + 1) == "O-C-B"
+
+
 def bracket(entry: str = "O-E") -> PendingBracket:
     return PendingBracket(
         entry_id=entry,

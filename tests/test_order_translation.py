@@ -250,15 +250,20 @@ def test_a_level_finer_than_the_venue_price_scale_is_refused() -> None:
         tr.relative_level(Decimal("1.2"), Decimal("1.000001"), below=True)
 
 
-def test_a_level_finer_than_the_instruments_price_precision_is_refused() -> None:
+@pytest.mark.parametrize(
+    ("stop", "target"),
+    [("17000.123", "19000.00"), ("17000.00", "19000.123")],
+    ids=["stop-loss", "take-profit"],
+)
+def test_a_level_finer_than_the_instruments_price_precision_is_refused(stop, target) -> None:
     orders = (
         factory()
         .bracket(
             instrument_id=GER40.id,
             order_side=OrderSide.BUY,
             quantity=Quantity.from_str("0.01"),
-            sl_trigger_price=Price.from_str("17000.123"),
-            tp_price=Price.from_str("19000.00"),
+            sl_trigger_price=Price.from_str(stop),
+            tp_price=Price.from_str(target),
         )
         .orders
     )
@@ -306,6 +311,10 @@ def test_a_reference_price_off_the_venue_grid_is_refused_by_name(side, bid, ask)
 def test_a_non_positive_reference_price_is_refused() -> None:
     with pytest.raises(tr.Unsupported, match="reference price"):
         tr.relative_level(Decimal("0"), Decimal("1.1"), below=False)
+
+
+def test_a_level_is_measured_from_a_reference_below_one() -> None:
+    assert tr.relative_level(Decimal("0.85000"), Decimal("0.84999"), below=True) == 1
 
 
 def test_a_pending_entry_is_refused_by_name() -> None:
@@ -621,6 +630,26 @@ def test_a_close_with_a_time_in_force_other_than_gtc_or_ioc_is_refused() -> None
     order = market_entry(OrderSide.SELL, reduce_only=True, time_in_force=TimeInForce.FOK)
 
     with pytest.raises(tr.Unsupported, match="FOK"):
+        tr.close_position(ACCOUNT_ID, 5_000_001, order, position_side=PositionSide.LONG)
+
+
+def test_a_close_linked_to_others_is_refused() -> None:
+    order = MarketOrder(
+        trader_id=_TRADER,
+        strategy_id=_STRATEGY,
+        instrument_id=EURUSD.id,
+        client_order_id=ClientOrderId("O-1"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_int(1000),
+        init_id=UUID4(),
+        ts_init=0,
+        reduce_only=True,
+        contingency_type=ContingencyType.OUO,
+        order_list_id=OrderListId("OL-1"),
+        linked_order_ids=[ClientOrderId("O-2")],
+    )
+
+    with pytest.raises(tr.Unsupported, match="bracket"):
         tr.close_position(ACCOUNT_ID, 5_000_001, order, position_side=PositionSide.LONG)
 
 

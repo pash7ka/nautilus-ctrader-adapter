@@ -2817,6 +2817,44 @@ def test_a_foreign_legs_later_news_is_order_events_on_its_venue_order_id(event, 
     assert b.apply(event, NOTHING) == expected
 
 
+def test_a_short_foreign_positions_legs_are_buys() -> None:
+    b = book()
+    b.apply(
+        make_event(
+            om.ORDER_FILLED,
+            make_order(FENTRY, FP, side=om.SELL, utc=20),
+            position=make_position(FP, side=om.SELL),
+            deal=make_deal(9_200_005, FENTRY, FP, side=om.SELL, volume=100, price=85250.0, ts=20),
+        ),
+        NOTHING,
+    )
+    protective = foreign_protective(PROTECTED_AT, stop=85500.0, limit=85000.0)
+    protective.tradeData.tradeSide = om.BUY
+
+    records = b.apply(
+        make_event(
+            om.ORDER_ACCEPTED, protective, position=make_position(FP, side=om.SELL), server=True
+        ),
+        NOTHING,
+    )
+
+    assert [(r.venue_order_id, r.side) for r in records] == [
+        (foreign_leg_id(Level.STOP_LOSS), "BUY"),
+        (foreign_leg_id(Level.TAKE_PROFIT), "BUY"),
+    ]
+
+
+def test_a_closed_foreign_positions_legs_end_once() -> None:
+    b = book()
+    foreign_opened(b)
+    b.apply(foreign_close(9_100_007, 100, 0, 41), NOTHING)
+
+    after = b.apply(make_event(om.ORDER_CANCELLED, foreign_protective(42, **BOTH)), NOTHING)
+
+    assert after == []
+    assert b.view(FP).foreign_legs == {}
+
+
 @pytest.mark.parametrize(
     ("held_closed", "generation"),
     [
