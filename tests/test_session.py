@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import struct
+import time
 
 import pytest
 from nautilus_trader.common.component import Logger
@@ -212,42 +213,81 @@ async def test_a_removed_restore_is_not_replayed() -> None:
         await server.stop()
 
 
-@pytest.mark.parametrize(
-    "lose",
-    [
-        pytest.param(lambda server: server.drop_connections(), id="dropped-socket"),
-        pytest.param(
-            lambda server: server.push(
-                oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID)
-            ),
-            id="ended-by-the-venue",
-        ),
-    ],
-)
-async def test_a_loss_is_told_to_every_loss_listener(lose) -> None:
+@pytest.mark.parametrize("loss", ["dropped-socket", "ended-by-the-venue", "token-refresh"])
+async def test_a_loss_is_told_to_every_loss_listener(
+    loss: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     server = authenticating_server()
+    server.on(
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOARefreshTokenRes(
+            accessToken="new-access",
+            tokenType="bearer",
+            expiresIn=2_592_000,
+            refreshToken="new-refresh",
+        ),
+    )
     await server.start()
     logger = RecordingLogger()
-    session = session_for(server, logger, backoff_base_secs=0.05)
-    told: list[SessionState] = []
+    expiry = {}
+    if loss == "token-refresh":
+        # The proactive refresh falls due about a second after bring-up, then re-authenticates.
+        monkeypatch.setattr("nautilus_ctrader.common.session.TOKEN_REFRESH_MARGIN_SECS", 1.0)
+        expiry = {"refresh_token": "old-refresh", "expires_at_secs": time.time() + 2.0}
+    session = session_for(server, logger, backoff_base_secs=0.05, **expiry)
+    # The connections opened when each loss was told.
+    told: list[int] = []
 
     def failing() -> None:
         raise RuntimeError("listener failed")
 
     try:
         session.add_loss_listener(failing)
-        session.add_loss_listener(lambda: told.append(session.state))
+        session.add_loss_listener(lambda: told.append(server.connection_count))
         await session.start()
         await session.wait_ready(timeout_secs=2.0)
 
-        await lose(server)
-        await wait_until(lambda: told, description="loss told")
+        if loss == "dropped-socket":
+            await server.drop_connections()
+        elif loss == "ended-by-the-venue":
+            await server.push(oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=ACCOUNT_ID))
+        await wait_until(lambda: told, timeout_secs=5.0, description="loss told")
         await wait_until(lambda: server.connection_count >= 2, description="reconnect")
         await session.wait_ready(timeout_secs=3.0)
 
         # Told once, before the reconnect, despite the listener before it raising.
-        assert told == [SessionState.CONNECTING]
+        assert told == [1]
         assert any("listener" in line for line in logger.errors())
+    finally:
+        await session.stop()
+        await server.stop()
+
+
+async def test_a_loss_while_restoring_is_told() -> None:
+    server = authenticating_server()
+    await server.start()
+    session = session_for(server, backoff_base_secs=0.05)
+    restores: list[int] = []
+    told: list[int] = []
+
+    async def drop_on_the_first_reconnect() -> None:
+        restores.append(1)
+        if len(restores) == 2:
+            await server.drop_connections()
+            await wait_until(lambda: session.state is SessionState.CONNECTING)
+
+    try:
+        session.add_restore("dropping", drop_on_the_first_reconnect)
+        session.add_loss_listener(lambda: told.append(len(restores)))
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+
+        await server.drop_connections()
+        await wait_until(lambda: len(restores) >= 3, description="a third bring-up")
+        await session.wait_ready(timeout_secs=3.0)
+
+        # The ready session's loss, then the one inside the reconnect's restore.
+        assert told == [1, 2]
     finally:
         await session.stop()
         await server.stop()

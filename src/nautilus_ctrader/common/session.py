@@ -176,10 +176,11 @@ class CTraderSession:
             del self._event_handlers[payload_class]
 
     def add_loss_listener(self, callback: Callable[[], None]) -> None:
-        """Register `callback()` for every loss of a ready session, before it reconnects.
+        """Register `callback()` for every loss, before the session reconnects.
 
         A loss is a dropped connection or an authentication the venue ended, including the
-        re-authentication after a token refresh; `stop()` is none.
+        re-authentication after a token refresh, of a ready session or of one authenticating or
+        restoring; `stop()` is none.
         """
         self._loss_listeners.append(callback)
 
@@ -285,8 +286,10 @@ class CTraderSession:
         loop = asyncio.get_running_loop()
         attempt = 0
         while not self._stopping:
+            up = False
             try:
                 await self._bring_up()
+                up = True
                 ready_at = loop.time()
                 await self._lost.wait()
                 if self._stopping:
@@ -316,6 +319,10 @@ class CTraderSession:
             except Exception as e:
                 self.last_error = e
                 attempt += 1
+                # `_bring_up` clears `_lost` first: set, it is a loss inside this bring-up, after
+                # restores may have run.
+                if not up and self._lost.is_set() and not self._stopping:
+                    self._tell_loss()
                 await self._teardown_connection()
                 await self._back_off(attempt, f"Session bring-up failed (attempt {attempt}): {e}")
 

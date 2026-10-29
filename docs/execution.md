@@ -826,22 +826,32 @@ Nautilus's while the node runs.
 ```
 
 - `positions` is sorted by position id. `position_id` is the broker's id, the same value Nautilus
-  holds as the position's `venue_position_id`. `symbol` is the broker's symbol name. `side` is
-  `"LONG"` or `"SHORT"`. `units` is plain decimal text without trailing zeros. An empty account has
-  `"positions": []`.
-- `complete` is `true` while the model follows the broker. It turns `false` when the connection is
-  lost, when the client disconnects, and while a rebuild of the model runs. It stays `false`, with
-  the last positions kept, until the next rebuild has stood. A rebuild that fails without a loss
-  turns it back to `true`, because the earlier model still stands. With `false`, skip the
-  comparison.
+  holds as the position's `venue_position_id`. `symbol` is the broker's symbol name, or the
+  numeric symbol id as text when the account's symbol list lacks it. `side` is `"LONG"` or
+  `"SHORT"`. `units` is plain decimal text without trailing zeros. An empty account has
+  `"positions": []`. A position that a rebuild's snapshot lacked but the model keeps until its
+  close event arrives is listed.
+- `complete` is `true` while no outage and no rebuild is known. It turns `false` when the
+  connection is lost, also during a reconnect, when the client disconnects, and while a rebuild
+  of the model runs. It stays `false`, with the last positions kept, until the next rebuild has
+  stood. A rebuild that fails without a loss turns it back to `true`, because the earlier model
+  still stands. `true` does not prove the model exact. With `false`, skip the comparison.
 - `updated_ms` is the newest broker time the client had seen when the key was written, in ms, or
-  `null` before any. Snapshots, execution events and spots all advance it, so it can be later than
-  the last change to a position. On a quiet account it can stay the same for hours.
+  `null` before any; an empty, quiet account can have `null` with `complete: true`. Snapshots,
+  execution events and spots all advance it, so it can be later than the last change to a
+  position. On a quiet account it can stay the same for hours.
 
 The key is absent until the first rebuild, at connect. It is written whole after every rebuild
 (at connect, and in every reconciliation pass before the mass status is returned or sent), after
 every execution event the model applies, and whenever `complete` changes. Read it as you read
 `ctrader.unloaded_exposure`: in `on_start`, and whenever `reports.execution.CTRADER` fires.
+
+- **It can run ahead of Nautilus.** The key is written as an event is applied to the model, while
+  Nautilus gets the fill through its own queue, possibly behind earlier reports the adapter still
+  holds. Before alerting on a mismatch, compare again later or after a grace period.
+- **A cache database can hold an old key.** With a database behind the Nautilus cache, a key
+  written by a previous process may be loaded at start. Read it only after the client has
+  connected, for example in `on_start`.
 
 ```python
 import json

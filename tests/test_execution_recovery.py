@@ -970,6 +970,34 @@ async def test_a_lost_connection_marks_the_venue_positions_incomplete() -> None:
         assert venue_positions(h)["positions"] == TWO_POSITIONS[:1]
 
 
+async def test_a_loss_while_restoring_after_the_rebuild_marks_the_venue_positions_incomplete() -> (
+    None
+):
+    venue = ExecutionVenue()
+    two_positions(venue)
+    async with harness(execution_venue=venue) as h:
+        await started(h)
+        held: list[HeldReplies] = []
+
+        async def drop_once() -> None:
+            # A restore after the client's, during which the socket drops.
+            if held:
+                return
+            held.append(hold_account_auth(h.server))
+            await h.server.drop_connections()
+            await wait_until(lambda: h.client._session.state is SessionState.CONNECTING)
+
+        h.client._session.add_restore("zz-drop", drop_once)
+        await h.server.drop_connections()
+        await wait_until(lambda: held, timeout_secs=10)
+        await asyncio.wait_for(held[0].arrived.wait(), timeout=10)
+
+        # The reconnect's pass stood, then the connection was lost again.
+        assert len(h.mass_statuses) == 1
+        assert venue_positions(h)["complete"] is False
+        await held[0].stop_holding()
+
+
 async def test_a_detach_marks_the_venue_positions_incomplete() -> None:
     venue = ExecutionVenue()
     two_positions(venue)
