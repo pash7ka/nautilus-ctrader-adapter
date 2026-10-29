@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import struct
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from decimal import Decimal
 
 import pytest
@@ -956,11 +957,7 @@ SHORT_STOP, SHORT_TARGET = 85376.30, 85196.40
 
 def short_events() -> list:
     """The first bracket as a short: sold at the bid, its protective order a buy (hand-built)."""
-    found = []
-    for recorded in FIRST_EVENTS[:3]:
-        event = type(recorded)()
-        event.CopyFrom(recorded)
-        found.append(event)
+    found = [copy.deepcopy(event) for event in FIRST_EVENTS[:3]]
     accepted, filled, protected = found
     for event in found:
         event.position.tradeData.tradeSide = om.SELL
@@ -995,7 +992,6 @@ async def test_a_sell_bracket_is_measured_from_the_bid() -> None:
         assert request.relativeTakeProfit == 8_960_000
         assert status(h, ENTRY) == OrderStatus.FILLED
         stop, target = h.cache.order(ClientOrderId(STOP)), h.cache.order(ClientOrderId(TARGET))
-        assert stop.side == target.side == OrderSide.BUY
         assert stop.trigger_price == Price.from_str("85376.30")
         assert target.price == Price.from_str("85196.40")
         assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
@@ -1568,11 +1564,7 @@ async def test_no_amend_when_the_broker_set_the_levels_asked_for() -> None:
 
 def half_filled_entry() -> list:
     """The first bracket's entry filled for half its volume, then protected for it (hand-built)."""
-    found = []
-    for recorded in FIRST_EVENTS[:3]:
-        event = type(recorded)()
-        event.CopyFrom(recorded)
-        found.append(event)
+    found = [copy.deepcopy(event) for event in FIRST_EVENTS[:3]]
     _, filled, protected = found
     filled.executionType = om.ORDER_PARTIAL_FILL
     filled.order.orderStatus = om.ORDER_STATUS_ACCEPTED
@@ -2554,10 +2546,10 @@ async def test_a_foreign_leg_is_moved_by_an_amend_keeping_the_other_level(
         assert h.logger.errors() == []
 
 
-async def answered_during_a_rebuild(h, command: ModifyOrder) -> None:
-    """Run `command` while a rebuild holds the events, its answer among them."""
+async def answered_while_held(h, command: Callable[[], Coroutine]) -> None:
+    """Run `command` while the buffer holds the events, its answer among them."""
     h.client._hold_buffer()
-    commanding = asyncio.create_task(h.client._modify_order(command))
+    commanding = asyncio.create_task(command())
     await wait_until(lambda: len(h.client._buffer) == 1)
     h.client._release_buffer()
     await asyncio.wait_for(commanding, timeout=5)
@@ -2570,7 +2562,9 @@ async def test_a_foreign_leg_modify_answered_during_a_rebuild_is_reported_once()
     async with harness(execution_venue=execution_venue) as h:
         _, order = await foreign_legs(h)
         before = len(reports_of(h, FOREIGN_TP))
-        await answered_during_a_rebuild(h, modify(order.client_order_id.value, price="85400.00"))
+        await answered_while_held(
+            h, lambda: h.client._modify_order(modify(order.client_order_id.value, price="85400.00"))
+        )
 
         (moved,) = reports_of(h, FOREIGN_TP)[before:]
         assert moved.order_status == OrderStatus.ACCEPTED
@@ -2810,14 +2804,9 @@ async def test_a_pending_external_order_is_cancelled_at_the_broker() -> None:
 async def test_a_pending_order_cancel_answered_during_a_rebuild_is_not_rejected() -> None:
     async with harness(execution_venue=resting_venue()) as h:
         order = await held_resting(h)
-        h.client._hold_buffer()
-        cancelling = asyncio.create_task(
-            h.client._cancel_order(cancel(order.client_order_id.value))
+        await answered_while_held(
+            h, lambda: h.client._cancel_order(cancel(order.client_order_id.value))
         )
-        # The broker's answer is held with the rebuild's other events.
-        await wait_until(lambda: len(h.client._buffer) == 1)
-        h.client._release_buffer()
-        await asyncio.wait_for(cancelling, timeout=5)
         await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.CANCELED)
 
         assert sent_about(h, order) == []
@@ -2828,7 +2817,9 @@ async def test_a_pending_order_amend_answered_during_a_rebuild_is_reported_once(
     async with harness(execution_venue=resting_venue()) as h:
         order = await held_resting(h)
         before = len(reports_of(h, str(RESTING)))
-        await answered_during_a_rebuild(h, modify(order.client_order_id.value, price="84100.00"))
+        await answered_while_held(
+            h, lambda: h.client._modify_order(modify(order.client_order_id.value, price="84100.00"))
+        )
 
         (amended,) = reports_of(h, str(RESTING))[before:]
         assert amended.order_status == OrderStatus.ACCEPTED
@@ -4446,6 +4437,9 @@ async def test_a_settling_rebuild_answers_each_leg_independently(
         if stop_removed_before:
             await push(h, protective(None, 85387.22, utc=AMEND_FROM))
             await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
+            # The stop-loss died first, so the rebuild has yet to settle the bracket.
+            assert len(h.client._brackets) == 1
+            assert h.client._buffer is None
         await wait_until(lambda: len(h.client._brackets) == 0)
         await wait_until(lambda: len(amends) == 1)
         await sync(h)

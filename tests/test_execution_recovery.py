@@ -12,7 +12,7 @@ import functools
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -827,15 +827,11 @@ async def test_exposure_written_at_connect_and_on_change() -> None:
         assert h.cache.get(UNLOADED_EXPOSURE_KEY) == b"[]"
 
 
-async def test_reconciliation_reads_unloaded_symbols_open_positions_only_and_covers_the_rest() -> (
-    None
-):
+async def test_a_pass_reads_only_open_unloaded_positions() -> None:
     now = int(time.time() * 1000)
     venue = ExecutionVenue()
     # Ids in the order the pass covers them: closed unloaded, open unloaded, loaded.
     closed_unloaded, open_unloaded = 5_000_101, 5_000_102
-    order = make_order(6_000_101, closed_unloaded, symbol=EURUSD_SYMBOL_ID)
-    order.orderStatus = om.ORDER_STATUS_FILLED
     for deal_id, side in ((7_000_101, om.BUY), (7_000_102, om.SELL)):
         deal = make_deal(
             deal_id, 6_000_101, closed_unloaded, side=side, volume=100, price=1.1, ts=now - 60_000
@@ -1254,7 +1250,7 @@ def target_moved_to(price: float | None) -> oa.ProtoOAExecutionEvent:
 async def answered_during_a_rebuild(
     h: Harness,
     venue: ExecutionVenue,
-    command: Callable[[], object],
+    command: Callable[[], Coroutine],
     *,
     read_after: oa.ProtoOAExecutionEvent | None = None,
 ) -> None:
@@ -1297,6 +1293,7 @@ def target_modify(price: str) -> ModifyOrder:
 
 
 def target_updates(h: Harness) -> list[Price]:
+    """The prices of the `OrderUpdated` events the client sent for `TARGET`."""
     return [e.price for e in h.events_of(TARGET) if isinstance(e, OrderUpdated)]
 
 
@@ -1319,7 +1316,8 @@ async def test_an_amend_answered_during_a_rebuild_reads_the_rebuilt_view() -> No
 
 
 async def test_an_amend_the_rebuild_read_already_is_still_answered() -> None:
-    # The answer changes nothing once released, so no update of the model's answers the modify.
+    # Released, the answer changes nothing, so the modify is answered from the standing level.
+    # `target_updates` counts the updates the client sent, which a mass-status pass would not add.
     venue = serving()
     venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: target_moved_to(85400.0))
     async with harness(execution_venue=venue) as h:
@@ -1689,27 +1687,27 @@ async def test_a_bracket_the_broker_does_not_list_stays_pending_across_a_reconne
         assert status(h, STOP) == OrderStatus.SUBMITTED
 
 
-RESTING_ENTRY, RESTING_STOP, RESTING_TARGET = "O-E-5400009", "O-SL-5400009", "O-TP-5400009"
+UNFILLED_ENTRY, UNFILLED_STOP, UNFILLED_TARGET = "O-E-5400009", "O-SL-5400009", "O-TP-5400009"
 
 
-async def test_a_reconnect_keeps_a_resting_entrys_bracket_and_ends_a_closed_one() -> None:
+async def test_a_reconnect_keeps_an_unfilled_entrys_bracket_and_ends_a_closed_one() -> None:
     now = int(time.time() * 1000)
     venue = ExecutionVenue()
     async with harness(execution_venue=venue, config=LOSING) as h:
         # Pending first, so the pass meets it first.
-        await lost_bracket_with_a_waiting_modify(h, RESTING_ENTRY, RESTING_STOP, RESTING_TARGET)
+        await lost_bracket_with_a_waiting_modify(h, UNFILLED_ENTRY, UNFILLED_STOP, UNFILLED_TARGET)
         await lost_bracket_with_a_waiting_modify(h)
         # The broker holds the first entry accepted and unfilled.
-        resting = make_order(
+        unfilled = make_order(
             6_400_009,
             5_400_009,
             utc=now - 30_000,
-            label=order_record.encode_label(RESTING_ENTRY),
-            comment=order_record.encode_comment(LegIds(RESTING_STOP, RESTING_TARGET)),
-            client_order_id=RESTING_ENTRY,
+            label=order_record.encode_label(UNFILLED_ENTRY),
+            comment=order_record.encode_comment(LegIds(UNFILLED_STOP, UNFILLED_TARGET)),
+            client_order_id=UNFILLED_ENTRY,
             symbol=US100_SYMBOL_ID,
         )
-        venue.snapshot.order.append(resting)
+        venue.snapshot.order.append(unfilled)
         bracket_closed_meanwhile(venue, opened=now - 120_000, closed=now - 60_000)
 
         await h.server.drop_connections()
@@ -1720,12 +1718,13 @@ async def test_a_reconnect_keeps_a_resting_entrys_bracket_and_ends_a_closed_one(
         (listed,) = [
             r
             for r in built.order_reports.values()
-            if r.client_order_id == ClientOrderId(RESTING_ENTRY)
+            if r.client_order_id == ClientOrderId(UNFILLED_ENTRY)
         ]
         assert listed.filled_qty == Quantity.from_str("0.00")
         assert h.client._brackets.by_entry(ENTRY) is None
-        assert h.client._brackets.by_entry(RESTING_ENTRY) is not None
-        assert "OrderModifyRejected" not in h.kinds_of(RESTING_STOP)
+        assert h.client._brackets.by_entry(UNFILLED_ENTRY) is not None
+        assert "OrderModifyRejected" not in h.kinds_of(UNFILLED_STOP)
+        assert status(h, UNFILLED_STOP) == OrderStatus.SUBMITTED
 
 
 def moved(event: oa.ProtoOAExecutionEvent, by_ms: int) -> oa.ProtoOAExecutionEvent:

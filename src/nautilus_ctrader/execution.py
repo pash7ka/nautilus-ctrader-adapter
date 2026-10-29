@@ -383,8 +383,8 @@ _ModelEvent = oa.ProtoOAExecutionEvent | oa.ProtoOATrailingSLChangedEvent
 class _Buffered:
     """An event held while the venue model is rebuilt; it is applied later.
 
-    `records` are what applying it produced, set when the buffer is released; `None` until
-    then, and for good if a detach drops the buffer.
+    `records` are what applying the held event produced; `None` until the release applies it,
+    and for good if it never does.
     """
 
     records: list[Record] | None = None

@@ -555,8 +555,9 @@ on the same account, which run afterwards at a lower request priority.
 
 A modify whose answer arrives while the venue model is being rebuilt, at a reconnect or any
 other time, is held with the other events. The command waits for the rebuild and is answered by
-what its held answer did when applied, so the leg or order it changed is updated once. One limit
-remains: if the rebuild takes longer than `connect_timeout_secs`, the command does not wait any
+what its held answer did when applied, so the client sends one update for the leg or order it
+changed. If the rebuild's snapshot already holds the new level, the mass-status pass of a
+reconnect reconciles that level as well. One limit remains: if the rebuild takes longer than `connect_timeout_secs`, the command does not wait any
 longer and is answered from the model as it stands. That can be an `OrderUpdated` at the old
 level, followed by a second `OrderUpdated` at the new level when the held answer is applied.
 
