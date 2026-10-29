@@ -929,7 +929,13 @@ def test_entries_rejected_without_a_position_id_are_each_reported() -> None:
     assert b.view(0) is None
 
 
-def test_a_position_first_seen_through_its_protective_order_takes_the_opposite_side() -> None:
+@pytest.mark.parametrize(
+    ("protective_side", "stop", "target", "expected"),
+    [(om.SELL, 85000.0, 85500.0, "BUY"), (om.BUY, 85500.0, 85000.0, "SELL")],
+)
+def test_a_position_first_seen_through_its_protective_order_takes_the_opposite_side(
+    protective_side, stop, target, expected
+) -> None:
     b = book()
     b.apply(
         make_event(
@@ -938,17 +944,18 @@ def test_a_position_first_seen_through_its_protective_order_takes_the_opposite_s
                 78,
                 67,
                 order_type=om.STOP_LOSS_TAKE_PROFIT,
-                side=om.SELL,
+                side=protective_side,
                 closing=True,
                 utc=29,
-                stop=85000.0,
-                limit=85500.0,
+                stop=stop,
+                limit=target,
             ),
         ),
         NOTHING,
     )
 
-    assert b.view(67).side == "BUY"
+    assert b.view(67).side == expected
+    assert b.view(67).symbol_id == SYMBOL
 
 
 # Protection that came short.
@@ -965,6 +972,53 @@ def test_a_leg_whose_level_the_protective_order_lacks_is_missing_after_the_wait(
     )
 
     assert b.protection_timed_out(P) == [ProtectionMissing(P, None, target_id(P))]
+
+
+def test_a_bracket_with_only_a_take_profit_has_that_leg_accepted() -> None:
+    b = book()
+    entry = make_order(
+        ENTRY,
+        P,
+        utc=10,
+        label=encode_label(entry_id(P)),
+        comment=encode_comment(LegIds(None, target_id(P))),
+        client_order_id=entry_id(P),
+    )
+    b.apply(
+        make_event(
+            om.ORDER_ACCEPTED,
+            entry,
+            position=make_position(P, volume=0, status=om.POSITION_STATUS_CREATED),
+        ),
+        NOTHING,
+    )
+    b.apply(
+        make_event(
+            om.ORDER_FILLED,
+            entry,
+            position=make_position(P),
+            deal=make_deal(9_200_001, ENTRY, P, side=om.BUY, volume=100, price=85250.0, ts=20),
+        ),
+        NOTHING,
+    )
+
+    records = b.apply(
+        make_event(
+            om.ORDER_ACCEPTED, protective(21, limit=85500.0), position=make_position(P), server=True
+        ),
+        NOTHING,
+    )
+
+    assert records == [
+        leg(
+            OrderEventKind.ACCEPTED,
+            Level.TAKE_PROFIT,
+            21,
+            quantity=Decimal("1"),
+            price=Decimal("85500.00"),
+        )
+    ]
+    assert b.view(P).legs == {Level.TAKE_PROFIT: (target_id(P), True)}
 
 
 @pytest.mark.parametrize(
@@ -1096,24 +1150,68 @@ def test_an_event_seen_before_means_nothing_new() -> None:
     assert b.apply(event, Amending()) == []
 
 
-def test_two_replaces_in_the_same_millisecond_both_apply() -> None:
+@pytest.mark.parametrize(
+    ("second", "expected"),
+    [
+        (
+            {"stop": 85200.0},
+            [
+                leg(
+                    OrderEventKind.UPDATED,
+                    Level.STOP_LOSS,
+                    25,
+                    quantity=Decimal("1"),
+                    trigger_price=Decimal("85200.00"),
+                )
+            ],
+        ),
+        (
+            {"limit": 85600.0},
+            [
+                leg(
+                    OrderEventKind.UPDATED,
+                    Level.TAKE_PROFIT,
+                    25,
+                    quantity=Decimal("1"),
+                    price=Decimal("85600.00"),
+                )
+            ],
+        ),
+        (
+            {"volume": 60},
+            [
+                leg(OrderEventKind.UPDATED, Level.STOP_LOSS, 25, quantity=Decimal("0.6")),
+                leg(OrderEventKind.UPDATED, Level.TAKE_PROFIT, 25, quantity=Decimal("0.6")),
+            ],
+        ),
+    ],
+    ids=["stop", "target", "volume"],
+)
+def test_two_replaces_in_the_same_millisecond_both_apply(second, expected) -> None:
     b = book()
     opened(b)
+    first = {"stop": 85100.0, "limit": 85500.0}
 
-    b.apply(make_event(om.ORDER_REPLACED, protective(25, stop=85100.0, limit=85500.0)), Amending())
-    records = b.apply(
-        make_event(om.ORDER_REPLACED, protective(25, stop=85200.0, limit=85500.0)), Amending()
-    )
+    b.apply(make_event(om.ORDER_REPLACED, protective(25, **first)), Amending())
+    records = b.apply(make_event(om.ORDER_REPLACED, protective(25, **(first | second))), Amending())
 
-    assert records == [
-        leg(
-            OrderEventKind.UPDATED,
-            Level.STOP_LOSS,
-            25,
-            quantity=Decimal("1"),
-            trigger_price=Decimal("85200.00"),
-        )
-    ]
+    assert records == expected
+
+
+def test_a_deal_seen_again_under_another_execution_type_fills_once() -> None:
+    b = book()
+    opened(b)
+    levels = {"stop": 85000.0, "limit": 85500.0}
+    partial = {"deal_volume": 40, "left": 60, **levels}
+
+    first = trigger(b, 9_200_005, 84990.0, 30, kind=om.ORDER_PARTIAL_FILL, **partial)
+    # The same deal as a fill event, as a read of the position's deals rebuilds it.
+    again = trigger(b, 9_200_005, 84990.0, 30, kind=om.ORDER_FILLED, **partial)
+
+    assert first != []
+    assert again == []
+    assert b.deal_applied(9_200_005) is True
+    assert b.deal_applied(9_200_006) is False
 
 
 def test_an_event_whose_handling_failed_can_be_applied_again(monkeypatch) -> None:
@@ -1302,6 +1400,19 @@ def test_load_an_unreadable_leg_record_is_a_notice() -> None:
     assert b.view(P).ours and b.view(P).legs == {}
 
 
+def test_a_kept_positions_close_older_than_the_snapshot_ends_its_keep() -> None:
+    b = book()
+    opened(b)
+    b.load(oa.ProtoOAReconcileRes(ctidTraderAccountId=1_000_001), {}, keep_gone=True, read_ms=100)
+    assert b.kept() == frozenset({P})
+
+    # The snapshot lacked the position because this close came before it.
+    trader_close(b, 9_100_004, 100, 0, 50)
+
+    assert b.kept() == frozenset()
+    assert not b.awaits_close(P)
+
+
 # Branches of the entry, the protective order and the closes.
 
 
@@ -1449,17 +1560,20 @@ def test_inverted_levels_on_a_short_follow_the_rule_with_a_notice() -> None:
 def test_a_traders_partial_close_then_the_protective_order_follows_the_volume() -> None:
     b = book()
     opened(b)
+    levels = {"stop": 85000.0, "limit": 85500.0}
 
     closing = trader_close(b, 9_100_004, 40, 60, 41)
     followed = b.apply(
         make_event(
             om.ORDER_REPLACED,
-            protective(42, stop=85000.0, limit=85500.0, volume=60),
+            protective(42, volume=60, **levels),
             position=make_position(P, volume=60),
             server=True,
         ),
         NOTHING,
     )
+    # The resized leg fills in full at the trigger, and so ends filled.
+    triggered = trigger(b, 9_200_010, 84990.0, 50, deal_volume=60, volume=60, **levels)
 
     assert closing == [
         external_close(9_100_004, "0.4", 41),
@@ -1468,6 +1582,15 @@ def test_a_traders_partial_close_then_the_protective_order_follows_the_volume() 
     assert followed == [
         leg(OrderEventKind.UPDATED, Level.STOP_LOSS, 42, quantity=Decimal("0.6")),
         leg(OrderEventKind.UPDATED, Level.TAKE_PROFIT, 42, quantity=Decimal("0.6")),
+    ]
+    assert triggered == [
+        leg(
+            OrderEventKind.FILLED,
+            Level.STOP_LOSS,
+            50,
+            fill=fill(9_200_010, "84990.00", 50, units="0.6"),
+        ),
+        leg(OrderEventKind.CANCELED, Level.TAKE_PROFIT, 50),
     ]
 
 
@@ -1582,24 +1705,75 @@ def test_a_foreign_order_filled_after_its_report_is_a_fill() -> None:
     ]
 
 
+def test_an_external_order_first_seen_at_a_partial_fill_is_reported_once() -> None:
+    b = book()
+    order = make_order(17, 18, order_type=om.LIMIT, utc=10, limit=84000.0)
+
+    first = b.apply(
+        make_event(
+            om.ORDER_PARTIAL_FILL,
+            order,
+            position=make_position(18, volume=40),
+            deal=make_deal(19, 17, 18, side=om.BUY, volume=40, price=84000.0, ts=11),
+        ),
+        NOTHING,
+    )
+    rest = b.apply(
+        make_event(
+            om.ORDER_FILLED,
+            order,
+            position=make_position(18),
+            deal=make_deal(20, 17, 18, side=om.BUY, volume=60, price=84000.0, ts=12),
+        ),
+        NOTHING,
+    )
+
+    assert first == [
+        ExternalOrder(
+            "17",
+            SYMBOL,
+            "BUY",
+            ExternalType.LIMIT,
+            Decimal("1"),
+            False,
+            "18",
+            10,
+            price=Decimal("84000.00"),
+            fills=(fill(19, "84000.00", 11, units="0.4", side="BUY", position=18),),
+        )
+    ]
+    assert rest == [
+        OrderEvent(
+            OrderEventKind.FILLED,
+            "17",
+            None,
+            12,
+            fill=fill(20, "84000.00", 12, units="0.6", side="BUY", position=18),
+        )
+    ]
+
+
 # Symbols the node has not loaded.
 
 UNLOADED = 279
 
 
 @pytest.mark.parametrize("with_position", [True, False])
-def test_an_unloaded_protective_order_is_a_change_of_its_position(with_position) -> None:
+@pytest.mark.parametrize(("position_side", "expected"), [(om.BUY, "BUY"), (om.SELL, "SELL")])
+def test_an_unloaded_protective_order_is_a_change_of_its_position(
+    with_position, position_side, expected
+) -> None:
     order = make_order(
         70,
         8,
         order_type=om.STOP_LOSS_TAKE_PROFIT,
-        side=om.SELL,
+        side=om.SELL if position_side == om.BUY else om.BUY,
         closing=True,
         utc=50,
         stop=1.0,
         symbol=UNLOADED,
     )
-    position = make_position(8, symbol=UNLOADED) if with_position else None
+    position = make_position(8, side=position_side, symbol=UNLOADED) if with_position else None
 
     records = book().apply(make_event(om.ORDER_REPLACED, order, position=position), NOTHING)
 
@@ -1608,7 +1782,7 @@ def test_an_unloaded_protective_order_is_a_change_of_its_position(with_position)
             ActivityKind.UNLOADED_SYMBOL,
             UNLOADED,
             "position",
-            "BUY",
+            expected,
             Decimal("1"),
             Action.CHANGED,
             50,
@@ -2524,6 +2698,22 @@ def test_close_order_is_known_once_matched() -> None:
     assert b.known_closes() == {9_100_003: "O-C-1"}
 
 
+def test_a_close_matched_by_a_query_is_the_nodes_accepted_close_and_named_once() -> None:
+    b = book()
+    opened(b)
+    close = make_order(9_100_003, P, side=om.SELL, closing=True, utc=40)
+
+    b.match_close(9_100_003, P, "O-C-1")
+    b.match_close(9_100_004, P, "O-C-1")
+    b.match_close(9_100_003, P, "O-C-2")
+    late = b.apply(make_event(om.ORDER_ACCEPTED, close, position=make_position(P)), NOTHING)
+
+    assert b.known_closes() == {9_100_003: "O-C-1"}
+    assert b.close_order("O-C-1") == (9_100_003, P)
+    # Listed by the broker, so already accepted.
+    assert late == []
+
+
 def test_a_fill_that_cannot_be_built_does_not_consume_the_acceptance() -> None:
     b = book()
 
@@ -3343,6 +3533,20 @@ def test_an_open_pending_order_is_held_as_last_changed() -> None:
 
     assert b.open_order(7) == resting(12, limit=84100.0)
     assert stale == []
+
+
+def test_a_pending_orders_replace_in_the_millisecond_of_its_held_state_is_an_update() -> None:
+    b = book()
+    b.apply(make_event(om.ORDER_ACCEPTED, resting(10)), NOTHING)
+
+    records = b.apply(make_event(om.ORDER_REPLACED, resting(10, limit=84100.0)), NOTHING)
+
+    assert records == [
+        OrderEvent(
+            OrderEventKind.UPDATED, "7", None, 10, quantity=Decimal("1"), price=Decimal("84100.00")
+        )
+    ]
+    assert b.open_order(7) == resting(10, limit=84100.0)
 
 
 def test_a_partly_filled_pending_order_is_held_with_its_fill() -> None:
