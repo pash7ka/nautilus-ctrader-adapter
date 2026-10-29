@@ -12,7 +12,7 @@ from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import OrderStatusReport
-from nautilus_trader.model.currencies import CAD, CHF, JPY, USD
+from nautilus_trader.model.currencies import BTC, CAD, CHF, JPY, USD
 from nautilus_trader.model.enums import (
     AccountType,
     ContingencyType,
@@ -145,6 +145,14 @@ def test_a_commission_not_in_the_base_currency_stays_in_the_deposit_currency() -
     assert reports.commission(fx_deal("1.16420"), USD, EURUSD) == Money(Decimal("24.98"), USD)
     assert reports.commission(fill(), USD, US100) == Money(Decimal("27.41"), USD)
     assert reports.commission(fx_deal("157.734", commission="0"), USD, USDJPY) == Money(0, JPY)
+
+
+def test_only_a_currency_pair_has_its_base_currency_commission_converted() -> None:
+    # Nautilus shrinks only a `CurrencyPair` position; another instrument keeps its commission.
+    perpetual = TestInstrumentProvider.xbtusd_bitmex()
+    deal = fill(units=Decimal(1), price=Decimal("68000.0"), commission=Decimal("-0.0005"))
+
+    assert reports.commission(deal, BTC, perpetual) == Money(Decimal("0.0005"), BTC)
 
 
 @pytest.mark.parametrize(

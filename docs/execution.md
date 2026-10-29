@@ -897,6 +897,10 @@ currency, then includes the commission.
 - **Realised profit** in Nautilus differs from the broker's by swap, by conversion fees (both
   reach the balance through the closing deal and never through a fill), and by the timing of the
   opening commission: Nautilus counts it at the open, the broker's balance takes it at the close.
+  Nautilus keeps realised profit in the instrument's quote currency and subtracts a commission only
+  when it is in that currency: on an instrument quoted in another currency than the deposit one
+  (EURGBP on a USD account, for example) the commission is left out entirely, and on a pair whose
+  base is the deposit currency it is counted at the deal's rate.
 
 ## 9. Known limits
 

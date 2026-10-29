@@ -749,7 +749,9 @@ def checklist(log_path: pathlib.Path) -> str:
             "order id and its comment the two legs' ids, exactly as logged here;",
             "- levels: the stop-loss and take-profit the broker holds, after the correcting "
             "amend, equal the legs' prices here; the moved stop-loss is an OrderUpdated;",
-            "- commission: each OrderFilled's commission equals its deal's, sign flipped;",
+            "- commission: each OrderFilled's commission equals its deal's, sign flipped (on a "
+            "pair whose base is the deposit currency: in the quote currency, at the deal's "
+            "price);",
             "- volume scaling: each quantity here, in units, is the broker's volume / 100, "
             "for the first entry (the minimum), the second (the minimum plus one size step), "
             "both closes and the partial close of one size step.",
