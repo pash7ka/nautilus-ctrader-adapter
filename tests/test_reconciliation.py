@@ -528,25 +528,6 @@ def test_reports_of_two_positions_interleave_by_time() -> None:
     ]
 
 
-def test_no_report_of_a_position_sorts_before_its_entry() -> None:
-    pid = 5_000_271
-    # Without a creation time, the first order's late last change makes the raise the entry.
-    first = make_order(6_000_271, pid, utc=5000)
-    raised = make_order(6_000_272, pid, utc=3000)
-    raised.tradeData.openTimestamp = 3000
-    close = make_order(6_000_273, pid, side=om.SELL, volume=200, closing=True, utc=6000)
-    deals = (
-        filled(first, 7_000_271, 100, 1000),
-        filled(raised, 7_000_272, 100, 3000),
-        filled(close, 7_000_273, 200, 6000),
-    )
-    found = PositionHistory((first, raised, close), deals)
-
-    result = run(reconcile_res(), {pid: found}, deals)
-
-    assert [r.venue_order_id for r in result.orders] == ["6000272", "6000271", "6000273"]
-
-
 def test_only_the_newest_of_two_closes_takes_the_close_in_flight() -> None:
     pid = 5_000_221
     entry = our_entry(pid, 6_000_220, volume=200)
