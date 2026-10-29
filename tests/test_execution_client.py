@@ -84,6 +84,7 @@ from tests.execution_replay import (
 )
 from tests.execution_venue import (
     ENTRY,
+    EURUSD_ID,
     FIRST_EVENTS,
     FOREIGN_EVENTS,
     STOP,
@@ -950,6 +951,56 @@ def test_a_sell_bracket_is_logged_as_measured_from_the_bid() -> None:
     assert text == "bid 1.10990, take-profit 0.025 away"
 
 
+SHORT_STOP, SHORT_TARGET = 85376.30, 85196.40
+
+
+def short_events() -> list:
+    """The first bracket as a short: sold at the bid, its protective order a buy (hand-built)."""
+    found = []
+    for recorded in FIRST_EVENTS[:3]:
+        event = type(recorded)()
+        event.CopyFrom(recorded)
+        found.append(event)
+    accepted, filled, protected = found
+    for event in found:
+        event.position.tradeData.tradeSide = om.SELL
+    accepted.order.tradeData.tradeSide = om.SELL
+    filled.order.tradeData.tradeSide = om.SELL
+    filled.deal.tradeSide = om.SELL
+    filled.deal.executionPrice = filled.position.price = protected.position.price = 85286.0
+    protected.order.tradeData.tradeSide = om.BUY
+    protected.order.stopPrice = protected.position.stopLoss = SHORT_STOP
+    protected.order.limitPrice = protected.position.takeProfit = SHORT_TARGET
+    return found
+
+
+async def test_a_sell_bracket_is_measured_from_the_bid() -> None:
+    async with harness(execution_venue=answered(short_events())) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(
+            h,
+            bracket(
+                h,
+                side=OrderSide.SELL,
+                stop_price=str(SHORT_STOP),
+                target_price=str(SHORT_TARGET),
+            ),
+        )
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.ACCEPTED)
+
+        (request,) = h.received(oa.ProtoOANewOrderReq)
+        assert request.tradeSide == om.SELL
+        # From the bid, 85286.00: the stop-loss above it, the take-profit below.
+        assert request.relativeStopLoss == 9_030_000
+        assert request.relativeTakeProfit == 8_960_000
+        assert status(h, ENTRY) == OrderStatus.FILLED
+        stop, target = h.cache.order(ClientOrderId(STOP)), h.cache.order(ClientOrderId(TARGET))
+        assert stop.side == target.side == OrderSide.BUY
+        assert stop.trigger_price == Price.from_str("85376.30")
+        assert target.price == Price.from_str("85196.40")
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+
+
 async def test_a_market_order_goes_out_without_levels_and_opens_a_position() -> None:
     async with harness(execution_venue=answered(market_events())) as h:
         await submit(h, market(h))
@@ -1232,6 +1283,25 @@ async def test_a_close_names_its_position_and_fills_under_its_own_id() -> None:
         assert h.reports == []
 
 
+async def test_a_close_is_matched_by_the_order_its_answer_names() -> None:
+    accepted, filled = close_events()
+    # Created in the ms of the fill the node saw last: by its time alone, a trader's close.
+    for event in (accepted, filled):
+        event.order.tradeData.openTimestamp = 20
+    execution_venue = answered(market_events())
+    execution_venue.server.on(om.PROTO_OA_CLOSE_POSITION_REQ, lambda _r: accepted)
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_market_position(h)
+        await submit(h, close_order(h), position_id=PositionId(str(MARKET_POSITION)))
+        await push(h, filled)
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.FILLED)
+
+        assert h.kinds_of(CLOSE_ID) == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+        (fill,) = [e for e in h.events_of(CLOSE_ID) if isinstance(e, OrderFilled)]
+        assert fill.trade_id == TradeId("7100002")
+        assert h.reports == []
+
+
 async def test_a_close_without_its_position_is_refused() -> None:
     async with harness() as h:
         await submit(h, close_order(h))
@@ -1302,6 +1372,24 @@ async def test_a_close_that_would_add_to_the_position_is_refused() -> None:
         await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
 
         assert "would not reduce" in rejection(h, CLOSE_ID)
+
+
+async def test_a_close_on_another_instrument_than_its_position_is_refused() -> None:
+    async with harness(execution_venue=closing_venue(), instruments=(US100_ID, EURUSD_ID)) as h:
+        await opened_market_position(h)
+        order = h.factory.market(
+            EURUSD_ID,
+            OrderSide.SELL,
+            Quantity.from_str("1.00"),
+            reduce_only=True,
+            client_order_id=ClientOrderId(CLOSE_ID),
+        )
+        await submit(h, order, position_id=PositionId(str(MARKET_POSITION)))
+        await wait_until(lambda: status(h, CLOSE_ID) == OrderStatus.REJECTED)
+
+        assert rejection(h, CLOSE_ID) == f"position {MARKET_POSITION} is not on {EURUSD_ID}"
+        assert h.received(oa.ProtoOAClosePositionReq) == []
+        assert h.logger.errors() == []
 
 
 async def test_a_close_the_broker_refuses_is_rejected_and_no_longer_in_flight() -> None:
@@ -1478,6 +1566,37 @@ async def test_no_amend_when_the_broker_set_the_levels_asked_for() -> None:
         assert len(h.client._brackets) == 0
 
 
+def half_filled_entry() -> list:
+    """The first bracket's entry filled for half its volume, then protected for it (hand-built)."""
+    found = []
+    for recorded in FIRST_EVENTS[:3]:
+        event = type(recorded)()
+        event.CopyFrom(recorded)
+        found.append(event)
+    _, filled, protected = found
+    filled.executionType = om.ORDER_PARTIAL_FILL
+    filled.order.orderStatus = om.ORDER_STATUS_ACCEPTED
+    filled.order.executedVolume = 50
+    filled.deal.volume = filled.deal.filledVolume = 50
+    filled.position.tradeData.volume = protected.position.tradeData.volume = 50
+    protected.order.tradeData.volume = 50
+    return found
+
+
+async def test_a_leg_accepted_after_a_partial_entry_fill_takes_the_protective_volume() -> None:
+    async with harness(execution_venue=answered(half_filled_entry())) as h:
+        await opened_bracket(h)
+
+        for leg in (STOP, TARGET):
+            assert h.kinds_of(leg) == ["OrderSubmitted", "OrderAccepted", "OrderUpdated"]
+            await wait_until(
+                lambda leg=leg: (
+                    h.cache.order(ClientOrderId(leg)).quantity == Quantity.from_str("0.50")
+                ),
+            )
+        assert status(h, ENTRY) == OrderStatus.PARTIALLY_FILLED
+
+
 async def test_a_refused_correction_leaves_each_leg_where_the_broker_holds_it() -> None:
     execution_venue = answered(FIRST_EVENTS[:3])
     execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
@@ -1569,6 +1688,33 @@ async def test_a_modify_waiting_on_a_rejected_entry_is_rejected_before_the_leg_i
         assert h.kinds_of(STOP) == ["OrderSubmitted", "OrderModifyRejected", "OrderCanceled"]
 
 
+async def test_a_refused_correction_rejects_the_cancel_and_the_modify_it_carried() -> None:
+    execution_venue = ExecutionVenue()
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_NEW_ORDER_REQ, lambda _r: FIRST_EVENTS[0]
+    )
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: REFUSED_STOPS)
+    async with harness(execution_venue=execution_venue) as h:
+        sending = await in_flight(h, held)
+        await h.client._modify_order(modify(STOP, trigger_price="85150.00"))
+        await h.client._cancel_order(cancel(TARGET))
+        await held.release()
+        await asyncio.wait_for(sending, timeout=5)
+        await push(h, *FIRST_EVENTS[1:3])
+        await wait_until(lambda: len(h.client._brackets) == 0)
+        await sync(h)
+
+        reason = "TRADING_BAD_STOPS: Invalid stops"
+        (cancel_rejected,) = refusals(h, h.cache.order(ClientOrderId(TARGET)))
+        assert isinstance(cancel_rejected, OrderCancelRejected)
+        assert cancel_rejected.reason == reason
+        (modify_rejected,) = refusals(h, h.cache.order(ClientOrderId(STOP)))
+        assert isinstance(modify_rejected, OrderModifyRejected)
+        assert modify_rejected.reason == reason
+        assert "OrderRejected" not in h.kinds_of(ENTRY)
+        assert len(h.received(oa.ProtoOAAmendPositionSLTPReq)) == 1
+
+
 def closed_by_hand() -> oa.ProtoOAExecutionEvent:
     """The first position closed whole by hand, with no level set yet (hand-built)."""
     event = type(FIRST_EVENTS[7])()
@@ -1621,15 +1767,25 @@ def entry_ended(kind: int, status: int) -> oa.ProtoOAExecutionEvent:
 
 
 @pytest.mark.parametrize(
-    ("kind", "order_status", "reason"),
+    ("kind", "order_status", "reason", "entry_status"),
     [
-        (om.ORDER_CANCELLED, om.ORDER_STATUS_CANCELLED, "the entry canceled"),
-        (om.ORDER_EXPIRED, om.ORDER_STATUS_EXPIRED, "the entry expired"),
-        (om.ORDER_REJECTED, om.ORDER_STATUS_REJECTED, "the entry rejected"),
+        (
+            om.ORDER_CANCELLED,
+            om.ORDER_STATUS_CANCELLED,
+            "the entry canceled",
+            OrderStatus.CANCELED,
+        ),
+        (om.ORDER_EXPIRED, om.ORDER_STATUS_EXPIRED, "the entry expired", OrderStatus.EXPIRED),
+        (
+            om.ORDER_REJECTED,
+            om.ORDER_STATUS_REJECTED,
+            "the entry rejected",
+            OrderStatus.REJECTED,
+        ),
     ],
 )
 async def test_a_bracket_whose_entry_ends_unfilled_answers_its_waiting_modify(
-    kind: int, order_status: int, reason: str
+    kind: int, order_status: int, reason: str, entry_status: OrderStatus
 ) -> None:
     execution_venue = ExecutionVenue()
     held = HeldReplies(
@@ -1656,6 +1812,10 @@ async def test_a_bracket_whose_entry_ends_unfilled_answers_its_waiting_modify(
             "OrderCanceled",
         ]
         assert h.kinds_of(TARGET)[-1] == "OrderCanceled"
+        await wait_until(lambda: status(h, ENTRY) == entry_status)
+        if kind == om.ORDER_REJECTED:
+            # The event names no error code.
+            assert rejection(h, ENTRY) == "rejected by the venue"
         assert h.logger.errors() == []
 
 
@@ -1730,6 +1890,50 @@ async def test_a_cancel_the_broker_refuses_is_rejected_and_the_level_stays() -> 
 
         assert status(h, STOP) == OrderStatus.ACCEPTED
         assert Level.STOP_LOSS in h.client._book.view(FIRST).levels
+
+
+def modify_rejections(h, client_order_id: str) -> list[OrderModifyRejected]:
+    return [e for e in h.events_of(client_order_id) if isinstance(e, OrderModifyRejected)]
+
+
+async def test_a_leg_modify_while_the_account_is_disconnected_is_refused_as_not_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with harness(execution_venue=answered(FIRST_EVENTS[:3])) as h:
+        await opened_bracket(h)
+        with monkeypatch.context() as patched:
+            # Gone from the account while the client still holds the position.
+            patched.setattr(h.account, "session", None)
+            await asyncio.wait_for(
+                h.client._modify_order(modify(STOP, trigger_price="85150.00")), timeout=5
+            )
+
+        (rejected,) = modify_rejections(h, STOP)
+        assert rejected.reason == "not connected to the venue"
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+        assert h.logger.errors() == []
+
+
+async def test_a_leg_modify_the_broker_refuses_is_rejected_after_one_send() -> None:
+    execution_venue = answered(FIRST_EVENTS[:3])
+    execution_venue.server.on(
+        om.PROTO_OA_AMEND_POSITION_SLTP_REQ,
+        lambda _r: oa.ProtoOAErrorRes(
+            ctidTraderAccountId=ACCOUNT_ID,
+            errorCode="TRADING_BAD_STOPS",
+            description="Invalid stops",
+        ),
+    )
+    async with harness(execution_venue=execution_venue) as h:
+        await opened_bracket(h)
+        await asyncio.wait_for(
+            h.client._modify_order(modify(STOP, trigger_price="85150.00")), timeout=10
+        )
+
+        assert len(h.received(oa.ProtoOAAmendPositionSLTPReq)) == 1
+        (rejected,) = modify_rejections(h, STOP)
+        assert rejected.reason == "TRADING_BAD_STOPS: Invalid stops"
+        assert h.cache.order(ClientOrderId(STOP)).trigger_price == Price.from_str("85197.20")
 
 
 def keep_levels(execution_venue: ExecutionVenue) -> list:
@@ -1950,6 +2154,40 @@ async def test_levels_the_broker_refuses_after_the_wait_reject_the_legs_with_an_
         )
 
         assert any("stands without its levels" in line for line in h.logger.errors())
+
+
+def protected_without_target() -> oa.ProtoOAExecutionEvent:
+    """The first position's protective order with its stop-loss alone (hand-built)."""
+    event = type(FIRST_EVENTS[2])()
+    event.CopyFrom(FIRST_EVENTS[2])
+    event.order.ClearField("limitPrice")
+    event.position.ClearField("takeProfit")
+    return event
+
+
+async def test_missing_protection_of_a_refused_bracket_rejects_its_legs() -> None:
+    execution_venue = answered([*FIRST_EVENTS[:2], protected_without_target()])
+    amends: list = []
+
+    def keep_stop_alone(request):
+        amends.append(request)
+        return protective(85197.2, None, utc=AMEND_FROM + len(amends))
+
+    execution_venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, keep_stop_alone)
+    config = exec_config(protective_order_timeout_secs=0.5)
+    async with harness(execution_venue=execution_venue, config=config) as h:
+        await push_spot(h, BID, ASK)
+        await submit_bracket(h, bracket(h))
+        await wait_until(lambda: any("kept other levels" in w for w in h.logger.warnings()))
+        assert len(amends) == 3
+        assert status(h, TARGET) == OrderStatus.SUBMITTED
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.REJECTED)
+        await sync(h)
+
+        assert rejection(h, TARGET) == "the levels asked for are no longer known"
+        assert status(h, STOP) == OrderStatus.ACCEPTED
+        (error,) = h.logger.errors()
+        assert "stands without its levels" in error
 
 
 async def test_an_amend_without_an_answer_is_sent_again_once_reconnected() -> None:
@@ -2543,6 +2781,23 @@ async def test_a_pending_external_order_is_cancelled_at_the_broker() -> None:
         assert h.logger.errors() == []
 
 
+async def test_a_pending_order_cancel_answered_during_a_rebuild_is_not_rejected() -> None:
+    async with harness(execution_venue=resting_venue()) as h:
+        order = await held_resting(h)
+        h.client._hold_buffer()
+        cancelling = asyncio.create_task(
+            h.client._cancel_order(cancel(order.client_order_id.value))
+        )
+        # The broker's answer is held with the rebuild's other events.
+        await wait_until(lambda: len(h.client._buffer) == 1)
+        h.client._release_buffer()
+        await asyncio.wait_for(cancelling, timeout=5)
+        await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.CANCELED)
+
+        assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+
 @pytest.mark.parametrize(
     ("kind", "change", "sent", "held"),
     [
@@ -2942,10 +3197,10 @@ async def test_a_pending_orders_amend_lock_goes_once_the_order_has_ended() -> No
         assert RESTING not in h.client._order_locks
 
 
-def answer_amend_with(execution_venue: ExecutionVenue, kind: int) -> None:
+def answer_amend_with(execution_venue: ExecutionVenue, kind: int) -> Callable:
     """The broker answers an amend of the pending order with an event of `kind`, unchanged.
 
-    `ORDER_EXPIRED` ends the order; any other kind leaves it open.
+    `ORDER_EXPIRED` ends the order; any other kind leaves it open. Returns the answer.
     """
 
     def answer(_request):
@@ -2959,6 +3214,7 @@ def answer_amend_with(execution_venue: ExecutionVenue, kind: int) -> None:
         return pending_event(kind, stated)
 
     execution_venue.server.on(om.PROTO_OA_AMEND_ORDER_REQ, answer)
+    return answer
 
 
 async def test_an_amend_answered_by_the_order_ending_is_no_refusal() -> None:
@@ -2971,6 +3227,36 @@ async def test_an_amend_answered_by_the_order_ending_is_no_refusal() -> None:
         await sync(h)
 
         assert sent_about(h, order) == []
+        assert h.logger.errors() == []
+
+
+async def test_a_second_amend_of_a_pending_order_that_ended_meanwhile_is_rejected_unsent() -> None:
+    execution_venue = resting_venue()
+    held = HeldReplies(
+        execution_venue.server,
+        om.PROTO_OA_AMEND_ORDER_REQ,
+        answer_amend_with(execution_venue, om.ORDER_EXPIRED),
+    )
+    async with harness(execution_venue=execution_venue) as h:
+        order = await held_resting(h)
+        client_order_id = order.client_order_id.value
+        first = asyncio.create_task(
+            h.client._modify_order(modify(client_order_id, price="84100.00"))
+        )
+        await asyncio.wait_for(held.arrived.wait(), timeout=5)
+        second = asyncio.create_task(
+            h.client._modify_order(modify(client_order_id, price="84200.00"))
+        )
+        # The second now waits for the first's answer, which ends the order.
+        await sync(h)
+        await held.stop_holding()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+        await wait_until(lambda: foreign_leg(h, str(RESTING)).status == OrderStatus.EXPIRED)
+
+        (rejected,) = sent_about(h, order)
+        assert isinstance(rejected, OrderModifyRejected)
+        assert rejected.reason == "the order is not open at the venue"
+        assert len(order_amends(h)) == 1
         assert h.logger.errors() == []
 
 
@@ -3059,6 +3345,76 @@ async def test_a_modify_of_a_leg_that_closed_while_waiting_for_the_amend_is_refu
         (rejected,) = [e for e in h.events_of(STOP) if isinstance(e, OrderModifyRejected)]
         assert rejected.reason == "the leg is already closed"
         assert "OrderUpdated" not in h.kinds_of(STOP)
+
+
+async def test_a_modify_of_a_dead_leg_is_rejected_once_and_unsent() -> None:
+    async with harness(execution_venue=answered(FIRST_EVENTS[:3])) as h:
+        await opened_bracket(h)
+        # The trader removes the take-profit; the modify comes before Nautilus applies the cancel.
+        h.client._on_execution_event(FIRST_EVENTS[4])
+        assert status(h, TARGET) == OrderStatus.ACCEPTED
+        await h.client._modify_order(modify(TARGET, price="85400.00"))
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+
+        (rejected,) = modify_rejections(h, TARGET)
+        assert rejected.reason == "the leg is already closed"
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+
+
+async def test_a_modify_of_a_foreign_leg_no_longer_live_is_rejected_once_and_unsent() -> None:
+    async with harness() as h:
+        _, target = await foreign_legs(h)
+        # The trader removes the take-profit.
+        await push(h, FOREIGN_EVENTS[4])
+        await wait_until(lambda: target.status == OrderStatus.CANCELED)
+        await h.client._modify_order(modify(target.client_order_id.value, price="85400.00"))
+
+        (rejected,) = sent_about(h, target)
+        assert isinstance(rejected, OrderModifyRejected)
+        assert rejected.reason == "the leg is already closed"
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+        assert h.logger.errors() == []
+
+
+def foreign_stop_removed() -> oa.ProtoOAExecutionEvent:
+    """A trader's removal of the foreign position's stop-loss (hand-built)."""
+    event = type(FOREIGN_EVENTS[2])()
+    event.CopyFrom(FOREIGN_EVENTS[2])
+    event.executionType = om.ORDER_REPLACED
+    event.isServerEvent = False
+    event.order.ClearField("stopPrice")
+    event.position.ClearField("stopLoss")
+    event.order.utcLastUpdateTimestamp = AMEND_FROM - 1_000
+    event.position.utcLastUpdateTimestamp = AMEND_FROM - 1_000
+    return event
+
+
+async def test_a_foreign_leg_modify_whose_leg_ends_behind_an_amend_is_rejected_once() -> None:
+    execution_venue = ExecutionVenue()
+    amends: list = []
+    held = HeldReplies(
+        execution_venue.server, om.PROTO_OA_AMEND_POSITION_SLTP_REQ, amend_echo(amends)
+    )
+    async with harness(execution_venue=execution_venue) as h:
+        stop, target = await foreign_legs(h)
+        moving = asyncio.create_task(
+            h.client._modify_order(modify(target.client_order_id.value, price="85400.00"))
+        )
+        await asyncio.wait_for(held.arrived.wait(), timeout=5)
+        modifying = asyncio.create_task(
+            h.client._modify_order(modify(stop.client_order_id.value, trigger_price="85150.00"))
+        )
+        # While the stop's modify waits for the take-profit's amend, a trader removes the stop.
+        await push(h, foreign_stop_removed())
+        await wait_until(lambda: stop.status == OrderStatus.CANCELED)
+        await held.stop_holding()
+        await asyncio.wait_for(asyncio.gather(moving, modifying), timeout=10)
+
+        (rejected,) = sent_about(h, stop)
+        assert isinstance(rejected, OrderModifyRejected)
+        assert rejected.reason == "the leg is already closed"
+        assert len(amends) == 1
+        assert h.logger.errors() == []
 
 
 def trailed_at(stop: float, *, utc: int = AMEND_FROM + 100) -> oa.ProtoOATrailingSLChangedEvent:
@@ -4025,6 +4381,75 @@ async def test_a_level_removed_during_the_settling_rebuild_cancels_its_leg_once(
         assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
 
 
+@pytest.mark.parametrize(
+    "stop_removed_before",
+    [
+        # The rebuild ends the stop-loss, while the take-profit carries a modify.
+        pytest.param(False, id="stop-ended-by-the-rebuild"),
+        # A trader removed the stop-loss before it, while the take-profit carries a cancel.
+        pytest.param(True, id="stop-dead-before"),
+    ],
+)
+async def test_a_settling_rebuild_answers_each_leg_independently(
+    monkeypatch: pytest.MonkeyPatch, stop_removed_before: bool
+) -> None:
+    execution_venue, held = entry_held()
+    amends = echo_amends(execution_venue)
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        broker_holds(execution_venue, stop=None, target=85387.22)
+        command = (
+            (lambda: h.client._cancel_order(cancel(TARGET)))
+            if stop_removed_before
+            else (lambda: h.client._modify_order(modify(TARGET, price="85400.00")))
+        )
+        await corrections_lost(h, held, monkeypatch, command)
+        if stop_removed_before:
+            await push(h, protective(None, 85387.22, utc=AMEND_FROM))
+            await wait_until(lambda: status(h, STOP) == OrderStatus.CANCELED)
+        await wait_until(lambda: len(h.client._brackets) == 0)
+        await wait_until(lambda: len(amends) == 1)
+        await sync(h)
+
+        assert h.kinds_of(STOP).count("OrderCanceled") == 1
+        assert refusals(h, h.cache.order(ClientOrderId(STOP))) == []
+        (amend,) = amends
+        assert not amend.HasField("stopLoss")
+        if stop_removed_before:
+            assert not amend.HasField("takeProfit")
+            await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        else:
+            assert amend.takeProfit == 85400.0
+            await wait_until(
+                lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
+            )
+        assert refusals(h, h.cache.order(ClientOrderId(TARGET))) == []
+        # Only the holds of the lost rounds.
+        assert all("whether its levels were set is unknown" in e for e in h.logger.errors())
+
+
+async def test_a_settling_rebuild_reports_a_level_the_trader_moved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        # The lost amends applied, and a trader moved the take-profit with no event reaching us.
+        broker_holds(execution_venue, stop=85150.0, target=85400.0)
+        await corrections_lost(
+            h,
+            held,
+            monkeypatch,
+            lambda: h.client._modify_order(modify(STOP, trigger_price="85150.00")),
+        )
+        target = h.cache.order(ClientOrderId(TARGET))
+        await wait_until(lambda: len(h.client._brackets) == 0)
+        await wait_until(lambda: target.price == Price.from_str("85400.00"))
+        await sync(h)
+
+        (updated,) = [e for e in h.events_of(TARGET) if isinstance(e, OrderUpdated)]
+        assert updated.price == Price.from_str("85400.00")
+        assert h.received(oa.ProtoOAAmendPositionSLTPReq) == []
+
+
 async def test_the_legs_of_a_position_gone_at_the_rebuild_are_left_to_their_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4423,6 +4848,42 @@ async def test_a_stashed_leg_nautilus_holds_closed_is_not_cancelled_again(
         await reconnect_after_a_stashed_close(h, held, monkeypatch, execution_venue)
 
         assert_each_leg_ended_once(h)
+        assert h.client._kept_brackets == {}
+
+
+async def test_a_leg_a_later_rebuild_ended_is_cancelled_when_its_kept_position_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_venue, held = entry_held()
+    stop_fill = stop_filled_whole()
+    async with harness(execution_venue=execution_venue, config=LOSING) as h:
+        read_broker = h.client._read_broker
+        closing: list = []
+
+        async def read(**kwargs):
+            if kwargs.get("positions") is not None:
+                raise CTraderConnectionError("dropped for the test")
+            state = await read_broker(**kwargs)
+            if closing:
+                # The stop's fill, held behind a read that lists the position open.
+                await h.server.push(closing.pop())
+                await wait_until(lambda: bool(h.client._buffer))
+            return state
+
+        monkeypatch.setattr(h.client, "_read_broker", read)
+        await stop_modify_lost(h, held, monkeypatch)
+        await wait_until(lambda: any("check by hand" in e for e in h.logger.errors()))
+        assert h.client._kept_brackets
+
+        # A later rebuild lists the position open without its take-profit.
+        broker_holds(execution_venue, stop=85197.2, target=None)
+        closing.append(stop_fill)
+        await asyncio.wait_for(h.client._load(), timeout=10)
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        await sync(h)
+
+        assert status(h, STOP) == OrderStatus.FILLED
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
         assert h.client._kept_brackets == {}
 
 

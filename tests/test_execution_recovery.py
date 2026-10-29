@@ -23,6 +23,7 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import (
+    CancelOrder,
     GenerateFillReports,
     GenerateOrderStatusReports,
     GeneratePositionStatusReports,
@@ -1225,8 +1226,11 @@ async def test_a_close_in_flight_across_a_reconnect_keeps_the_node_id() -> None:
         assert h.client._operations.close_position(CLOSE) is None
 
 
-def target_moved_to(price: float) -> oa.ProtoOAExecutionEvent:
-    """The broker's answer to an amend moving the take-profit of the position at `OPEN_AT`."""
+def target_moved_to(price: float | None) -> oa.ProtoOAExecutionEvent:
+    """The broker's answer to an amend moving the take-profit of the position at `OPEN_AT`.
+
+    `None` removes it.
+    """
     at = snapshot_at(OPEN_AT).position[0].utcLastUpdateTimestamp
     (last,) = [
         e
@@ -1236,27 +1240,45 @@ def target_moved_to(price: float) -> oa.ProtoOAExecutionEvent:
     event = type(last)()
     event.CopyFrom(last)
     event.isServerEvent = False
-    event.order.limitPrice = price
+    if price is None:
+        event.order.ClearField("limitPrice")
+        event.position.ClearField("takeProfit")
+    else:
+        event.order.limitPrice = price
+        event.position.takeProfit = price
     event.order.utcLastUpdateTimestamp = at + 1_000
-    event.position.takeProfit = price
     event.position.utcLastUpdateTimestamp = at + 1_000
     return event
+
+
+async def answered_during_a_rebuild(
+    h: Harness, venue: ExecutionVenue, command: Callable[[], object]
+) -> None:
+    """Run `command` while a reconnect's rebuild holds the events, its answer among them."""
+    await started(h)
+    held = HeldReplies(
+        h.server,
+        om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
+        venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
+    )
+    rebuilding = asyncio.create_task(h.client._reload())
+    await asyncio.wait_for(held.arrived.wait(), timeout=10)
+    commanding = asyncio.create_task(command())
+    await wait_until(lambda: len(h.client._buffer or []) == 1)
+
+    await held.stop_holding()
+    await asyncio.wait_for(rebuilding, timeout=10)
+    await asyncio.wait_for(commanding, timeout=10)
 
 
 async def test_an_amend_answered_during_a_rebuild_reads_the_rebuilt_view() -> None:
     venue = serving()
     venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: target_moved_to(85400.0))
     async with harness(execution_venue=venue) as h:
-        await started(h)
-        held = HeldReplies(
-            h.server,
-            om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ,
-            venue.replies[om.PROTO_OA_ORDER_LIST_BY_POSITION_ID_REQ],
-        )
-        rebuilding = asyncio.create_task(h.client._reload())
-        await asyncio.wait_for(held.arrived.wait(), timeout=10)
-        modifying = asyncio.create_task(
-            h.client._modify_order(
+        await answered_during_a_rebuild(
+            h,
+            venue,
+            lambda: h.client._modify_order(
                 ModifyOrder(
                     trader_id=TRADER_ID,
                     strategy_id=STRATEGY_ID,
@@ -1271,17 +1293,39 @@ async def test_an_amend_answered_during_a_rebuild_reads_the_rebuilt_view() -> No
                 ),
             ),
         )
-        await wait_until(lambda: len(h.client._buffer or []) == 1)
-
-        await held.stop_holding()
-        await asyncio.wait_for(rebuilding, timeout=10)
-        await asyncio.wait_for(modifying, timeout=10)
 
         await wait_until(
             lambda: h.cache.order(ClientOrderId(TARGET)).price == Price.from_str("85400.00"),
         )
         assert "OrderModifyRejected" not in h.kinds_of(TARGET)
         assert h.kinds_of(TARGET)[-1] == "OrderUpdated"
+        assert h.logger.errors() == []
+
+
+async def test_a_leg_cancel_answered_during_a_rebuild_is_not_rejected() -> None:
+    venue = serving()
+    venue.server.on(om.PROTO_OA_AMEND_POSITION_SLTP_REQ, lambda _r: target_moved_to(None))
+    async with harness(execution_venue=venue) as h:
+        await answered_during_a_rebuild(
+            h,
+            venue,
+            lambda: h.client._cancel_order(
+                CancelOrder(
+                    trader_id=TRADER_ID,
+                    strategy_id=STRATEGY_ID,
+                    instrument_id=US100_ID,
+                    client_order_id=ClientOrderId(TARGET),
+                    venue_order_id=None,
+                    command_id=UUID4(),
+                    ts_init=0,
+                ),
+            ),
+        )
+
+        await wait_until(lambda: status(h, TARGET) == OrderStatus.CANCELED)
+        await sync(h)
+        assert "OrderCancelRejected" not in h.kinds_of(TARGET)
+        assert h.kinds_of(TARGET).count("OrderCanceled") == 1
         assert h.logger.errors() == []
 
 

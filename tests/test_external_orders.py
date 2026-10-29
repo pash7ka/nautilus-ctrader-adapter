@@ -166,6 +166,25 @@ async def test_an_order_changed_then_cancelled_ends_cancelled_at_its_new_price()
         assert h.logger.errors() == []
 
 
+async def test_an_external_order_first_seen_by_its_fill_reports_that_fill() -> None:
+    deal = make_deal(7_800_001, ORDER, POSITION, side=om.BUY, volume=200, price=83995.5, ts=11)
+    async with harness() as h:
+        with no_events_of_the_order(h):
+            # No acceptance came before it; the deal is better than the limit.
+            burst(
+                h,
+                limit(om.ORDER_FILLED, 11, position=make_position(POSITION, volume=200), deal=deal),
+            )
+            await wait_until(lambda: external(h) is not None and external(h).is_closed)
+
+        order = external(h)
+        assert order.status == OrderStatus.FILLED
+        (fill,) = [e for e in order.events if isinstance(e, OrderFilled)]
+        assert fill.trade_id == TradeId("7800001")
+        assert fill.last_px == Price.from_str("83995.50")
+        assert h.logger.errors() == []
+
+
 async def test_news_of_an_order_nautilus_has_closed_is_not_reported() -> None:
     async with harness() as h:
         burst(
