@@ -355,6 +355,61 @@ async def test_on_disconnect_discards_the_partial_bar_and_queues_a_closed_baseli
     assert emitted == [bar(T0, tag="late"), bar(T0 + 60, tag="fresh")]
 
 
+async def test_a_bar_forming_after_a_stream_close_is_closed_by_its_own_timer() -> None:
+    clock = FakeClock(T0 + 10)
+    hist = History(clock, lag=0)
+    emitted: list[RawBar] = []
+    closer = make_closer(clock, hist.fetch, emitted, RecordingLogger())
+
+    closer.on_update(s(0))
+    closer.on_update(s(60))  # the stream closes T0; T0+60 is now the forming bar
+    assert emitted == [s(0)]
+
+    # No further update arrives, as in a quiet market.
+    await clock.advance(111)  # T0+121: T0+60 + period + grace
+
+    assert hist.calls == [T0 + 60]
+    assert emitted == [s(0), h(60)]
+    closer.close()
+
+
+async def test_the_partial_bar_of_a_lost_connection_is_never_emitted() -> None:
+    clock = FakeClock(T0 + 10)
+    hist = History(clock, lag=0)
+    emitted: list[RawBar] = []
+    closer = make_closer(clock, hist.fetch, emitted, RecordingLogger())
+
+    closer.on_update(s(0))
+    closer.on_disconnect()
+    clock.t = T0 + 70
+    closer.on_update(s(60))  # the first update on the new connection, for a newer bar
+    assert emitted == []  # the old partial T0 is not closed by it
+
+    await clock.advance(51)  # T0+121: the bar forming at reconnect closes via history
+
+    assert emitted == [h(60)]
+    assert hist.calls == [T0 + 60]
+    closer.close()
+
+
+async def test_a_closed_first_update_after_a_reconnect_goes_to_history_if_a_newer_bar_follows():
+    clock = FakeClock(T0 + 10)
+    fetch = FetchStub([h(0)])
+    emitted: list[RawBar] = []
+    closer = make_closer(clock, fetch, emitted, RecordingLogger())
+
+    closer.on_update(s(0))
+    closer.on_disconnect()
+    clock.t = T0 + 70
+    closer.on_update(s(0))  # a closed snapshot: the baseline of the new connection
+    closer.on_update(s(60))
+    await settle()
+
+    assert emitted == [h(0)]  # not the streamed s0
+    assert fetch.calls == [T0]
+    closer.close()
+
+
 async def test_close_stops_updates_timers_and_backfill() -> None:
     clock = FakeClock(T0)
     fetch = FetchStub([bar(T0, tag="history")])
@@ -802,6 +857,32 @@ async def test_backfill_queues_a_history_only_retry_for_a_missing_unheld_tail() 
     assert logger.lines == []  # silent: there was never a streamed state to fall back to
 
 
+async def test_the_stream_state_of_a_tail_boundary_is_its_fallback() -> None:
+    clock = FakeClock(T0 + 5)
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+
+    async def fetch(boundary_secs: int) -> RawBar | None:
+        return None
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        return []
+
+    closer = make_closer(clock, fetch, emitted, logger)
+    given_emitted(closer, clock, emitted, T0)
+    clock.t = T0 + 130
+    await closer.backfill(fetch_range)  # queues T0+60 for history alone
+
+    closer.on_update(s(60))  # the closing state of that boundary arrives afterwards
+    await clock.advance(0)
+    await clock.advance(GRACE)
+    await clock.advance(GRACE)
+
+    assert emitted == [s(60)]
+    assert warnings_of(logger) == ["L: history had no closed bar; emitting the streamed state"]
+    closer.close()
+
+
 async def test_an_emit_callback_exception_during_backfill_is_caught_and_replay_continues() -> None:
     clock = FakeClock(T0 + 5)
     fetch = FetchStub([])
@@ -1051,6 +1132,75 @@ async def test_a_history_entry_left_queued_by_an_outage_resumes_on_the_next_clos
     assert emitted == [h(0), h(60)]
 
 
+async def test_an_outage_after_the_first_of_two_queued_bars_leaves_the_second_queued():
+    clock = FakeClock(T0 + 10)
+    hist = History(clock, lag=0)
+    gate = asyncio.Event()
+    down = [False]
+    attempts: list[int] = []
+    emitted: list[RawBar] = []
+
+    async def fetch(boundary_secs: int) -> RawBar | None:
+        attempts.append(boundary_secs)
+        if boundary_secs == T0:
+            await gate.wait()
+        elif down[0]:
+            raise CTraderConnectionError("session not ready (state=CONNECTING)")
+        return await hist.fetch(boundary_secs)
+
+    closer = make_closer(clock, fetch, emitted, RecordingLogger())
+    clock.t = T0 + 100
+    closer.on_update(s(0))  # a baseline already closed: T0 is queued, its request waits
+    await settle()
+    closer.on_update(s(60))
+    await clock.advance(21)  # T0+121: T0+60 is queued behind T0
+    assert attempts == [T0]
+
+    down[0] = True
+    gate.set()
+    await settle()
+
+    assert emitted == [h(0)]
+    assert attempts == [T0, T0 + 60]  # the entry stays queued, it is not a spent attempt
+
+    down[0] = False
+    closer.on_update(s(120))
+    await clock.advance(60)  # T0+181: T0+120 is queued, which resumes T0+60 ahead of it
+    await settle()
+
+    assert emitted == [h(0), h(60), h(120)]
+    closer.close()
+
+
+async def test_a_connection_lost_on_a_retry_is_not_a_spent_attempt() -> None:
+    clock = FakeClock(T0)
+    fetch = FetchStub([None, CTraderConnectionError("session not ready"), h(0)])
+    emitted: list[RawBar] = []
+    logger = RecordingLogger()
+    closer = make_closer(clock, fetch, emitted, logger)
+
+    closer.on_update(s(0))
+    await clock.advance(61)  # first attempt: no bar yet
+    await clock.advance(GRACE)  # the retry finds the connection gone
+    await clock.advance(GRACE)
+    await clock.advance(GRACE)
+
+    assert fetch.calls == [T0, T0]  # no third attempt, no fallback
+    assert emitted == []
+    assert warnings_of(logger) == []
+
+    async def fetch_range(start: int, end: int) -> list[RawBar]:
+        return []
+
+    closer.on_disconnect()
+    await closer.backfill(fetch_range)  # the reconnect resumes the queued entry
+    await settle()
+
+    assert emitted == [h(0)]
+    assert warnings_of(logger) == []
+    closer.close()
+
+
 async def test_backfill_gives_up_waiting_on_a_fetch_that_never_returns() -> None:
     clock = FakeClock(T0)
     emitted: list[RawBar] = []
@@ -1085,6 +1235,15 @@ async def test_backfill_gives_up_waiting_on_a_fetch_that_never_returns() -> None
 
     assert any("still resolving" in line for line in warnings_of(logger))
     assert emitted == []  # the entries stay queued, in order, for the resolver
+
+    # The stuck request answers at last. The bar the range fetch served is still in the queue
+    # after the backfill's history-only enqueue of the same boundary.
+    never.set()
+    await clock.advance(0)
+    await clock.advance(GRACE)
+    await clock.advance(GRACE)
+    await settle()
+    assert emitted == [s(0), h(60)]
     closer.close()
 
 
