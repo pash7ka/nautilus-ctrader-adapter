@@ -914,8 +914,9 @@ read inline, so neither is held up. If the answer is further back, the key says 
 with the reason `history incomplete` until a background walk, capped at 156 weeks, settles it and
 writes the key again. The first-deposit walk works the same way; until it finds the deposit,
 `first_deposit` is `null`. A first-deposit walk that reaches the present without a deposit stops
-there and continues from that point at the next refresh. A walk cut short by a lost connection writes nothing: the key keeps its
-previous value, with its own `checkpoint`, until the reconnect writes it.
+there and continues from that point at the next refresh. A walk cut short by a lost connection
+writes nothing: the key keeps its previous value, with its own `checkpoint`, until the reconnect
+writes it.
 
 **`unavailable` reasons.** The reason is always one of a fixed list:
 

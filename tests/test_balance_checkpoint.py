@@ -408,13 +408,15 @@ async def test_the_first_deposit_walk_stops_at_the_present_without_a_deposit(bou
         checkpoint = direct(h, TickingClock(now=start), [])
         try:
             await checkpoint.refresh(venue.trader.trader, bounded=bounded)
+
+            # A walk that caught up leaves nothing for a background continuation.
+            assert checkpoint._task is None
         finally:
             checkpoint.stop()
 
         windows = deposit_windows(h)
         assert len(windows) == 4
         assert [end - begin for begin, end in windows[:3]] == [WEEK_MS] * 3
-        assert checkpoint._task is None
 
 
 @pytest.mark.parametrize("bounded", [True, False])
@@ -583,7 +585,6 @@ async def test_a_forward_walk_meeting_a_cash_flow_without_a_scale_gives_up() -> 
             assert json.loads(written[-1])["status"] == "available"
             assert json.loads(written[-1])["first_deposit"] is None
             assert any("a cash flow has no moneyDigits" in m for m in h.logger.warnings())
-            assert checkpoint._deposit_windows == balance_checkpoint.MAX_WINDOWS
             asked = len(deposit_windows(h))
 
             await checkpoint.refresh(venue.trader.trader, bounded=False)

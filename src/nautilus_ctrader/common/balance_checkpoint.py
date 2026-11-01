@@ -126,6 +126,9 @@ class BalanceCheckpoint:
         # Where the first-deposit walk goes on from; `None` until it starts.
         self._deposit_from_ms: int | None = None
         self._deposit_windows = 0
+        # Set when the walk reaches the present, cleared when a refresh begins: the walk has
+        # nothing more to read until then, though the clock has moved on.
+        self._deposit_caught_up = False
         # The checkpoint of the value last written.
         self._written_ms: int | None = None
         # Overlapping refreshes share the walk, so none reads a window twice or counts it twice.
@@ -192,6 +195,7 @@ class BalanceCheckpoint:
 
     async def _run(self, trader: om.ProtoOATrader | None, *, bounded: bool) -> None:
         assert self._hour is not None
+        self._deposit_caught_up = False
         now = self._now_ms()
         t_ms = _ms(checkpoint_at(_moment(now), self._hour, self._zone))
         walk = _Walk(t_ms, upper_ms=now, covered_from_ms=now)
@@ -368,13 +372,12 @@ class BalanceCheckpoint:
                 self._deposit = found
                 return
             if end == now:
-                # Caught up. The clock has moved on by the next pass, so the loop would go on
-                # asking for windows a few milliseconds wide; the next refresh continues.
+                self._deposit_caught_up = True
                 return
 
     def _deposit_unfinished(self, registration_ms: int | None) -> bool:
         """Whether the first-deposit walk has more to read now."""
-        if registration_ms is None or self._deposit is not None:
+        if registration_ms is None or self._deposit is not None or self._deposit_caught_up:
             return False
         if self._deposit_windows >= MAX_WINDOWS:
             return False
