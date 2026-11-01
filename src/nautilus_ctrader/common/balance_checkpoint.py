@@ -367,6 +367,10 @@ class BalanceCheckpoint:
             if found is not None:
                 self._deposit = found
                 return
+            if end == now:
+                # Caught up. The clock has moved on by the next pass, so the loop would go on
+                # asking for windows a few milliseconds wide; the next refresh continues.
+                return
 
     def _deposit_unfinished(self, registration_ms: int | None) -> bool:
         """Whether the first-deposit walk has more to read now."""

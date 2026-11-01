@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from functools import partial
 from zoneinfo import ZoneInfo
 
+import pytest
 from nautilus_trader.cache.cache import Cache
 
 from nautilus_ctrader import execution
@@ -253,6 +254,22 @@ def direct(h, clock: dict, written: list, request=None) -> BalanceCheckpoint:
     )
 
 
+class TickingClock(dict):
+    """A `direct` clock that moves 1 ms forward each time `now` is read."""
+
+    def __getitem__(self, name):
+        value = super().__getitem__(name)
+        self[name] = value + 1
+        return value
+
+
+def deposit_windows(h) -> list[tuple[int, int]]:
+    """The cash-flow windows asked beyond the anchor walk's, which pairs each with a deal list."""
+    anchor = {(r.fromTimestamp, r.toTimestamp) for r in h.received(oa.ProtoOADealListReq)}
+    asked = [(r.fromTimestamp, r.toTimestamp) for r in h.received(oa.ProtoOACashFlowHistoryListReq)]
+    return [window for window in asked if window not in anchor]
+
+
 async def test_timer_fires_after_the_grace_and_recomputes() -> None:
     real_now = now_ms()
     t_ms = last_t()
@@ -379,6 +396,52 @@ async def test_overlapping_refreshes_read_each_deposit_window_once() -> None:
         assert len(deposit_windows) == 6
         assert len(set(deposit_windows)) == len(deposit_windows)
         assert checkpoint._deposit_windows == 6
+        assert json.loads(written[-1])["first_deposit"] == AVAILABLE["first_deposit"]
+
+
+@pytest.mark.parametrize("bounded", [True, False])
+async def test_the_first_deposit_walk_stops_at_the_present_without_a_deposit(bounded) -> None:
+    start = now_ms()
+    venue = history_venue(last_at=start - 2 * DAY_MS, registration=start - 3 * WEEK_MS - 100)
+    venue.deals, venue.cash_flow = [], []
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
+        checkpoint = direct(h, TickingClock(now=start), [])
+        try:
+            await checkpoint.refresh(venue.trader.trader, bounded=bounded)
+        finally:
+            checkpoint.stop()
+
+        windows = deposit_windows(h)
+        assert len(windows) == 4
+        assert [end - begin for begin, end in windows[:3]] == [WEEK_MS] * 3
+        assert checkpoint._task is None
+
+
+@pytest.mark.parametrize("bounded", [True, False])
+async def test_a_deposit_made_after_the_walk_reached_the_present_is_stated(bounded) -> None:
+    start = now_ms()
+    venue = history_venue(last_at=start - 2 * DAY_MS, registration=start - 3 * WEEK_MS - 100)
+    venue.deals, venue.cash_flow = [], []
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
+        clock = TickingClock(now=start)
+        written: list[bytes] = []
+        checkpoint = direct(h, clock, written)
+        try:
+            await checkpoint.refresh(venue.trader.trader, bounded=bounded)
+            reached = deposit_windows(h)[-1][1]
+            assert json.loads(written[-1])["first_deposit"] is None
+
+            deposit = om.ProtoOADepositWithdraw()
+            deposit.CopyFrom(recorded_cash_flow()[0])
+            deposit.changeBalanceTimestamp = reached + 1
+            venue.cash_flow = [deposit]
+            asked = len(deposit_windows(h))
+            await checkpoint.refresh(venue.trader.trader, bounded=bounded)
+        finally:
+            checkpoint.stop()
+
+        assert len(deposit_windows(h)) == asked + 1
+        assert deposit_windows(h)[-1][0] == reached
         assert json.loads(written[-1])["first_deposit"] == AVAILABLE["first_deposit"]
 
 
