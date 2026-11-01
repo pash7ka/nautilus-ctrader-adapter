@@ -566,6 +566,72 @@ async def test_an_item_without_a_scale_is_mixed_scales() -> None:
         assert any("moneyDigits" in line for line in h.logger.warnings())
 
 
+async def test_a_forward_walk_meeting_a_cash_flow_without_a_scale_gives_up() -> None:
+    t_ms = last_t()
+    # The deposit lies before the anchor walk's first week, so only the forward walk meets it.
+    last_at = t_ms - 2 * DAY_MS
+    deposit_ms = deposit_at(last_at)
+    venue = history_venue(last_at=last_at, registration=deposit_ms - 1000)
+    (operation,) = venue.cash_flow
+    operation.ClearField("moneyDigits")
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
+        written: list[bytes] = []
+        checkpoint = direct(h, {"now": now_ms()}, written)
+        try:
+            await checkpoint.refresh(venue.trader.trader, bounded=False)
+
+            assert json.loads(written[-1])["status"] == "available"
+            assert json.loads(written[-1])["first_deposit"] is None
+            assert any("a cash flow has no moneyDigits" in m for m in h.logger.warnings())
+            assert checkpoint._deposit_windows == balance_checkpoint.MAX_WINDOWS
+            asked = len(deposit_windows(h))
+
+            await checkpoint.refresh(venue.trader.trader, bounded=False)
+
+            assert len(deposit_windows(h)) == asked
+        finally:
+            checkpoint.stop()
+
+
+async def test_the_first_deposit_walk_stops_at_its_window_cap(monkeypatch) -> None:
+    monkeypatch.setattr(balance_checkpoint, "MAX_WINDOWS", 3)
+    t_ms = last_t()
+    last_at = t_ms - DAY_MS
+    venue = history_venue(last_at=last_at, registration=deposit_at(last_at) - 5 * WEEK_MS)
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
+        written: list[bytes] = []
+        checkpoint = direct(h, {"now": now_ms()}, written)
+        try:
+            await checkpoint.refresh(venue.trader.trader, bounded=True)
+
+            assert len(deposit_windows(h)) == 3
+            assert json.loads(written[-1])["first_deposit"] is None
+
+            await checkpoint.refresh(venue.trader.trader, bounded=True)
+
+            assert len(deposit_windows(h)) == 3
+        finally:
+            checkpoint.stop()
+
+
+async def test_a_trader_without_a_balance_version_does_not_chain() -> None:
+    venue = history_venue(last_at=last_t() - DAY_MS)
+    venue.trader.trader.ClearField("balanceVersion")
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
+        written: list[bytes] = []
+        checkpoint = direct(h, {"now": now_ms()}, written)
+        try:
+            await checkpoint.refresh(venue.trader.trader, bounded=False)
+        finally:
+            checkpoint.stop()
+
+        value = json.loads(written[-1])
+        assert value["status"] == "unavailable"
+        assert value["reason"] == "balance versions do not chain"
+        assert value["balance"] is None
+        assert any("the trader has no balanceVersion" in m for m in h.logger.warnings())
+
+
 def gated(h, gates: dict) -> object:
     """The harness's request, held while the asking task is a key of `gates` and its gate shut."""
     plain = partial(h.client._request, priority=RequestPriority.CHECKPOINT)
@@ -636,6 +702,59 @@ async def test_a_stopped_checkpoint_starts_no_background_walk() -> None:
             assert written == []
         finally:
             gate.set()
+            checkpoint.stop()
+
+
+async def test_stop_cancels_the_armed_timer() -> None:
+    async with harness() as h:
+        checkpoint = direct(h, {"now": now_ms()}, [])
+        checkpoint.schedule()
+        armed = checkpoint._timer
+        assert armed is not None
+
+        checkpoint.stop()
+
+        assert armed.cancelled()
+        assert checkpoint._timer is None
+
+
+async def test_stop_cancels_the_background_walk() -> None:
+    t_ms = last_t()
+    last_at = t_ms - 12 * WEEK_MS
+    venue = history_venue(last_at=last_at, registration=deposit_at(last_at) - 20 * WEEK_MS)
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
+        plain = partial(h.client._request, priority=RequestPriority.CHECKPOINT)
+        release, entered = asyncio.Event(), asyncio.Event()
+        asked: list[object] = []
+        refreshing: list[asyncio.Task] = []
+
+        async def request(payload):
+            # The bounded refresh reads freely; its continuation waits at the first request.
+            if asyncio.current_task() is not refreshing[0]:
+                asked.append(payload)
+                entered.set()
+                await release.wait()
+            return await plain(payload)
+
+        checkpoint = direct(h, {"now": now_ms()}, [], request)
+        try:
+            refreshing.append(
+                asyncio.create_task(checkpoint.refresh(venue.trader.trader, bounded=True))
+            )
+            await asyncio.wait_for(refreshing[0], timeout=10)
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            walk = checkpoint._task
+            assert walk is not None
+
+            checkpoint.stop()
+            before = len(asked)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(walk, return_exceptions=True), timeout=20)
+
+            assert walk.cancelled()
+            assert len(asked) == before
+        finally:
+            release.set()
             checkpoint.stop()
 
 
