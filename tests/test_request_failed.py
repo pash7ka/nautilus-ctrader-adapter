@@ -42,6 +42,7 @@ from tests.test_data_client import (
     EURUSD_H1,
     EURUSD_ID,
     EURUSD_LAST,
+    GER40_ID,
     LAST_H1_MINUTE,
     at_minute,
     close_ns,
@@ -462,6 +463,16 @@ async def test_an_instrument_that_is_not_loaded_fails() -> None:
         failure = n.assert_failed_once(request_id)
         assert failure.reason == f"instrument {USDJPY_ID} is not loaded"
         assert failure.data_type == DataType(Instrument, metadata={"instrument_id": USDJPY_ID})
+
+
+async def test_request_instruments_through_the_engine_is_answered_and_claimed() -> None:
+    async with node() as n:
+        n.actor.request_instruments(CTRADER_VENUE, callback=n.actor.on_answered)
+        await n.answered()
+
+        (response,) = n.responses
+        assert {i.id for i in response.data} == {GER40_ID, EURUSD_ID}
+        assert not n.client._unanswered
 
 
 def _ask(n: Node, what: str) -> UUID4:

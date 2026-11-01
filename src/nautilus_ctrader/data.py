@@ -1019,8 +1019,8 @@ class CTraderDataClient(LiveMarketDataClient):
                 ts_init,
             )
         except CTraderProtocolError as e:
-            # Raising here would reach the account's shared spot dispatcher and disable this
-            # listener for every later event.
+            # Not raised: the account's dispatcher would catch it, but `_on_bar_spot` would be
+            # skipped for this event, and so for every tick while the price is unrepresentable.
             self._log_once(
                 self._quote_errors,
                 instrument_id,

@@ -57,7 +57,12 @@ from nautilus_ctrader.common.errors import (
 from nautilus_ctrader.common.parsing import price_from_raw
 from nautilus_ctrader.config import CTraderDataClientConfig, parse_asset_class_overrides
 from nautilus_ctrader.constants import CTRADER_VENUE
-from nautilus_ctrader.data import CTraderDataClient, _conversion_message, _raw_bar
+from nautilus_ctrader.data import (
+    CTraderDataClient,
+    _conversion_message,
+    _ConversionRetry,
+    _raw_bar,
+)
 from nautilus_ctrader.failures import REQUEST_FAILED_TOPIC
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
 from nautilus_ctrader.messages import OpenApiModelMessages_pb2 as om
@@ -698,6 +703,20 @@ async def test_failed_connect_does_not_release_the_account_twice(
         assert h.account.session is not None
 
 
+async def test_a_second_disconnect_after_a_successful_connect_releases_nothing() -> None:
+    async with harness() as h:
+        # Another client of the same account, which must keep the session up.
+        await h.account.connect()
+        await h.client._connect()
+
+        # What Nautilus does when the node stops, after the client was already disconnected.
+        await h.client._disconnect()
+        await h.client._disconnect()
+
+        assert h.account._users == 1
+        assert h.account.session is not None
+
+
 async def test_connect_re_queries_the_conversion_chain_every_time() -> None:
     async with harness() as h:
         await h.client._connect()
@@ -1131,6 +1150,19 @@ async def test_unsubscribing_quotes_releases_the_subscription_and_stops_the_tick
         assert not h.quotes()
 
 
+async def test_quotes_are_not_doubled_after_an_unsubscribe_and_a_resubscribe() -> None:
+    async with harness() as h:
+        await h.client._connect()
+        await subscribe_quotes(h, GER40_ID)
+        await unsubscribe_quotes(h, GER40_ID)
+        await subscribe_quotes(h, GER40_ID)
+
+        await push_spot(h, GER40_SPOT)
+
+        assert len(ger40_quotes(h)) == 1
+        assert len(h.account.subscriptions._spot_listeners[GER40_SYMBOL_ID]) == 1
+
+
 async def test_a_load_all_instrument_converts_before_its_first_subscription() -> None:
     client_config = config(instrument_provider=InstrumentProviderConfig(load_all=True))
     async with harness(client_config=client_config) as h:
@@ -1524,6 +1556,21 @@ async def test_the_next_subscribe_retries_a_refused_conversion() -> None:
         assert GER40_CONVERSION in h.account.subscriptions.consumers(EURUSD_SYMBOL_ID)
 
 
+async def test_a_chain_resolved_after_an_earlier_refusal_publishes_its_leg_and_reports_it() -> None:
+    server = data_venue()
+    server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, refusal("BLOCKED_PAYLOAD_TYPE"))
+    async with harness(server=server, logged=True) as h:
+        await h.client._connect()
+        # The leg is not loaded until a chain through it resolves.
+        assert EURUSD_ID not in {i.id for i in h.instruments()}
+
+        h.server.on(om.PROTO_OA_SYMBOLS_FOR_CONVERSION_REQ, recorded_chain)
+        await subscribe_quotes(h, GER40_ID)
+
+        assert EURUSD_ID in {i.id for i in h.instruments()}
+        assert ("info", _conversion_message("EUR", "USD", ["EURUSD"])) in h.logger.lines
+
+
 async def through_engine(h: Harness, command: object) -> None:
     """Hand `command` to the data engine, and return once the client's tasks for it are done."""
     h.engine.execute(command)
@@ -1777,6 +1824,30 @@ async def test_a_disconnect_ends_a_retry_attempt_its_unsubscribe_overtook() -> N
         await h.account.request(oa.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT_ID))
         assert not h.account.subscriptions.spot_holds(h.client._owner)
         assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+
+
+async def test_a_waiter_failing_after_a_conversion_retry_does_not_strand_the_others() -> None:
+    async with harness(logged=True) as h:
+        await h.client._connect()
+        completed: list[str] = []
+
+        async def succeeds(_instrument: Instrument) -> None:
+            completed.append("quotes")
+
+        async def fails(_instrument: Instrument) -> None:
+            raise RuntimeError("subscribe bug")
+
+        retry = _ConversionRetry()
+        # Completed last-in first-out, so the failing one goes first.
+        retry.waiting = {"quotes": ("quotes", succeeds), "bars": ("bars", fails)}
+
+        await h.client._complete_waiting(h.provider.find(GER40_ID), retry)
+
+        assert completed == ["quotes"]
+        assert not retry.waiting
+        assert any(
+            "Subscribing bars after a conversion retry raised" in e for e in h.logger.errors()
+        )
 
 
 def second_eur_quoted_venue() -> FakeCTraderServer:
@@ -2131,6 +2202,51 @@ async def test_a_subscribe_unsubscribe_subscribe_during_one_conversion_ends_subs
         assert [q.instrument_id for q in h.quotes()] == [GER40_ID]
 
 
+async def test_a_subscribe_abandoned_while_converting_starts_no_conversion_retry() -> None:
+    client_config = config(
+        instrument_provider=InstrumentProviderConfig(load_all=True),
+        restore_retry_interval_secs=0.05,
+    )
+    async with harness(client_config=client_config) as h:
+        await h.client._connect()
+        held = hold_conversion_leg(h)
+        subscribing = asyncio.create_task(subscribe_quotes(h, GER40_ID))
+        await asyncio.wait_for(held.arrived.wait(), timeout=3.0)
+
+        await unsubscribe_quotes(h, GER40_ID)
+        await held.stop_holding()
+        await asyncio.wait_for(subscribing, timeout=3.0)
+
+        assert not h.client._conversion_retries
+        # A retry would complete the subscribe it was not asked for within a few intervals.
+        await asyncio.sleep(0.3)
+        assert GER40_SYMBOL_ID not in h.subscribed_symbol_ids()
+
+
+async def test_a_second_concurrent_subscribe_of_a_bar_type_keeps_the_first_closer() -> None:
+    async with harness(client_config=load_all_config(), server=trendbar_venue()) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        closers = []
+        make_closer = h.client._make_closer
+
+        def recording(*args):
+            closers.append(make_closer(*args))
+            return closers[-1]
+
+        h.client._make_closer = recording
+        held = hold_conversion_leg(h)
+        subscribing = [asyncio.create_task(subscribe_bars(h, GER40_M1)) for _ in range(2)]
+        await asyncio.wait_for(held.arrived.wait(), timeout=3.0)
+
+        await held.stop_holding()
+        await asyncio.wait_for(asyncio.gather(*subscribing), timeout=3.0)
+
+        assert len(received(h.server, oa.ProtoOASubscribeLiveTrendbarReq)) == 1
+        assert [sub.closer for sub in h.client._bars.values()] == closers
+        assert len(h.client._bar_routes) == 1
+
+
 async def disconnect_during_conversion(h: Harness, subscribe: Callable, key: object) -> int:
     """Disconnect the client while `subscribe` of `key` waits on its EURUSD leg.
 
@@ -2336,6 +2452,44 @@ async def test_an_intraday_open_time_off_the_grid_is_published_not_rounded() -> 
         assert [b.ts_event for b in h.bars()] == [close_ns(opened, 900)]
 
 
+def spot_after_an_unrouted_trendbar(
+    unrouted_period: int | None,
+    minute: int,
+) -> oa.ProtoOASpotEvent:
+    """A spot event carrying a trendbar nobody subscribed ahead of the forming H1 bar at `minute`.
+
+    With `unrouted_period` `None`, the first trendbar has no period at all, as a historical one.
+    """
+    event = forming_spot(H1, minute)
+    routed = om.ProtoOATrendbar()
+    routed.CopyFrom(event.trendbar[0])
+    unrouted = om.ProtoOATrendbar()
+    unrouted.CopyFrom(routed)
+    if unrouted_period is None:
+        unrouted.ClearField("period")
+    else:
+        unrouted.period = unrouted_period
+    del event.trendbar[:]
+    event.trendbar.extend([unrouted, routed])
+    return event
+
+
+@pytest.mark.parametrize("unrouted_period", [M1, None], ids=["other period", "no period"])
+async def test_a_trendbar_of_an_unrouted_period_does_not_hide_the_ones_after_it(
+    unrouted_period: int | None,
+) -> None:
+    async with harness(server=trendbar_venue()) as h:
+        await h.client._connect()
+        clock = pin_clock(h, LAST_H1_MINUTE)
+        await subscribe_bars(h, EURUSD_H1)
+
+        await push_spot(h, spot_after_an_unrouted_trendbar(unrouted_period, LAST_H1_MINUTE))
+        clock.t = (LAST_H1_MINUTE + 60) * 60 + 5
+        await push_spot(h, spot_after_an_unrouted_trendbar(unrouted_period, LAST_H1_MINUTE + 60))
+
+        assert [b.ts_event for b in h.bars()] == [close_ns(LAST_H1_MINUTE, 3600)]
+
+
 async def test_a_quote_resubscribe_pairs_a_side_kept_while_the_bars_held_the_spots() -> None:
     # No conversion, so the bars are the only other hold on the symbol's spots.
     client_config = config(
@@ -2359,6 +2513,26 @@ async def test_a_quote_resubscribe_pairs_a_side_kept_while_the_bars_held_the_spo
         assert str(quote.bid_price) == "1.14813"
         assert str(quote.ask_price) == "1.14814"
         assert quote.ts_event == ASK_ONLY.timestamp * 1_000_000
+
+
+async def test_the_production_bar_clock_runs_timers_on_the_event_loop() -> None:
+    async with harness() as h:
+        clock = h.client._bar_clock
+        fired = asyncio.Event()
+        stopped = asyncio.Event()
+        later = asyncio.Event()
+
+        first = clock.call_later(0.01, fired.set)
+        cancelled = clock.call_later(0.02, stopped.set)
+        cancelled.cancel()
+        clock.call_later(0.05, later.set)
+
+        await asyncio.wait_for(fired.wait(), timeout=3.0)
+        assert isinstance(first, asyncio.TimerHandle)
+        assert cancelled.cancelled()
+        # Due before `later`, so it would have fired by now.
+        await asyncio.wait_for(later.wait(), timeout=3.0)
+        assert not stopped.is_set()
 
 
 async def test_subscribing_bars_holds_the_trendbar_subscription() -> None:
@@ -2844,6 +3018,35 @@ async def test_request_bars_counts_only_closed_bars_towards_the_limit() -> None:
         assert bars[-1].ts_event == close_ns(LAST_H1_MINUTE - 60, 3600)
 
 
+async def test_the_forming_bar_does_not_count_towards_a_request_limit() -> None:
+    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+        await h.client._connect()
+        # Half way into the bar opening at LAST_H1_MINUTE, which is therefore still forming.
+        h.client._bar_clock = PinnedClock(LAST_H1_MINUTE * 60 + 1800)
+
+        # The first page holds 21 closed bars and the forming one, so a second page is needed.
+        bars = await request_bars(h, EURUSD_H1, limit=22)
+
+        assert len(bars) == 22
+        assert bars[-1].ts_event == close_ns(LAST_H1_MINUTE - 60, 3600)
+
+
+async def test_a_limited_bar_request_without_a_start_ends_when_history_runs_out() -> None:
+    async with harness(client_config=config(history_page_size=20), server=trendbar_venue()) as h:
+        await h.client._connect()
+
+        # More than the recording holds. Bounded, so a request that never ends fails the test.
+        bars = await asyncio.wait_for(
+            request_bars(h, EURUSD_H1, limit=100, end=at_minute(LAST_H1_MINUTE + 60)),
+            timeout=10.0,
+        )
+
+        assert len(bars) == RECORDED_H1_BARS
+        # Four pages with bars, the last of them only the edge bar the venue repeats, and then
+        # the empty one that ends it.
+        assert len(received(h.server, oa.ProtoOAGetTrendbarsReq)) <= 5
+
+
 async def test_a_page_the_venue_cuts_short_is_continued_from_what_it_served() -> None:
     client_config = config(history_page_size=20)
     async with harness(client_config=client_config, server=trendbar_venue(chunk=5)) as h:
@@ -3145,6 +3348,37 @@ async def test_a_closed_bar_with_impossible_prices_is_dropped_and_reported_once(
         assert not h.bars()
         # Recorded once for the bar type, so a repeat is logged at DEBUG.
         assert h.client._bar_errors == {EURUSD_M1}
+
+
+def unpriceable(event: oa.ProtoOASpotEvent) -> oa.ProtoOASpotEvent:
+    """`event` with prices off the symbol's digits, so no quote can be made of it."""
+    bad = oa.ProtoOASpotEvent()
+    bad.CopyFrom(event)
+    bad.bid = 1
+    bad.ask = 1
+    return bad
+
+
+async def test_a_quote_with_an_unrepresentable_price_is_dropped_and_later_ticks_flow() -> None:
+    async with harness(server=trendbar_venue(), logged=True) as h:
+        await h.client._connect()
+        pin_clock(h, FIRST_M1_MINUTE)
+        await subscribe_quotes(h, GER40_ID)
+        await subscribe_bars(h, GER40_M1)
+        events = spots_until(GER40_SYMBOL_ID, FIRST_M1_MINUTE + 1)
+
+        for event in events:
+            await push_spot(h, unpriceable(event))
+
+        assert not h.quotes()
+        dropped = [(k, m) for k, m in h.logger.lines if "Dropped quote for" in m]
+        # In full once, and then at DEBUG for every repeat.
+        assert [k for k, _ in dropped] == ["error"] + ["debug"] * (len(events) - 1)
+        assert not [e for e in h.logger.errors() if "Spot listener" in e]
+        # The trendbars of the same events were routed all the same.
+        assert [b.bar_type for b in h.bars()] == [GER40_M1]
+        await push_spot(h, GER40_SPOT)
+        assert len(ger40_quotes(h)) == 1
 
 
 async def test_a_failed_request_covering_a_live_subscription_leaves_the_bar_to_the_stream() -> None:
@@ -3899,7 +4133,11 @@ async def test_a_first_subscribe_confirmed_late_backfills_once(
         assert EURUSD_M1_TRENDBARS not in session.failed_restores
         await asyncio.wait_for(asyncio.shield(sub.backfill), timeout=10.0)
 
+        # Owed once: neither trigger starts another backfill now that the first has finished.
+        await push_spot(h, forming_spot(M1, FIRST_M1_MINUTE + 5))
+        h.client._on_trendbars_recovered(EURUSD_SYMBOL_ID, M1)
         assert started == [sub]
+        assert not sub.owes_backfill
         assert [b.ts_event for b in h.bars()] == [
             close_ns(FIRST_M1_MINUTE + i, 60) for i in range(5)
         ]
