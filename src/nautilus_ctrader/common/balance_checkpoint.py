@@ -6,7 +6,8 @@ each checkpoint:
 - **The anchor walk** reads closing deals and cash flows a week at a time, back from now, until
   the rule has its answer, at most 156 weeks.
 - **The first-deposit walk** reads cash flows a week at a time, forward from the account's
-  registration, until it finds the deposit; what it finds is kept for the session.
+  registration, until it finds the deposit; what it finds is kept for the session. At the
+  present it stops, and goes on from there at the next refresh.
 - **At start and on a reconnect** each walk reads at most 8 weeks, so neither is held up. The
   key is written with what is known (`history incomplete`, or no first deposit yet), and the
   walks finish in the background, writing the key again.
@@ -360,7 +361,6 @@ class BalanceCheckpoint:
                 ),
             )
             self._deposit_from_ms = end
-            self._deposit_windows += 1
             try:
                 found = first_deposit([change_of_cash_flow(op) for op in response.depositWithdraw])
             except MissingField as e:
@@ -368,6 +368,9 @@ class BalanceCheckpoint:
                 # Given up for the session: no first deposit is stated.
                 self._deposit_windows = MAX_WINDOWS
                 return
+            # Only the walk up to the present counts against the cap.
+            if end < now:
+                self._deposit_windows += 1
             if found is not None:
                 self._deposit = found
                 return

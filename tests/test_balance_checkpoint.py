@@ -388,13 +388,13 @@ async def test_overlapping_refreshes_read_each_deposit_window_once() -> None:
         finally:
             checkpoint.stop()
 
-        deposit_windows = [
+        asked = [
             (r.fromTimestamp, r.toTimestamp)
             for r in h.received(oa.ProtoOACashFlowHistoryListReq)
             if (r.fromTimestamp - registration) % WEEK_MS == 0
         ]
-        assert len(deposit_windows) == 6
-        assert len(set(deposit_windows)) == len(deposit_windows)
+        assert len(asked) == 6
+        assert len(set(asked)) == len(asked)
         assert checkpoint._deposit_windows == 6
         assert json.loads(written[-1])["first_deposit"] == AVAILABLE["first_deposit"]
 
@@ -444,6 +444,34 @@ async def test_a_deposit_made_after_the_walk_reached_the_present_is_stated(bound
 
         assert len(deposit_windows(h)) == asked + 1
         assert deposit_windows(h)[-1][0] == reached
+        assert json.loads(written[-1])["first_deposit"] == AVAILABLE["first_deposit"]
+
+
+async def test_windows_read_at_the_present_do_not_spend_the_first_deposit_budget(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(balance_checkpoint, "MAX_WINDOWS", 5)
+    start = now_ms()
+    venue = history_venue(last_at=start - 2 * DAY_MS, registration=start - WEEK_MS - 100)
+    venue.deals, venue.cash_flow = [], []
+    async with harness(execution_venue=venue, pacing=_FAST_HISTORY) as h:
+        written: list[bytes] = []
+        checkpoint = direct(h, TickingClock(now=start), written)
+        try:
+            # More refreshes than the budget holds, each reading one window at the present.
+            for _ in range(8):
+                await checkpoint.refresh(venue.trader.trader, bounded=False)
+            assert len(deposit_windows(h)) == 2 + 7
+            assert json.loads(written[-1])["first_deposit"] is None
+
+            deposit = om.ProtoOADepositWithdraw()
+            deposit.CopyFrom(recorded_cash_flow()[0])
+            deposit.changeBalanceTimestamp = deposit_windows(h)[-1][1] + 1
+            venue.cash_flow = [deposit]
+            await checkpoint.refresh(venue.trader.trader, bounded=False)
+        finally:
+            checkpoint.stop()
+
         assert json.loads(written[-1])["first_deposit"] == AVAILABLE["first_deposit"]
 
 
