@@ -23,9 +23,10 @@ from nautilus_ctrader.common.errors import (
     CTraderAuthError,
     CTraderConnectionError,
     CTraderError,
+    CTraderProtocolError,
     CTraderTimeoutError,
 )
-from nautilus_ctrader.common.session import SessionState
+from nautilus_ctrader.common.session import CTraderSession, SessionState
 from nautilus_ctrader.config import CTraderDataClientConfig, CTraderExecClientConfig
 from nautilus_ctrader.constants import CTRADER_VENUE
 from nautilus_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -42,6 +43,7 @@ from tests.account_venue import (
     account_list,
     cached_account_client,
     credentials,
+    for_account,
     hold_account_auth,
     received,
     route_hosts,
@@ -446,6 +448,57 @@ async def test_auto_without_a_refresh_token_fails_on_a_rejected_token() -> None:
         with pytest.raises(CTraderAuthError, match="no refresh token"):
             await client.connect()
         assert not received(server, oa.ProtoOARefreshTokenReq)
+    finally:
+        await server.stop()
+
+
+async def test_a_rejected_start_up_refresh_is_an_auth_error() -> None:
+    server = venue()
+    for payload_type in (
+        oa_model.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ,
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+    ):
+        server.on(
+            payload_type,
+            lambda _r: oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID"),
+        )
+    await server.start()
+    logger = RecordingLogger()
+    client = account_client(server, logger=logger)
+    try:
+        with pytest.raises(
+            CTraderAuthError,
+            match="token refresh rejected: CH_ACCESS_TOKEN_INVALID",
+        ) as info:
+            await client.connect()
+
+        assert any("Token refresh rejected: CH_ACCESS_TOKEN_INVALID" in m for m in logger.errors())
+        assert client.last_connect_error is info.value
+        assert client.session is None
+        await wait_until(lambda: server.open_connection_count == 0, description="all closed")
+    finally:
+        await server.stop()
+
+
+async def test_a_trader_reply_without_money_digits_fails_the_connect() -> None:
+    # A silent default of 0 digits would misscale every monetary value.
+    server = venue()
+
+    def trader_without_money_digits(request: oa.ProtoOATraderReq) -> Message:
+        reply = for_account(RECORDED["trader"][0], request.ctidTraderAccountId)
+        reply.trader.ClearField("moneyDigits")
+        return reply
+
+    server.on(oa_model.PROTO_OA_TRADER_REQ, trader_without_money_digits)
+    await server.start()
+    client = account_client(server)
+    try:
+        with pytest.raises(CTraderProtocolError, match="moneyDigits") as info:
+            await client.connect()
+
+        assert client.last_connect_error is info.value
+        assert client.session is None
+        await wait_until(lambda: server.open_connection_count == 0, description="all closed")
     finally:
         await server.stop()
 
@@ -1453,6 +1506,48 @@ async def test_failed_restores_are_retried_while_ready() -> None:
         await server.stop()
 
 
+async def test_a_restore_retry_tick_during_a_reconnect_does_not_end_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = venue()
+    await server.start()
+    client = account_client(server, environment="demo", restore_retry_interval_secs=0.02)
+    try:
+        held = await _connect_then_lose_the_connection(server, client, monkeypatch)
+        session = client.session
+
+        # The loop reads `is_ready` once per tick, and nothing else does while the session is held.
+        ticks_while_down = 0
+        is_ready = CTraderSession.is_ready
+
+        def counting_is_ready(self: CTraderSession) -> bool:
+            nonlocal ticks_while_down
+            ready = is_ready.fget(self)
+            ticks_while_down += not ready
+            return ready
+
+        monkeypatch.setattr(CTraderSession, "is_ready", property(counting_is_ready))
+        await wait_until(lambda: ticks_while_down >= 3, description="ticks during the reconnect")
+        await held.release()
+        await wait_until(lambda: session.is_ready, description="the session ready again")
+
+        attempts = []
+
+        async def flaky() -> None:
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise RuntimeError("rejected")
+
+        session.add_restore("flaky", flaky)
+        session._failed_restores.add("flaky")
+
+        await wait_until(lambda: not session.failed_restores, description="restore retried")
+        assert len(attempts) == 2
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
 async def test_a_persistently_failing_restore_logs_one_error() -> None:
     server = venue()
     await server.start()
@@ -2007,6 +2102,36 @@ async def test_the_account_reloads_a_changed_symbol_once_and_notifies_every_list
         assert provider.find(GER40_ID) is first[0]
         assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests + 1
         assert _symbol_warnings(logger) == ["Symbol changed at the venue: GER40.cash; reloading"]
+    finally:
+        await client.disconnect()
+        await server.stop()
+
+
+async def test_a_symbol_change_naming_an_unloaded_symbol_first_still_reloads_the_loaded_one() -> (
+    None
+):
+    server = venue()
+    await server.start()
+    client = account_client(server)
+    provider = _instrument_provider(client)
+    notified: list = []
+    client.add_reload_listener(notified.append)
+    try:
+        await client.connect()
+        await provider.initialize()
+        requests = len(received(server, oa.ProtoOASymbolByIdReq))
+
+        await server.push(
+            oa.ProtoOASymbolChangedEvent(
+                ctidTraderAccountId=ACCOUNT_ID,
+                symbolId=[EURUSD_SYMBOL_ID, GER40_SYMBOL_ID],
+            ),
+        )
+        await wait_until(lambda: notified, description="the loaded symbol reloaded")
+        await _round_trip(client)
+
+        assert [i.id for i in notified] == [GER40_ID]
+        assert len(received(server, oa.ProtoOASymbolByIdReq)) == requests + 1
     finally:
         await client.disconnect()
         await server.stop()

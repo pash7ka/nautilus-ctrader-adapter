@@ -739,6 +739,72 @@ async def test_a_late_refresh_reply_during_bring_up_is_adopted_and_the_bring_up_
         await server.stop()
 
 
+@pytest.mark.parametrize("variant", ["rejected-account-auth", "due-at-bring-up"])
+async def test_a_later_refresh_that_times_out_still_waits_for_its_late_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+) -> None:
+    # An earlier refresh left its pair taken. That must not end the wait for this one's reply:
+    # the connection would be torn down with the only pair that still works in flight.
+    monkeypatch.setattr("nautilus_ctrader.common.session.LATE_REFRESH_WAIT_SECS", 3.0)
+    monkeypatch.setattr("nautilus_ctrader.common.session.MIN_TOKEN_REFRESH_INTERVAL_SECS", 0.0)
+    server = _server()
+    server.on(
+        oa_model.PROTO_OA_ACCOUNT_AUTH_REQ,
+        lambda request: (
+            oa.ProtoOAAccountAuthRes(ctidTraderAccountId=ACCOUNT_ID)
+            if request.accessToken in ("old-access", "late-access")
+            else oa.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID")
+        ),
+    )
+    # The first pair is already due at the next bring-up, or not due for a long time.
+    first_expires_in = 1 if variant == "due-at-bring-up" else 2_592_000
+    server.on(
+        oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+        lambda _r: oa.ProtoOARefreshTokenRes(
+            accessToken="new-access",
+            tokenType="bearer",
+            expiresIn=first_expires_in,
+            refreshToken="new-refresh",
+        ),
+    )
+    await server.start()
+    session = _session(server, request_timeout_secs=0.2, backoff_base_secs=0.05)
+    timed_out_and_waiting = asyncio.Event()
+    wait_for_late_pair = session._wait_for_late_pair
+
+    async def noting_wait(timed_out: CTraderTimeoutError) -> None:
+        timed_out_and_waiting.set()
+        await wait_for_late_pair(timed_out)
+
+    monkeypatch.setattr(session, "_wait_for_late_pair", noting_wait)
+    try:
+        await session.start()
+        await session.wait_ready(timeout_secs=2.0)
+        await session.refresh_tokens()
+        held = HeldReplies(
+            server,
+            oa_model.PROTO_OA_REFRESH_TOKEN_REQ,
+            _pair_reply("late-access", "late-refresh"),
+        )
+
+        await server.drop_connections()
+        await asyncio.wait_for(timed_out_and_waiting.wait(), 5.0)
+        await asyncio.wait_for(held.arrived.wait(), 5.0)
+        await held.release()
+        await session.wait_ready(timeout_secs=3.0)
+
+        assert server.connection_count == 2
+        assert [m.accessToken for m in _account_auths(server)] == (
+            ["old-access", "late-access"]
+            if variant == "due-at-bring-up"
+            else ["old-access", "new-access", "late-access"]
+        )
+    finally:
+        await session.stop()
+        await server.stop()
+
+
 async def test_a_bring_up_refresh_that_is_never_answered_fails_the_bring_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

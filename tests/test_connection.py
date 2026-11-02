@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import itertools
+import socket
 import struct
 
 import pytest
@@ -867,6 +868,52 @@ async def test_a_raising_disconnect_handler_still_marks_the_connection_down() ->
     finally:
         await connection.close()
         await server.stop()
+
+
+async def test_a_connection_reset_while_reading_is_reported_as_a_loss() -> None:
+    loop = asyncio.get_running_loop()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.setblocking(False)
+    connection = CTraderConnection(
+        host="127.0.0.1",
+        port=listener.getsockname()[1],
+        logger=Logger("test"),
+        request_timeout_secs=10.0,
+        tls=False,
+    )
+    losses: list[Exception] = []
+    connection.set_disconnect_handler(losses.append)
+    peer: socket.socket | None = None
+    pending: asyncio.Task | None = None
+    try:
+        await connection.connect()
+        async with asyncio.timeout(5.0):
+            peer, _ = await loop.sock_accept(listener)
+            pending = asyncio.create_task(
+                connection.request(oa.ProtoOATraderReq(ctidTraderAccountId=1)),
+            )
+            # The request is on the wire before the peer goes.
+            await loop.sock_recv(peer, 4096)
+        # Closing with a zero linger time resets the connection instead of ending it.
+        peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        peer.close()
+
+        # Far sooner than the request's own timeout.
+        with pytest.raises(CTraderConnectionError, match="read failed") as raised:
+            await asyncio.wait_for(pending, timeout=3.0)
+
+        assert not isinstance(raised.value, CTraderNotSentError)
+        assert losses == [raised.value]
+        assert connection.is_connected is False
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+        await connection.close()
+        if peer is not None:
+            peer.close()
+        listener.close()
 
 
 @pytest.mark.parametrize(

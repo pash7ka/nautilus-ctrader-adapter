@@ -840,6 +840,42 @@ def test_exchange_code_masks_request_values_the_endpoint_echoes(token_url: str) 
     assert_secret_free(exc_info.value, "the-code", "csecret", "cid", "AT-echo")
 
 
+def test_exchange_code_masks_a_refresh_token_the_endpoint_echoes(token_url: str) -> None:
+    _respond(
+        {
+            "errorCode": "BAD RT-echo",
+            "description": "token RT-echo",
+            "refreshToken": "RT-echo",
+        },
+    )
+
+    with pytest.raises(CTraderTokenExchangeError) as exc_info:
+        _exchange(token_url)
+
+    assert_secret_free(exc_info.value, "RT-echo")
+    assert exc_info.value.error_code == "BAD ***"
+    assert exc_info.value.description == "token ***"
+
+
+def test_sanitize_for_terminal_masks_the_longest_form_first() -> None:
+    redact = ("tok", "tok-long")
+
+    assert oauth._sanitize_for_terminal("a tok-long b", redact=redact) == "a *** b"
+
+
+def test_sanitize_for_terminal_ignores_redact_entries_that_are_not_secrets() -> None:
+    assert oauth._sanitize_for_terminal("a b", redact=("", None, 12345)) == "a b"
+
+
+def test_exchange_code_ignores_echoed_values_that_are_not_strings(token_url: str) -> None:
+    _respond({"errorCode": "BAD", "accessToken": 12345, "refreshToken": ""})
+
+    with pytest.raises(CTraderTokenExchangeError) as exc_info:
+        _exchange(token_url)
+
+    assert exc_info.value.error_code == "BAD"
+
+
 def test_exchange_code_masks_url_encoded_echoes_of_request_values(token_url: str) -> None:
     secret = "se cret/+&="
     encoded = (urllib.parse.quote_plus(secret), urllib.parse.quote(secret, safe=""))
